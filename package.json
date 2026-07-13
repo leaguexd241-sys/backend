@@ -4,7 +4,7 @@
   "description": "Server-Authoritative Relay System for Blockchain Games",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "$env:NODE_ENV="development"; $env:KEYSTORE_PASSWORD="blake27931412xdxd"; node server2.js",
     "dev": "nodemon server.js",
     "dev-debug": "nodemon --inspect server.js",
     "test": "jest --verbose",
