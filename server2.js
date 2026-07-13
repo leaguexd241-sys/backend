@@ -28,7 +28,7 @@ const keystore = require('./keystore');
 
 // --- Configuración Principal ---
 const PORT = parseInt(process.env.PORT || '3001', 10);
-const MONGO = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/grassland';
+const MONGO = process.env.MONGO_URL || process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/grassland';
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
 const ACCESS_TOKEN_EXPIRES = process.env.ACCESS_EXPIRES || '15m';
 const REFRESH_TOKEN_TTL_DAYS = parseInt(process.env.REFRESH_TTL_DAYS || '7', 10);
