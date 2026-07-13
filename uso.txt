@@ -1,0 +1,2 @@
+NODE_ENV=development KEYSTORE_PASSWORD="blake27931412xdxd" node server2.js
+$env:NODE_ENV="development"; $env:KEYSTORE_PASSWORD="blake27931412xdxd"; node server2.js
