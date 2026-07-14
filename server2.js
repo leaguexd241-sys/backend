@@ -29,16 +29,47 @@ const keystore = require('./keystore');
 // --- Configuración Principal ---
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const MONGO = process.env.MONGO_URL || process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/grassland';
+const NODE_ENV = process.env.NODE_ENV || 'development';
+
+// --- FIX CRÍTICO: JWT_SECRET debe ser persistente en producción ---
+// Antes: si no había JWT_SECRET en el entorno, se generaba uno aleatorio en
+// cada arranque. Eso invalida TODAS las sesiones en cada reinicio/redeploy, y
+// si el hosting corre más de una instancia, cada una firma con un secreto
+// distinto: un token válido en la instancia que hizo login puede llegar a
+// otra instancia y fallar la verificación. Ambos casos producen el mismo
+// síntoma: "Authentication required" justo después de un login que parecía
+// exitoso.
+if (!process.env.JWT_SECRET) {
+  if (NODE_ENV === 'production') {
+    console.error('❌ ERROR CRÍTICO: JWT_SECRET no está configurada en producción.');
+    console.error('   Genera una y expórtala ANTES de arrancar el proceso, ej:');
+    console.error('   node -e "console.log(require(\'crypto\').randomBytes(64).toString(\'hex\'))"');
+    process.exit(1);
+  } else {
+    console.warn('⚠️  JWT_SECRET no definida — usando un secreto temporal válido solo para esta ejecución (development).');
+  }
+}
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
+
 const ACCESS_TOKEN_EXPIRES = process.env.ACCESS_EXPIRES || '15m';
 const REFRESH_TOKEN_TTL_DAYS = parseInt(process.env.REFRESH_TTL_DAYS || '7', 10);
 const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
-const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:5501,http://127.0.0.1:5501,http://localhost:8080,http://127.0.0.1:8080,https://grasslandforest.com,https://www.grasslandforest.com,https://app.grasslandforest.com';
+// 'lax' funciona para login/API/juego repartidos en subdominios de un mismo dominio
+// (app.grasslandforest.com, api.grasslandforest.com, game.grasslandforest.com...).
+// Solo usa 'none' si tu backend vive en un dominio TOTALMENTE distinto al del
+// frontend/juego (ej. sigue en Railway mientras el resto ya está en tu dominio).
+const COOKIE_SAMESITE = (process.env.COOKIE_SAMESITE || 'lax').toLowerCase();
+const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:5501,http://127.0.0.1:5501,http://localhost:8080,http://127.0.0.1:8080,https://grasslandforest.com,https://www.grasslandforest.com,https://app.grasslandforest.com,https://game.grasslandforest.com';
 const APP_NAME = process.env.APP_NAME || 'Grassland Forest';
-const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // IMPORTANTE: En desarrollo, escuchar en 127.0.0.1 para consistencia
 const HOST = NODE_ENV === 'development' ? '127.0.0.1' : '0.0.0.0';
+
+// --- AUTOCHEQUEO: revisa esto en los logs de arranque para confirmar el entorno real ---
+console.log(`🧪 Entorno: NODE_ENV=${JSON.stringify(NODE_ENV)} | COOKIE_DOMAIN=${COOKIE_DOMAIN || '(no seteado → cookie "host-only")'} | COOKIE_SAMESITE=${COOKIE_SAMESITE}`);
+if (NODE_ENV !== 'production' && (process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID)) {
+  console.warn('⚠️  Detecté variables de Railway pero NODE_ENV no es "production". Con NODE_ENV distinto de "production" las cookies se configuran en modo desarrollo (dominio forzado a 127.0.0.1) y el login en tu dominio real se rompe. Define NODE_ENV=production en las variables de entorno de Railway.');
+}
 
 // --- Configuración de Blockchain y Relay ---
 const RPC_URL = process.env.RPC_URL || "https://dream-rpc.somnia.network";
@@ -3749,7 +3780,7 @@ io.use((socket, next) => {
       return next();
     }
 
-    const payload = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
     if (payload.type !== 'access') {
       socket.authenticatedAddress = null;
       socket.authenticatedPlayer  = null;
@@ -4200,7 +4231,7 @@ app.use(helmet({
       styleSrc: ["'self'", "'unsafe-inline'"],
       scriptSrc: ["'self'"],
       imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'", "http://localhost:*", "http://127.0.0.1:*", "ws://localhost:*", "ws://127.0.0.1:*", "wss://*.grasslandforest.com"],
+      connectSrc: ["'self'", "http://localhost:*", "http://127.0.0.1:*", "ws://localhost:*", "ws://127.0.0.1:*", "https://*.grasslandforest.com", "wss://*.grasslandforest.com"],
       fontSrc: ["'self'", "data:"],
       frameSrc: ["'none'"],
       objectSrc: ["'none'"],
@@ -4367,31 +4398,49 @@ const transactionLimiter = rateLimit({
   }
 });
 
-// --- FUNCIONES DE COOKIES CORREGIDAS PARA DESARROLLO ---
+// --- FUNCIONES DE COOKIES ---
+// FIX: la versión anterior forzaba domain:'127.0.0.1' en cualquier entorno que
+// NO fuera exactamente NODE_ENV==='production'. Si el proceso arranca en un
+// host real sin NODE_ENV=production seteada explícitamente, cae en la rama de
+// "desarrollo" y el navegador recibe un Set-Cookie con Domain=127.0.0.1 desde
+// un host que NO es 127.0.0.1 → lo descarta silenciosamente (no es un error
+// visible, la cookie simplemente nunca se guarda). El login parece exitoso
+// porque igual puedes leer el JSON de respuesta, pero la sesión nunca queda
+// guardada, y /api/auth/me falla siempre con "Authentication required".
 function setCookieOptions(maxAgeSeconds, csrf = false) {
+  const isProd = NODE_ENV === 'production';
+  const sameSite = COOKIE_SAMESITE === 'none' ? 'None'
+                  : COOKIE_SAMESITE === 'strict' ? 'Strict'
+                  : 'Lax';
+
   const opts = {
     httpOnly: !csrf,
-    secure: NODE_ENV === 'production',
-    sameSite: NODE_ENV === 'development' ? 'Lax' : 'Strict',
+    secure: isProd,
+    sameSite,
     maxAge: (maxAgeSeconds || 0) * 1000,
     path: '/',
   };
-  
-  // EN DESARROLLO: Configuración especial para 127.0.0.1
-  if (NODE_ENV === 'development') {
-    opts.sameSite = 'Lax';
-    opts.secure = false;
-    opts.httpOnly = true;
-    
-    // IMPORTANTE: Establecer dominio explícitamente para 127.0.0.1
-    // Esto asegura que las cookies se envíen desde 127.0.0.1:5501 a 127.0.0.1:3001
+
+  // 'SameSite=None' exige 'Secure' obligatoriamente o el navegador la descarta.
+  if (opts.sameSite === 'None') {
+    opts.secure = true;
+  }
+
+  if (isProd) {
+    // Solo fija Domain si te lo dieron explícitamente por env var. Si el
+    // login, el juego y la API viven en subdominios de grasslandforest.com,
+    // pon COOKIE_DOMAIN=.grasslandforest.com para que la misma cookie de
+    // sesión sea válida en todos ellos (incluyendo game.grasslandforest.com).
+    if (COOKIE_DOMAIN) {
+      opts.domain = COOKIE_DOMAIN;
+    }
+  } else {
+    // Solo en desarrollo LOCAL real usamos 127.0.0.1 explícito.
     opts.domain = '127.0.0.1';
+    opts.secure = false;
+    opts.sameSite = 'Lax';
   }
-  
-  if (NODE_ENV === 'production' && COOKIE_DOMAIN) {
-    opts.domain = COOKIE_DOMAIN;
-  }
-  
+
   return opts;
 }
 
@@ -4525,7 +4574,7 @@ function authMiddleware(req, res, next) {
     console.log('🔍 Token encontrado, verificando...');
     
     try {
-      const payload = jwt.verify(token, JWT_SECRET);
+      const payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
       
       if (payload.type !== 'access') {
         console.log('❌ Token no es de tipo access');
@@ -5179,7 +5228,7 @@ app.post('/api/auth/refresh', async (req, res) => {
 
     let payload;
     try {
-      payload = jwt.verify(raw, JWT_SECRET);
+      payload = jwt.verify(raw, JWT_SECRET, { algorithms: ['HS256'] });
       if (payload.type !== 'refresh') {
         console.log('❌ Token no es de tipo refresh');
         throw new Error('Invalid token type');
@@ -5362,7 +5411,7 @@ app.post('/api/auth/logout', csrfProtection, async (req, res) => {
     
     if (raw) {
       try {
-        const payload = jwt.verify(raw, JWT_SECRET);
+        const payload = jwt.verify(raw, JWT_SECRET, { algorithms: ['HS256'] });
         if (payload.type === 'refresh' && payload.address) {
           console.log(`🔒 Logout para ${payload.address.substring(0, 10)}...`);
           
@@ -6355,7 +6404,7 @@ const adminAuth = async (req, res, next) => {
   }
   
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
     
     if (decoded.role !== 'admin' && decoded.role !== 'security_admin') {
       return res.status(403).json({ error: 'No autorizado para operaciones de seguridad' });
@@ -6378,7 +6427,7 @@ const contractAdminAuth = async (req, res, next) => {
   }
   
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
     
     if (decoded.role !== 'admin' && decoded.role !== 'contract_admin') {
       return res.status(403).json({ error: 'No autorizado para operaciones de contratos' });
