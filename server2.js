@@ -33,7 +33,7 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('he
 const ACCESS_TOKEN_EXPIRES = process.env.ACCESS_EXPIRES || '15m';
 const REFRESH_TOKEN_TTL_DAYS = parseInt(process.env.REFRESH_TTL_DAYS || '7', 10);
 const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
-const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:5501,http://127.0.0.1:5501,http://localhost:8080,http://127.0.0.1:8080,https://grasslandforest.com,https://www.grasslandforest.com';
+const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:5501,http://127.0.0.1:5501,http://localhost:8080,http://127.0.0.1:8080,https://grasslandforest.com,https://www.grasslandforest.com,https://app.grasslandforest.com';
 const APP_NAME = process.env.APP_NAME || 'Grassland Forest';
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
@@ -4200,7 +4200,7 @@ app.use(helmet({
       styleSrc: ["'self'", "'unsafe-inline'"],
       scriptSrc: ["'self'"],
       imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'", "http://localhost:*", "http://127.0.0.1:*", "ws://localhost:*", "ws://127.0.0.1:*", "wss://*.grasslandforest.xyz"],
+      connectSrc: ["'self'", "http://localhost:*", "http://127.0.0.1:*", "ws://localhost:*", "ws://127.0.0.1:*", "wss://*.grasslandforest.com"],
       fontSrc: ["'self'", "data:"],
       frameSrc: ["'none'"],
       objectSrc: ["'none'"],
