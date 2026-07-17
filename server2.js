@@ -53,12 +53,15 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('he
 
 const ACCESS_TOKEN_EXPIRES = process.env.ACCESS_EXPIRES || '15m';
 const REFRESH_TOKEN_TTL_DAYS = parseInt(process.env.REFRESH_TTL_DAYS || '7', 10);
-const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
+const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN ? process.env.COOKIE_DOMAIN.trim() : undefined;
 // 'lax' funciona para login/API/juego repartidos en subdominios de un mismo dominio
 // (app.grasslandforest.com, api.grasslandforest.com, game.grasslandforest.com...).
 // Solo usa 'none' si tu backend vive en un dominio TOTALMENTE distinto al del
 // frontend/juego (ej. sigue en Railway mientras el resto ya está en tu dominio).
-const COOKIE_SAMESITE = (process.env.COOKIE_SAMESITE || 'lax').toLowerCase();
+const COOKIE_SAMESITE = (process.env.COOKIE_SAMESITE || 'lax').trim().toLowerCase();
+if (!['lax', 'strict', 'none'].includes(COOKIE_SAMESITE)) {
+  console.warn(`⚠️  COOKIE_SAMESITE="${process.env.COOKIE_SAMESITE}" no es válido (usa lax/strict/none). Cayendo a "lax" por defecto.`);
+}
 const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:5501,http://127.0.0.1:5501,http://localhost:8080,http://127.0.0.1:8080,https://grasslandforest.com,https://www.grasslandforest.com,https://app.grasslandforest.com,https://game.grasslandforest.com';
 const APP_NAME = process.env.APP_NAME || 'Grassland Forest';
 
@@ -4321,7 +4324,11 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+// FIX: '*' como string ya no es válido en Express 5 / path-to-regexp 8+ (tira
+// "PathError: Missing parameter name at index 1: *" y el servidor no arranca).
+// Con una RegExp real (/.*/), evitamos el parser de rutas de string y funciona
+// igual en Express 4 y 5, sin depender de qué versión resuelva tu npm install.
+app.options(/.*/, cors(corsOptions));
 
 // Middleware para debug de cookies en desarrollo
 app.use((req, res, next) => {
@@ -4540,6 +4547,16 @@ function validateSignedMessage(message, expectedToken) {
 // --- AUTH MIDDLEWARE (ACTUALIZADO Y CORREGIDO) ---
 function authMiddleware(req, res, next) {
   console.log('🔐 Verificando autenticación...');
+
+  // 🍪 LOG DE DIAGNÓSTICO — esto es lo que necesitas mirar en los logs de Railway.
+  // Muestra exactamente qué le llegó al servidor en esta petición: si el
+  // Cookie header viene vacío, el navegador NUNCA mandó la cookie (bloqueo del
+  // navegador / SameSite / third-party); si viene pero sin "session=", algo la
+  // está limpiando antes; si viene con "session=" pero igual falla más abajo,
+  // ya es un problema de verificación del JWT, no de transporte de la cookie.
+  console.log('🍪 [authMiddleware] Cookie header crudo:', req.headers.cookie || '(vacío — el navegador no mandó ninguna cookie)');
+  console.log('🍪 [authMiddleware] req.cookies parseadas:', req.cookies);
+  console.log('🍪 [authMiddleware] Origin:', req.headers.origin || '(sin Origin)', '| Referer:', req.headers.referer || '(sin Referer)');
   
   try {
     // PRIMERO buscar en cookies
@@ -4555,7 +4572,7 @@ function authMiddleware(req, res, next) {
     }
     
     if (!token) {
-      console.log('❌ No se encontró token de autenticación');
+      console.log('❌ No se encontró token de autenticación (ni cookie "session" ni header Authorization)');
       console.log('🔍 Detalles de la solicitud:', {
         method: req.method,
         path: req.path,
@@ -4981,6 +4998,7 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
     const { address, signature, token, message } = req.body || {};
     
     console.log(`🔐 Intentando login para: ${address ? address.substring(0, 10) + '...' : 'dirección no proporcionada'}`);
+    console.log('🍪 [login] Origin:', req.headers.origin || '(sin Origin)', '| Cookie header entrante:', req.headers.cookie || '(vacío)');
     console.log('📦 Body recibido:', { 
       hasAddress: !!address, 
       hasSignature: !!signature, 
@@ -5177,6 +5195,8 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
     // IMPORTANTE: Configurar cookies CORRECTAMENTE para desarrollo
     const accessCookieOpts = setCookieOptions(15 * 60); // 15 minutos
     const refreshCookieOpts = setCookieOptions(REFRESH_TOKEN_TTL_DAYS * 24 * 3600);
+
+    console.log('🍪 [login] Seteando cookie "session" con opts:', accessCookieOpts);
 
     // Establecer cookies
     res.cookie('session', accessToken, accessCookieOpts);
@@ -6871,80 +6891,87 @@ app.post('/api/water/collect',
 );
 
 // Misiones diarias
-app.get('/api/missions/daily/:npcId/:date?',
-  apiLimiter,
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const { npcId, date } = req.params;
-      const address = req.user.address.toLowerCase();
-      
-      // Usar PlayerAuth en lugar de User
-      const auth = await PlayerAuth.findOne({ address }).exec();
-      
-      if (!auth || !auth.playerName) {
-        return res.status(404).json({ error: 'Usuario no encontrado' });
-      }
+// FIX: ':date?' (parámetro opcional al final) usa una sintaxis que solo
+// entiende el path-to-regexp viejo que trae Express 4 (0.1.x). En Express 5
+// (path-to-regexp 8.x) esa misma sintaxis lanza un error real al arrancar
+// ("Unexpected ? at index..."), y la alternativa moderna con llaves
+// ("{/:date}") es al revés: no explota en Express 4, pero tampoco matchea
+// nada ahí (queda en 404 silencioso). No hay una sola sintaxis que sirva
+// igual en ambas versiones, así que se registran dos rutas simples (sin
+// parámetro opcional) apuntando al mismo handler — eso sí es idéntico en
+// las dos.
+async function getDailyMissionsHandler(req, res) {
+  try {
+    const { npcId, date } = req.params;
+    const address = req.user.address.toLowerCase();
+    
+    // Usar PlayerAuth en lugar de User
+    const auth = await PlayerAuth.findOne({ address }).exec();
+    
+    if (!auth || !auth.playerName) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
 
-      const playerName = auth.playerName;
+    const playerName = auth.playerName;
 
-      // Usar fecha proporcionada o hoy
-      const targetDate = date || new Date().toISOString().split('T')[0];
-      
-      // Buscar misiones del día
-      const dailyMission = await DailyMission.findOne({ 
-        npcId, 
-        day: targetDate 
-      });
+    // Usar fecha proporcionada o hoy
+    const targetDate = date || new Date().toISOString().split('T')[0];
+    
+    // Buscar misiones del día
+    const dailyMission = await DailyMission.findOne({ 
+      npcId, 
+      day: targetDate 
+    });
 
-      if (!dailyMission) {
-        return res.status(404).json({ 
-          error: 'No hay misiones disponibles para hoy',
-          npcId,
-          day: targetDate
-        });
-      }
-
-      // Obtener progreso del usuario
-      const userProgress = await UserDailyProgress.findOne({
-        playerName: playerName,
+    if (!dailyMission) {
+      return res.status(404).json({ 
+        error: 'No hay misiones disponibles para hoy',
         npcId,
         day: targetDate
       });
-
-      // Calcular tiempo hasta el reset
-      const now = new Date();
-      const resetTime = new Date(now);
-      resetTime.setUTCHours(dailyMission.dailyResetHour, 0, 0, 0);
-      
-      if (now >= resetTime) {
-        resetTime.setDate(resetTime.getDate() + 1);
-      }
-      
-      const hoursUntilReset = Math.ceil((resetTime - now) / (1000 * 60 * 60));
-
-      res.json({
-        success: true,
-        npcId,
-        day: targetDate,
-        missions: dailyMission.missions,
-        userProgress: userProgress || {
-          completedMissions: [],
-          completedCount: 0
-        },
-        resetInfo: {
-          nextResetUTC: resetTime.toISOString(),
-          hoursUntilReset,
-          resetHourUTC: dailyMission.dailyResetHour
-        }
-      });
-
-    } catch (error) {
-      console.error('Error obteniendo misiones diarias:', error);
-      res.status(500).json({ error: 'Error interno del servidor' });
     }
+
+    // Obtener progreso del usuario
+    const userProgress = await UserDailyProgress.findOne({
+      playerName: playerName,
+      npcId,
+      day: targetDate
+    });
+
+    // Calcular tiempo hasta el reset
+    const now = new Date();
+    const resetTime = new Date(now);
+    resetTime.setUTCHours(dailyMission.dailyResetHour, 0, 0, 0);
+    
+    if (now >= resetTime) {
+      resetTime.setDate(resetTime.getDate() + 1);
+    }
+    
+    const hoursUntilReset = Math.ceil((resetTime - now) / (1000 * 60 * 60));
+
+    res.json({
+      success: true,
+      npcId,
+      day: targetDate,
+      missions: dailyMission.missions,
+      userProgress: userProgress || {
+        completedMissions: [],
+        completedCount: 0
+      },
+      resetInfo: {
+        nextResetUTC: resetTime.toISOString(),
+        hoursUntilReset,
+        resetHourUTC: dailyMission.dailyResetHour
+      }
+    });
+
+  } catch (error) {
+    console.error('Error obteniendo misiones diarias:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
   }
-);
+}
+app.get('/api/missions/daily/:npcId', apiLimiter, authMiddleware, getDailyMissionsHandler);
+app.get('/api/missions/daily/:npcId/:date', apiLimiter, authMiddleware, getDailyMissionsHandler);
 
 // Marketplace P2P — todas las rutas /api/marketplace/* viven en marketplace-routes.js
 // (se monta más abajo, después de que PlayerStats esté definido — ver "MARKETPLACE ROUTES MOUNT")
@@ -7954,8 +7981,18 @@ console.log('✅ Stats routes cargados: GET/POST /api/stats/:playerName (sync, u
 
 
 // --- MANEJO DE ERRORES ---
-app.use('/api/*', (req, res) => {
-  res.status(404).json({ error: 'not_found' });
+// FIX: '/api/*' como string también se rompe en Express 5 / path-to-regexp 8+
+// (mismo "Missing parameter name" que el de app.options). Probé el reemplazo
+// obvio con una RegExp de ruta (app.use(/^\/api\//, ...)) y NO funcionó en
+// ninguna de las dos versiones al probarlo — Express no lo matcheaba nunca,
+// devolvía su 404 HTML por defecto en vez de pasar por el handler. La forma
+// que sí probé y funciona igual en Express 4 y 5 es no usar un patrón de ruta
+// en absoluto: un middleware normal que revisa req.path a mano.
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    return res.status(404).json({ error: 'not_found' });
+  }
+  next();
 });
 
 app.use((err, req, res, next) => {
