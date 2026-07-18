@@ -7797,6 +7797,11 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
       } else {
         // ── Leer límites reales del contrato antes de crear ──────────────
         let createVal = STAT_DEFAULTS_MAP[stat] || 0;
+        // FIX: oro/plata tienen default 0 a propósito (arrancan en 0 para todo
+        // jugador nuevo). "createVal <= 0" antes frenaba su creación como si
+        // fuera un límite agotado en el contrato — ahora eso solo debe aplicar
+        // a stats cuyo default SÍ es > 0 (vida/agua/comida).
+        const isZeroByDesign = (STAT_DEFAULTS_MAP[stat] || 0) === 0;
         try {
           const ts = await contract.getTipoStats(stat);
           const exists = ts[5] !== undefined ? Boolean(ts[5]) : Boolean(ts.exists);
@@ -7816,11 +7821,12 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
           const available       = totalLimit > totalQuantity ? totalLimit - totalQuantity : 0;
           if (perInvoiceLimit > 0) createVal = Math.min(createVal, perInvoiceLimit);
           if (available       > 0) createVal = Math.min(createVal, available);
-          if (createVal <= 0) { console.log(`⏭️  Stats sync [${stat}]: límite agotado en contrato`); continue; }
+          if (createVal < 0) createVal = 0;
+          if (createVal <= 0 && !isZeroByDesign) { console.log(`⏭️  Stats sync [${stat}]: límite agotado en contrato`); continue; }
           console.log(`📊 [${stat}] perInvoice=${perInvoiceLimit} available=${available} → crear con ${createVal}`);
         } catch (limErr) {
           console.warn(`⚠️  getTipoStats [${stat}] falló:`, limErr.message, '— usando default');
-          if (createVal <= 0) continue;
+          if (createVal <= 0 && !isZeroByDesign) continue;
         }
 
         const manualId = buildStatManualId(address, stat);
