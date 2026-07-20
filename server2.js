@@ -318,7 +318,7 @@ const CONTRACTS = {
     abi: loadContractABI('SecureMessageLogger')
   },
   ITEMS_CONTRACT: {
-    address: process.env.ITEM_CONTRACT_ADDRESS || '0x52E07418A64b23F2537d4F682e57e1804d46a089',
+    address: process.env.ITEM_CONTRACT_ADDRESS || '0x4356Eb1A19ed6302d1a9582A5d684bF76cafd97e',
     name: 'ItemContract',
     description: 'Contrato para manejar items del juego',
     abi: loadContractABI('ItemContract')
@@ -7393,6 +7393,10 @@ const PlayerStats = mongoose.model('PlayerStats', playerStatsSchema);
 
 const STAT_TYPES_LIST    = ['vida', 'agua', 'comida', 'oro', 'plata'];
 const STAT_DEFAULTS_MAP  = { vida: 100000, agua: 100000, comida: 100000, oro: 0, plata: 0 };
+// Valores con los que se CREA la factura de un jugador nuevo. Separado de
+// STAT_DEFAULTS_MAP porque ese mapa actúa como "piso" en el sync — si oro/plata
+// tuvieran piso 1000, cada sync regalaría monedas a jugadores que ya gastaron.
+const STAT_INITIAL_MAP   = { vida: 100000, agua: 100000, comida: 100000, oro: 1000, plata: 1000 };
 
 // ── MARKETPLACE ROUTES MOUNT ────────────────────────────────────────────────
 // Se monta aquí (y no más arriba) porque necesita GamePlayer, Listing (ya
@@ -7796,12 +7800,12 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
           console.log(`✅ Stats sync [${stat}]: id=${existing.id}, qty=${statsDoc[stat]}`);
       } else {
         // ── Leer límites reales del contrato antes de crear ──────────────
-        let createVal = STAT_DEFAULTS_MAP[stat] || 0;
-        // FIX: oro/plata tienen default 0 a propósito (arrancan en 0 para todo
-        // jugador nuevo). "createVal <= 0" antes frenaba su creación como si
-        // fuera un límite agotado en el contrato — ahora eso solo debe aplicar
-        // a stats cuyo default SÍ es > 0 (vida/agua/comida).
-        const isZeroByDesign = (STAT_DEFAULTS_MAP[stat] || 0) === 0;
+        let createVal = STAT_INITIAL_MAP[stat] || 0;
+        // oro/plata pueden crearse con cantidad 0 si el contrato no tiene cupo
+        // disponible (piso 0 en STAT_DEFAULTS_MAP) — así la factura existe igual.
+        // Para vida/agua/comida (piso > 0), quedar en 0 significa límite agotado
+        // y se salta la creación.
+        const canCreateAtZero = (STAT_DEFAULTS_MAP[stat] || 0) === 0;
         try {
           const ts = await contract.getTipoStats(stat);
           const exists = ts[5] !== undefined ? Boolean(ts[5]) : Boolean(ts.exists);
@@ -7822,11 +7826,11 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
           if (perInvoiceLimit > 0) createVal = Math.min(createVal, perInvoiceLimit);
           if (available       > 0) createVal = Math.min(createVal, available);
           if (createVal < 0) createVal = 0;
-          if (createVal <= 0 && !isZeroByDesign) { console.log(`⏭️  Stats sync [${stat}]: límite agotado en contrato`); continue; }
+          if (createVal <= 0 && !canCreateAtZero) { console.log(`⏭️  Stats sync [${stat}]: límite agotado en contrato`); continue; }
           console.log(`📊 [${stat}] perInvoice=${perInvoiceLimit} available=${available} → crear con ${createVal}`);
         } catch (limErr) {
           console.warn(`⚠️  getTipoStats [${stat}] falló:`, limErr.message, '— usando default');
-          if (createVal <= 0 && !isZeroByDesign) continue;
+          if (createVal <= 0 && !canCreateAtZero) continue;
         }
 
         const manualId = buildStatManualId(address, stat);
@@ -7843,8 +7847,8 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
           }
         } catch (_) {}
 
-        // Nunca crear con más de STAT_DEFAULTS_MAP (evita usar "available" corrupto por invoices fallidas)
-        if (createVal > (STAT_DEFAULTS_MAP[stat] || 0)) createVal = STAT_DEFAULTS_MAP[stat];
+        // Nunca crear con más de STAT_INITIAL_MAP (evita usar "available" corrupto por invoices fallidas)
+        if (createVal > (STAT_INITIAL_MAP[stat] || 0)) createVal = STAT_INITIAL_MAP[stat];
 
         try {
           // Obtener nonce fresco para evitar colisión de nonces en TXs concurrentes
