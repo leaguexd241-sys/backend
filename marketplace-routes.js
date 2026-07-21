@@ -145,21 +145,77 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
     return currency === 'plata' ? 'plata' : 'oro';
   }
 
-  function serializeInventory(inventory) {
-    return (inventory || [])
-      .filter(e => e && e.objeto && Number(e.cantidad) > 0)
-      .map(e => {
+  // FIX "faltan objetos en el market": antes solo se serializaba gp.inventory
+  // (los 40 espacios del bolso). Los objetos de la BARRA RÁPIDA (gp.chest, 7
+  // espacios — regadera, hacha, tijeras, balde...) no aparecían. Ahora se
+  // fusionan ambos, etiquetando cada uno con su `source` para que la venta
+  // descuente del array correcto (ver POST /list).
+  function serializeInventory(gp) {
+    const rows = [];
+    const pushFrom = (arr, source) => {
+      (arr || []).forEach(e => {
+        if (!e || !e.objeto || !(Number(e.cantidad) > 0)) return;
         const meta = catalogMeta(e.objeto);
-        return {
+        rows.push({
           slotId: e.id,
+          source,                 // 'inventory' | 'chest'
           itemId: e.objeto,
           name: meta.name,
           category: meta.category,
           icon: meta.icon,
           maxStack: meta.maxStack,
           qty: Number(e.cantidad)
-        };
+        });
       });
+    };
+    pushFrom(gp && gp.inventory, 'inventory');
+    pushFrom(gp && gp.chest, 'chest');
+    return rows;
+  }
+
+  // ── Historial de mercado (persistente, por jugador) ──────────────────────
+  // Modelo propio. Cada compra genera DOS filas: una 'buy' para el comprador y
+  // una 'sell' para el vendedor, cada una indexada por su playerName/address,
+  // así el historial de un jugador NUNCA se mezcla con el de otro.
+  const marketHistorySchema = new mongoose.Schema({
+    playerName:       { type: String, required: true, index: true },
+    address:          { type: String, index: true },
+    type:             { type: String, enum: ['buy', 'sell'], required: true },
+    itemId:           String,
+    name:             String,
+    category:         String,
+    qty:              Number,
+    pricePerUnit:     Number,
+    total:            Number,   // bruto = qty * pricePerUnit
+    fee:              Number,   // comisión aplicada (relevante en 'sell')
+    sellerReceives:   Number,   // neto recibido por el vendedor (filas 'sell')
+    currency:         String,
+    counterparty:     String,   // address de la contraparte
+    counterpartyName: String,   // playerName de la contraparte
+    createdAt:        { type: Date, default: Date.now }
+  }, { collection: 'market_history' });
+
+  // Reutiliza el modelo si ya está registrado (evita OverwriteModelError si el
+  // módulo se carga más de una vez).
+  const MarketHistory = mongoose.models.MarketHistory
+    || mongoose.model('MarketHistory', marketHistorySchema);
+
+  function serializeHistory(h) {
+    return {
+      type: h.type,
+      itemId: h.itemId,
+      name: h.name,
+      category: h.category,
+      icon: catalogMeta(h.itemId).icon,
+      qty: h.qty,
+      pricePerUnit: h.pricePerUnit,
+      total: h.total,
+      fee: h.fee,
+      sellerReceives: h.sellerReceives,
+      currency: h.currency,
+      counterpartyName: h.counterpartyName,
+      createdAt: h.createdAt
+    };
   }
 
   function serializeListing(doc, myAddress) {
@@ -262,7 +318,7 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
         playerName: gp.playerName,
         oro: stats.oro,
         plata: stats.plata,
-        inventory: serializeInventory(gp.inventory)
+        inventory: serializeInventory(gp)
       });
     } catch (err) {
       console.error('❌ /api/marketplace/account:', err);
@@ -310,13 +366,19 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
   app.post('/api/marketplace/list', writeLimiter, authMiddleware, csrfProtection, async (req, res) => {
     try {
       const address = (req.user.address || '').toLowerCase();
-      let { slotId, itemId, qty, pricePerUnit, currency } = req.body || {};
+      let { slotId, itemId, qty, pricePerUnit, currency, source } = req.body || {};
 
       slotId = Number(slotId);
       qty = Math.floor(Number(qty));
       pricePerUnit = round2(Number(pricePerUnit));
+      // FIX inventario completo: el objeto puede venir del bolso principal
+      // ('inventory') o de la barra rápida ('chest'). Se descuenta del array
+      // correcto; por defecto 'inventory' para compatibilidad.
+      const srcField = source === 'chest' ? 'chest' : 'inventory';
+      // El bolso tiene 40 espacios (0-39); la barra rápida 7 (0-6).
+      const maxSlot = srcField === 'chest' ? 6 : 39;
 
-      if (!Number.isInteger(slotId) || slotId < 0 || slotId > 39) {
+      if (!Number.isInteger(slotId) || slotId < 0 || slotId > maxSlot) {
         return res.status(400).json({ error: 'invalid_slot' });
       }
       if (!itemId || typeof itemId !== 'string') {
@@ -335,13 +397,14 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       const gp = await getGamePlayerByAddress(address);
       if (!gp) return res.status(404).json({ error: 'player_not_found' });
 
-      // Descuento atómico: sólo si ese slot sigue teniendo ese ítem y cantidad suficiente
+      // Descuento atómico sobre el array correcto (inventory o chest): sólo si
+      // ese slot sigue teniendo ese ítem y cantidad suficiente
       const updated = await GamePlayer.findOneAndUpdate(
         {
           address,
-          inventory: { $elemMatch: { id: slotId, objeto: itemId, cantidad: { $gte: qty } } }
+          [srcField]: { $elemMatch: { id: slotId, objeto: itemId, cantidad: { $gte: qty } } }
         },
-        { $inc: { 'inventory.$[slot].cantidad': -qty } },
+        { $inc: { [`${srcField}.$[slot].cantidad`]: -qty } },
         {
           new: true,
           arrayFilters: [{ 'slot.id': slotId, 'slot.objeto': itemId }]
@@ -352,10 +415,10 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
         return res.status(400).json({ error: 'insufficient_item_quantity', message: 'No tienes esa cantidad de ese objeto en ese espacio' });
       }
 
-      // Limpieza best-effort de slots que quedaron en 0
+      // Limpieza best-effort de slots que quedaron en 0 (en el array usado)
       await GamePlayer.updateOne(
         { address },
-        { $pull: { inventory: { cantidad: { $lte: 0 } } } }
+        { $pull: { [srcField]: { cantidad: { $lte: 0 } } } }
       ).exec();
 
       const meta = catalogMeta(itemId);
@@ -375,7 +438,7 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       return res.json({
         success: true,
         listing: serializeListing(listing, address),
-        inventory: serializeInventory(fresh.inventory)
+        inventory: serializeInventory(fresh)
       });
     } catch (err) {
       console.error('❌ POST /api/marketplace/list:', err);
@@ -413,7 +476,7 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       await applyInsertPlan(address, listing.itemId, plan);
 
       const fresh = await getGamePlayerByAddress(address);
-      return res.json({ success: true, inventory: serializeInventory(fresh.inventory) });
+      return res.json({ success: true, inventory: serializeInventory(fresh) });
     } catch (err) {
       console.error('❌ POST /api/marketplace/cancel/:id:', err);
       return res.status(500).json({ error: 'internal_server_error' });
@@ -506,6 +569,50 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       // 5) Entregar el ítem al comprador
       await applyInsertPlan(address, listing.itemId, plan);
 
+      // 6) Registrar el HISTORIAL (persistente, por jugador). Dos filas: una
+      //    para el comprador y otra para el vendedor. No es crítico para la
+      //    transacción, así que si falla solo se avisa (best-effort).
+      try {
+        await MarketHistory.insertMany([
+          {
+            playerName: buyerGP.playerName,
+            address,
+            type: 'buy',
+            itemId: listing.itemId,
+            name: meta.name,
+            category: meta.category,
+            qty,
+            pricePerUnit: listing.pricePerUnit,
+            total: totalPrice,
+            fee: 0,
+            sellerReceives: null,
+            currency: listing.currency,
+            counterparty: listing.owner,
+            counterpartyName: listing.ownerName,
+            createdAt: new Date()
+          },
+          {
+            playerName: listing.ownerName,
+            address: listing.owner,
+            type: 'sell',
+            itemId: listing.itemId,
+            name: meta.name,
+            category: meta.category,
+            qty,
+            pricePerUnit: listing.pricePerUnit,
+            total: totalPrice,
+            fee,
+            sellerReceives,
+            currency: listing.currency,
+            counterparty: address,
+            counterpartyName: buyerGP.playerName,
+            createdAt: new Date()
+          }
+        ]);
+      } catch (histErr) {
+        console.warn('⚠️ No se pudo registrar el historial de mercado:', histErr.message);
+      }
+
       const freshStats = await PlayerStats.findOne({ playerName: buyerGP.playerName }).lean();
       const freshGP = await getGamePlayerByAddress(address);
 
@@ -516,10 +623,35 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
         currency: listing.currency,
         oro: freshStats.oro,
         plata: freshStats.plata,
-        inventory: serializeInventory(freshGP.inventory)
+        inventory: serializeInventory(freshGP)
       });
     } catch (err) {
       console.error('❌ POST /api/marketplace/buy/:id:', err);
+      return res.status(500).json({ error: 'internal_server_error' });
+    }
+  });
+
+  // ── GET /api/marketplace/history ────────────────────────────────────────
+  // Historial de compras/ventas del jugador logeado. Sólo devuelve SUS filas
+  // (por playerName o address), así nunca se mezcla con otros jugadores.
+  app.get('/api/marketplace/history', apiLimiter, authMiddleware, async (req, res) => {
+    try {
+      const address = (req.user.address || '').toLowerCase();
+      const gp = await getGamePlayerByAddress(address);
+      const playerName = gp ? gp.playerName : null;
+
+      const query = playerName
+        ? { $or: [{ playerName }, { address }] }
+        : { address };
+
+      const rows = await MarketHistory.find(query)
+        .sort({ createdAt: -1 })
+        .limit(100)
+        .lean();
+
+      return res.json({ history: rows.map(serializeHistory) });
+    } catch (err) {
+      console.error('❌ GET /api/marketplace/history:', err);
       return res.status(500).json({ error: 'internal_server_error' });
     }
   });
