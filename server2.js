@@ -312,7 +312,7 @@ function loadContractABI(contractName) {
 // --- CONFIGURACIÓN DE MÚLTIPLES CONTRATOS CON ABIs EXTERNOS ---
 const CONTRACTS = {
   SIMPLE_MESSAGE_LOGGER: {
-    address: process.env.SIMPLE_MESSAGE_LOGGER_ADDRESS || '0x5b52665d600a48452a84C3B3E2ed02435b489ED9',
+    address: process.env.SIMPLE_MESSAGE_LOGGER_ADDRESS || '0x52E07418A64b23F2537d4F682e57e1804d46a089',
     name: 'SecureMessageLogger',
     description: 'Contrato seguro para registrar mensajes en la blockchain',
     abi: loadContractABI('SecureMessageLogger')
