@@ -318,7 +318,7 @@ const CONTRACTS = {
     abi: loadContractABI('SecureMessageLogger')
   },
   ITEMS_CONTRACT: {
-    address: process.env.ITEM_CONTRACT_ADDRESS || '0x4356Eb1A19ed6302d1a9582A5d684bF76cafd97e',
+    address: process.env.ITEM_CONTRACT_ADDRESS || '0x52E07418A64b23F2537d4F682e57e1804d46a089',
     name: 'ItemContract',
     description: 'Contrato para manejar items del juego',
     abi: loadContractABI('ItemContract')
