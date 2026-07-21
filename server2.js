@@ -500,6 +500,9 @@ const gamePlayerSchema = new mongoose.Schema({
   moneda: { type: Number, default: 100000 },
   moneda_plata: { type: Number, default: 100000 },
   Username: { type: String, default: '---' },
+  // Nombre de la mascota. Igual que Username: nace en '---' y solo puede
+  // fijarse UNA vez (regla aplicada en /api/save).
+  petName: { type: String, default: '---' },
   lenguaje: { type: Number, default: 1 },
   nivel: { type: Number, default: 0 },
   nivel_exp: { type: Number, default: 0 },
@@ -6713,6 +6716,54 @@ app.post('/api/save/:playerName',
       // Sobrescribir con los arrays ya validados
       if (inventory) update.inventory = inventory;
       if (chest) update.chest = chest;
+
+      // ── REGLA DE NOMBRE ÚNICO (personaje y mascota) ─────────────────────
+      // Ambos nombres nacen como '---'. El jugador puede fijar cada uno UNA
+      // sola vez: cuando el valor guardado ya NO es '---', cualquier intento
+      // de cambiarlo se ignora (se conserva el existente). Validación en
+      // servidor para que no dependa del cliente.
+      try {
+        const sanitizeOneTimeName = (raw) => {
+          if (typeof raw !== 'string') return null;
+          let s = raw.normalize('NFC').trim().replace(/<[^>]*>/g, '');
+          try { s = s.replace(/[^\p{L}]/gu, ''); }
+          catch (e) { s = s.replace(/[^A-Za-zÁÉÍÓÚáéíóúÑñÜü]/g, ''); }
+          return s.slice(0, 10);
+        };
+
+        const existingGP = await GamePlayer.findOne({ playerName }).lean();
+
+        for (const field of ['Username', 'petName']) {
+          if (update[field] === undefined) continue;
+
+          const current = existingGP && typeof existingGP[field] === 'string'
+            ? existingGP[field] : '---';
+
+          if (current && current !== '---') {
+            // Nombre ya fijado: inmutable, conservar el existente.
+            if (update[field] !== current) {
+              console.log(`🔒 ${field} ya fijado para ${playerName} ('${current}') — cambio ignorado`);
+            }
+            update[field] = current;
+            continue;
+          }
+
+          // Aún en '---': permitir fijarlo una vez, sanitizado.
+          const clean = sanitizeOneTimeName(update[field]);
+          if (!clean) {
+            // Vacío o inválido: mantener '---' (no cuenta como fijado)
+            update[field] = '---';
+          } else {
+            update[field] = clean;
+            if (clean !== '---') console.log(`✅ ${field} fijado para ${playerName}: '${clean}' (definitivo)`);
+          }
+        }
+      } catch (nameErr) {
+        console.warn('⚠️  No se pudo aplicar la regla de nombre único:', nameErr.message);
+        // Ante cualquier duda, no permitir cambios de nombre en esta petición
+        delete update.Username;
+        delete update.petName;
+      }
 
       // ── Usar valores canónicos del contrato para moneda/moneda_plata ──────
       // El cliente puede enviar valores stale. PlayerStats tiene la verdad.
