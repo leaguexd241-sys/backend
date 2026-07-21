@@ -3,6 +3,19 @@
     "inputs": [
       {
         "internalType": "address",
+        "name": "_admin",
+        "type": "address"
+      }
+    ],
+    "name": "addAdmin",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
         "name": "initialOwner",
         "type": "address"
       }
@@ -30,6 +43,144 @@
     "inputs": [],
     "name": "CannotRenounceOwnership",
     "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ExceedsTipoLimit",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InsufficientQuantity",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidManualIdLength",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvoiceNotActive",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvoiceNotFound",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvoiceWouldExceedPerInvoiceLimit",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ManualIdAlreadyExists",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ManualIdNotFound",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "MigrationAlreadySealed",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "owner",
+        "type": "address"
+      }
+    ],
+    "name": "OwnableInvalidOwner",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "account",
+        "type": "address"
+      }
+    ],
+    "name": "OwnableUnauthorizedAccount",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "PerInvoiceLimitTooLow",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ReentrancyGuardReentrantCall",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "SameInvoice",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "TipoLimitZero",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "TipoNotConfigured",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "TransferAmountZero",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "Unauthorized",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroAddress",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroAmount",
+    "type": "error"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "admin",
+        "type": "address"
+      }
+    ],
+    "name": "AdminAdded",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "admin",
+        "type": "address"
+      }
+    ],
+    "name": "AdminRemoved",
+    "type": "event"
   },
   {
     "inputs": [
@@ -116,11 +267,6 @@
     "type": "function"
   },
   {
-    "inputs": [],
-    "name": "ExceedsTipoLimit",
-    "type": "error"
-  },
-  {
     "inputs": [
       {
         "internalType": "uint256",
@@ -143,138 +289,6 @@
     ],
     "stateMutability": "nonpayable",
     "type": "function"
-  },
-  {
-    "inputs": [],
-    "name": "InsufficientQuantity",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "InvalidManualIdLength",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "InvoiceNotActive",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "InvoiceNotFound",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "InvoiceWouldExceedPerInvoiceLimit",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "ManualIdAlreadyExists",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "ManualIdNotFound",
-    "type": "error"
-  },
-  {
-    "inputs": [
-      {
-        "internalType": "address",
-        "name": "owner",
-        "type": "address"
-      }
-    ],
-    "name": "OwnableInvalidOwner",
-    "type": "error"
-  },
-  {
-    "inputs": [
-      {
-        "internalType": "address",
-        "name": "account",
-        "type": "address"
-      }
-    ],
-    "name": "OwnableUnauthorizedAccount",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "PerInvoiceLimitTooLow",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "ReentrancyGuardReentrantCall",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "renounceOwnership",
-    "outputs": [],
-    "stateMutability": "nonpayable",
-    "type": "function"
-  },
-  {
-    "inputs": [],
-    "name": "SameInvoice",
-    "type": "error"
-  },
-  {
-    "inputs": [
-      {
-        "internalType": "string",
-        "name": "_tipo",
-        "type": "string"
-      },
-      {
-        "internalType": "uint256",
-        "name": "_limit",
-        "type": "uint256"
-      },
-      {
-        "internalType": "uint256",
-        "name": "_perInvoiceLimit",
-        "type": "uint256"
-      }
-    ],
-    "name": "setLimit",
-    "outputs": [],
-    "stateMutability": "nonpayable",
-    "type": "function"
-  },
-  {
-    "inputs": [],
-    "name": "TipoLimitZero",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "TipoNotConfigured",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "TransferAmountZero",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "Unauthorized",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "ZeroAddress",
-    "type": "error"
-  },
-  {
-    "inputs": [],
-    "name": "ZeroAmount",
-    "type": "error"
   },
   {
     "anonymous": false,
@@ -336,6 +350,37 @@
       }
     ],
     "name": "InvoiceDeleted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "owner",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "tipo",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "cantidad",
+        "type": "uint256"
+      }
+    ],
+    "name": "InvoiceMigrated",
     "type": "event"
   },
   {
@@ -464,6 +509,62 @@
     "type": "event"
   },
   {
+    "inputs": [
+      {
+        "components": [
+          {
+            "internalType": "uint256",
+            "name": "id",
+            "type": "uint256"
+          },
+          {
+            "internalType": "string",
+            "name": "manualId",
+            "type": "string"
+          },
+          {
+            "internalType": "address",
+            "name": "owner",
+            "type": "address"
+          },
+          {
+            "internalType": "string",
+            "name": "tipo",
+            "type": "string"
+          },
+          {
+            "internalType": "uint256",
+            "name": "cantidad",
+            "type": "uint256"
+          },
+          {
+            "internalType": "bool",
+            "name": "active",
+            "type": "bool"
+          },
+          {
+            "internalType": "uint256",
+            "name": "createdAt",
+            "type": "uint256"
+          }
+        ],
+        "internalType": "struct InvoiceSystem.Invoice[]",
+        "name": "batch",
+        "type": "tuple[]"
+      }
+    ],
+    "name": "migrateInvoicesBatch",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "anonymous": false,
+    "inputs": [],
+    "name": "MigrationSealed",
+    "type": "event"
+  },
+  {
     "anonymous": false,
     "inputs": [
       {
@@ -481,6 +582,56 @@
     ],
     "name": "OwnershipTransferred",
     "type": "event"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_admin",
+        "type": "address"
+      }
+    ],
+    "name": "removeAdmin",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "renounceOwnership",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "sealMigration",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "string",
+        "name": "_tipo",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_limit",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_perInvoiceLimit",
+        "type": "uint256"
+      }
+    ],
+    "name": "setLimit",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
   },
   {
     "anonymous": false,
@@ -973,6 +1124,25 @@
     "type": "function"
   },
   {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_who",
+        "type": "address"
+      }
+    ],
+    "name": "isAdmin",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
     "inputs": [],
     "name": "MAX_BATCH_SIZE",
     "outputs": [
@@ -987,12 +1157,38 @@
   },
   {
     "inputs": [],
+    "name": "migrationSealed",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "owner",
     "outputs": [
       {
         "internalType": "address",
         "name": "",
         "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "totalInvoicesEver",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
       }
     ],
     "stateMutability": "view",
