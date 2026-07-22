@@ -8104,6 +8104,23 @@ const battleLogSchema = new mongoose.Schema({
 }, { timestamps: true });
 const BattleLog = mongoose.model('BattleLog', battleLogSchema);
 
+// Batallas diarias contra bot: 5 por día y cada una más difícil que la
+// anterior. El contador vive en el servidor (día en UTC) para que no se pueda
+// reiniciar borrando datos del navegador.
+const battleDailySchema = new mongoose.Schema({
+  playerName: { type: String, required: true },
+  day: { type: String, required: true },      // 'YYYY-MM-DD' (UTC)
+  done: { type: Number, default: 0, min: 0 },
+  wins: { type: Number, default: 0, min: 0 }
+}, { timestamps: true });
+battleDailySchema.index({ playerName: 1, day: 1 }, { unique: true });
+const BattleDaily = mongoose.model('BattleDaily', battleDailySchema);
+
+const BATTLE_DAILY_MAX = 5;
+function battleTodayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
 // ---------------------------------------------------------------------------
 // TEMPORADA ACTIVA (con reinicio automático cada 15 días)
 // ---------------------------------------------------------------------------
@@ -8244,8 +8261,55 @@ function battlePublicPlayer(p) {
     addressShort: shortAddress(p.address),
     level: p.level,
     hp: p.hp,
-    maxHp: p.maxHp
+    maxHp: p.maxHp,
+    isBot: !!p.isBot
   };
+}
+
+// ---------------------------------------------------------------------------
+// BOT DE LAS BATALLAS DIARIAS
+// ---------------------------------------------------------------------------
+// ronda va de 1 a 5 y cada una es más dura que la anterior: sube de nivel,
+// vida, ataque y también la "inteligencia" con la que elige su jugada.
+const BATTLE_BOT_NAMES = ['Rooty', 'Thorn', 'Boulder', 'Blaze', 'Warden'];
+
+function crearBotDeRonda(ronda, nivelJugador) {
+  const r = Math.max(1, Math.min(BATTLE_DAILY_MAX, Number(ronda) || 1));
+  const nivel = Math.max(1, (Number(nivelJugador) || 1) + (r - 1));
+  const base = battleStatsForLevel(nivel);
+
+  const maxHp = Math.round(base.maxHp * (1 + 0.12 * (r - 1)));
+  const attack = Math.round(base.attack * (1 + 0.10 * (r - 1)));
+
+  return {
+    socket: null,
+    isBot: true,
+    ronda: r,
+    // 0.2 en la ronda 1 → 0.6 en la 5: probabilidad de leer la jugada del rival
+    astucia: 0.2 + 0.1 * (r - 1),
+    playerName: `BOT · Round ${r}`,
+    petName: BATTLE_BOT_NAMES[r - 1] || `Bot ${r}`,
+    address: '',
+    level: nivel,
+    maxHp,
+    hp: maxHp,
+    attack
+  };
+}
+
+// Elige la jugada del bot. Con "astucia" alta intenta contrarrestar lo que el
+// jugador hizo el turno anterior (attack ← defend, defend ← strong, strong ←
+// attack); si no, juega al azar con algo de sesgo hacia el ataque.
+function elegirAccionBot(bot, ultimaAccionRival) {
+  if (Math.random() < (bot.astucia || 0.2) && ultimaAccionRival) {
+    if (ultimaAccionRival === 'strong') return 'defend';
+    if (ultimaAccionRival === 'defend') return 'strong';
+    return 'attack';
+  }
+  const dado = Math.random();
+  if (dado < 0.45) return 'attack';
+  if (dado < 0.78) return 'strong';
+  return 'defend';
 }
 
 // Daño según el par de acciones. Devuelve { dmgToA, dmgToB, texto }
@@ -8292,12 +8356,19 @@ async function saveBattleResult(match, winnerKey, reason) {
 
     const bump = async (p, gano) => {
       if (!p || !p.playerName || p.playerName === '---') return;
+      if (p.isBot) return; // el bot no entra en la clasificación
+
+      // Puntos: P2P → 3 por ganar, 1 por participar.
+      //         Bot  → 1 por ganar, 0 por perder (tope de 5 batallas al día,
+      //         así no se puede farmear la tabla contra la máquina).
+      const puntos = match.esBot ? (gano ? 1 : 0) : (gano ? 3 : 1);
+
       const doc = await BattleScore.findOneAndUpdate(
         { seasonNumber: season.seasonNumber, playerName: p.playerName },
         {
           $set: { address: p.address || '', petName: p.petName || '---', lastBattleAt: new Date() },
           $inc: {
-            points: gano ? 3 : 1,   // ganar 3, perder 1 (participar cuenta)
+            points: puntos,
             wins: gano ? 1 : 0,
             losses: gano ? 0 : 1,
             battles: 1
@@ -8339,15 +8410,35 @@ async function endBattle(match, winnerKey, reason) {
 
   await saveBattleResult(match, winnerKey, reason);
 
+  // Contador de batallas diarias contra bot (solo si esta era una de ellas)
+  let dailyInfo = null;
+  if (match.esBot && match.a && match.a.playerName && match.a.playerName !== '---') {
+    try {
+      const doc = await BattleDaily.findOneAndUpdate(
+        { playerName: match.a.playerName, day: battleTodayKey() },
+        { $inc: { done: 1, wins: winnerKey === 'a' ? 1 : 0 } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      dailyInfo = { done: doc.done, max: BATTLE_DAILY_MAX, remaining: Math.max(0, BATTLE_DAILY_MAX - doc.done) };
+    } catch (e) {
+      console.error('❌ Error actualizando batallas diarias:', e);
+    }
+  }
+
   ['a', 'b'].forEach(key => {
     const p = match[key];
-    if (!p || !p.socket) return;
+    if (!p || !p.socket) return;   // el bot no tiene socket
     const gano = winnerKey === key;
     p.socket.emit('battle:end', {
       matchId: match.id,
       result: winnerKey ? (gano ? 'win' : 'lose') : 'draw',
       reason: reason || 'ko',
-      pointsEarned: winnerKey ? (gano ? 3 : 1) : 0,
+      // Contra bot se da 1 punto por victoria (máximo 5 batallas al día);
+      // en P2P, 3 por ganar y 1 por participar.
+      pointsEarned: winnerKey ? (match.esBot ? (gano ? 1 : 0) : (gano ? 3 : 1)) : 0,
+      mode: match.esBot ? 'bot' : 'pvp',
+      round: match.esBot ? match.ronda : null,
+      daily: dailyInfo,
       you: battlePublicPlayer(p),
       rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
     });
@@ -8375,6 +8466,11 @@ function startBattleTurn(match) {
     }
   });
 
+  // El bot elige al momento (el jugador no ve su jugada hasta resolver el turno)
+  if (match.b && match.b.isBot) {
+    match.actions.b = elegirAccionBot(match.b, match.ultimaAccionJugador);
+  }
+
   // Si alguien no elige a tiempo, se le asigna 'defend' y sigue el combate
   match.turnTimer = setTimeout(() => {
     if (match.ended) return;
@@ -8390,6 +8486,7 @@ async function resolveBattleTurn(match) {
 
   const accionA = match.actions.a || 'defend';
   const accionB = match.actions.b || 'defend';
+  match.ultimaAccionJugador = accionA; // el bot la usa para leer al jugador
   const { dmgToA, dmgToB, texto } = resolveBattleActions(match.a, match.b, accionA, accionB);
 
   match.a.hp = Math.max(0, match.a.hp - dmgToA);
@@ -8426,6 +8523,56 @@ async function resolveBattleTurn(match) {
   setTimeout(() => startBattleTurn(match), 1200);
 }
 
+// Datos del jugador humano a partir de su socket (nivel, nombre de mascota…)
+async function construirJugadorDeSocket(socket) {
+  let playerName = socket.authenticatedPlayer || null;
+  if (!playerName && socket.authenticatedAddress) {
+    try {
+      const auth = await PlayerAuth.findOne({
+        address: socket.authenticatedAddress.toLowerCase()
+      }).select('playerName').lean();
+      if (auth && auth.playerName) playerName = auth.playerName;
+    } catch (e) { /* se usa el fallback */ }
+  }
+  if (!playerName) playerName = socket.playerData?.username || '---';
+
+  let nivel = 1, petName = 'Pet';
+  try {
+    const gp = await GamePlayer.findOne({ playerName }).select('nivel petName').lean();
+    if (gp) {
+      nivel = gp.nivel || 1;
+      petName = gp.petName && gp.petName !== '---' ? gp.petName : 'Pet';
+    }
+  } catch (e) { /* valores por defecto */ }
+
+  const stats = battleStatsForLevel(nivel);
+  return {
+    socket,
+    isBot: false,
+    playerName,
+    petName,
+    address: socket.authenticatedAddress || '',
+    level: nivel,
+    maxHp: stats.maxHp,
+    hp: stats.maxHp,
+    attack: stats.attack
+  };
+}
+
+// Estado de las 5 batallas diarias de un jugador
+async function estadoBatallasDiarias(playerName) {
+  const day = battleTodayKey();
+  const doc = await BattleDaily.findOne({ playerName, day }).lean();
+  const done = doc ? doc.done : 0;
+  return {
+    done,
+    max: BATTLE_DAILY_MAX,
+    remaining: Math.max(0, BATTLE_DAILY_MAX - done),
+    nextRound: Math.min(BATTLE_DAILY_MAX, done + 1),
+    wins: doc ? doc.wins : 0
+  };
+}
+
 async function tryBattleMatchmaking() {
   while (battleQueue.length >= 2) {
     const sa = battleQueue.shift();
@@ -8433,45 +8580,13 @@ async function tryBattleMatchmaking() {
     if (!sa || !sa.connected) { if (sb && sb.connected) battleQueue.unshift(sb); continue; }
     if (!sb || !sb.connected) { battleQueue.unshift(sa); continue; }
 
-    const construir = async (socket) => {
-      // authenticatedPlayer solo se llena tras joinRoom; si el jugador entró
-      // directo a la batalla, se resuelve por su address.
-      let playerName = socket.authenticatedPlayer || null;
-      if (!playerName && socket.authenticatedAddress) {
-        try {
-          const auth = await PlayerAuth.findOne({
-            address: socket.authenticatedAddress.toLowerCase()
-          }).select('playerName').lean();
-          if (auth && auth.playerName) playerName = auth.playerName;
-        } catch (e) { /* se usa el fallback de abajo */ }
-      }
-      if (!playerName) playerName = socket.playerData?.username || '---';
-
-      let nivel = 1, petName = '---';
-      try {
-        const gp = await GamePlayer.findOne({ playerName }).select('nivel petName').lean();
-        if (gp) {
-          nivel = gp.nivel || 1;
-          petName = gp.petName && gp.petName !== '---' ? gp.petName : 'Pet';
-        }
-      } catch (e) { /* valores por defecto */ }
-      const stats = battleStatsForLevel(nivel);
-      return {
-        socket,
-        playerName,
-        petName,
-        address: socket.authenticatedAddress || '',
-        level: nivel,
-        maxHp: stats.maxHp,
-        hp: stats.maxHp,
-        attack: stats.attack
-      };
-    };
-
-    const [a, b] = await Promise.all([construir(sa), construir(sb)]);
+    const [a, b] = await Promise.all([
+      construirJugadorDeSocket(sa),
+      construirJugadorDeSocket(sb)
+    ]);
     const match = {
       id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      a, b, turn: 0, ended: false,
+      a, b, turn: 0, ended: false, esBot: false,
       actions: { a: null, b: null },
       turnTimer: null
     };
@@ -8494,7 +8609,77 @@ async function tryBattleMatchmaking() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// BATALLA DIARIA CONTRA BOT (5 al día, cada una más difícil)
+// ---------------------------------------------------------------------------
+async function iniciarBatallaBot(socket) {
+  const jugador = await construirJugadorDeSocket(socket);
+  if (!jugador.playerName || jugador.playerName === '---') {
+    return socket.emit('battle:error', { error: 'not_authenticated' });
+  }
+
+  const estado = await estadoBatallasDiarias(jugador.playerName);
+  if (estado.remaining <= 0) {
+    return socket.emit('battle:error', { error: 'daily_limit', daily: estado });
+  }
+
+  const ronda = estado.nextRound;
+  const bot = crearBotDeRonda(ronda, jugador.level);
+
+  const match = {
+    id: `b_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    a: jugador, b: bot,
+    turn: 0, ended: false,
+    esBot: true, ronda,
+    actions: { a: null, b: null },
+    ultimaAccionJugador: null,
+    turnTimer: null
+  };
+
+  battleMatches.set(match.id, match);
+  socketMatch.set(socket.id, match.id);
+
+  socket.emit('battle:matched', {
+    matchId: match.id,
+    mode: 'bot',
+    round: ronda,
+    daily: estado,
+    you: battlePublicPlayer(jugador),
+    rival: battlePublicPlayer(bot)
+  });
+
+  console.log(`🤖 Batalla diaria ${match.id}: ${jugador.playerName} vs ${bot.petName} (ronda ${ronda})`);
+  setTimeout(() => startBattleTurn(match), 2000);
+}
+
 io.on('connection', (socket) => {
+  socket.on('battle:dailyStatus', async () => {
+    try {
+      const jugador = await construirJugadorDeSocket(socket);
+      if (!jugador.playerName || jugador.playerName === '---') {
+        return socket.emit('battle:daily', { done: 0, max: BATTLE_DAILY_MAX, remaining: BATTLE_DAILY_MAX, nextRound: 1, wins: 0 });
+      }
+      socket.emit('battle:daily', await estadoBatallasDiarias(jugador.playerName));
+    } catch (e) {
+      console.error('❌ battle:dailyStatus', e);
+    }
+  });
+
+  socket.on('battle:bot', async () => {
+    try {
+      if (!socket.authenticatedAddress) {
+        return socket.emit('battle:error', { error: 'not_authenticated' });
+      }
+      if (socketMatch.has(socket.id)) {
+        return socket.emit('battle:error', { error: 'already_in_battle' });
+      }
+      await iniciarBatallaBot(socket);
+    } catch (e) {
+      console.error('❌ battle:bot', e);
+      socket.emit('battle:error', { error: 'bot_failed' });
+    }
+  });
+
   socket.on('battle:queue', async () => {
     try {
       // Solo jugadores autenticados (la tabla es por playerName)
@@ -8529,7 +8714,7 @@ io.on('connection', (socket) => {
       if (!match || match.ended) return;
 
       const accion = data && ['attack', 'strong', 'defend'].includes(data.action) ? data.action : 'defend';
-      const key = match.a.socket.id === socket.id ? 'a' : 'b';
+      const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
       if (match.actions[key]) return; // ya eligió en este turno
       match.actions[key] = accion;
 
@@ -8548,7 +8733,7 @@ io.on('connection', (socket) => {
     if (!matchId) return;
     const match = battleMatches.get(matchId);
     if (!match || match.ended) return;
-    const key = match.a.socket.id === socket.id ? 'a' : 'b';
+    const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
     await endBattle(match, key === 'a' ? 'b' : 'a', 'forfeit');
   });
 
@@ -8560,7 +8745,7 @@ io.on('connection', (socket) => {
     if (!matchId) return;
     const match = battleMatches.get(matchId);
     if (!match || match.ended) return;
-    const key = match.a.socket.id === socket.id ? 'a' : 'b';
+    const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
     await endBattle(match, key === 'a' ? 'b' : 'a', 'forfeit');
   });
 });
