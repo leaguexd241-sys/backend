@@ -7024,6 +7024,188 @@ async function getDailyMissionsHandler(req, res) {
 app.get('/api/missions/daily/:npcId', apiLimiter, authMiddleware, getDailyMissionsHandler);
 app.get('/api/missions/daily/:npcId/:date', apiLimiter, authMiddleware, getDailyMissionsHandler);
 
+// ============================================================================
+// ADMIN: CARGA DE LAS MISIONES DIARIAS (panel misiones.html)
+// ============================================================================
+// Todo pasa por adminAuth (JWT con role 'admin'), igual que el resto de rutas
+// de administración. El panel solo compone el JSON; la validación de verdad
+// está aquí, para que un JSON manipulado no meta basura en la colección.
+
+const MISSION_NPCS = ['granjero', 'guardian'];
+const MISSION_LANGS = ['en-US', 'en-PH', 'es-419', 'pt-BR', 'zh-CN', 'ko-KR'];
+
+function sanearMisionesDelDia(missions) {
+  if (!Array.isArray(missions) || missions.length === 0) {
+    throw new Error('missions debe ser una lista con al menos una misión');
+  }
+  if (missions.length > 10) {
+    throw new Error('máximo 10 misiones por NPC y día');
+  }
+
+  const limpiarTexto = (v, max = 200) =>
+    String(v == null ? '' : v).replace(/<[^>]*>/g, '').trim().slice(0, max);
+
+  const ids = new Set();
+
+  return missions.map((m, i) => {
+    const missionId = limpiarTexto(m.missionId, 60) || `m${i + 1}`;
+    if (ids.has(missionId)) throw new Error(`missionId repetido: ${missionId}`);
+    ids.add(missionId);
+
+    const itemId = limpiarTexto(m.itemId, 60);
+    if (!itemId) throw new Error(`la misión ${missionId} no tiene itemId`);
+
+    const requiredAmount = Math.max(1, Math.min(9999, parseInt(m.requiredAmount, 10) || 1));
+    const expReward = Math.max(0, Math.min(100000, parseInt(m.expReward, 10) || 0));
+
+    const salida = { missionId, itemId, requiredAmount, expReward, texts: {} };
+
+    const rewardItemId = limpiarTexto(m.rewardItemId, 60);
+    if (rewardItemId) {
+      salida.rewardItemId = rewardItemId;
+      salida.rewardAmount = Math.max(1, Math.min(9999, parseInt(m.rewardAmount, 10) || 1));
+    }
+
+    const textos = m.texts || {};
+    MISSION_LANGS.forEach(lang => {
+      const t = textos[lang] || {};
+      salida.texts[lang] = {
+        title: limpiarTexto(t.title, 80),
+        description: limpiarTexto(t.description, 300),
+        itemName: limpiarTexto(t.itemName, 80),
+        rewardName: limpiarTexto(t.rewardName, 80)
+      };
+    });
+
+    // El inglés es el idioma de respaldo del juego: si falta, se rellena con
+    // lo que haya en español, y si tampoco hay, con el propio itemId.
+    if (!salida.texts['en-US'].title) {
+      salida.texts['en-US'].title = salida.texts['es-419'].title || `Bring ${requiredAmount} ${itemId}`;
+    }
+    if (!salida.texts['en-US'].itemName) {
+      salida.texts['en-US'].itemName = salida.texts['es-419'].itemName || itemId;
+    }
+
+    return salida;
+  });
+}
+
+// Leer las misiones de un NPC en un día (para editarlas en el panel)
+app.get('/api/admin/missions/daily/:npcId/:day', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const { npcId, day } = req.params;
+    if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: 'day debe ser YYYY-MM-DD' });
+
+    const doc = await DailyMission.findOne({ npcId, day }).lean();
+    res.json({ success: true, npcId, day, found: !!doc, mission: doc || null });
+  } catch (error) {
+    console.error('❌ admin missions GET:', error);
+    res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// Días ya cargados de un NPC (para ver de un vistazo qué falta)
+app.get('/api/admin/missions/days/:npcId', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const { npcId } = req.params;
+    if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
+
+    const docs = await DailyMission.find({ npcId })
+      .sort({ day: -1 }).limit(60)
+      .select('day missions dailyResetHour -_id').lean();
+
+    res.json({
+      success: true,
+      npcId,
+      days: docs.map(d => ({ day: d.day, count: d.missions.length, dailyResetHour: d.dailyResetHour }))
+    });
+  } catch (error) {
+    console.error('❌ admin missions days:', error);
+    res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// Crear o reemplazar las misiones de un NPC para un día
+app.put('/api/admin/missions/daily', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const { npcId, day, missions, dailyResetHour } = req.body || {};
+
+    if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day || '')) return res.status(400).json({ error: 'day debe ser YYYY-MM-DD' });
+
+    let limpias;
+    try {
+      limpias = sanearMisionesDelDia(missions);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+
+    const hora = Math.max(0, Math.min(23, parseInt(dailyResetHour, 10) || 0));
+
+    const doc = await DailyMission.findOneAndUpdate(
+      { npcId, day },
+      { $set: { missions: limpias, dailyResetHour: hora } },
+      { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
+    );
+
+    console.log(`📜 Misiones de ${npcId} para ${day} guardadas (${limpias.length}) por admin`);
+    res.json({ success: true, npcId, day, count: limpias.length, mission: doc });
+  } catch (error) {
+    console.error('❌ admin missions PUT:', error);
+    res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// Copiar las misiones de un día a otro (o a varios días seguidos)
+app.post('/api/admin/missions/copy', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const { npcId, fromDay, toDay, repeatDays } = req.body || {};
+    if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDay || '')) return res.status(400).json({ error: 'fromDay inválido' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(toDay || '')) return res.status(400).json({ error: 'toDay inválido' });
+
+    const origen = await DailyMission.findOne({ npcId, day: fromDay }).lean();
+    if (!origen) return res.status(404).json({ error: 'no hay misiones en fromDay' });
+
+    const repeticiones = Math.max(1, Math.min(30, parseInt(repeatDays, 10) || 1));
+    const base = new Date(`${toDay}T00:00:00Z`);
+    const creados = [];
+
+    for (let i = 0; i < repeticiones; i++) {
+      const d = new Date(base.getTime() + i * 86400000).toISOString().slice(0, 10);
+      await DailyMission.findOneAndUpdate(
+        { npcId, day: d },
+        { $set: { missions: origen.missions, dailyResetHour: origen.dailyResetHour } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      creados.push(d);
+    }
+
+    res.json({ success: true, npcId, from: fromDay, days: creados });
+  } catch (error) {
+    console.error('❌ admin missions copy:', error);
+    res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// Borrar las misiones de un día
+app.delete('/api/admin/missions/daily/:npcId/:day', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const { npcId, day } = req.params;
+    if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: 'day debe ser YYYY-MM-DD' });
+
+    const r = await DailyMission.deleteOne({ npcId, day });
+    res.json({ success: true, deleted: r.deletedCount });
+  } catch (error) {
+    console.error('❌ admin missions DELETE:', error);
+    res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+console.log('✅ Admin missions routes: GET/PUT/DELETE /api/admin/missions/*');
+
 // Marketplace P2P — todas las rutas /api/marketplace/* viven en marketplace-routes.js
 // (se monta más abajo, después de que PlayerStats esté definido — ver "MARKETPLACE ROUTES MOUNT")
 
