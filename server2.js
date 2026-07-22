@@ -8040,6 +8040,533 @@ app.get('/api/stats/:playerName/chain', authMiddleware, async (req, res) => {
 
 console.log('✅ Stats routes cargados: GET/POST /api/stats/:playerName (sync, update, chain)');
 
+// ============================================================================
+// SISTEMA DE BATALLAS P2P DE MASCOTAS (matchmaking + turnos + clasificación)
+// ============================================================================
+//
+// Todo el estado vive en el servidor: el cliente solo dibuja lo que se le
+// manda y envía la acción del turno. Ni puntos ni temporada se guardan en el
+// navegador.
+//
+//  Flujo:
+//    1. socket.emit('battle:queue')            → entra a la cola
+//    2. cuando hay 2 en cola → 'battle:matched' a ambos (datos del rival)
+//    3. cada turno: socket.emit('battle:action', { action })
+//       cuando LOS DOS han elegido, el servidor resuelve y emite 'battle:turn'
+//    4. al llegar a 0 de vida → 'battle:end' + puntos guardados en Mongo
+//
+//  Acciones y resolución (piedra-papel-tijera con daño):
+//    attack  (equilibrado)  gana a  charge   → daño normal
+//    strong  (cargado)      gana a  attack   → daño alto, pero si el rival
+//                                              defiende, se falla
+//    defend  (defensa)      gana a  strong   → bloquea y contraataca flojo
+//
+// ---------------------------------------------------------------------------
+// MODELOS
+// ---------------------------------------------------------------------------
+
+// Temporada de la clasificación: se reinicia cada 15 días.
+const BATTLE_SEASON_DAYS = 15;
+
+const battleSeasonSchema = new mongoose.Schema({
+  seasonNumber: { type: Number, required: true, unique: true },
+  startedAt: { type: Date, required: true },
+  endsAt: { type: Date, required: true }
+}, { timestamps: true });
+const BattleSeason = mongoose.model('BattleSeason', battleSeasonSchema);
+
+// Puntuación de un jugador DENTRO de una temporada.
+const battleScoreSchema = new mongoose.Schema({
+  seasonNumber: { type: Number, required: true, index: true },
+  playerName: { type: String, required: true, index: true },
+  address: { type: String, default: '', lowercase: true },
+  petName: { type: String, default: '---' },
+  points: { type: Number, default: 0, min: 0 },
+  wins: { type: Number, default: 0, min: 0 },
+  losses: { type: Number, default: 0, min: 0 },
+  battles: { type: Number, default: 0, min: 0 },
+  bestStreak: { type: Number, default: 0, min: 0 },
+  streak: { type: Number, default: 0, min: 0 },
+  lastBattleAt: { type: Date, default: null }
+}, { timestamps: true });
+battleScoreSchema.index({ seasonNumber: 1, playerName: 1 }, { unique: true });
+battleScoreSchema.index({ seasonNumber: 1, points: -1, wins: -1 });
+const BattleScore = mongoose.model('BattleScore', battleScoreSchema);
+
+// Historial (para auditar resultados raros y detectar abusos)
+const battleLogSchema = new mongoose.Schema({
+  seasonNumber: { type: Number, required: true, index: true },
+  matchId: { type: String, required: true, index: true },
+  winner: { type: String, default: '' },
+  loser: { type: String, default: '' },
+  turns: { type: Number, default: 0 },
+  reason: { type: String, default: 'ko' } // 'ko' | 'forfeit' | 'timeout'
+}, { timestamps: true });
+const BattleLog = mongoose.model('BattleLog', battleLogSchema);
+
+// ---------------------------------------------------------------------------
+// TEMPORADA ACTIVA (con reinicio automático cada 15 días)
+// ---------------------------------------------------------------------------
+async function getCurrentBattleSeason() {
+  const now = new Date();
+
+  // La temporada vigente es la que aún no ha terminado
+  let season = await BattleSeason.findOne({ endsAt: { $gt: now } }).sort({ seasonNumber: -1 });
+  if (season) return season;
+
+  // No hay ninguna viva: crear la siguiente (esto ES el "reinicio" de la
+  // tabla — los BattleScore viejos quedan archivados con su seasonNumber).
+  const last = await BattleSeason.findOne().sort({ seasonNumber: -1 });
+  const seasonNumber = last ? last.seasonNumber + 1 : 1;
+  const startedAt = now;
+  const endsAt = new Date(now.getTime() + BATTLE_SEASON_DAYS * 24 * 60 * 60 * 1000);
+
+  try {
+    season = await BattleSeason.create({ seasonNumber, startedAt, endsAt });
+    console.log(`🏆 Nueva temporada de batallas #${seasonNumber} (termina ${endsAt.toISOString()})`);
+  } catch (e) {
+    // Carrera entre dos peticiones simultáneas: releer la que ganó
+    season = await BattleSeason.findOne({ seasonNumber });
+    if (!season) throw e;
+  }
+  return season;
+}
+
+// Mínimo de batallas para aparecer en la tabla (pedido: "si el usuario hace 3
+// o más batallas, todos los puntos los dará la tabla")
+const BATTLE_MIN_FOR_RANKING = 3;
+
+// ---------------------------------------------------------------------------
+// ENDPOINT: CLASIFICACIÓN
+// ---------------------------------------------------------------------------
+app.get('/api/battle/leaderboard', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const season = await getCurrentBattleSeason();
+    const limit = Math.min(100, Math.max(5, parseInt(req.query.limit, 10) || 50));
+
+    const top = await BattleScore.find({
+      seasonNumber: season.seasonNumber,
+      battles: { $gte: BATTLE_MIN_FOR_RANKING }
+    })
+      .sort({ points: -1, wins: -1, battles: 1 })
+      .limit(limit)
+      .select('playerName address petName points wins losses battles bestStreak -_id')
+      .lean();
+
+    const rows = top.map((r, i) => ({ rank: i + 1, ...r }));
+
+    // Fila del jugador que pregunta (aunque aún no llegue al mínimo).
+    // El token solo trae la address; el playerName sale de PlayerAuth, igual
+    // que en el resto de rutas autenticadas.
+    let me = null;
+    let myName = null;
+    try {
+      const addr = req.user && req.user.address ? req.user.address.toLowerCase() : null;
+      if (addr) {
+        const auth = await PlayerAuth.findOne({ address: addr }).select('playerName').lean();
+        if (auth && auth.playerName) myName = auth.playerName;
+      }
+    } catch (e) { /* sin fila propia */ }
+
+    if (myName) {
+      const mine = await BattleScore.findOne({
+        seasonNumber: season.seasonNumber,
+        playerName: myName
+      }).select('playerName address petName points wins losses battles bestStreak -_id').lean();
+
+      if (mine) {
+        const mejores = await BattleScore.countDocuments({
+          seasonNumber: season.seasonNumber,
+          battles: { $gte: BATTLE_MIN_FOR_RANKING },
+          points: { $gt: mine.points }
+        });
+        me = {
+          ...mine,
+          rank: mine.battles >= BATTLE_MIN_FOR_RANKING ? mejores + 1 : null,
+          missingBattles: Math.max(0, BATTLE_MIN_FOR_RANKING - mine.battles)
+        };
+      } else {
+        me = {
+          playerName: myName, address: '', petName: '---',
+          points: 0, wins: 0, losses: 0, battles: 0, bestStreak: 0,
+          rank: null, missingBattles: BATTLE_MIN_FOR_RANKING
+        };
+      }
+    }
+
+    res.json({
+      success: true,
+      season: {
+        number: season.seasonNumber,
+        startedAt: season.startedAt,
+        endsAt: season.endsAt,
+        daysTotal: BATTLE_SEASON_DAYS,
+        msRemaining: Math.max(0, season.endsAt.getTime() - Date.now())
+      },
+      minBattlesForRanking: BATTLE_MIN_FOR_RANKING,
+      rows,
+      me
+    });
+  } catch (error) {
+    console.error('❌ Error en /api/battle/leaderboard:', error);
+    res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// MATCHMAKING + COMBATE POR TURNOS (socket.io)
+// ---------------------------------------------------------------------------
+const battleQueue = [];              // sockets esperando rival
+const battleMatches = new Map();     // matchId → estado del combate
+const socketMatch = new Map();       // socket.id → matchId
+
+const BATTLE_TURN_MS = 20000;        // tiempo máximo para elegir acción
+const BATTLE_MAX_TURNS = 30;         // corte de seguridad
+
+function battleStatsForLevel(nivel) {
+  const lvl = Math.max(1, Number(nivel) || 1);
+  return {
+    maxHp: 80 + lvl * 12,
+    attack: 10 + lvl * 2
+  };
+}
+
+function shortAddress(addr) {
+  if (!addr || typeof addr !== 'string' || addr.length < 10) return '';
+  return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+}
+
+function battlePublicPlayer(p) {
+  return {
+    playerName: p.playerName,
+    petName: p.petName,
+    address: p.address,
+    addressShort: shortAddress(p.address),
+    level: p.level,
+    hp: p.hp,
+    maxHp: p.maxHp
+  };
+}
+
+// Daño según el par de acciones. Devuelve { dmgToA, dmgToB, texto }
+function resolveBattleActions(a, b, accionA, accionB) {
+  const rnd = (base) => Math.max(1, Math.round(base * (0.85 + Math.random() * 0.3)));
+  let dmgToA = 0, dmgToB = 0;
+  const partes = [];
+
+  const golpe = (atacante, defensor, accionAt, accionDef) => {
+    if (accionAt === 'strong') {
+      if (accionDef === 'defend') return { dmg: 0, txt: `${defensor.petName} blocked the heavy attack!` };
+      return { dmg: rnd(atacante.attack * 1.8), txt: `${atacante.petName} lands a heavy attack!` };
+    }
+    if (accionAt === 'attack') {
+      if (accionDef === 'defend') return { dmg: rnd(atacante.attack * 0.35), txt: `${defensor.petName} blocks most of it.` };
+      return { dmg: rnd(atacante.attack), txt: `${atacante.petName} attacks!` };
+    }
+    // defend: sin daño propio, pero contragolpea si el rival cargó
+    if (accionDef === 'strong') return { dmg: rnd(atacante.attack * 0.6), txt: `${atacante.petName} counters the heavy attack!` };
+    return { dmg: 0, txt: `${atacante.petName} defends.` };
+  };
+
+  const gA = golpe(a, b, accionA, accionB);
+  const gB = golpe(b, a, accionB, accionA);
+  dmgToB += gA.dmg;
+  dmgToA += gB.dmg;
+  partes.push(gA.txt, gB.txt);
+
+  return { dmgToA, dmgToB, texto: partes.join(' ') };
+}
+
+function clearBattleTurnTimer(match) {
+  if (match && match.turnTimer) {
+    clearTimeout(match.turnTimer);
+    match.turnTimer = null;
+  }
+}
+
+async function saveBattleResult(match, winnerKey, reason) {
+  try {
+    const season = await getCurrentBattleSeason();
+    const winner = winnerKey ? match[winnerKey] : null;
+    const loser = winnerKey ? match[winnerKey === 'a' ? 'b' : 'a'] : null;
+
+    const bump = async (p, gano) => {
+      if (!p || !p.playerName || p.playerName === '---') return;
+      const doc = await BattleScore.findOneAndUpdate(
+        { seasonNumber: season.seasonNumber, playerName: p.playerName },
+        {
+          $set: { address: p.address || '', petName: p.petName || '---', lastBattleAt: new Date() },
+          $inc: {
+            points: gano ? 3 : 1,   // ganar 3, perder 1 (participar cuenta)
+            wins: gano ? 1 : 0,
+            losses: gano ? 0 : 1,
+            battles: 1
+          }
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+
+      // Racha
+      const nuevaRacha = gano ? (doc.streak || 0) + 1 : 0;
+      await BattleScore.updateOne(
+        { _id: doc._id },
+        { $set: { streak: nuevaRacha, bestStreak: Math.max(doc.bestStreak || 0, nuevaRacha) } }
+      );
+    };
+
+    if (winner && loser) {
+      await bump(winner, true);
+      await bump(loser, false);
+    }
+
+    await BattleLog.create({
+      seasonNumber: season.seasonNumber,
+      matchId: match.id,
+      winner: winner ? winner.playerName : '',
+      loser: loser ? loser.playerName : '',
+      turns: match.turn,
+      reason: reason || 'ko'
+    });
+  } catch (e) {
+    console.error('❌ Error guardando resultado de batalla:', e);
+  }
+}
+
+async function endBattle(match, winnerKey, reason) {
+  if (!match || match.ended) return;
+  match.ended = true;
+  clearBattleTurnTimer(match);
+
+  await saveBattleResult(match, winnerKey, reason);
+
+  ['a', 'b'].forEach(key => {
+    const p = match[key];
+    if (!p || !p.socket) return;
+    const gano = winnerKey === key;
+    p.socket.emit('battle:end', {
+      matchId: match.id,
+      result: winnerKey ? (gano ? 'win' : 'lose') : 'draw',
+      reason: reason || 'ko',
+      pointsEarned: winnerKey ? (gano ? 3 : 1) : 0,
+      you: battlePublicPlayer(p),
+      rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
+    });
+    socketMatch.delete(p.socket.id);
+  });
+
+  battleMatches.delete(match.id);
+}
+
+function startBattleTurn(match) {
+  clearBattleTurnTimer(match);
+  match.actions = { a: null, b: null };
+  match.turn += 1;
+
+  ['a', 'b'].forEach(key => {
+    const p = match[key];
+    if (p && p.socket) {
+      p.socket.emit('battle:turnStart', {
+        matchId: match.id,
+        turn: match.turn,
+        msToChoose: BATTLE_TURN_MS,
+        you: battlePublicPlayer(p),
+        rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
+      });
+    }
+  });
+
+  // Si alguien no elige a tiempo, se le asigna 'defend' y sigue el combate
+  match.turnTimer = setTimeout(() => {
+    if (match.ended) return;
+    if (!match.actions.a) match.actions.a = 'defend';
+    if (!match.actions.b) match.actions.b = 'defend';
+    resolveBattleTurn(match);
+  }, BATTLE_TURN_MS + 1000);
+}
+
+async function resolveBattleTurn(match) {
+  if (match.ended) return;
+  clearBattleTurnTimer(match);
+
+  const accionA = match.actions.a || 'defend';
+  const accionB = match.actions.b || 'defend';
+  const { dmgToA, dmgToB, texto } = resolveBattleActions(match.a, match.b, accionA, accionB);
+
+  match.a.hp = Math.max(0, match.a.hp - dmgToA);
+  match.b.hp = Math.max(0, match.b.hp - dmgToB);
+
+  ['a', 'b'].forEach(key => {
+    const p = match[key];
+    if (!p || !p.socket) return;
+    p.socket.emit('battle:turn', {
+      matchId: match.id,
+      turn: match.turn,
+      yourAction: key === 'a' ? accionA : accionB,
+      rivalAction: key === 'a' ? accionB : accionA,
+      damageToYou: key === 'a' ? dmgToA : dmgToB,
+      damageToRival: key === 'a' ? dmgToB : dmgToA,
+      log: texto,
+      you: battlePublicPlayer(p),
+      rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
+    });
+  });
+
+  const muertoA = match.a.hp <= 0;
+  const muertoB = match.b.hp <= 0;
+
+  if (muertoA || muertoB || match.turn >= BATTLE_MAX_TURNS) {
+    let ganador = null;
+    if (muertoA && !muertoB) ganador = 'b';
+    else if (muertoB && !muertoA) ganador = 'a';
+    else if (!muertoA && !muertoB) ganador = match.a.hp === match.b.hp ? null : (match.a.hp > match.b.hp ? 'a' : 'b');
+    await endBattle(match, ganador, muertoA || muertoB ? 'ko' : 'timeout');
+    return;
+  }
+
+  setTimeout(() => startBattleTurn(match), 1200);
+}
+
+async function tryBattleMatchmaking() {
+  while (battleQueue.length >= 2) {
+    const sa = battleQueue.shift();
+    const sb = battleQueue.shift();
+    if (!sa || !sa.connected) { if (sb && sb.connected) battleQueue.unshift(sb); continue; }
+    if (!sb || !sb.connected) { battleQueue.unshift(sa); continue; }
+
+    const construir = async (socket) => {
+      // authenticatedPlayer solo se llena tras joinRoom; si el jugador entró
+      // directo a la batalla, se resuelve por su address.
+      let playerName = socket.authenticatedPlayer || null;
+      if (!playerName && socket.authenticatedAddress) {
+        try {
+          const auth = await PlayerAuth.findOne({
+            address: socket.authenticatedAddress.toLowerCase()
+          }).select('playerName').lean();
+          if (auth && auth.playerName) playerName = auth.playerName;
+        } catch (e) { /* se usa el fallback de abajo */ }
+      }
+      if (!playerName) playerName = socket.playerData?.username || '---';
+
+      let nivel = 1, petName = '---';
+      try {
+        const gp = await GamePlayer.findOne({ playerName }).select('nivel petName').lean();
+        if (gp) {
+          nivel = gp.nivel || 1;
+          petName = gp.petName && gp.petName !== '---' ? gp.petName : 'Pet';
+        }
+      } catch (e) { /* valores por defecto */ }
+      const stats = battleStatsForLevel(nivel);
+      return {
+        socket,
+        playerName,
+        petName,
+        address: socket.authenticatedAddress || '',
+        level: nivel,
+        maxHp: stats.maxHp,
+        hp: stats.maxHp,
+        attack: stats.attack
+      };
+    };
+
+    const [a, b] = await Promise.all([construir(sa), construir(sb)]);
+    const match = {
+      id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      a, b, turn: 0, ended: false,
+      actions: { a: null, b: null },
+      turnTimer: null
+    };
+
+    battleMatches.set(match.id, match);
+    socketMatch.set(sa.id, match.id);
+    socketMatch.set(sb.id, match.id);
+
+    ['a', 'b'].forEach(key => {
+      const p = match[key];
+      p.socket.emit('battle:matched', {
+        matchId: match.id,
+        you: battlePublicPlayer(p),
+        rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
+      });
+    });
+
+    console.log(`⚔️ Batalla ${match.id}: ${a.playerName} vs ${b.playerName}`);
+    setTimeout(() => startBattleTurn(match), 2500);
+  }
+}
+
+io.on('connection', (socket) => {
+  socket.on('battle:queue', async () => {
+    try {
+      // Solo jugadores autenticados (la tabla es por playerName)
+      if (!socket.authenticatedAddress) {
+        return socket.emit('battle:error', { error: 'not_authenticated' });
+      }
+      if (socketMatch.has(socket.id)) {
+        return socket.emit('battle:error', { error: 'already_in_battle' });
+      }
+      if (battleQueue.some(s => s.id === socket.id)) return;
+
+      battleQueue.push(socket);
+      socket.emit('battle:queued', { position: battleQueue.length });
+      await tryBattleMatchmaking();
+    } catch (e) {
+      console.error('❌ battle:queue', e);
+      socket.emit('battle:error', { error: 'queue_failed' });
+    }
+  });
+
+  socket.on('battle:leaveQueue', () => {
+    const i = battleQueue.findIndex(s => s.id === socket.id);
+    if (i >= 0) battleQueue.splice(i, 1);
+    socket.emit('battle:leftQueue', {});
+  });
+
+  socket.on('battle:action', (data) => {
+    try {
+      const matchId = socketMatch.get(socket.id);
+      if (!matchId) return;
+      const match = battleMatches.get(matchId);
+      if (!match || match.ended) return;
+
+      const accion = data && ['attack', 'strong', 'defend'].includes(data.action) ? data.action : 'defend';
+      const key = match.a.socket.id === socket.id ? 'a' : 'b';
+      if (match.actions[key]) return; // ya eligió en este turno
+      match.actions[key] = accion;
+
+      // Avisar al rival de que ya eligió (sin decir qué)
+      const rival = match[key === 'a' ? 'b' : 'a'];
+      if (rival && rival.socket) rival.socket.emit('battle:rivalReady', { turn: match.turn });
+
+      if (match.actions.a && match.actions.b) resolveBattleTurn(match);
+    } catch (e) {
+      console.error('❌ battle:action', e);
+    }
+  });
+
+  socket.on('battle:forfeit', async () => {
+    const matchId = socketMatch.get(socket.id);
+    if (!matchId) return;
+    const match = battleMatches.get(matchId);
+    if (!match || match.ended) return;
+    const key = match.a.socket.id === socket.id ? 'a' : 'b';
+    await endBattle(match, key === 'a' ? 'b' : 'a', 'forfeit');
+  });
+
+  socket.on('disconnect', async () => {
+    const i = battleQueue.findIndex(s => s.id === socket.id);
+    if (i >= 0) battleQueue.splice(i, 1);
+
+    const matchId = socketMatch.get(socket.id);
+    if (!matchId) return;
+    const match = battleMatches.get(matchId);
+    if (!match || match.ended) return;
+    const key = match.a.socket.id === socket.id ? 'a' : 'b';
+    await endBattle(match, key === 'a' ? 'b' : 'a', 'forfeit');
+  });
+});
+
+console.log('✅ Battle routes cargados: GET /api/battle/leaderboard + sockets battle:*');
+
 
 // --- MANEJO DE ERRORES ---
 // FIX: '/api/*' como string también se rompe en Express 5 / path-to-regexp 8+
