@@ -8490,21 +8490,39 @@ const BATTLE_ENERGY_PER_TURN = 3;
 const BATTLE_HAND_SIZE = 4;
 
 const BATTLE_CARDS = {
-  zarpazo:    { id: 'zarpazo',    name: 'Claw',        emoji: '🐾', cost: 1, dmg: 1.00, shield: 0.00, heal: 0.00, desc: 'Quick strike' },
-  mordisco:   { id: 'mordisco',   name: 'Bite',        emoji: '🦷', cost: 2, dmg: 1.85, shield: 0.00, heal: 0.00, desc: 'Strong bite' },
-  embestida:  { id: 'embestida',  name: 'Charge',      emoji: '💥', cost: 3, dmg: 2.90, shield: 0.00, heal: 0.00, desc: 'Heavy charge' },
-  guardia:    { id: 'guardia',    name: 'Guard',       emoji: '🛡️', cost: 1, dmg: 0.00, shield: 1.25, heal: 0.00, desc: 'Blocks damage' },
-  aullido:    { id: 'aullido',    name: 'Howl',        emoji: '🌙', cost: 2, dmg: 0.70, shield: 0.85, heal: 0.00, desc: 'Hits and shields' },
-  lamer:      { id: 'lamer',      name: 'Lick Wounds', emoji: '💚', cost: 2, dmg: 0.00, shield: 0.00, heal: 0.95, desc: 'Heals your pet' },
-  colazo:     { id: 'colazo',     name: 'Tail Whip',   emoji: '🌀', cost: 1, dmg: 0.65, shield: 0.45, heal: 0.00, desc: 'Cheap and safe' }
+  zarpazo:    { id: 'zarpazo',   name: 'Claw',        emoji: '🐾', cost: 1, dmg: 1.00, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'common',
+                desc: 'A fast swipe. Cheap, reliable damage every turn.' },
+  mordisco:   { id: 'mordisco',  name: 'Bite',        emoji: '🦷', cost: 2, dmg: 1.85, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
+                desc: 'Sinks its fangs in for strong single-target damage.' },
+  embestida:  { id: 'embestida', name: 'Charge',      emoji: '💥', cost: 3, dmg: 2.90, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
+                desc: 'A full-power body slam. Huge damage, all your energy.' },
+  guardia:    { id: 'guardia',   name: 'Guard',       emoji: '🛡️', cost: 1, dmg: 0.00, shield: 1.25, heal: 0.00, type: 'defense', rarity: 'common',
+                desc: 'Raises a shield that soaks the rival’s hit this turn.' },
+  aullido:    { id: 'aullido',   name: 'Howl',        emoji: '🌙', cost: 2, dmg: 0.70, shield: 0.85, heal: 0.00, type: 'hybrid', rarity: 'rare',
+                desc: 'Strikes and shields at once. Solid all-rounder.' },
+  lamer:      { id: 'lamer',     name: 'Lick Wounds', emoji: '💚', cost: 2, dmg: 0.00, shield: 0.00, heal: 0.95, type: 'heal', rarity: 'rare',
+                desc: 'Licks its wounds and recovers a chunk of HP.' },
+  colazo:     { id: 'colazo',    name: 'Tail Whip',   emoji: '🌀', cost: 1, dmg: 0.65, shield: 0.45, heal: 0.00, type: 'hybrid', rarity: 'common',
+                desc: 'Cheap poke that also chips in a little shield.' }
 };
 const BATTLE_CARD_IDS = Object.keys(BATTLE_CARDS);
 
-// Datos de la carta que se mandan al cliente (sin multiplicadores internos)
-function cartaPublica(id) {
+// Datos de la carta para el cliente. Si se pasa un jugador, se incluyen los
+// valores REALES (daño/escudo/cura) calculados con su ataque, para mostrarlos
+// en la carta como en Axie ("Deal 24", "Shield 15"…).
+function cartaPublica(id, jugador) {
   const c = BATTLE_CARDS[id];
   if (!c) return null;
-  return { id: c.id, name: c.name, emoji: c.emoji, cost: c.cost, desc: c.desc };
+  const out = {
+    id: c.id, name: c.name, emoji: c.emoji, cost: c.cost,
+    type: c.type, rarity: c.rarity, desc: c.desc
+  };
+  if (jugador && typeof jugador.attack === 'number') {
+    out.dmg = c.dmg ? Math.round(jugador.attack * c.dmg) : 0;
+    out.shield = c.shield ? Math.round(jugador.attack * c.shield) : 0;
+    out.heal = c.heal ? Math.round(jugador.attack * c.heal) : 0;
+  }
+  return out;
 }
 
 function repartirMano() {
@@ -8724,7 +8742,9 @@ function startBattleTurn(match) {
         turn: match.turn,
         msToChoose: BATTLE_TURN_MS,
         energy: BATTLE_ENERGY_PER_TURN,
-        hand: match.hands[key].map(cartaPublica),
+        // Cada carta lleva ya sus valores reales para ESTE jugador (según su
+        // ataque), así la UI muestra "Deal 24 / Shield 15" como en Axie.
+        hand: match.hands[key].map(cid => cartaPublica(cid, p)),
         you: battlePublicPlayer(p),
         rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
       });
@@ -8763,11 +8783,12 @@ async function resolveBattleTurn(match) {
     if (!p || !p.socket) return;
     const mia = key === 'a' ? jugadaA : jugadaB;
     const suya = key === 'a' ? jugadaB : jugadaA;
+    const rivalP = match[key === 'a' ? 'b' : 'a'];
     p.socket.emit('battle:turn', {
       matchId: match.id,
       turn: match.turn,
-      yourCards: mia.cartas.map(c => cartaPublica(c.id)),
-      rivalCards: suya.cartas.map(c => cartaPublica(c.id)),
+      yourCards: mia.cartas.map(c => cartaPublica(c.id, p)),
+      rivalCards: suya.cartas.map(c => cartaPublica(c.id, rivalP)),
       damageToYou: key === 'a' ? dmgToA : dmgToB,
       damageToRival: key === 'a' ? dmgToB : dmgToA,
       healYou: key === 'a' ? res.curaA : res.curaB,
