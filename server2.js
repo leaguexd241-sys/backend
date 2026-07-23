@@ -8479,48 +8479,126 @@ function crearBotDeRonda(ronda, nivelJugador) {
   };
 }
 
-// Elige la jugada del bot. Con "astucia" alta intenta contrarrestar lo que el
-// jugador hizo el turno anterior (attack ← defend, defend ← strong, strong ←
-// attack); si no, juega al azar con algo de sesgo hacia el ataque.
-function elegirAccionBot(bot, ultimaAccionRival) {
-  if (Math.random() < (bot.astucia || 0.2) && ultimaAccionRival) {
-    if (ultimaAccionRival === 'strong') return 'defend';
-    if (ultimaAccionRival === 'defend') return 'strong';
-    return 'attack';
-  }
-  const dado = Math.random();
-  if (dado < 0.45) return 'attack';
-  if (dado < 0.78) return 'strong';
-  return 'defend';
+// ---------------------------------------------------------------------------
+// CARTAS (estilo Axie: mano + energía por turno)
+// ---------------------------------------------------------------------------
+// Cada turno se reparte una mano y una reserva de energía. Se juegan las
+// cartas que quepan en esa energía y AMBOS jugadores resuelven a la vez:
+// el daño de cada uno se reduce con el escudo que el rival haya puesto ESE
+// mismo turno, así que hay decisión real (atacar fuerte vs. cubrirse).
+const BATTLE_ENERGY_PER_TURN = 3;
+const BATTLE_HAND_SIZE = 4;
+
+const BATTLE_CARDS = {
+  zarpazo:    { id: 'zarpazo',    name: 'Claw',        emoji: '🐾', cost: 1, dmg: 1.00, shield: 0.00, heal: 0.00, desc: 'Quick strike' },
+  mordisco:   { id: 'mordisco',   name: 'Bite',        emoji: '🦷', cost: 2, dmg: 1.85, shield: 0.00, heal: 0.00, desc: 'Strong bite' },
+  embestida:  { id: 'embestida',  name: 'Charge',      emoji: '💥', cost: 3, dmg: 2.90, shield: 0.00, heal: 0.00, desc: 'Heavy charge' },
+  guardia:    { id: 'guardia',    name: 'Guard',       emoji: '🛡️', cost: 1, dmg: 0.00, shield: 1.25, heal: 0.00, desc: 'Blocks damage' },
+  aullido:    { id: 'aullido',    name: 'Howl',        emoji: '🌙', cost: 2, dmg: 0.70, shield: 0.85, heal: 0.00, desc: 'Hits and shields' },
+  lamer:      { id: 'lamer',      name: 'Lick Wounds', emoji: '💚', cost: 2, dmg: 0.00, shield: 0.00, heal: 0.95, desc: 'Heals your pet' },
+  colazo:     { id: 'colazo',     name: 'Tail Whip',   emoji: '🌀', cost: 1, dmg: 0.65, shield: 0.45, heal: 0.00, desc: 'Cheap and safe' }
+};
+const BATTLE_CARD_IDS = Object.keys(BATTLE_CARDS);
+
+// Datos de la carta que se mandan al cliente (sin multiplicadores internos)
+function cartaPublica(id) {
+  const c = BATTLE_CARDS[id];
+  if (!c) return null;
+  return { id: c.id, name: c.name, emoji: c.emoji, cost: c.cost, desc: c.desc };
 }
 
-// Daño según el par de acciones. Devuelve { dmgToA, dmgToB, texto }
-function resolveBattleActions(a, b, accionA, accionB) {
-  const rnd = (base) => Math.max(1, Math.round(base * (0.85 + Math.random() * 0.3)));
-  let dmgToA = 0, dmgToB = 0;
-  const partes = [];
+function repartirMano() {
+  const mano = [];
+  // Siempre al menos una carta de 1 de energía, para que nunca haya una mano
+  // imposible de jugar.
+  mano.push(Math.random() < 0.5 ? 'zarpazo' : 'colazo');
+  while (mano.length < BATTLE_HAND_SIZE) {
+    mano.push(BATTLE_CARD_IDS[Math.floor(Math.random() * BATTLE_CARD_IDS.length)]);
+  }
+  // Mezclar
+  for (let i = mano.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [mano[i], mano[j]] = [mano[j], mano[i]];
+  }
+  return mano;
+}
 
-  const golpe = (atacante, defensor, accionAt, accionDef) => {
-    if (accionAt === 'strong') {
-      if (accionDef === 'defend') return { dmg: 0, txt: `${defensor.petName} blocked the heavy attack!` };
-      return { dmg: rnd(atacante.attack * 1.8), txt: `${atacante.petName} lands a heavy attack!` };
+// Valida la jugada del cliente: índices reales de su mano y energía suficiente
+function validarJugada(mano, indices) {
+  const usados = new Set();
+  const cartas = [];
+  let energia = 0;
+
+  (Array.isArray(indices) ? indices : []).forEach(i => {
+    const idx = parseInt(i, 10);
+    if (isNaN(idx) || idx < 0 || idx >= mano.length || usados.has(idx)) return;
+    const carta = BATTLE_CARDS[mano[idx]];
+    if (!carta) return;
+    if (energia + carta.cost > BATTLE_ENERGY_PER_TURN) return; // no cabe
+    usados.add(idx);
+    energia += carta.cost;
+    cartas.push(carta);
+  });
+
+  return { cartas, indices: [...usados], energia };
+}
+
+// El bot juega: gasta toda la energía que pueda, priorizando curarse si está
+// bajo de vida y atacando fuerte cuanto más difícil es la ronda.
+function elegirCartasBot(bot, mano) {
+  const vidaBaja = bot.hp / bot.maxHp < 0.35;
+  const orden = [...mano.keys()].sort((i, j) => {
+    const ci = BATTLE_CARDS[mano[i]], cj = BATTLE_CARDS[mano[j]];
+    const valor = (c) => (vidaBaja ? c.heal * 3 + c.shield * 2 + c.dmg : c.dmg * (1 + (bot.astucia || 0.2)) + c.shield * 0.8 + c.heal);
+    return valor(cj) - valor(ci);
+  });
+
+  const elegidas = [];
+  let energia = 0;
+  orden.forEach(i => {
+    const c = BATTLE_CARDS[mano[i]];
+    if (energia + c.cost <= BATTLE_ENERGY_PER_TURN) {
+      elegidas.push(i);
+      energia += c.cost;
     }
-    if (accionAt === 'attack') {
-      if (accionDef === 'defend') return { dmg: rnd(atacante.attack * 0.35), txt: `${defensor.petName} blocks most of it.` };
-      return { dmg: rnd(atacante.attack), txt: `${atacante.petName} attacks!` };
-    }
-    // defend: sin daño propio, pero contragolpea si el rival cargó
-    if (accionDef === 'strong') return { dmg: rnd(atacante.attack * 0.6), txt: `${atacante.petName} counters the heavy attack!` };
-    return { dmg: 0, txt: `${atacante.petName} defends.` };
+  });
+  return elegidas;
+}
+
+// Resuelve el turno con las cartas de ambos lados.
+// Devuelve { dmgToA, dmgToB, curaA, curaB, escudoA, escudoB, texto }
+function resolverCartas(a, b, cartasA, cartasB) {
+  const azar = (v) => Math.max(0, Math.round(v * (0.9 + Math.random() * 0.2)));
+
+  const sumar = (jugador, cartas) => cartas.reduce((acc, c) => ({
+    dmg: acc.dmg + azar(jugador.attack * c.dmg),
+    shield: acc.shield + azar(jugador.attack * c.shield),
+    heal: acc.heal + azar(jugador.attack * c.heal)
+  }), { dmg: 0, shield: 0, heal: 0 });
+
+  const A = sumar(a, cartasA);
+  const B = sumar(b, cartasB);
+
+  // El escudo del rival absorbe daño de ESTE turno
+  const dmgToB = Math.max(0, A.dmg - B.shield);
+  const dmgToA = Math.max(0, B.dmg - A.shield);
+
+  const nombres = (cartas) => cartas.length
+    ? cartas.map(c => `${c.emoji} ${c.name}`).join(' + ')
+    : 'nothing (no energy spent)';
+
+  const texto =
+    `${a.petName}: ${nombres(cartasA)} → ${dmgToB} dmg` +
+    (A.heal ? ` (+${A.heal} HP)` : '') +
+    `  |  ${b.petName}: ${nombres(cartasB)} → ${dmgToA} dmg` +
+    (B.heal ? ` (+${B.heal} HP)` : '');
+
+  return {
+    dmgToA, dmgToB,
+    curaA: A.heal, curaB: B.heal,
+    escudoA: A.shield, escudoB: B.shield,
+    texto
   };
-
-  const gA = golpe(a, b, accionA, accionB);
-  const gB = golpe(b, a, accionB, accionA);
-  dmgToB += gA.dmg;
-  dmgToA += gB.dmg;
-  partes.push(gA.txt, gB.txt);
-
-  return { dmgToA, dmgToB, texto: partes.join(' ') };
 }
 
 function clearBattleTurnTimer(match) {
@@ -8635,6 +8713,9 @@ function startBattleTurn(match) {
   match.actions = { a: null, b: null };
   match.turn += 1;
 
+  // Mano nueva para cada uno en cada turno
+  match.hands = { a: repartirMano(), b: repartirMano() };
+
   ['a', 'b'].forEach(key => {
     const p = match[key];
     if (p && p.socket) {
@@ -8642,22 +8723,24 @@ function startBattleTurn(match) {
         matchId: match.id,
         turn: match.turn,
         msToChoose: BATTLE_TURN_MS,
+        energy: BATTLE_ENERGY_PER_TURN,
+        hand: match.hands[key].map(cartaPublica),
         you: battlePublicPlayer(p),
         rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
       });
     }
   });
 
-  // El bot elige al momento (el jugador no ve su jugada hasta resolver el turno)
+  // El bot juega al momento (el jugador no ve sus cartas hasta resolver)
   if (match.b && match.b.isBot) {
-    match.actions.b = elegirAccionBot(match.b, match.ultimaAccionJugador);
+    match.actions.b = elegirCartasBot(match.b, match.hands.b);
   }
 
-  // Si alguien no elige a tiempo, se le asigna 'defend' y sigue el combate
+  // Si alguien no juega a tiempo, pasa turno sin gastar energía
   match.turnTimer = setTimeout(() => {
     if (match.ended) return;
-    if (!match.actions.a) match.actions.a = 'defend';
-    if (!match.actions.b) match.actions.b = 'defend';
+    if (!match.actions.a) match.actions.a = [];
+    if (!match.actions.b) match.actions.b = [];
     resolveBattleTurn(match);
   }, BATTLE_TURN_MS + 1000);
 }
@@ -8666,24 +8749,30 @@ async function resolveBattleTurn(match) {
   if (match.ended) return;
   clearBattleTurnTimer(match);
 
-  const accionA = match.actions.a || 'defend';
-  const accionB = match.actions.b || 'defend';
-  match.ultimaAccionJugador = accionA; // el bot la usa para leer al jugador
-  const { dmgToA, dmgToB, texto } = resolveBattleActions(match.a, match.b, accionA, accionB);
+  const jugadaA = validarJugada(match.hands.a, match.actions.a || []);
+  const jugadaB = validarJugada(match.hands.b, match.actions.b || []);
 
-  match.a.hp = Math.max(0, match.a.hp - dmgToA);
-  match.b.hp = Math.max(0, match.b.hp - dmgToB);
+  const res = resolverCartas(match.a, match.b, jugadaA.cartas, jugadaB.cartas);
+  const { dmgToA, dmgToB, texto } = res;
+
+  match.a.hp = Math.max(0, Math.min(match.a.maxHp, match.a.hp - dmgToA + res.curaA));
+  match.b.hp = Math.max(0, Math.min(match.b.maxHp, match.b.hp - dmgToB + res.curaB));
 
   ['a', 'b'].forEach(key => {
     const p = match[key];
     if (!p || !p.socket) return;
+    const mia = key === 'a' ? jugadaA : jugadaB;
+    const suya = key === 'a' ? jugadaB : jugadaA;
     p.socket.emit('battle:turn', {
       matchId: match.id,
       turn: match.turn,
-      yourAction: key === 'a' ? accionA : accionB,
-      rivalAction: key === 'a' ? accionB : accionA,
+      yourCards: mia.cartas.map(c => cartaPublica(c.id)),
+      rivalCards: suya.cartas.map(c => cartaPublica(c.id)),
       damageToYou: key === 'a' ? dmgToA : dmgToB,
       damageToRival: key === 'a' ? dmgToB : dmgToA,
+      healYou: key === 'a' ? res.curaA : res.curaB,
+      shieldYou: key === 'a' ? res.escudoA : res.escudoB,
+      shieldRival: key === 'a' ? res.escudoB : res.escudoA,
       log: texto,
       you: battlePublicPlayer(p),
       rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
@@ -8895,10 +8984,14 @@ io.on('connection', (socket) => {
       const match = battleMatches.get(matchId);
       if (!match || match.ended) return;
 
-      const accion = data && ['attack', 'strong', 'defend'].includes(data.action) ? data.action : 'defend';
       const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
-      if (match.actions[key]) return; // ya eligió en este turno
-      match.actions[key] = accion;
+      if (match.actions[key]) return; // ya jugó en este turno
+
+      // El cliente manda los ÍNDICES de las cartas de su mano; la validación
+      // (que existan, que no repita y que quepan en la energía) se hace aquí,
+      // nunca en el navegador.
+      const indices = (data && Array.isArray(data.cards)) ? data.cards.slice(0, BATTLE_HAND_SIZE) : [];
+      match.actions[key] = indices;
 
       // Avisar al rival de que ya eligió (sin decir qué)
       const rival = match[key === 'a' ? 'b' : 'a'];
