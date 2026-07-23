@@ -75,10 +75,10 @@ if (NODE_ENV !== 'production' && (process.env.RAILWAY_ENVIRONMENT || process.env
 }
 
 // --- Configuración de Blockchain y Relay ---
-const RPC_URL = process.env.RPC_URL || "https://dream-rpc.somnia.network";
-const CHAIN_ID = 50312;
-const NETWORK_NAME = "Somnia Testnet";
-const EXPLORER_URL = "https://shannon-explorer.somnia.network";
+const RPC_URL = process.env.RPC_URL || "https://liteforge.rpc.caldera.xyz/http";
+const CHAIN_ID = 4441;
+const NETWORK_NAME = "LitVM Testnet";
+const EXPLORER_URL = "https://liteforge.explorer.caldera.xyz";
 
 // SISTEMA SEGURO DE GESTIÓN DE CLAVES PRIVADAS
 const KEY_MANAGEMENT_TYPE = process.env.KEY_MANAGEMENT_TYPE || 'ENV_VARS';
@@ -155,7 +155,7 @@ function _filteredWrite(orig, chunk, encoding, cb) {
     if (now - _rpcLastWarn >= RPC_WARN_MS) {
       _rpcLastWarn = now;
       const mins = Math.floor((now - _rpcDownSince) / 60000);
-      _origStderrWrite('⚠️  [RPC] Red Somnia no disponible' + (mins > 0 ? ' (' + mins + 'm)' : '') + '. Reintentando cada 60s...\n');
+      _origStderrWrite('⚠️  [RPC] Red LitVM no disponible' + (mins > 0 ? ' (' + mins + 'm)' : '') + '. Reintentando cada 60s...\n');
     }
     if (typeof cb === 'function') cb();
     return true;
@@ -163,7 +163,7 @@ function _filteredWrite(orig, chunk, encoding, cb) {
   // Red vuelve: si el chunk tiene algo exitoso y estábamos caídos, avisar
   const s = chunk.toString();
   if (_rpcDownSince && (s.includes('✅') || s.includes('Relay Manager'))) {
-    _origStderrWrite('✅ [RPC] Conexión con Somnia restablecida.\n');
+    _origStderrWrite('✅ [RPC] Conexión con LitVM restablecida.\n');
     _rpcDownSince = null;
     _rpcLastWarn  = 0;
   }
@@ -253,7 +253,7 @@ async function checkRelayerBalance() {
   try {
     const balance = await provider.getBalance(relayerWallet.address);
     const balanceInEth = ethers.formatEther(balance);
-    console.log(`💰 Relayer balance (${relayerWallet.address.substring(0, 10)}...): ${balanceInEth} STT`);
+    console.log(`💰 Relayer balance (${relayerWallet.address.substring(0, 10)}...): ${balanceInEth} zkLTC`);
     
     if (balance < ethers.parseEther("0.01")) {
       console.warn('⚠️  ADVERTENCIA: Saldo del relayer muy bajo. Puede fallar en enviar transacciones.');
@@ -2776,16 +2776,16 @@ class RelayManager {
         // 1. Configurar gas limit
         if (relayTx.functionName === 'logMessage') {
           // Para SimpleMessageLogger, usar límite alto fijo
-          gasLimit = 10000000n; // 3 millones de gas para STT
+          gasLimit = 10000000n; // 3 millones de gas para zkLTC
           console.log(`   - Gas limit fijo para logMessage: ${gasLimit}`);
         } else if (relayTx.gasLimit) {
           // Usar el gas limit anterior pero aumentarlo en 200%
           gasLimit = BigInt(relayTx.gasLimit) * 3n / 1n; // Triple para asegurar
           console.log(`   - Gas limit aumentado (200%): ${gasLimit} (anterior: ${relayTx.gasLimit})`);
         } else {
-          // Valor por defecto muy alto para STT
+          // Valor por defecto muy alto para zkLTC
           gasLimit = 10000000n; // 3 millones de gas
-          console.log(`   - Gas limit por defecto para STT: ${gasLimit}`);
+          console.log(`   - Gas limit por defecto para zkLTC: ${gasLimit}`);
         }
         
         // 2. Configurar gas price
@@ -2816,23 +2816,23 @@ class RelayManager {
         }
       }
       
-      // 3. Verificar límites de gas para STT
+      // 3. Verificar límites de gas para zkLTC
       await this.validateGasParameters(gasLimit, gasPrice);
       
-      // Calcular costo estimado en STT
+      // Calcular costo estimado en zkLTC
       const estimatedCost = gasLimit * gasPrice;
-      console.log(`💰 Costo estimado en STT: ${ethers.formatEther(estimatedCost)} STT`);
+      console.log(`💰 Costo estimado en zkLTC: ${ethers.formatEther(estimatedCost)} zkLTC`);
       console.log(`📊 Detalles de gas finales:`);
       console.log(`   - Gas Limit: ${gasLimit}`);
       console.log(`   - Gas Price: ${ethers.formatUnits(gasPrice, 'gwei')} gwei`);
-      console.log(`   - Costo Total: ${ethers.formatEther(estimatedCost)} STT`);
+      console.log(`   - Costo Total: ${ethers.formatEther(estimatedCost)} zkLTC`);
       
-      // 4. Verificar saldo del relayer en STT
+      // 4. Verificar saldo del relayer en zkLTC
       const relayerBalance = await provider.getBalance(relayerWallet.address);
-      console.log(`💰 Saldo del relayer: ${ethers.formatEther(relayerBalance)} STT`);
+      console.log(`💰 Saldo del relayer: ${ethers.formatEther(relayerBalance)} zkLTC`);
       
       if (relayerBalance < estimatedCost) {
-        const errorMsg = `Relayer insufficient STT balance: ${ethers.formatEther(relayerBalance)} < ${ethers.formatEther(estimatedCost)}`;
+        const errorMsg = `Relayer insufficient zkLTC balance: ${ethers.formatEther(relayerBalance)} < ${ethers.formatEther(estimatedCost)}`;
         console.error(`❌ ${errorMsg}`);
         
         relayTx.status = 'failed';
@@ -2877,7 +2877,7 @@ class RelayManager {
       console.log(`✅ Transacción firmada`);
       
       // 8. Enviar transacción
-      console.log(`📤 Enviando transacción a la red Somnia...`);
+      console.log(`📤 Enviando transacción a la red LitVM...`);
       const txResponse = await provider.broadcastTransaction(signedTx);
       
       console.log(`🎉 Transacción enviada exitosamente!`);
