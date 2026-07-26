@@ -312,13 +312,13 @@ function loadContractABI(contractName) {
 // --- CONFIGURACIÓN DE MÚLTIPLES CONTRATOS CON ABIs EXTERNOS ---
 const CONTRACTS = {
   SIMPLE_MESSAGE_LOGGER: {
-    address: process.env.SIMPLE_MESSAGE_LOGGER_ADDRESS || '0x52E07418A64b23F2537d4F682e57e1804d46a089',
+    address: process.env.SIMPLE_MESSAGE_LOGGER_ADDRESS || '0x686E17D89Bf97247fadC04C3A3f0dfD02F914115',
     name: 'SecureMessageLogger',
     description: 'Contrato seguro para registrar mensajes en la blockchain',
     abi: loadContractABI('SecureMessageLogger')
   },
   ITEMS_CONTRACT: {
-    address: process.env.ITEM_CONTRACT_ADDRESS || '0x52E07418A64b23F2537d4F682e57e1804d46a089',
+    address: process.env.ITEM_CONTRACT_ADDRESS || '0x686E17D89Bf97247fadC04C3A3f0dfD02F914115',
     name: 'ItemContract',
     description: 'Contrato para manejar items del juego',
     abi: loadContractABI('ItemContract')
