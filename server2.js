@@ -519,6 +519,9 @@ const gamePlayerSchema = new mongoose.Schema({
   agricultura: { type: Number, default: 0 },
   agricultura_exp: { type: Number, default: 0 },
   misiones: { type: Number, default: 0 },
+  // Tutorial de bienvenida: 0 = el jugador aún no lo ha hecho, 1 = ya lo hizo.
+  // Los jugadores nuevos nacen en 0 y ven el tutorial la primera vez que entran.
+  tutorial: { type: Number, default: 0 },
   inventory: { type: Array, default: [] },
   chest: { type: Array, default: [] },
   address: { type: String, lowercase: true, default: null }
