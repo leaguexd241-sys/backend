@@ -2475,11 +2475,41 @@ class RelayManager {
       relayTx.status = 'signed';
       relayTx.signedAt = new Date();
       await relayTx.save();
-      
-      // 11. Firmar y enviar
-      const signedTx = await relayerWallet.signTransaction(tx);
-      const txResponse = await provider.broadcastTransaction(signedTx);
-      
+
+      // 11. Firmar y enviar — CON AUTO-RECUPERACIÓN de nonce desincronizado.
+      // Antes, si el broadcast fallaba con "nonce too low"/"nonce has already
+      // been used" (NONCE_EXPIRED), la transacción se marcaba como fallida y se
+      // reembolsaba (síntoma: "Compra parcial 0/N — reembolso"). Ahora, ante ese
+      // error, se resetea el nonce del relayer desde la cadena y se REINTENTA
+      // con un nonce fresco, así el sistema se auto-corrige solo.
+      let txResponse;
+      let currentTxNonce = nonce;
+      const MAX_NONCE_RETRIES = 3;
+      for (let attempt = 0; attempt < MAX_NONCE_RETRIES; attempt++) {
+        try {
+          tx.nonce = currentTxNonce;
+          const signedTx = await relayerWallet.signTransaction(tx);
+          txResponse = await provider.broadcastTransaction(signedTx);
+          break; // enviado con éxito
+        } catch (sendErr) {
+          const msg = String(sendErr?.shortMessage || sendErr?.message || '').toLowerCase();
+          const isNonceError =
+            sendErr?.code === 'NONCE_EXPIRED' ||
+            msg.includes('nonce too low') ||
+            msg.includes('nonce has already been used') ||
+            msg.includes('replacement transaction underpriced');
+
+          if (isNonceError && attempt < MAX_NONCE_RETRIES - 1) {
+            console.warn(`⚠️  Nonce desincronizado (usado ${currentTxNonce}): reseteando desde la cadena y reintentando (intento ${attempt + 1}/${MAX_NONCE_RETRIES})…`);
+            await relayerNonceManager.resetNonce();
+            currentTxNonce = await relayerNonceManager.getNextNonce();
+            relayTx.nonce = currentTxNonce;
+            continue;
+          }
+          throw sendErr; // error no recuperable o se agotaron los reintentos
+        }
+      }
+
       relayTx.status = 'broadcasted';
       relayTx.txHash = txResponse.hash;
       relayTx.broadcastedAt = new Date();
@@ -2742,15 +2772,13 @@ class RelayManager {
         throw new Error(`Function ${relayTx.functionName} not found in contract ABI`);
       }
       
-      // Reutilizar nonce si existe, sino obtener nuevo
-      let nonce;
-      if (relayTx.nonce && relayTx.nonce > 0) {
-        nonce = relayTx.nonce;
-        console.log(`🔢 Reutilizando nonce existente: ${nonce}`);
-      } else {
-        nonce = await relayerNonceManager.getNextNonce();
-        console.log(`🔢 Obteniendo nuevo nonce: ${nonce}`);
-      }
+      // SIEMPRE obtener un nonce FRESCO al reprocesar. Antes se REUTILIZABA
+      // relayTx.nonce, pero si la tx original falló por "nonce too low" /
+      // "nonce has already been used" (la cadena ya pasó ese nonce), reusar el
+      // MISMO nonce la hace fallar en bucle infinito. Un nonce nuevo del manager
+      // rompe ese bucle.
+      let nonce = await relayerNonceManager.getNextNonce();
+      console.log(`🔢 Nonce fresco para reproceso: ${nonce}`);
       
       // ========== CONFIGURACIÓN DE GAS MEJORADA ==========
       let gasLimit;
@@ -2874,15 +2902,33 @@ class RelayManager {
       console.log(`   - Chain ID: ${CHAIN_ID}`);
       console.log(`   - To: ${relayTx.contractAddress}`);
       
-      // 7. Firmar transacción
-      console.log(`✍️ Firmando transacción...`);
-      const signedTx = await relayerWallet.signTransaction(tx);
-      console.log(`✅ Transacción firmada`);
-      
-      // 8. Enviar transacción
-      console.log(`📤 Enviando transacción a la red LitVM...`);
-      const txResponse = await provider.broadcastTransaction(signedTx);
-      
+      // 7-8. Firmar y enviar CON auto-recuperación de nonce desincronizado.
+      console.log(`✍️ Firmando y enviando transacción...`);
+      let txResponse;
+      const MAX_NONCE_RETRIES = 3;
+      for (let attempt = 0; attempt < MAX_NONCE_RETRIES; attempt++) {
+        try {
+          tx.nonce = nonce;
+          const signedTx = await relayerWallet.signTransaction(tx);
+          txResponse = await provider.broadcastTransaction(signedTx);
+          break; // enviado con éxito
+        } catch (sendErr) {
+          const msg = String(sendErr?.shortMessage || sendErr?.message || '').toLowerCase();
+          const isNonceError =
+            sendErr?.code === 'NONCE_EXPIRED' ||
+            msg.includes('nonce too low') ||
+            msg.includes('nonce has already been used') ||
+            msg.includes('replacement transaction underpriced');
+          if (isNonceError && attempt < MAX_NONCE_RETRIES - 1) {
+            console.warn(`⚠️  Nonce desincronizado (usado ${nonce}) al reprocesar: reseteando desde la cadena y reintentando (${attempt + 1}/${MAX_NONCE_RETRIES})…`);
+            await relayerNonceManager.resetNonce();
+            nonce = await relayerNonceManager.getNextNonce();
+            continue;
+          }
+          throw sendErr; // error no recuperable o reintentos agotados
+        }
+      }
+
       console.log(`🎉 Transacción enviada exitosamente!`);
       console.log(`📝 Hash: ${txResponse.hash}`);
       console.log(`🔗 Explorer URL: ${EXPLORER_URL}/tx/${txResponse.hash}`);
@@ -4899,10 +4945,20 @@ app.get('/api/health', async (req, res) => {
 
 // CSRF token endpoint
 app.get('/api/auth/csrf-token', (req, res) => {
-  const csrfToken = generateCSRFToken();
-  res.cookie('csrf-token', csrfToken, setCookieOptions(3600, true));
+  // REUTILIZAR el token existente si la cookie ya tiene uno válido (64 hex).
+  // Antes se generaba SIEMPRE uno nuevo en cada GET, rotando la cookie y
+  // desincronizándola del header X-CSRF-Token que el cliente ya tenía → error
+  // 'csrf_token_invalid' intermitente ("se desconecta el CSRF"). Un token CSRF
+  // estable por sesión es válido y más fiable para el patrón double-submit.
+  // (login/refresh SÍ siguen rotándolo a propósito, en el cambio de sesión.)
+  const existing = req.cookies && req.cookies['csrf-token'];
+  const isValid = typeof existing === 'string' && /^[a-f0-9]{64}$/i.test(existing);
+  const csrfToken = isValid ? existing : generateCSRFToken();
+  if (!isValid) {
+    res.cookie('csrf-token', csrfToken, setCookieOptions(3600, true));
+  }
   res.setHeader('X-CSRF-Token', csrfToken);
-  return res.json({ 
+  return res.json({
     csrfToken,
     expiresIn: 3600,
     message: 'Token CSRF generado exitosamente',
