@@ -2325,6 +2325,66 @@ class RelayManager {
     return true;
   }
   
+  // ---------------------------------------------------------------------------
+  // VERIFICADOR DE PROPIEDAD DE FACTURA (anti-trampa)
+  // Antes de firmar una manipulación de una factura EXISTENTE, lee la factura
+  // on-chain y confirma que su `owner` es el jugador solicitante (y, para las
+  // que restan/mueven, que hay cantidad suficiente). Lanza si no cumple, así el
+  // relay NUNCA firma la manipulación de facturas ajenas o inexistentes.
+  // Funciones que NO tocan una factura existente (createInvoice, setLimit,
+  // vistas, logMessage…) se omiten.
+  // ---------------------------------------------------------------------------
+  async verifyInvoiceOwnership(contract, functionName, parameters, playerAddress) {
+    // función → posición del id de factura, cantidad y (opcional) dueño de origen.
+    const OWNED_INVOICE_FNS = {
+      decreaseInvoiceQuantity:         { idArg: 0, amountArg: 1 },
+      increaseInvoiceQuantity:         { idArg: 0 },
+      deleteInvoice:                   { idArg: 0 },
+      transferInvoice:                 { idArg: 2, amountArg: 3, ownerArg: 0 },
+      transferQuantityBetweenInvoices: { idArg: 0, amountArg: 2 }
+    };
+    const cfg = OWNED_INVOICE_FNS[functionName];
+    if (!cfg) return; // no es manipulación de una factura existente
+
+    const args = Array.isArray(parameters) ? parameters : Object.values(parameters || {});
+    const player = String(playerAddress || '').toLowerCase();
+
+    const invoiceId = Number(args[cfg.idArg]);
+    if (!Number.isFinite(invoiceId) || invoiceId <= 0) {
+      throw new Error('ownership_check_failed: invalid invoice id');
+    }
+
+    // transferInvoice manda el fromOwner explícito: debe ser el propio jugador.
+    if (cfg.ownerArg != null) {
+      const fromOwner = String(args[cfg.ownerArg] || '').toLowerCase();
+      if (fromOwner !== player) {
+        throw new Error('ownership_check_failed: fromOwner is not the requesting player');
+      }
+    }
+
+    // Leer la factura on-chain (getInvoice revierte si no existe → se captura).
+    let inv;
+    try {
+      inv = await contract.getInvoice(invoiceId);
+    } catch (e) {
+      throw new Error(`ownership_check_failed: invoice ${invoiceId} not found on-chain`);
+    }
+    if (!inv || !inv.active) {
+      throw new Error(`ownership_check_failed: invoice ${invoiceId} is inactive`);
+    }
+    if (String(inv.owner || '').toLowerCase() !== player) {
+      throw new Error(`ownership_check_failed: invoice ${invoiceId} does not belong to the player`);
+    }
+    if (cfg.amountArg != null) {
+      let amount;
+      try { amount = BigInt(args[cfg.amountArg]); } catch (e) { amount = 0n; }
+      if (amount > 0n && BigInt(inv.cantidad) < amount) {
+        throw new Error(`ownership_check_failed: insufficient quantity in invoice ${invoiceId}`);
+      }
+    }
+    console.log(`🔐 [ownership] OK: ${functionName} sobre factura ${invoiceId} (dueño ${player.substring(0, 10)}…)`);
+  }
+
   async processTransaction(transactionData) {
     if (!relayerWallet) {
       throw new Error('Relayer no configurado');
@@ -2392,7 +2452,13 @@ class RelayManager {
       if (!contract[functionName]) {
         throw new Error(`Function ${functionName} not found in contract ABI`);
       }
-      
+
+      // 3.5. VERIFICACIÓN DE PROPIEDAD (anti-trampa). Antes de manipular una
+      // factura EXISTENTE (decrease/increase/delete/transfer), confirmar on-chain
+      // que pertenece al jugador que la solicita y que tiene cantidad suficiente.
+      // Sin esto, un jugador podía pedir manipular facturas de OTRO usuario.
+      await this.verifyInvoiceOwnership(contract, functionName, parameters, playerAddress);
+
       // 4. Obtener nonce
       const nonce = await relayerNonceManager.getNextNonce();
       relayTx.nonce = nonce;
@@ -6890,6 +6956,61 @@ app.post('/api/save/:playerName',
       return res.json(response);
     } catch (e) {
       console.error('Error en save:', e);
+      return res.status(500).json({ error: 'internal_server_error' });
+    }
+  }
+);
+
+// -----------------------------------------------------------------------------
+// RESET DE CACHE — se llama ANTES de sincronizar el inventario con la blockchain
+// (LoadingScenegame). Limpia SOLO el "cache" que la blockchain vuelve a poblar
+// (inventario, cofre, oro/plata y vitales) + las siembras del jugador, para que
+// la sincronización deje toda la info fresca desde el contrato.
+// SE CONSERVAN (no están on-chain, se perderían): mundo, Username, petName,
+// posicionplayerx/y, nivel, todas las habilidades + exp, misiones y tutorial.
+// -----------------------------------------------------------------------------
+app.post('/api/cache/reset/:playerName',
+  apiLimiter,
+  authMiddleware,
+  csrfProtection,
+  param('playerName').isString().notEmpty(),
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    const { playerName } = req.params;
+    const address = req.user.address.toLowerCase();
+
+    try {
+      const auth = await PlayerAuth.findOne({ address }).exec();
+      if (!auth) return res.status(404).json({ error: 'user_not_found' });
+      if (auth.playerName && auth.playerName !== playerName) {
+        return res.status(403).json({ error: 'not_authorized_for_player' });
+      }
+
+      // Reset SOLO del cache respaldado por la blockchain.
+      await GamePlayer.findOneAndUpdate(
+        { playerName },
+        { $set: {
+            inventory: [],
+            chest: [],
+            moneda: 0,
+            moneda_plata: 0,
+            vidaPorcentaje: 100000,
+            aguaPorcentaje: 100000,
+            comidaPorcentaje: 10000
+        } },
+        { new: true }
+      );
+
+      // Borrar las siembras del jugador (UserCrop.userId = dirección wallet).
+      const escaped = address.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const del = await UserCrop.deleteMany({ userId: new RegExp('^' + escaped + '$', 'i') });
+
+      console.log(`🧹 Cache reseteado para ${playerName} (${address.substring(0, 10)}…); siembras borradas: ${del.deletedCount || 0}`);
+      return res.json({ ok: true, cropsDeleted: del.deletedCount || 0 });
+    } catch (e) {
+      console.error('Error en cache reset:', e);
       return res.status(500).json({ error: 'internal_server_error' });
     }
   }
