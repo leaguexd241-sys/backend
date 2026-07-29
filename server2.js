@@ -6961,61 +6961,6 @@ app.post('/api/save/:playerName',
   }
 );
 
-// -----------------------------------------------------------------------------
-// RESET DE CACHE — se llama ANTES de sincronizar el inventario con la blockchain
-// (LoadingScenegame). Limpia SOLO el "cache" que la blockchain vuelve a poblar
-// (inventario, cofre, oro/plata y vitales) + las siembras del jugador, para que
-// la sincronización deje toda la info fresca desde el contrato.
-// SE CONSERVAN (no están on-chain, se perderían): mundo, Username, petName,
-// posicionplayerx/y, nivel, todas las habilidades + exp, misiones y tutorial.
-// -----------------------------------------------------------------------------
-app.post('/api/cache/reset/:playerName',
-  apiLimiter,
-  authMiddleware,
-  csrfProtection,
-  param('playerName').isString().notEmpty(),
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
-    const { playerName } = req.params;
-    const address = req.user.address.toLowerCase();
-
-    try {
-      const auth = await PlayerAuth.findOne({ address }).exec();
-      if (!auth) return res.status(404).json({ error: 'user_not_found' });
-      if (auth.playerName && auth.playerName !== playerName) {
-        return res.status(403).json({ error: 'not_authorized_for_player' });
-      }
-
-      // Reset SOLO del cache respaldado por la blockchain.
-      await GamePlayer.findOneAndUpdate(
-        { playerName },
-        { $set: {
-            inventory: [],
-            chest: [],
-            moneda: 0,
-            moneda_plata: 0,
-            vidaPorcentaje: 100000,
-            aguaPorcentaje: 100000,
-            comidaPorcentaje: 10000
-        } },
-        { new: true }
-      );
-
-      // Borrar las siembras del jugador (UserCrop.userId = dirección wallet).
-      const escaped = address.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const del = await UserCrop.deleteMany({ userId: new RegExp('^' + escaped + '$', 'i') });
-
-      console.log(`🧹 Cache reseteado para ${playerName} (${address.substring(0, 10)}…); siembras borradas: ${del.deletedCount || 0}`);
-      return res.json({ ok: true, cropsDeleted: del.deletedCount || 0 });
-    } catch (e) {
-      console.error('Error en cache reset:', e);
-      return res.status(500).json({ error: 'internal_server_error' });
-    }
-  }
-);
-
 // LOAD endpoint
 app.get('/api/load/:playerName',
   apiLimiter,
