@@ -537,6 +537,66 @@ const adminSchema = new mongoose.Schema({
 }, { versionKey: false });
 const Admin = mongoose.model('Admin', adminSchema);
 
+// Control de acceso al juego (whitelist / baneos). Doc único '_id: config'.
+//   mode 'all'       → entran todos (salvo baneados).
+//   mode 'whitelist' → solo direcciones en whitelist (salvo baneados).
+// banned: [{ address, reason, date }] — los baneos SIEMPRE aplican.
+const accessControlSchema = new mongoose.Schema({
+  _id: { type: String, default: 'config' },
+  mode: { type: String, enum: ['all', 'whitelist'], default: 'all' },
+  whitelist: { type: [String], default: [] },
+  banned: {
+    type: [{ address: String, reason: String, date: { type: Date, default: Date.now } }],
+    default: []
+  }
+}, { versionKey: false, timestamps: true });
+const AccessControl = mongoose.model('AccessControl', accessControlSchema);
+
+async function getAccessControl() {
+  let ac = await AccessControl.findById('config').lean();
+  if (!ac) { await AccessControl.create({ _id: 'config' }); ac = await AccessControl.findById('config').lean(); }
+  return ac;
+}
+
+// ¿La dirección es admin? (env ADMIN_ADDRESSES o isAdmin on-chain del ItemContract)
+async function isAdminAddress(address) {
+  const addr = String(address || '').toLowerCase();
+  if (!addr) return false;
+  if (process.env.ADMIN_ADDRESSES &&
+      process.env.ADMIN_ADDRESSES.toLowerCase().split(',').map(s => s.trim()).includes(addr)) {
+    return true;
+  }
+  try {
+    const c = new ethers.Contract(CONTRACTS.ITEMS_CONTRACT.address, CONTRACTS.ITEMS_CONTRACT.abi, provider);
+    return await c.isAdmin(addr);
+  } catch (_) { return false; }
+}
+
+// ¿Puede este address entrar al juego? Devuelve { allowed, error?, reason?, date? }
+async function checkGameAccess(address) {
+  const addr = String(address || '').toLowerCase();
+  // Los admins siempre pueden entrar (para poder abrir puerta_login).
+  if (await isAdminAddress(addr)) return { allowed: true };
+  const ac = await getAccessControl();
+  const ban = (ac.banned || []).find(b => String(b.address).toLowerCase() === addr);
+  if (ban) return { allowed: false, error: 'banned', reason: ban.reason || '', date: ban.date || null };
+  if (ac.mode === 'whitelist') {
+    const wl = (ac.whitelist || []).map(a => String(a).toLowerCase());
+    if (!wl.includes(addr)) return { allowed: false, error: 'not_whitelisted' };
+  }
+  return { allowed: true };
+}
+
+// Middleware: exige que el usuario autenticado sea admin.
+async function requireAdmin(req, res, next) {
+  try {
+    if (await isAdminAddress(req.user && req.user.address)) return next();
+    return res.status(403).json({ error: 'admin_required' });
+  } catch (e) {
+    return res.status(500).json({ error: 'admin_check_failed' });
+  }
+}
+
 // MissionsPlayer
 const missionsPlayerSchema = new mongoose.Schema({
   playerName: { type: String, required: true, unique: true },
@@ -2103,8 +2163,8 @@ class RelayManager {
 
         case 'ItemContract':
           securityConfig = {
-            maxCallsPerHour: 50,
-            maxCallsPerDay: 500,
+            maxCallsPerHour: 350,
+            maxCallsPerDay: 3500,
             requirePlayerOwnership: true,
             allowedFunctions: [
               'createInvoice',
@@ -2385,6 +2445,26 @@ class RelayManager {
     console.log(`🔐 [ownership] OK: ${functionName} sobre factura ${invoiceId} (dueño ${player.substring(0, 10)}…)`);
   }
 
+  // Bloquea (si GATHER_ENFORCE) que el CLIENTE acuñe tipos de recolección vía
+  // relay: esos ítems solo puede acuñarlos el servidor (/api/gather/claim), que
+  // llama al contrato directamente (sin pasar por aquí). Inerte con el flag off.
+  async blockClientGatherMint(contract, functionName, parameters) {
+    if (!GATHER_ENFORCE) return;
+    const args = Array.isArray(parameters) ? parameters : Object.values(parameters || {});
+    let tipo = null;
+    if (functionName === 'createInvoice') {
+      tipo = String(args[1] || '');                 // createInvoice(owner, tipo, cantidad, manualId)
+    } else if (functionName === 'increaseInvoiceQuantity') {
+      const id = Number(args[0]);
+      if (id > 0) { try { const inv = await contract.getInvoice(id); tipo = String(inv.tipo || ''); } catch (_) {} }
+    } else {
+      return;
+    }
+    if (tipo && GATHER_TIPOS.has(tipo)) {
+      throw new Error('gather_mint_blocked: los recursos de recolección solo los acuña el servidor (/api/gather/claim)');
+    }
+  }
+
   async processTransaction(transactionData) {
     if (!relayerWallet) {
       throw new Error('Relayer no configurado');
@@ -2458,6 +2538,12 @@ class RelayManager {
       // que pertenece al jugador que la solicita y que tiene cantidad suficiente.
       // Sin esto, un jugador podía pedir manipular facturas de OTRO usuario.
       await this.verifyInvoiceOwnership(contract, functionName, parameters, playerAddress);
+
+      // 3.6. ANTI-TRAMPA DE RECOLECCIÓN: si GATHER_ENFORCE está activo, el
+      // cliente NO puede acuñar los tipos de recolección (madera/minerales);
+      // esos SOLO los acuña el servidor en /api/gather/claim. Inerte si el flag
+      // está apagado.
+      await this.blockClientGatherMint(contract, functionName, parameters);
 
       // 4. Obtener nonce
       const nonce = await relayerNonceManager.getNextNonce();
@@ -5254,10 +5340,28 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
 
     if (!recovered || recovered.toLowerCase() !== lcAddress.toLowerCase()) {
       console.log(`❌ Dirección no coincide: ${recovered} vs ${lcAddress}`);
-      return res.status(401).json({ 
+      return res.status(401).json({
         error: 'address_mismatch',
         message: 'Dirección no coincide'
       });
+    }
+
+    // ── CONTROL DE ACCESO (whitelist / baneos) ──────────────────────────────
+    // Tras verificar la firma, comprobar si esta wallet puede entrar. Los
+    // admins pasan siempre. Baneado → 403 banned + reason + date. Sin WL (modo
+    // whitelist) → 403 not_whitelisted. El login del juego muestra el mensaje.
+    try {
+      const access = await checkGameAccess(lcAddress);
+      if (!access.allowed) {
+        if (access.error === 'banned') {
+          console.log(`⛔ Login bloqueado (baneado): ${lcAddress.substring(0, 10)}…`);
+          return res.status(403).json({ error: 'banned', reason: access.reason || '', date: access.date || null });
+        }
+        console.log(`⛔ Login bloqueado (sin whitelist): ${lcAddress.substring(0, 10)}…`);
+        return res.status(403).json({ error: 'not_whitelisted' });
+      }
+    } catch (accErr) {
+      console.warn('⚠️  checkGameAccess falló (se permite el login por defecto):', accErr.message);
     }
 
     // ✅ AUTENTICACIÓN EXITOSA
@@ -6027,9 +6131,234 @@ app.get(
     }
   }
 );
- 
+
+// =============================================================================
+// RECOLECCIÓN SERVER-AUTHORITATIVE (anti-trampa de talar/minar)
+// -----------------------------------------------------------------------------
+// Problema: hoy el CLIENTE decide la recompensa y pide al relay que la acuñe →
+// un tramposo podría acuñar madera/minerales sin trabajar. Solución: que el
+// SERVIDOR valide el nodo (árbol/mineral), aplique el bloqueo (respawn = tope
+// económico), DECIDA la recompensa y la ACUÑE él mismo. El relay, además,
+// rechaza que el cliente acuñe directamente los "tipos de recolección".
+//
+// SEGURIDAD DE DESPLIEGUE: todo esto está detrás del flag `GATHER_ENFORCE`
+// (env, apagado por defecto). Mientras esté apagado, NADA cambia (el endpoint
+// existe pero el relay no bloquea, así que el juego sigue como está). Actívalo
+// (`GATHER_ENFORCE=true`) SOLO tras cablear el cliente para que llame a
+// /api/gather/claim en vez de acuñar, y probarlo en staging.
+// =============================================================================
+const GATHER_ENFORCE = String(process.env.GATHER_ENFORCE || '').toLowerCase() === 'true';
+
+// nodeKey (sprite) → tipo de nodo, y tipo de nodo → item que suelta.
+function gatherNodeTypeFromKey(key) {
+  const k = String(key || '');
+  if (k.startsWith('sprite_pinos'))    return { kind: 'tree', type: 'pinos' };
+  if (k.startsWith('sprite_arbustos')) return { kind: 'tree', type: 'arbustos' };
+  if (k.startsWith('sprite_arbolx'))   return { kind: 'tree', type: 'arbolx' };
+  if (k.includes('minar_piedra'))      return { kind: 'mine', type: 'piedra' };
+  if (k.includes('minar_cobre'))       return { kind: 'mine', type: 'cobre' };
+  if (k.includes('minar_hierro'))      return { kind: 'mine', type: 'hierro' };
+  if (k.includes('carbon'))            return { kind: 'mine', type: 'carbon' };
+  return null;
+}
+const GATHER_REWARD_TIPO = {
+  pinos: 'madera_pinos', arbolx: 'madera_seca', arbustos: 'madera_con_hojas',
+  piedra: 'mineral_piedra', cobre: 'mineral_cobre', hierro: 'mineral_hierro', carbon: 'carbon'
+};
+// Conjunto de tipos que SOLO el servidor puede acuñar (recolección).
+const GATHER_TIPOS = new Set(Object.values(GATHER_REWARD_TIPO));
+
+// El servidor decide la recompensa (misma idea que el cliente, pero autoritativa):
+// herramienta baja (madera) → menos probabilidad; alta → +cantidad. Puede dar 0.
+function decideGatherReward(nodeType, toolId) {
+  const tipo = GATHER_REWARD_TIPO[nodeType];
+  if (!tipo) return { tipo: null, quantity: 0 };
+  const t = String(toolId || '').toLowerCase();
+  let prob = 1.0, qty = 1;
+  if (t.includes('_madera'))      { prob = 0.6; }
+  else if (t.includes('_piedra')) { prob = 1.0; }
+  else if (t.includes('_cobre'))  { prob = 1.0; if (Math.random() < 0.20) qty += 1; }
+  else if (t.includes('_hierro')) { prob = 1.0; if (Math.random() < 0.40) qty += 1; }
+  if (Math.random() > prob) return { tipo, quantity: 0 }; // falló (herramienta baja)
+  return { tipo, quantity: qty };
+}
+
+function gatherGasPrice() {
+  // Precio de gas fijo si está configurado; si no, un mínimo seguro.
+  if (FIXED_GAS_PRICE_GWEI !== null) return ethers.parseUnits(String(FIXED_GAS_PRICE_GWEI), 'gwei');
+  return ethers.parseUnits(String(MIN_GAS_PRICE_GWEI), 'gwei');
+}
+
+// Acuña `quantity` de `tipo` para `address`: si el jugador ya tiene una factura
+// activa de ese tipo con cupo, la aumenta; si no, crea una nueva. Devuelve
+// { id, manualId, cantidad } o null.
+async function mintGatherReward(address, tipo, quantity) {
+  if (!relayerWallet || quantity <= 0) return null;
+  const c = new ethers.Contract(CONTRACTS.ITEMS_CONTRACT.address, CONTRACTS.ITEMS_CONTRACT.abi, relayerWallet);
+  const gasPrice = gatherGasPrice();
+
+  // Límite por factura del tipo (para saber si podemos aumentar una existente).
+  let perInvoiceLimit = 50;
+  try {
+    const ts = await c.getTipoStats(tipo);
+    const pil = Number(ts.perInvoiceLimit ?? ts[2] ?? 0);
+    if (pil > 0) perInvoiceLimit = pil;
+  } catch (_) {}
+
+  // Buscar una factura activa del tipo con cupo.
+  let target = null;
+  try {
+    const snap = await c.getUserInventorySnapshot(address);
+    for (const inv of snap) {
+      if (inv.active && String(inv.tipo) === tipo && Number(inv.cantidad) + quantity <= perInvoiceLimit) {
+        target = { id: Number(inv.id), manualId: inv.manualId, cantidad: Number(inv.cantidad) };
+        break;
+      }
+    }
+  } catch (e) { console.warn('⚠️ gather: no se pudo leer inventario on-chain:', e.message); }
+
+  const nonce = await relayerNonceManager.getNextNonce();
+  try {
+    if (target) {
+      const tx = await c.increaseInvoiceQuantity(target.id, quantity, { gasPrice, nonce });
+      await tx.wait();
+      return { id: target.id, manualId: target.manualId, cantidad: target.cantidad + quantity };
+    } else {
+      const manualId = ('g' + tipo.replace(/[^a-z0-9]/gi, '').slice(0, 10) + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)).slice(0, 60);
+      const tx = await c.createInvoice(address, tipo, quantity, manualId, { gasPrice, nonce });
+      const receipt = await tx.wait();
+      let newId = null;
+      try {
+        for (const log of receipt.logs) {
+          const p = c.interface.parseLog(log);
+          if (p?.name === 'InvoiceCreated') { newId = Number(p.args.id); break; }
+        }
+      } catch (_) {}
+      return { id: newId, manualId, cantidad: quantity };
+    }
+  } catch (e) {
+    // Ante nonce desincronizado, resetear (mismo criterio que el relay).
+    console.error('❌ gather mint error:', e.message);
+    try { await relayerNonceManager.resetNonce(); } catch (_) {}
+    return null;
+  }
+}
+
+// Cooldown en memoria por jugador (evita spam del endpoint). El tope económico
+// REAL es el bloqueo por respawn del nodo.
+const _gatherLastByPlayer = new Map();
+
+// POST /api/gather/claim — el cliente lo llama al COMPLETAR una tala/mina.
+// Valida el nodo, lo bloquea (respawn), decide y acuña la recompensa.
+app.post('/api/gather/claim',
+  apiLimiter,
+  authMiddleware,
+  csrfProtection,
+  body('nodeKey').isString().notEmpty(),
+  body('toolId').optional().isString(),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+      const address = req.user.address.toLowerCase();
+      const { nodeKey, toolId } = req.body;
+
+      const node = gatherNodeTypeFromKey(nodeKey);
+      if (!node) return res.status(400).json({ error: 'invalid_node' });
+
+      // Cooldown por jugador (200ms) — anti-spam.
+      const now = Date.now();
+      const last = _gatherLastByPlayer.get(address) || 0;
+      if (now - last < 200) return res.status(429).json({ error: 'too_fast' });
+      _gatherLastByPlayer.set(address, now);
+
+      // El nodo no debe estar ya bloqueado (en respawn).
+      const respawnSec = 300;
+      if (node.kind === 'tree') {
+        const lock = await TreeLock.findOne({ treeKey: nodeKey });
+        if (lock && lock.lockedUntil && lock.lockedUntil > new Date()) {
+          return res.status(409).json({ error: 'node_locked', lockedUntil: lock.lockedUntil });
+        }
+      } else {
+        const lock = await MineLock.findOne({ mineKey: nodeKey });
+        if (lock && lock.lockedUntil && lock.lockedUntil > new Date()) {
+          return res.status(409).json({ error: 'node_locked', lockedUntil: lock.lockedUntil });
+        }
+      }
+
+      // Bloquear el nodo (respawn) — tope económico.
+      const lockedUntil = new Date(now + respawnSec * 1000);
+      if (node.kind === 'tree') {
+        await TreeLock.findOneAndUpdate({ treeKey: nodeKey }, { treeKey: nodeKey, treeType: node.type, lockedUntil }, { upsert: true });
+      } else {
+        await MineLock.findOneAndUpdate({ mineKey: nodeKey }, { mineKey: nodeKey, mineralType: node.type, lockedUntil }, { upsert: true });
+      }
+
+      // Decidir y acuñar la recompensa (server-authoritative).
+      const reward = decideGatherReward(node.type, toolId);
+      let minted = null;
+      if (reward.tipo && reward.quantity > 0) {
+        minted = await mintGatherReward(address, reward.tipo, reward.quantity);
+      }
+
+      return res.json({
+        ok: true,
+        locked: true,
+        lockedUntil,
+        reward: minted ? { tipo: reward.tipo, quantity: reward.quantity, invoiceId: minted.id, manualId: minted.manualId, newTotal: minted.cantidad } : null
+      });
+    } catch (e) {
+      console.error('❌ Error en /api/gather/claim:', e);
+      return res.status(500).json({ error: 'internal_server_error' });
+    }
+  }
+);
 
 
+
+// =============================================================================
+// CONTROL DE ACCESO — endpoints admin (usados por puerta_login.html)
+// Protegidos: exigen sesión de una wallet admin (env ADMIN_ADDRESSES o isAdmin
+// on-chain). GET lee la config; POST la reemplaza (modo, whitelist, baneos).
+// =============================================================================
+app.get('/api/access', apiLimiter, authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const ac = await getAccessControl();
+    return res.json({ mode: ac.mode, whitelist: ac.whitelist || [], banned: ac.banned || [] });
+  } catch (e) {
+    console.error('Error GET /api/access:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+app.post('/api/access', apiLimiter, authMiddleware, csrfProtection, requireAdmin, async (req, res) => {
+  try {
+    const { mode, whitelist, banned } = req.body || {};
+    const update = {};
+    if (mode === 'all' || mode === 'whitelist') update.mode = mode;
+    if (Array.isArray(whitelist)) {
+      update.whitelist = [...new Set(
+        whitelist.map(a => String(a).toLowerCase().trim()).filter(a => /^0x[a-f0-9]{40}$/.test(a))
+      )];
+    }
+    if (Array.isArray(banned)) {
+      update.banned = banned
+        .filter(b => b && b.address && /^0x[a-f0-9]{40}$/.test(String(b.address).toLowerCase().trim()))
+        .map(b => ({
+          address: String(b.address).toLowerCase().trim(),
+          reason: String(b.reason || '').slice(0, 300),
+          date: b.date ? new Date(b.date) : new Date()
+        }));
+    }
+    await AccessControl.findOneAndUpdate({ _id: 'config' }, { $set: update }, { upsert: true });
+    const ac = await getAccessControl();
+    return res.json({ ok: true, mode: ac.mode, whitelist: ac.whitelist || [], banned: ac.banned || [] });
+  } catch (e) {
+    console.error('Error POST /api/access:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
 
 // --- RUTAS DEL SISTEMA DE RELAY ---
 
