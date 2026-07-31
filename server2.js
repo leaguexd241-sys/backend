@@ -522,6 +522,9 @@ const gamePlayerSchema = new mongoose.Schema({
   // Tutorial de bienvenida: 0 = el jugador aún no lo ha hecho, 1 = ya lo hizo.
   // Los jugadores nuevos nacen en 0 y ven el tutorial la primera vez que entran.
   tutorial: { type: Number, default: 0 },
+  // Nivel de la MASCOTA. Sube con las batallas (ver computePetLevel/bump).
+  // Se muestra junto al nombre del perro, propio y de los demás jugadores.
+  petLevel: { type: Number, default: 1, min: 1 },
   inventory: { type: Array, default: [] },
   chest: { type: Array, default: [] },
   address: { type: String, lowercase: true, default: null }
@@ -572,12 +575,44 @@ async function isAdminAddress(address) {
   } catch (_) { return false; }
 }
 
+// ── CACHÉ DEL CONTROL DE ACCESO ────────────────────────────────────────────
+// El gate se evalúa en CADA petición autenticada, así que no puede consultar
+// Mongo (y menos el contrato, para isAdmin) cada vez. Se cachea 30s.
+const _accessCfgCache = { doc: null, at: 0 };
+const _adminAddrCache = new Map();     // address -> { value, at }
+const ACCESS_CACHE_MS = 30000;
+
+function invalidateAccessCache() {
+  _accessCfgCache.doc = null;
+  _accessCfgCache.at  = 0;
+  _adminAddrCache.clear();
+}
+
+async function getAccessControlCached() {
+  const now = Date.now();
+  if (_accessCfgCache.doc && (now - _accessCfgCache.at) < ACCESS_CACHE_MS) return _accessCfgCache.doc;
+  const ac = await getAccessControl();
+  _accessCfgCache.doc = ac;
+  _accessCfgCache.at  = now;
+  return ac;
+}
+
+async function isAdminAddressCached(address) {
+  const a = String(address || '').toLowerCase();
+  const now = Date.now();
+  const hit = _adminAddrCache.get(a);
+  if (hit && (now - hit.at) < ACCESS_CACHE_MS) return hit.value;
+  const v = await isAdminAddress(a);
+  _adminAddrCache.set(a, { value: v, at: now });
+  return v;
+}
+
 // ¿Puede este address entrar al juego? Devuelve { allowed, error?, reason?, date? }
 async function checkGameAccess(address) {
   const addr = String(address || '').toLowerCase();
   // Los admins siempre pueden entrar (para poder abrir puerta_login).
-  if (await isAdminAddress(addr)) return { allowed: true };
-  const ac = await getAccessControl();
+  if (await isAdminAddressCached(addr)) return { allowed: true };
+  const ac = await getAccessControlCached();
   const ban = (ac.banned || []).find(b => String(b.address).toLowerCase() === addr);
   if (ban) return { allowed: false, error: 'banned', reason: ban.reason || '', date: ban.date || null };
   if (ac.mode === 'whitelist') {
@@ -585,6 +620,44 @@ async function checkGameAccess(address) {
     if (!wl.includes(addr)) return { allowed: false, error: 'not_whitelisted' };
   }
   return { allowed: true };
+}
+
+// ── GATE DE ACCESO EN TODA PETICIÓN AUTENTICADA ────────────────────────────
+// El control de whitelist/baneos de puerta_login.html se aplicaba SOLO en
+// /api/auth/login. Un jugador que ya tenía la cookie de sesión guardada entraba
+// directo al juego (GameScene/tiendajuego) y se saltaba el baneo por completo.
+// Aplicándolo aquí, banear a alguien lo expulsa también si YA está dentro: su
+// siguiente petición al backend falla con 403.
+// Se dejan fuera las rutas de sesión para que un baneado pueda cerrar sesión y
+// para que el cliente pueda leer el motivo del bloqueo.
+const ACCESS_EXEMPT_PATHS = new Set([
+  '/api/auth/logout',
+  '/api/auth/refresh',
+  '/api/auth/csrf-token',
+  '/api/auth/me'
+]);
+
+async function enforceGameAccess(req, res, next) {
+  try {
+    if (ACCESS_EXEMPT_PATHS.has(req.path)) return next();
+
+    const access = await checkGameAccess(req.user && req.user.address);
+    if (access.allowed) return next();
+
+    if (access.error === 'banned') {
+      return res.status(403).json({
+        error: 'banned',
+        reason: access.reason || '',
+        date: access.date || null,
+        message: 'This account is banned'
+      });
+    }
+    return res.status(403).json({ error: 'not_whitelisted', message: 'This wallet is not on the whitelist' });
+  } catch (e) {
+    // Ante un fallo del chequeo NO se deja fuera a todo el mundo.
+    console.warn('⚠️  enforceGameAccess falló (se permite el paso):', e.message);
+    return next();
+  }
 }
 
 // Middleware: exige que el usuario autenticado sea admin.
@@ -4814,8 +4887,10 @@ function authMiddleware(req, res, next) {
       }
       
       req.user = payload;
-      return next();
-      
+      // GATE: whitelist/baneos también para sesiones YA iniciadas (si no, quien
+      // entra directo al juego con la cookie guardada se salta el control).
+      return enforceGameAccess(req, res, next);
+
     } catch (err) {
       console.log(`❌ Error verificando token: ${err.name} - ${err.message}`);
       
@@ -6352,6 +6427,8 @@ app.post('/api/access', apiLimiter, authMiddleware, csrfProtection, requireAdmin
         }));
     }
     await AccessControl.findOneAndUpdate({ _id: 'config' }, { $set: update }, { upsert: true });
+    // Sin esto, un baneo tardaría hasta 30s (TTL de la caché) en hacer efecto.
+    invalidateAccessCache();
     const ac = await getAccessControl();
     return res.json({ ok: true, mode: ac.mode, whitelist: ac.whitelist || [], banned: ac.banned || [] });
   } catch (e) {
@@ -8052,9 +8129,15 @@ setInterval(async () => {
 const playerStatsSchema = new mongoose.Schema({
   playerName: { type: String, required: true, unique: true, index: true },
   address:    { type: String, required: true, lowercase: true, index: true },
-  vida:       { type: Number, default: 100000, min: 0 },
-  agua:       { type: Number, default: 100000, min: 0 },
-  comida:     { type: Number, default: 100000, min: 0 },
+  // Escala de juego 0..100 (las barras se pintan como `${valor}%` sin dividir).
+  // Antes el default era 100000 y, combinado con el piso Math.max del sync,
+  // producía barras de "100000%".
+  // NOTA: sin validador `max` a propósito — hay documentos viejos con 100000 y
+  // un max haría fallar su .save() con error de validación. El recorte se hace
+  // con clampStat() al escribir y al responder.
+  vida:       { type: Number, default: 100, min: 0 },
+  agua:       { type: Number, default: 100, min: 0 },
+  comida:     { type: Number, default: 100, min: 0 },
   oro:        { type: Number, default: 0,      min: 0 },
   plata:      { type: Number, default: 0,      min: 0 },
   invoiceIds: {
@@ -8656,7 +8739,9 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
     const txErrors   = [];
 
     for (const stat of validKeys) {
-      const newVal  = Math.max(0, Math.round(Number(updates[stat])));
+      // clampStat acota las vitales a 0..100 (escala real del juego). Sin esto,
+      // un cliente podía escribir 100000 y la barra mostraba "100000%".
+      const newVal  = clampStat(stat, Math.round(Number(updates[stat])));
       const oldVal  = doc[stat] || 0;
       const invId   = doc.invoiceIds[stat];
       if (newVal === oldVal) continue;
@@ -8705,6 +8790,101 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
     return res.json({ stats: buildStatsResponse(doc), errors: txErrors.length ? txErrors : undefined });
 
   } catch (err) { console.error('POST /api/stats/update error:', err); return res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── POST /api/currency/exchange — CAMBIO DE MONEDA (1000 plata = 1 oro) ──────
+// La conversión la decide y ejecuta el SERVIDOR (nunca el cliente): valida el
+// saldo, mueve las facturas on-chain de oro y plata, y solo entonces guarda.
+// Mismo criterio anti-eliminación que /api/stats/update: en la cadena no se baja
+// de 1, para que la factura no se borre y siga siendo movible.
+const SILVER_PER_GOLD = 1000;
+
+app.post('/api/currency/exchange', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const address = (req.user.address || '').toLowerCase();
+    const { direction, amount } = req.body || {};
+    const qty = Math.floor(Number(amount));
+
+    if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ error: 'invalid_amount' });
+    if (direction !== 'silverToGold' && direction !== 'goldToSilver') {
+      return res.status(400).json({ error: 'invalid_direction' });
+    }
+
+    const gp = await GamePlayer.findOne({ address }).lean();
+    if (!gp || !gp.playerName) return res.status(404).json({ error: 'player_not_found' });
+
+    const doc = await PlayerStats.findOne({ playerName: gp.playerName });
+    if (!doc) return res.status(404).json({ error: 'stats_not_found. Call /sync first' });
+
+    const oroActual   = Number(doc.oro   || 0);
+    const plataActual = Number(doc.plata || 0);
+    const silverCost  = qty * SILVER_PER_GOLD;
+
+    let newOro, newPlata;
+    if (direction === 'silverToGold') {
+      if (plataActual < silverCost) {
+        return res.status(400).json({ error: 'insufficient_silver', need: silverCost, have: plataActual });
+      }
+      newPlata = plataActual - silverCost;
+      newOro   = oroActual + qty;
+    } else {
+      if (oroActual < qty) {
+        return res.status(400).json({ error: 'insufficient_gold', need: qty, have: oroActual });
+      }
+      newOro   = oroActual - qty;
+      newPlata = plataActual + silverCost;
+    }
+
+    const contract = getStatsContract();
+    const gasPrice = await getSafeGasPriceStats();
+    const aplicados = [];
+    const errores   = [];
+
+    // Aplica el nuevo valor de un stat a su factura on-chain.
+    const aplicar = async (stat, oldVal, newVal) => {
+      const invId = doc.invoiceIds && doc.invoiceIds[stat];
+      if (!contract || !invId) { doc[stat] = newVal; aplicados.push(stat); return; }
+
+      const chainNew = Math.max(1, newVal);      // nunca 0: la factura se borraría
+      const chainOld = Math.max(1, oldVal);
+      const delta    = chainNew - chainOld;
+      try {
+        if (delta > 0) {
+          const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+          const tx = await contract.increaseInvoiceQuantity(invId, delta, { gasPrice, nonce });
+          await tx.wait();
+        } else if (delta < 0) {
+          const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+          const tx = await contract.decreaseInvoiceQuantity(invId, Math.abs(delta), { gasPrice, nonce });
+          await tx.wait();
+        }
+        doc[stat] = newVal;
+        aplicados.push(stat);
+      } catch (e) {
+        console.error(`❌ exchange TX [${stat}]:`, e.message);
+        errores.push({ stat, error: e.message });
+      }
+    };
+
+    // Primero se QUITA y luego se DA: si el cobro falla, no se entrega nada.
+    if (direction === 'silverToGold') {
+      await aplicar('plata', plataActual, newPlata);
+      if (errores.length) return res.status(502).json({ error: 'exchange_failed', errors: errores });
+      await aplicar('oro', oroActual, newOro);
+    } else {
+      await aplicar('oro', oroActual, newOro);
+      if (errores.length) return res.status(502).json({ error: 'exchange_failed', errors: errores });
+      await aplicar('plata', plataActual, newPlata);
+    }
+
+    await doc.save();
+    console.log(`💱 Cambio ${direction} x${qty} para ${gp.playerName}: oro=${doc.oro} plata=${doc.plata}`);
+    return res.json({ ok: true, rate: SILVER_PER_GOLD, stats: buildStatsResponse(doc), errors: errores.length ? errores : undefined });
+
+  } catch (err) {
+    console.error('POST /api/currency/exchange error:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
 });
 
 // ── GET /api/stats/:playerName/chain (admin) ─────────────────────────────────
@@ -8764,6 +8944,17 @@ const battleSeasonSchema = new mongoose.Schema({
 const BattleSeason = mongoose.model('BattleSeason', battleSeasonSchema);
 
 // Puntuación de un jugador DENTRO de una temporada.
+// NIVEL DE LA MASCOTA a partir de su historial de batallas.
+// Cada VICTORIA aporta el doble que una derrota (jugar también suma, para que
+// el nivel avance aunque se pierda). 5 puntos = 1 nivel. Tope 50.
+function computePetLevel(wins, battles) {
+  const w = Math.max(0, Number(wins) || 0);
+  const b = Math.max(0, Number(battles) || 0);
+  const losses = Math.max(0, b - w);
+  const puntos = w * 2 + losses;              // victorias valen doble
+  return Math.max(1, Math.min(50, 1 + Math.floor(puntos / 5)));
+}
+
 const battleScoreSchema = new mongoose.Schema({
   seasonNumber: { type: Number, required: true, index: true },
   playerName: { type: String, required: true, index: true },
@@ -9167,6 +9358,16 @@ async function saveBattleResult(match, winnerKey, reason) {
         { _id: doc._id },
         { $set: { streak: nuevaRacha, bestStreak: Math.max(doc.bestStreak || 0, nuevaRacha) } }
       );
+
+      // NIVEL DE LA MASCOTA: sube con las batallas. Se guarda en GamePlayer para
+      // que viaje en /api/load y en los paquetes de multijugador (así los demás
+      // jugadores también ven el nivel junto al nombre del perro).
+      try {
+        const nivelPet = computePetLevel(doc.wins || 0, doc.battles || 0);
+        await GamePlayer.updateOne({ playerName: p.playerName }, { $set: { petLevel: nivelPet } });
+      } catch (e) {
+        console.warn('⚠️  No se pudo actualizar petLevel:', e.message);
+      }
     };
 
     if (winner && loser) {
