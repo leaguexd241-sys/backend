@@ -8558,10 +8558,22 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
       }
     }
 
-    // Para stats sin factura en el contrato, asegurar que DB también tiene 0
+    // Stats SIN factura en el contrato.
+    // FIX (personaje nuevo aparecía con vida/agua/comida en 0, sobre todo en
+    // móvil): antes se forzaba SIEMPRE a 0. Si la creación de la factura no
+    // alcanzó a confirmar en este sync (tx lenta, RPC intermitente, límite del
+    // tipo momentáneamente agotado) el jugador nuevo quedaba con 0% de vida,
+    // agua y comida — un estado que no es real, solo "aún no aprovisionado".
+    // Ahora: para las vitales (piso > 0) se conserva su valor inicial y se
+    // creará la factura en el próximo sync; para oro/plata (piso 0) sí es
+    // correcto dejar 0 (no regalar monedas).
+    // OJO con la escala: en juego las barras se muestran como porcentaje 0..100
+    // (el cliente pinta `${valor}%` sin dividir), así que aquí se usa 100 = lleno.
+    const VITALS_FULL = 100;
     for (const stat of STAT_TYPES_LIST) {
       if (!statsDoc.invoiceIds[stat]) {
-        statsDoc[stat] = 0;
+        const esVital = (STAT_DEFAULTS_MAP[stat] || 0) > 0; // vida/agua/comida
+        statsDoc[stat] = esVital ? VITALS_FULL : 0;         // oro/plata → 0
       }
     }
 
