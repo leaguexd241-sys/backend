@@ -8079,11 +8079,29 @@ const playerStatsSchema = new mongoose.Schema({
 const PlayerStats = mongoose.model('PlayerStats', playerStatsSchema);
 
 const STAT_TYPES_LIST    = ['vida', 'agua', 'comida', 'oro', 'plata'];
-const STAT_DEFAULTS_MAP  = { vida: 100000, agua: 100000, comida: 100000, oro: 0, plata: 0 };
+
+// ⚠️ ESCALA DE LAS VITALES: en el juego las barras se pintan como `${valor}%`
+// SIN dividir, así que la escala real de vida/agua/comida es 0..100.
+// Antes estos mapas estaban en 100000 y eso causaba DOS bugs:
+//   • "100000%": el sync usaba STAT_DEFAULTS_MAP como PISO (Math.max), así que
+//     un valor legítimo bajo (0, 1, o tu 34%) saltaba a 100000.
+//   • "7%" / "5%" en jugadores nuevos: la factura se creaba pidiendo 100000
+//     unidades, lo que agota el cupo (`limit`) del tipo en el contrato; cuando
+//     quedaban 7 o 5 disponibles, el jugador nuevo nacía con 7% o 5%.
+const VITAL_MAX          = 100;
+const STAT_DEFAULTS_MAP  = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 0, plata: 0 };
 // Valores con los que se CREA la factura de un jugador nuevo. Separado de
 // STAT_DEFAULTS_MAP porque ese mapa actúa como "piso" en el sync — si oro/plata
 // tuvieran piso 1000, cada sync regalaría monedas a jugadores que ya gastaron.
-const STAT_INITIAL_MAP   = { vida: 100000, agua: 100000, comida: 100000, oro: 1000, plata: 1000 };
+const STAT_INITIAL_MAP   = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 1000, plata: 1000 };
+
+const isVitalStat = (stat) => stat === 'vida' || stat === 'agua' || stat === 'comida';
+// Acota un stat a su rango válido: las vitales a 0..100; oro/plata solo a >= 0.
+function clampStat(stat, value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return isVitalStat(stat) ? Math.min(VITAL_MAX, n) : n;
+}
 
 // ── MARKETPLACE ROUTES MOUNT ────────────────────────────────────────────────
 // Se monta aquí (y no más arriba) porque necesita GamePlayer, Listing (ya
@@ -8137,8 +8155,14 @@ async function getSafeGasPriceStats() {
 }
 
 function buildStatsResponse(doc) {
+  // Se acota SIEMPRE al devolver: así los documentos que ya quedaron corruptos
+  // (vitales guardadas en 100000 por el bug del piso) se muestran bien de
+  // inmediato, sin esperar a que un sync los reescriba.
   return {
-    vida: doc.vida, agua: doc.agua, comida: doc.comida, oro: doc.oro, plata: doc.plata,
+    vida:   clampStat('vida',   doc.vida),
+    agua:   clampStat('agua',   doc.agua),
+    comida: clampStat('comida', doc.comida),
+    oro: doc.oro, plata: doc.plata,
     invoiceIds: {
       vida:   doc.invoiceIds?.vida   ?? null,
       agua:   doc.invoiceIds?.agua   ?? null,
@@ -8479,10 +8503,16 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
               console.log(`✅ [${stat}] restaurado a ${dbQty} en contrato`);
             } catch (e) {
               console.warn(`⚠️  No se pudo restaurar [${stat}]:`, e.message);
-              statsDoc[stat] = Math.max(chainQty, STAT_DEFAULTS_MAP[stat] || 0);
+              statsDoc[stat] = clampStat(stat, chainQty);
             }
           } else {
-            statsDoc[stat] = chainQty > 1 ? chainQty : Math.max(chainQty, dbQty, STAT_DEFAULTS_MAP[stat] || 0);
+            // FIX "100000%": antes era
+            //   chainQty > 1 ? chainQty : Math.max(chainQty, dbQty, STAT_DEFAULTS_MAP[stat])
+            // Ese Math.max usaba el default como PISO, así que un valor legítimo
+            // bajo (0 = sin agua, 1, o un 34% leído como 0 por una lectura floja)
+            // se disparaba al default y la barra mostraba "100000%".
+            // La CADENA es la fuente de verdad; solo se acota al rango válido.
+            statsDoc[stat] = clampStat(stat, chainQty);
           }
           console.log(`✅ Stats sync [${stat}]: id=${existing.id}, qty=${statsDoc[stat]}`);
       } else {
@@ -8514,6 +8544,16 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
           if (available       > 0) createVal = Math.min(createVal, available);
           if (createVal < 0) createVal = 0;
           if (createVal <= 0 && !canCreateAtZero) { console.log(`⏭️  Stats sync [${stat}]: límite agotado en contrato`); continue; }
+
+          // FIX "jugador nuevo con 7% / 5% de vida": si al tipo le queda MENOS
+          // cupo del que necesita una vital, antes se creaba igual una factura
+          // PARCIAL (7 unidades = 7%) y el jugador nacía tullido. Ahora no se
+          // crea a medias: se deja el valor completo en BD y se reintenta la
+          // creación en el siguiente sync (cuando haya cupo).
+          if (isVitalStat(stat) && createVal < (STAT_INITIAL_MAP[stat] || 0)) {
+            console.warn(`⏭️  Stats sync [${stat}]: cupo insuficiente (${createVal}/${STAT_INITIAL_MAP[stat]}) — NO se crea factura parcial`);
+            continue;
+          }
           console.log(`📊 [${stat}] perInvoice=${perInvoiceLimit} available=${available} → crear con ${createVal}`);
         } catch (limErr) {
           console.warn(`⚠️  getTipoStats [${stat}] falló:`, limErr.message, '— usando default');
