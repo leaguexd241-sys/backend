@@ -2538,6 +2538,75 @@ class RelayManager {
     }
   }
 
+  /**
+   * ¿El error viene de que el NODO no responde, y no de la transacción en sí?
+   *
+   * El nodo de LitVM se cae y vuelve cada pocos minutos ("[RPC] Red LitVM no
+   * disponible"). Cuando eso pasa a mitad de una transacción, cualquier lectura
+   * o el propio envío revientan, y hasta ahora la acción del jugador se perdía:
+   * daba igual que fuera cosechar, craftear, talar, minar, recoger agua,
+   * comer/beber o comprar en la tienda — todo pasa por aquí.
+   *
+   * Un revert del CONTRATO (sin cupo, sin saldo, no autorizado) NO entra aquí:
+   * ese error es real y hay que devolverlo tal cual.
+   */
+  static esErrorTransitorioRPC(err) {
+    if (!err) return false;
+    const code = String(err.code || '');
+    if (['NETWORK_ERROR', 'SERVER_ERROR', 'TIMEOUT', 'ECONNRESET', 'ECONNREFUSED',
+         'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EHOSTUNREACH'].includes(code)) {
+      return true;
+    }
+    // Un revert del contrato nunca es transitorio, aunque el texto se parezca.
+    if (code === 'CALL_EXCEPTION' || err.reason || err.revert) return false;
+
+    const msg = String(err.shortMessage || err.message || '').toLowerCase();
+    return (
+      msg.includes('could not detect network') ||
+      msg.includes('failed to fetch')          ||
+      msg.includes('fetch failed')             ||
+      msg.includes('connection refused')       ||
+      msg.includes('connection reset')         ||
+      msg.includes('socket hang up')           ||
+      msg.includes('network error')            ||
+      msg.includes('timeout')                  ||
+      msg.includes('timed out')                ||
+      msg.includes('bad gateway')              ||
+      msg.includes('service unavailable')      ||
+      msg.includes('gateway timeout')          ||
+      msg.includes('502') || msg.includes('503') || msg.includes('504') ||
+      msg.includes('server response')          ||
+      // Los errno de Node llegan a veces solo dentro del texto (por ejemplo
+      // "FetchError: request failed, reason: connect ECONNREFUSED"), sin que
+      // err.code los traiga. Sin esto, una caída del nodo se tomaba por un
+      // error real y la acción del jugador se perdía.
+      msg.includes('econnrefused') || msg.includes('econnreset')  ||
+      msg.includes('etimedout')    || msg.includes('enotfound')   ||
+      msg.includes('eai_again')    || msg.includes('ehostunreach') ||
+      msg.includes('epipe')        || msg.includes('enetunreach')
+    );
+  }
+
+  /**
+   * Ejecuta `fn` reintentando SOLO si el nodo no responde, con espera creciente.
+   * Le da al RPC tiempo de volver en vez de perder la acción del jugador.
+   */
+  static async conReintentoRPC(fn, etiqueta = 'rpc', intentos = 4) {
+    let ultimo;
+    for (let i = 0; i < intentos; i++) {
+      try {
+        return await fn();
+      } catch (e) {
+        ultimo = e;
+        if (!RelayManager.esErrorTransitorioRPC(e) || i === intentos - 1) throw e;
+        const espera = 800 * Math.pow(2, i);   // 0.8s, 1.6s, 3.2s
+        console.warn(`⚠️  [RPC] ${etiqueta} falló (${e.shortMessage || e.message}). Reintento ${i + 1}/${intentos - 1} en ${espera}ms`);
+        await new Promise(r => setTimeout(r, espera));
+      }
+    }
+    throw ultimo;
+  }
+
   async processTransaction(transactionData) {
     if (!relayerWallet) {
       throw new Error('Relayer no configurado');
@@ -2610,7 +2679,12 @@ class RelayManager {
       // factura EXISTENTE (decrease/increase/delete/transfer), confirmar on-chain
       // que pertenece al jugador que la solicita y que tiene cantidad suficiente.
       // Sin esto, un jugador podía pedir manipular facturas de OTRO usuario.
-      await this.verifyInvoiceOwnership(contract, functionName, parameters, playerAddress);
+      // Envuelta en reintento: si el nodo está caído justo ahora, esta lectura
+      // fallaría y la acción del jugador se perdería sin motivo real.
+      await RelayManager.conReintentoRPC(
+        () => this.verifyInvoiceOwnership(contract, functionName, parameters, playerAddress),
+        'verifyInvoiceOwnership'
+      );
 
       // 3.6. ANTI-TRAMPA DE RECOLECCIÓN: si GATHER_ENFORCE está activo, el
       // cliente NO puede acuñar los tipos de recolección (madera/minerales);
@@ -2650,7 +2724,9 @@ class RelayManager {
         gasPrice = ethers.parseUnits(FIXED_GAS_PRICE_GWEI.toString(), 'gwei');
         console.log(`   - ⚙️ Gas price fijo (FIXED_GAS_PRICE_GWEI): ${FIXED_GAS_PRICE_GWEI} gwei`);
       } else {
-        const feeData = await provider.getFeeData();
+        const feeData = await RelayManager.conReintentoRPC(
+          () => provider.getFeeData(), 'getFeeData'
+        );
         gasPrice = feeData.gasPrice || await provider.getGasPrice();
         console.log(`   - Gas price base: ${ethers.formatUnits(gasPrice, 'gwei')} gwei`);
 
@@ -2686,7 +2762,9 @@ class RelayManager {
       relayTx.gasPrice = gasPrice.toString();
       
       // 9. Verificar saldo del relayer
-      const relayerBalance = await provider.getBalance(relayerWallet.address);
+      const relayerBalance = await RelayManager.conReintentoRPC(
+        () => provider.getBalance(relayerWallet.address), 'getBalance'
+      );
       if (relayerBalance < estimatedCost) {
         throw new Error(`Relayer insufficient balance: ${ethers.formatEther(relayerBalance)} < ${ethers.formatEther(estimatedCost)}`);
       }
@@ -2707,10 +2785,14 @@ class RelayManager {
       // reembolsaba (síntoma: "Compra parcial 0/N — reembolso"). Ahora, ante ese
       // error, se resetea el nonce del relayer desde la cadena y se REINTENTA
       // con un nonce fresco, así el sistema se auto-corrige solo.
+      // Además del nonce, ahora se reintenta cuando el NODO no responde: era el
+      // caso más doloroso, porque el jugador ya había gastado el ítem o el
+      // recurso y la transacción se perdía por una caída de 10 segundos del RPC.
       let txResponse;
       let currentTxNonce = nonce;
-      const MAX_NONCE_RETRIES = 3;
-      for (let attempt = 0; attempt < MAX_NONCE_RETRIES; attempt++) {
+      const MAX_SEND_RETRIES = 5;
+      let esperaRPC = 800;
+      for (let attempt = 0; attempt < MAX_SEND_RETRIES; attempt++) {
         try {
           tx.nonce = currentTxNonce;
           const signedTx = await relayerWallet.signTransaction(tx);
@@ -2724,14 +2806,31 @@ class RelayManager {
             msg.includes('nonce has already been used') ||
             msg.includes('replacement transaction underpriced');
 
-          if (isNonceError && attempt < MAX_NONCE_RETRIES - 1) {
-            console.warn(`⚠️  Nonce desincronizado (usado ${currentTxNonce}): reseteando desde la cadena y reintentando (intento ${attempt + 1}/${MAX_NONCE_RETRIES})…`);
+          const quedanIntentos = attempt < MAX_SEND_RETRIES - 1;
+
+          if (isNonceError && quedanIntentos) {
+            console.warn(`⚠️  Nonce desincronizado (usado ${currentTxNonce}): reseteando desde la cadena y reintentando (intento ${attempt + 1}/${MAX_SEND_RETRIES})…`);
             await relayerNonceManager.resetNonce();
             currentTxNonce = await relayerNonceManager.getNextNonce();
             relayTx.nonce = currentTxNonce;
             continue;
           }
-          throw sendErr; // error no recuperable o se agotaron los reintentos
+
+          if (RelayManager.esErrorTransitorioRPC(sendErr) && quedanIntentos) {
+            console.warn(`⚠️  [RPC] Nodo no disponible al enviar (${sendErr.shortMessage || sendErr.message}). Reintento ${attempt + 1}/${MAX_SEND_RETRIES} en ${esperaRPC}ms…`);
+            await new Promise(r => setTimeout(r, esperaRPC));
+            esperaRPC = Math.min(esperaRPC * 2, 6000);
+            // El nonce se relee: mientras el nodo estaba caído puede haber
+            // avanzado por otra vía.
+            try {
+              await relayerNonceManager.resetNonce();
+              currentTxNonce = await relayerNonceManager.getNextNonce();
+              relayTx.nonce = currentTxNonce;
+            } catch (_) { /* se reintenta con el mismo nonce */ }
+            continue;
+          }
+
+          throw sendErr; // revert real del contrato, o se agotaron los reintentos
         }
       }
 
@@ -8376,10 +8475,15 @@ async function ensureStatTipo(contract, stat, gasPrice, { force = false, minPerI
   return info;
 }
 
+// Reintento ante caídas del nodo, compartido con el relay. El nodo de LitVM se
+// cae y vuelve cada pocos minutos; sin esto, un sync o una actualización de
+// stats que caiga en esa ventana pierde el valor del jugador.
+const reintentarRPC = (fn, etiqueta) => RelayManager.conReintentoRPC(fn, etiqueta);
+
 /** Lee la cantidad real de una factura. null si no existe o está inactiva. */
 async function readInvoiceQty(contract, invId) {
   try {
-    const inv = await contract.getInvoice(invId);
+    const inv = await reintentarRPC(() => contract.getInvoice(invId), `getInvoice(${invId})`);
     if (!inv || Number(inv.id) === 0 || !inv.active) return null;
     return Number(inv.cantidad);
   } catch (_) { return null; }
@@ -8401,7 +8505,9 @@ async function applyStatOnChain(contract, stat, invId, target, gasPrice) {
   if (current === null) return { ok: false, chainQty: null, error: 'invoice_not_found_or_inactive' };
   if (current === desired) return { ok: true, chainQty: current };
 
-  const runTx = async () => {
+  // Envuelto en reintento por caída del nodo: es la misma protección que tiene
+  // el relay. Un revert del contrato NO se reintenta aquí (se trata abajo).
+  const runTx = () => reintentarRPC(async () => {
     const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
     if (desired > current) {
       const delta = desired - current;
@@ -8414,7 +8520,7 @@ async function applyStatOnChain(contract, stat, invId, target, gasPrice) {
       const tx = await contract.decreaseInvoiceQuantity(invId, delta, { gasPrice, nonce });
       await tx.wait();
     }
-  };
+  }, `applyStatOnChain[${stat}]`);
 
   try {
     await runTx();
@@ -9739,7 +9845,9 @@ async function endBattle(match, winnerKey, reason) {
 
   await saveBattleResult(match, winnerKey, reason);
 
-  // Contador de batallas diarias contra bot (solo si esta era una de ellas)
+  // Contador de batallas diarias contra bot (solo si esta era una de ellas).
+  // El contador vive ENTERO en el backend: se incrementa aquí y el valor
+  // resultante se manda al cliente, que solo lo pinta.
   let dailyInfo = null;
   if (match.esBot && match.a && match.a.playerName && match.a.playerName !== '---') {
     try {
@@ -9748,7 +9856,15 @@ async function endBattle(match, winnerKey, reason) {
         { $inc: { done: 1, wins: winnerKey === 'a' ? 1 : 0 } },
         { upsert: true, new: true, setDefaultsOnInsert: true }
       );
-      dailyInfo = { done: doc.done, max: BATTLE_DAILY_MAX, remaining: Math.max(0, BATTLE_DAILY_MAX - doc.done) };
+      const done = doc.done;
+      dailyInfo = {
+        done,
+        max: BATTLE_DAILY_MAX,
+        remaining: Math.max(0, BATTLE_DAILY_MAX - done),
+        nextRound: Math.min(BATTLE_DAILY_MAX, done + 1),
+        wins: doc.wins || 0
+      };
+      console.log(`🗓️  Batallas diarias de ${match.a.playerName}: ${done}/${BATTLE_DAILY_MAX}`);
     } catch (e) {
       console.error('❌ Error actualizando batallas diarias:', e);
     }
@@ -9771,6 +9887,12 @@ async function endBattle(match, winnerKey, reason) {
       you: battlePublicPlayer(p),
       rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
     });
+    // Además del 'battle:end', se manda el contador por su propio evento: así
+    // el hub del mundo lo repinta aunque el jugador ya hubiera salido de la
+    // escena de batalla, sin tener que volver a preguntar.
+    if (dailyInfo && key === 'a') {
+      try { p.socket.emit('battle:daily', dailyInfo); } catch (_) {}
+    }
     socketMatch.delete(p.socket.id);
   });
 
@@ -9866,18 +9988,53 @@ async function resolveBattleTurn(match) {
   setTimeout(() => startBattleTurn(match), 1200);
 }
 
+/**
+ * Nombre CANÓNICO del jugador de un socket. Es la clave con la que se cuentan
+ * las batallas diarias, así que tiene que dar SIEMPRE el mismo valor para el
+ * mismo jugador.
+ *
+ * El fallo que arregla: antes, si no se resolvía, se caía a
+ * `socket.playerData?.username`, que es el nombre VISIBLE del personaje (el
+ * campo Username), no el playerName. Según en qué estado estuviera el socket
+ * —recién reconectado, antes o después de joinRoom— la misma persona contaba
+ * sus batallas bajo dos claves distintas. Por eso el contador iba 5 → 4 y al
+ * rato volvía a 5: la segunda lectura miraba un documento diferente, vacío.
+ *
+ * @returns {string|null} el playerName, o null si no se puede resolver.
+ */
+async function resolveBattlePlayerName(socket) {
+  if (socket.authenticatedPlayer && socket.authenticatedPlayer !== '---') {
+    return socket.authenticatedPlayer;
+  }
+  const addr = socket.authenticatedAddress ? socket.authenticatedAddress.toLowerCase() : null;
+  if (!addr) return null;
+
+  try {
+    const auth = await PlayerAuth.findOne({ address: addr }).select('playerName').lean();
+    if (auth && auth.playerName && auth.playerName !== '---') {
+      socket.authenticatedPlayer = auth.playerName;   // se cachea en el socket
+      return auth.playerName;
+    }
+  } catch (e) { /* se sigue con el fallback de abajo */ }
+
+  try {
+    const gp = await GamePlayer.findOne({ address: addr }).select('playerName').lean();
+    if (gp && gp.playerName && gp.playerName !== '---') {
+      socket.authenticatedPlayer = gp.playerName;
+      return gp.playerName;
+    }
+  } catch (e) { /* nada */ }
+
+  // Última opción estable: la propia dirección. NUNCA el Username visible, que
+  // el jugador puede cambiar y que no identifica la cuenta.
+  socket.authenticatedPlayer = addr;
+  return addr;
+}
+
 // Datos del jugador humano a partir de su socket (nivel, nombre de mascota…)
 async function construirJugadorDeSocket(socket) {
-  let playerName = socket.authenticatedPlayer || null;
-  if (!playerName && socket.authenticatedAddress) {
-    try {
-      const auth = await PlayerAuth.findOne({
-        address: socket.authenticatedAddress.toLowerCase()
-      }).select('playerName').lean();
-      if (auth && auth.playerName) playerName = auth.playerName;
-    } catch (e) { /* se usa el fallback */ }
-  }
-  if (!playerName) playerName = socket.playerData?.username || '---';
+  let playerName = await resolveBattlePlayerName(socket);
+  if (!playerName) playerName = '---';
 
   let nivel = 1, petName = 'Pet';
   try {
@@ -10089,6 +10246,26 @@ io.on('connection', (socket) => {
     if (i >= 0) battleQueue.splice(i, 1);
 
     const matchId = socketMatch.get(socket.id);
+    // El candado se suelta SIEMPRE. Antes se hacía `return` cuando el combate
+    // ya no existía o ya había terminado, y la entrada de socketMatch se
+    // quedaba puesta: a partir de ahí, cualquier intento de empezar otra
+    // batalla respondía 'already_in_battle' y el jugador no podía entrar más.
+    socketMatch.delete(socket.id);
+    if (!matchId) return;
+    const match = battleMatches.get(matchId);
+    if (!match || match.ended) return;
+    const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
+    await endBattle(match, key === 'a' ? 'b' : 'a', 'forfeit');
+  });
+
+  // Salir de la escena de batalla sin haber terminado (volver al mundo, cerrar
+  // el panel…). Sin esto el candado seguía puesto en el MISMO socket y el
+  // jugador se quedaba con 'already_in_battle' hasta recargar la página.
+  socket.on('battle:leave', async () => {
+    const matchId = socketMatch.get(socket.id);
+    socketMatch.delete(socket.id);
+    const i = battleQueue.findIndex(s => s.id === socket.id);
+    if (i >= 0) battleQueue.splice(i, 1);
     if (!matchId) return;
     const match = battleMatches.get(matchId);
     if (!match || match.ended) return;
