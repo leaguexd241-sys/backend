@@ -7306,6 +7306,13 @@ app.post('/api/save/:playerName',
           update.vidaPorcentaje   = pStats.vida   ?? update.vidaPorcentaje   ?? 0;
           update.aguaPorcentaje   = pStats.agua   ?? update.aguaPorcentaje   ?? 0;
           update.comidaPorcentaje = pStats.comida ?? update.comidaPorcentaje ?? 0;
+          // exp: igual que oro/plata, la factura manda. Solo se impone cuando
+          // la factura ya existe; si todavía no se creó, se deja pasar el valor
+          // del cliente para no borrarle la experiencia al jugador (el /sync la
+          // usará como semilla al crear la factura).
+          if (pStats.invoiceIds && pStats.invoiceIds.exp) {
+            update.nivel_exp = pStats.exp ?? update.nivel_exp ?? 0;
+          }
         }
       } catch (psErr) {
         console.warn('⚠️  No se pudo leer PlayerStats para save:', psErr.message);
@@ -8140,12 +8147,16 @@ const playerStatsSchema = new mongoose.Schema({
   comida:     { type: Number, default: 100, min: 0 },
   oro:        { type: Number, default: 0,      min: 0 },
   plata:      { type: Number, default: 0,      min: 0 },
+  // Experiencia del personaje (GamePlayer.nivel_exp). Se lleva al contrato con
+  // su propia tabla `exp`, igual que oro y plata.
+  exp:        { type: Number, default: 0,      min: 0 },
   invoiceIds: {
     vida:   { type: Number, default: null },
     agua:   { type: Number, default: null },
     comida: { type: Number, default: null },
     oro:    { type: Number, default: null },
     plata:  { type: Number, default: null },
+    exp:    { type: Number, default: null },
   },
   manualIds: {
     vida:   { type: String, default: null },
@@ -8153,6 +8164,7 @@ const playerStatsSchema = new mongoose.Schema({
     comida: { type: String, default: null },
     oro:    { type: String, default: null },
     plata:  { type: String, default: null },
+    exp:    { type: String, default: null },
   },
   lastSync:    { type: Date, default: null },
   lastUpdated: { type: Date, default: Date.now },
@@ -8161,7 +8173,7 @@ const playerStatsSchema = new mongoose.Schema({
 
 const PlayerStats = mongoose.model('PlayerStats', playerStatsSchema);
 
-const STAT_TYPES_LIST    = ['vida', 'agua', 'comida', 'oro', 'plata'];
+const STAT_TYPES_LIST    = ['vida', 'agua', 'comida', 'oro', 'plata', 'exp'];
 
 // ⚠️ ESCALA DE LAS VITALES: en el juego las barras se pintan como `${valor}%`
 // SIN dividir, así que la escala real de vida/agua/comida es 0..100.
@@ -8172,18 +8184,227 @@ const STAT_TYPES_LIST    = ['vida', 'agua', 'comida', 'oro', 'plata'];
 //     unidades, lo que agota el cupo (`limit`) del tipo en el contrato; cuando
 //     quedaban 7 o 5 disponibles, el jugador nuevo nacía con 7% o 5%.
 const VITAL_MAX          = 100;
-const STAT_DEFAULTS_MAP  = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 0, plata: 0 };
+const STAT_DEFAULTS_MAP  = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 0, plata: 0, exp: 0 };
 // Valores con los que se CREA la factura de un jugador nuevo. Separado de
 // STAT_DEFAULTS_MAP porque ese mapa actúa como "piso" en el sync — si oro/plata
 // tuvieran piso 1000, cada sync regalaría monedas a jugadores que ya gastaron.
-const STAT_INITIAL_MAP   = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 1000, plata: 1000 };
+const STAT_INITIAL_MAP   = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 1000, plata: 1000, exp: 0 };
 
 const isVitalStat = (stat) => stat === 'vida' || stat === 'agua' || stat === 'comida';
-// Acota un stat a su rango válido: las vitales a 0..100; oro/plata solo a >= 0.
+// Acota un stat a su rango válido: las vitales a 0..100; oro/plata/exp solo a >= 0.
 function clampStat(stat, value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return 0;
   return isVitalStat(stat) ? Math.min(VITAL_MAX, n) : n;
+}
+
+// =============================================================================
+// REGLA: UNA SOLA FACTURA POR (JUGADOR, STAT)
+// =============================================================================
+// vida, agua, comida, oro, plata y exp tienen EXACTAMENTE UNA factura por
+// jugador en el contrato. El backend es el único que la crea y el único que la
+// mueve, siempre con increase/decreaseInvoiceQuantity sobre ESE id.
+//
+// Reglas que se derivan de eso y que este módulo hace cumplir:
+//   1. La factura canónica es la que tiene manualId == buildStatManualId(addr,stat).
+//      Si por historia hay más de una factura del mismo tipo para el jugador,
+//      el sync las CONSOLIDA (fungibles: se mueve el saldo a la canónica;
+//      vitales: se queman) hasta dejar una sola.
+//   2. Nunca se crea una factura "a medias". Antes, si al tipo le quedaban 12
+//      unidades de cupo, el jugador nuevo nacía con 12% de agua y 7% de comida.
+//      Ahora el cupo del tipo se ASEGURA primero (ensureStatTipo) y solo
+//      después se crea la factura con el valor completo.
+//   3. El delta de cada increase/decrease se calcula contra la cantidad REAL
+//      leída del contrato, no contra el valor de Mongo. Si los dos se separan
+//      (una TX falló antes), la cadena converge igual al valor pedido.
+//   4. Si una TX falla, el valor que se devuelve al cliente es el de la cadena.
+//      Nunca se responde "30" cuando en la cadena quedaron 12.
+// -----------------------------------------------------------------------------
+
+// Piso en la cadena: bajar una factura a 0 la DESACTIVA y libera su manualId
+// (ver decreaseInvoiceQuantity en el contrato). Como la regla es "una sola
+// factura y siempre la misma", jamás se baja de 1. El 0 real vive en Mongo.
+const STAT_CHAIN_FLOOR = 1;
+
+// Configuración de cada tabla (tipo) en el contrato.
+//   perInvoiceLimit → techo de UNA factura. Para las vitales es 100 (la escala
+//                     del juego); para oro/plata/exp, un techo alto.
+//   headroom        → cupo global libre por debajo del cual se considera que
+//                     la tabla se está quedando corta.
+//   autoRaise       → si el backend puede subir `limit` por su cuenta cuando se
+//                     queda sin cupo. true en vitales y exp (no son economía
+//                     transferible); false en oro/plata, donde el techo de
+//                     emisión es una decisión del dueño del contrato y subirlo
+//                     solo se avisa por log.
+const STAT_TIPO_CONFIG = {
+  vida:   { perInvoiceLimit: VITAL_MAX, headroom: 1_000_000,     autoRaise: true  },
+  agua:   { perInvoiceLimit: VITAL_MAX, headroom: 1_000_000,     autoRaise: true  },
+  comida: { perInvoiceLimit: VITAL_MAX, headroom: 1_000_000,     autoRaise: true  },
+  oro:    { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: false },
+  plata:  { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: false },
+  exp:    { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: true  },
+};
+
+// Al ampliar una tabla se deja bastante más margen del que dispara la ampliación
+// (headroom × este factor). Si se subiera justo hasta el headroom, el propio
+// crecimiento normal volvería a cruzar el umbral enseguida y el backend estaría
+// mandando un setLimit cada pocos minutos.
+const TIPO_RAISE_FACTOR = 10;
+
+// Cache de la config de tipos ya verificada en esta ejecución (evita un
+// getTipoStats por stat en cada sync). TTL corto por si se toca desde fuera.
+const _tipoCheckCache = new Map(); // stat → { at: ms, info: {...} }
+const TIPO_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Se asegura de que la tabla `stat` exista en el contrato y tenga cupo para
+ * operar: perInvoiceLimit suficiente para una factura llena y `limit` global
+ * con headroom por delante. Si falta algo y el tipo es autoRaise, llama a
+ * setLimit (el relayer es admin del contrato).
+ *
+ * Esta es la causa raíz de "agua 12% / comida 7%": el tipo se quedaba sin cupo
+ * global, createInvoice truncaba la cantidad e increaseInvoiceQuantity revertía
+ * con ExceedsTipoLimit, así que las recargas no llegaban nunca a la cadena.
+ *
+ * @returns {{exists:boolean, limit:number, perInvoiceLimit:number, totalQuantity:number, available:number}|null}
+ */
+async function ensureStatTipo(contract, stat, gasPrice, { force = false } = {}) {
+  const cfg = STAT_TIPO_CONFIG[stat];
+  if (!cfg) return null;
+
+  if (!force) {
+    const cached = _tipoCheckCache.get(stat);
+    if (cached && (Date.now() - cached.at) < TIPO_CACHE_TTL_MS) return cached.info;
+  }
+
+  let info;
+  try {
+    const ts = await contract.getTipoStats(stat);
+    info = {
+      totalQuantity:   Number(ts.totalQuantity   ?? ts[0] ?? 0),
+      limit:           Number(ts.limit           ?? ts[1] ?? 0),
+      perInvoiceLimit: Number(ts.perInvoiceLimit ?? ts[2] ?? 0),
+      exists:          Boolean(ts.exists !== undefined ? ts.exists : ts[5]),
+    };
+  } catch (e) {
+    console.warn(`⚠️  ensureStatTipo[${stat}]: getTipoStats falló:`, e.message);
+    return null;
+  }
+  info.available = info.limit > info.totalQuantity ? info.limit - info.totalQuantity : 0;
+
+  const needPerInvoice = info.perInvoiceLimit < cfg.perInvoiceLimit;
+  const needHeadroom   = info.available       < cfg.headroom;
+
+  if (info.exists && !needPerInvoice && !needHeadroom) {
+    _tipoCheckCache.set(stat, { at: Date.now(), info });
+    return info;
+  }
+
+  if (!cfg.autoRaise && info.exists) {
+    // oro/plata: no se toca el techo de emisión por nuestra cuenta.
+    console.warn(
+      `⚠️  Tabla [${stat}] corta en el contrato ` +
+      `(perInvoice=${info.perInvoiceLimit}, libre=${info.available}). ` +
+      `No se sube automáticamente: ejecutá setLimit('${stat}', ...) desde el owner.`
+    );
+    _tipoCheckCache.set(stat, { at: Date.now(), info });
+    return info;
+  }
+
+  const newPerInvoice = Math.max(cfg.perInvoiceLimit, info.perInvoiceLimit);
+  const newLimit      = Math.max(info.limit, info.totalQuantity + cfg.headroom * TIPO_RAISE_FACTOR);
+
+  try {
+    const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+    console.log(
+      `🧾 setLimit[${stat}]: limit ${info.limit}→${newLimit}, ` +
+      `perInvoice ${info.perInvoiceLimit}→${newPerInvoice}` +
+      (info.exists ? '' : ' (tabla nueva)')
+    );
+    const tx = await contract.setLimit(stat, newLimit, newPerInvoice, { gasPrice, nonce });
+    await tx.wait();
+    info = {
+      exists: true,
+      limit: newLimit,
+      perInvoiceLimit: newPerInvoice,
+      totalQuantity: info.totalQuantity,
+      available: newLimit - info.totalQuantity,
+    };
+    console.log(`✅ Tabla [${stat}] configurada: limit=${newLimit} perInvoice=${newPerInvoice}`);
+  } catch (e) {
+    console.error(`❌ setLimit[${stat}] falló (¿el relayer es admin?):`, e.message);
+  }
+
+  _tipoCheckCache.set(stat, { at: Date.now(), info });
+  return info;
+}
+
+/** Lee la cantidad real de una factura. null si no existe o está inactiva. */
+async function readInvoiceQty(contract, invId) {
+  try {
+    const inv = await contract.getInvoice(invId);
+    if (!inv || Number(inv.id) === 0 || !inv.active) return null;
+    return Number(inv.cantidad);
+  } catch (_) { return null; }
+}
+
+/**
+ * Lleva LA factura `invId` de `stat` al valor `target`, con un único
+ * increase o decrease. El delta se calcula contra la cantidad real en la
+ * cadena, no contra Mongo, para que ambos converjan aunque se hubieran
+ * separado antes.
+ *
+ * @returns {{ok:boolean, chainQty:number, error?:string}} chainQty = cantidad
+ *          que quedó realmente en la factura (con el piso de 1 aplicado).
+ */
+async function applyStatOnChain(contract, stat, invId, target, gasPrice) {
+  const desired = Math.max(STAT_CHAIN_FLOOR, Math.round(clampStat(stat, target)));
+
+  let current = await readInvoiceQty(contract, invId);
+  if (current === null) return { ok: false, chainQty: null, error: 'invoice_not_found_or_inactive' };
+  if (current === desired) return { ok: true, chainQty: current };
+
+  const runTx = async () => {
+    const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+    if (desired > current) {
+      const delta = desired - current;
+      console.log(`⬆️  [${stat}] id=${invId} ${current}→${desired} (+${delta}, nonce=${nonce})`);
+      const tx = await contract.increaseInvoiceQuantity(invId, delta, { gasPrice, nonce });
+      await tx.wait();
+    } else {
+      const delta = current - desired;
+      console.log(`⬇️  [${stat}] id=${invId} ${current}→${desired} (-${delta}, nonce=${nonce})`);
+      const tx = await contract.decreaseInvoiceQuantity(invId, delta, { gasPrice, nonce });
+      await tx.wait();
+    }
+  };
+
+  try {
+    await runTx();
+    return { ok: true, chainQty: desired };
+  } catch (err) {
+    const msg = String(err.message || err);
+    // ExceedsTipoLimit / InvoiceWouldExceedPerInvoiceLimit: la tabla se quedó
+    // sin cupo. Esto era exactamente lo que hacía que "recargo a 30 y al
+    // refrescar tengo 12": la TX revertía y nadie lo notaba. Se amplía el cupo
+    // y se reintenta UNA vez.
+    if (/ExceedsTipoLimit|PerInvoiceLimit/i.test(msg)) {
+      console.warn(`⚠️  [${stat}] sin cupo en la tabla — ampliando y reintentando`);
+      await ensureStatTipo(contract, stat, gasPrice, { force: true });
+      try {
+        current = await readInvoiceQty(contract, invId);
+        if (current === null) return { ok: false, chainQty: null, error: 'invoice_not_found_or_inactive' };
+        if (current === desired) return { ok: true, chainQty: current };
+        await runTx();
+        return { ok: true, chainQty: desired };
+      } catch (err2) {
+        const after = await readInvoiceQty(contract, invId);
+        return { ok: false, chainQty: after, error: String(err2.message || err2) };
+      }
+    }
+    const after = await readInvoiceQty(contract, invId);
+    return { ok: false, chainQty: after, error: msg };
+  }
 }
 
 // ── MARKETPLACE ROUTES MOUNT ────────────────────────────────────────────────
@@ -8200,8 +8421,13 @@ require('./marketplace-routes')(app, {
   Listing
 });
 
+// manualId de LA factura de un stat. Usa la dirección COMPLETA: con los 8
+// primeros caracteres que se usaban antes, dos jugadores cuyas direcciones
+// empezaran igual generaban el mismo manualId, y como el manualId es único en
+// todo el contrato, el segundo terminaba adoptando la factura del primero.
+// Cabe de sobra en los 64 bytes que admite el contrato: 2 + 40 + 1 + 6 = 49.
 function buildStatManualId(address, stat) {
-  const addrPart = address.replace(/^0x/i, '').slice(0, 8).toLowerCase();
+  const addrPart = address.replace(/^0x/i, '').toLowerCase();
   return `s_${addrPart}_${stat}`;
 }
 
@@ -8212,13 +8438,46 @@ function getStatsContract() {
   catch (e) { console.error('getStatsContract error:', e.message); return null; }
 }
 
+/**
+ * Lee las facturas de stats del jugador y elige UNA canónica por tipo.
+ *
+ * Criterio de canónica (en orden):
+ *   1. la que tiene el manualId que emite este backend (buildStatManualId),
+ *   2. si ninguna lo tiene, la de id más bajo (la más antigua).
+ * Todo lo demás del mismo tipo queda en `duplicates` para consolidarse.
+ *
+ * Antes esta función hacía `map[inv.tipo] = ...` dentro del bucle, así que con
+ * dos facturas del mismo tipo ganaba la última del snapshot — y como el orden
+ * del snapshot cambia (swap-remove), el "valor real" del stat saltaba de una
+ * factura a otra entre recargas.
+ *
+ * @returns {Object|null} stat → { id, manualId, cantidad, duplicates: [...] }
+ */
 async function getOnChainStats(contract, address) {
   try {
     const snapshot = await contract.getUserInventorySnapshot(address);
-    const map = {};
+    const porTipo = {};
     for (const inv of snapshot) {
-      if (inv.active && STAT_TYPES_LIST.includes(inv.tipo)) {
-        map[inv.tipo] = { id: Number(inv.id), manualId: inv.manualId, cantidad: Number(inv.cantidad) };
+      if (!inv.active) continue;
+      const tipo = String(inv.tipo);
+      if (!STAT_TYPES_LIST.includes(tipo)) continue;
+      (porTipo[tipo] = porTipo[tipo] || []).push({
+        id: Number(inv.id), manualId: String(inv.manualId), cantidad: Number(inv.cantidad)
+      });
+    }
+
+    const map = {};
+    for (const [tipo, lista] of Object.entries(porTipo)) {
+      const esperado = buildStatManualId(address, tipo);
+      lista.sort((a, b) => a.id - b.id);
+      const idx = lista.findIndex(i => i.manualId === esperado);
+      const canonical = idx >= 0 ? lista[idx] : lista[0];
+      map[tipo] = { ...canonical, duplicates: lista.filter(i => i.id !== canonical.id) };
+      if (map[tipo].duplicates.length) {
+        console.warn(
+          `⚠️  ${address} tiene ${lista.length} facturas de [${tipo}]. ` +
+          `Canónica id=${canonical.id}; sobran ${map[tipo].duplicates.map(d => d.id).join(',')}`
+        );
       }
     }
     return map;
@@ -8226,6 +8485,41 @@ async function getOnChainStats(contract, address) {
     console.error('getOnChainStats error:', err.message);
     return null;
   }
+}
+
+/**
+ * Deja UNA sola factura del tipo. Las sobrantes:
+ *   • oro/plata/exp (fungibles): se mueve su saldo a la canónica con
+ *     transferQuantityBetweenInvoices, así no se pierde nada.
+ *   • vida/agua/comida: el valor es un porcentaje, sumarlo no significa nada,
+ *     así que la sobrante se quema con decreaseInvoiceQuantity.
+ * En ambos casos la factura sobrante llega a 0 y el contrato la desactiva.
+ *
+ * @returns {number} cantidad final de la factura canónica.
+ */
+async function consolidateDuplicateStatInvoices(contract, stat, canonical, duplicates, gasPrice) {
+  let total = canonical.cantidad;
+  const fungible = !isVitalStat(stat);
+
+  for (const dup of duplicates) {
+    if (dup.cantidad <= 0) continue;
+    try {
+      const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+      if (fungible) {
+        console.log(`🔗 Consolidando [${stat}]: id=${dup.id} (${dup.cantidad}) → id=${canonical.id}`);
+        const tx = await contract.transferQuantityBetweenInvoices(dup.id, canonical.id, dup.cantidad, { gasPrice, nonce });
+        await tx.wait();
+        total += dup.cantidad;
+      } else {
+        console.log(`🔥 Quemando factura duplicada de [${stat}]: id=${dup.id} (${dup.cantidad})`);
+        const tx = await contract.decreaseInvoiceQuantity(dup.id, dup.cantidad, { gasPrice, nonce });
+        await tx.wait();
+      }
+    } catch (e) {
+      console.warn(`⚠️  No se pudo consolidar [${stat}] id=${dup.id}:`, e.message);
+    }
+  }
+  return total;
 }
 
 async function getSafeGasPriceStats() {
@@ -8246,12 +8540,14 @@ function buildStatsResponse(doc) {
     agua:   clampStat('agua',   doc.agua),
     comida: clampStat('comida', doc.comida),
     oro: doc.oro, plata: doc.plata,
+    exp: doc.exp ?? 0,
     invoiceIds: {
       vida:   doc.invoiceIds?.vida   ?? null,
       agua:   doc.invoiceIds?.agua   ?? null,
       comida: doc.invoiceIds?.comida ?? null,
       oro:    doc.invoiceIds?.oro    ?? null,
       plata:  doc.invoiceIds?.plata  ?? null,
+      exp:    doc.invoiceIds?.exp    ?? null,
     }
   };
 }
@@ -8515,13 +8811,24 @@ app.get('/api/stats/:playerName', authMiddleware, async (req, res) => {
     }
 
     let doc = await PlayerStats.findOne({ playerName }).lean();
-    if (!doc) return res.json({ stats: { ...STAT_DEFAULTS_MAP, invoiceIds: { vida: null, agua: null, comida: null, oro: null, plata: null } } });
+    if (!doc) return res.json({ stats: { ...STAT_DEFAULTS_MAP, invoiceIds: { vida: null, agua: null, comida: null, oro: null, plata: null, exp: null } } });
     return res.json({ stats: buildStatsResponse(doc) });
   } catch (err) { console.error('GET /api/stats error:', err); return res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── POST /api/stats/:playerName/sync ─────────────────────────────────────────
+//
+// Deja al jugador con EXACTAMENTE UNA factura por stat (vida, agua, comida,
+// oro, plata, exp) y devuelve como verdad lo que hay en la cadena.
+//
+// Orden de trabajo por stat:
+//   1. ensureStatTipo  → la tabla existe y tiene cupo (si no, no se crea nada
+//                        a medias: eso era el "agua 12% / comida 7%").
+//   2. factura canónica → una sola; las duplicadas se consolidan o se queman.
+//   3. si no hay ninguna, se crea con el valor completo.
+//   4. Mongo copia lo que quedó en la cadena.
 app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (req, res) => {
+  let lockKey = null;
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
     const reqAddress2 = (req.user.address || '').toLowerCase();
@@ -8537,20 +8844,40 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
     if (!address) return res.status(400).json({ error: 'Player address not found' });
 
     // Prevenir sync concurrente para el mismo jugador
-    const lockKey = `sync_${address}`;
-    if (_syncLocks.get(lockKey)) {
+    const key = `sync_${address}`;
+    if (_syncLocks.get(key)) {
       console.log(`⏳ Sync ya en curso para ${address}, esperando...`);
       await new Promise(r => setTimeout(r, 3000));
       const existing = await PlayerStats.findOne({ playerName });
       if (existing) return res.json({ stats: buildStatsResponse(existing), source: 'lock_wait' });
     }
+    // A partir de aquí el lock es nuestro y el finally SIEMPRE lo suelta.
+    // Antes se soltaba solo en el camino feliz: si el sync salía por
+    // `!contract` o `!chainMap`, el lock quedaba puesto para siempre y todos
+    // los syncs siguientes de ese jugador caían en la rama 'lock_wait'.
+    lockKey = key;
     _syncLocks.set(lockKey, true);
 
     const contract = getStatsContract();
     let statsDoc = await PlayerStats.findOne({ playerName });
     if (!statsDoc) {
       statsDoc = new PlayerStats({ playerName, address });
+      // Piso conservador: las vitales nacen llenas, oro/plata/exp en 0. El valor
+      // definitivo lo pone la creación de la factura más abajo; así, si esa
+      // creación falla, no se le muestran al jugador monedas que no existen.
       STAT_TYPES_LIST.forEach(s => { statsDoc[s] = STAT_DEFAULTS_MAP[s]; });
+    }
+
+    // Semilla de `exp`: la experiencia venía viviendo solo en
+    // GamePlayer.nivel_exp. La primera vez que se sincroniza se arrastra ese
+    // valor para que la factura nazca con la exp real y no en 0.
+    if (!statsDoc.invoiceIds?.exp) {
+      const gpExp = await GamePlayer.findOne({ playerName }).select('nivel_exp').lean();
+      const prev  = Math.max(0, Math.round(Number(gpExp?.nivel_exp || 0)));
+      if (prev > Number(statsDoc.exp || 0)) {
+        statsDoc.exp = prev;
+        console.log(`🌱 Semilla de exp para ${playerName}: ${prev} (desde nivel_exp)`);
+      }
     }
 
     if (!contract) {
@@ -8565,153 +8892,142 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
     }
 
     const gasPrice = await getSafeGasPriceStats();
+    const pendientes = [];   // stats que quedaron sin factura en este sync
 
     for (const stat of STAT_TYPES_LIST) {
+      // ── 1. La tabla del tipo tiene que existir y tener cupo ───────────────
+      const tipo = await ensureStatTipo(contract, stat, gasPrice);
+      if (!tipo || !tipo.exists) {
+        console.warn(`⚠️  Stats sync [${stat}]: tabla no configurada en el contrato — se conserva el valor de BD`);
+        pendientes.push(stat);
+        continue;
+      }
+
       const existing = chainMap[stat];
+
+      // ── 2. Ya hay factura: se deja UNA sola y manda la cadena ─────────────
       if (existing) {
-         statsDoc.invoiceIds[stat] = existing.id;
-         statsDoc.manualIds[stat]  = existing.manualId;
+        let chainQty = Number(existing.cantidad);
 
-          // Si chain=1 (mínimo anti-eliminación) y DB tiene valor mayor, restaurar chain
-          const chainQty = Number(existing.cantidad);
-          const dbQty    = Number(statsDoc[stat] || 0);
-          if (chainQty === 1 && dbQty > 1) {
-            const restoreVal = dbQty - 1;
-            try {
-              const gasPrice = await getSafeGasPriceStats();
-              console.log(`🔄 Restaurando [${stat}] id=${existing.id}: chain=1 → ${dbQty}`);
-              const tx = await contract.increaseInvoiceQuantity(existing.id, restoreVal, { gasPrice });
-              await tx.wait();
-              statsDoc[stat] = dbQty;
-              console.log(`✅ [${stat}] restaurado a ${dbQty} en contrato`);
-            } catch (e) {
-              console.warn(`⚠️  No se pudo restaurar [${stat}]:`, e.message);
-              statsDoc[stat] = clampStat(stat, chainQty);
-            }
-          } else {
-            // FIX "100000%": antes era
-            //   chainQty > 1 ? chainQty : Math.max(chainQty, dbQty, STAT_DEFAULTS_MAP[stat])
-            // Ese Math.max usaba el default como PISO, así que un valor legítimo
-            // bajo (0 = sin agua, 1, o un 34% leído como 0 por una lectura floja)
-            // se disparaba al default y la barra mostraba "100000%".
-            // La CADENA es la fuente de verdad; solo se acota al rango válido.
-            statsDoc[stat] = clampStat(stat, chainQty);
-          }
-          console.log(`✅ Stats sync [${stat}]: id=${existing.id}, qty=${statsDoc[stat]}`);
-      } else {
-        // ── Leer límites reales del contrato antes de crear ──────────────
-        let createVal = STAT_INITIAL_MAP[stat] || 0;
-        // oro/plata pueden crearse con cantidad 0 si el contrato no tiene cupo
-        // disponible (piso 0 en STAT_DEFAULTS_MAP) — así la factura existe igual.
-        // Para vida/agua/comida (piso > 0), quedar en 0 significa límite agotado
-        // y se salta la creación.
-        const canCreateAtZero = (STAT_DEFAULTS_MAP[stat] || 0) === 0;
-        try {
-          const ts = await contract.getTipoStats(stat);
-          const exists = ts[5] !== undefined ? Boolean(ts[5]) : Boolean(ts.exists);
-          if (!exists) {
-            // Tipo no configurado: forzar a 0 en DB (no hay factura real)
-            if (statsDoc[stat] !== 0) {
-              statsDoc[stat] = 0;
-              console.warn(`⚠️  Stats sync [${stat}]: tipo no configurado, forzando a 0`);
-            } else {
-              console.warn(`⚠️  Stats sync [${stat}]: tipo no configurado en contrato — saltando`);
-            }
-            continue;
-          }
-          const perInvoiceLimit = Number(ts.perInvoiceLimit ?? ts[2] ?? 0);
-          const totalLimit      = Number(ts.limit          ?? ts[1] ?? 0);
-          const totalQuantity   = Number(ts.totalQuantity  ?? ts[0] ?? 0);
-          const available       = totalLimit > totalQuantity ? totalLimit - totalQuantity : 0;
-          if (perInvoiceLimit > 0) createVal = Math.min(createVal, perInvoiceLimit);
-          if (available       > 0) createVal = Math.min(createVal, available);
-          if (createVal < 0) createVal = 0;
-          if (createVal <= 0 && !canCreateAtZero) { console.log(`⏭️  Stats sync [${stat}]: límite agotado en contrato`); continue; }
-
-          // FIX "jugador nuevo con 7% / 5% de vida": si al tipo le queda MENOS
-          // cupo del que necesita una vital, antes se creaba igual una factura
-          // PARCIAL (7 unidades = 7%) y el jugador nacía tullido. Ahora no se
-          // crea a medias: se deja el valor completo en BD y se reintenta la
-          // creación en el siguiente sync (cuando haya cupo).
-          if (isVitalStat(stat) && createVal < (STAT_INITIAL_MAP[stat] || 0)) {
-            console.warn(`⏭️  Stats sync [${stat}]: cupo insuficiente (${createVal}/${STAT_INITIAL_MAP[stat]}) — NO se crea factura parcial`);
-            continue;
-          }
-          console.log(`📊 [${stat}] perInvoice=${perInvoiceLimit} available=${available} → crear con ${createVal}`);
-        } catch (limErr) {
-          console.warn(`⚠️  getTipoStats [${stat}] falló:`, limErr.message, '— usando default');
-          if (createVal <= 0 && !canCreateAtZero) continue;
+        if (existing.duplicates && existing.duplicates.length) {
+          chainQty = await consolidateDuplicateStatInvoices(
+            contract, stat, existing, existing.duplicates, gasPrice
+          );
         }
 
-        const manualId = buildStatManualId(address, stat);
+        statsDoc.invoiceIds[stat] = existing.id;
+        statsDoc.manualIds[stat]  = existing.manualId;
 
-        // SIEMPRE verificar manualId on-chain antes de crear — evita facturas duplicadas
-        try {
-          const [invFound, already] = await contract.getInvoiceByManualIdSafe(manualId);
-          if (already) {
-            statsDoc.invoiceIds[stat] = Number(invFound.id);
-            statsDoc.manualIds[stat]  = invFound.manualId;
-            statsDoc[stat]            = Number(invFound.cantidad);
-            console.log(`♻️  Stats sync [${stat}]: manualId ya existía id=${invFound.id} qty=${invFound.cantidad}`);
+        // El piso de 1 existe solo para que la factura no se borre, así que un
+        // 1 en la cadena es ambiguo: puede ser un 1 de verdad o un 0 apoyado en
+        // el piso. Solo en ese caso se mira Mongo:
+        //   • Mongo dice más de 1 → el 1 es piso, se restaura el valor de Mongo.
+        //   • Mongo dice 0        → es el 0 real, se respeta (no se sube a 1).
+        // Para cualquier otro valor la CADENA es la fuente de verdad.
+        const dbQty = Number(statsDoc[stat] || 0);
+        if (chainQty === STAT_CHAIN_FLOOR && dbQty > STAT_CHAIN_FLOOR) {
+          const r = await applyStatOnChain(contract, stat, existing.id, dbQty, gasPrice);
+          statsDoc[stat] = clampStat(stat, r.ok ? dbQty : (r.chainQty ?? chainQty));
+          if (!r.ok) console.warn(`⚠️  No se pudo restaurar [${stat}] a ${dbQty}:`, r.error);
+        } else if (chainQty === STAT_CHAIN_FLOOR && dbQty === 0) {
+          statsDoc[stat] = 0;
+        } else {
+          statsDoc[stat] = clampStat(stat, chainQty);
+        }
+        console.log(`✅ Stats sync [${stat}]: id=${existing.id}, qty=${statsDoc[stat]}`);
+        continue;
+      }
+
+      // ── 3. No hay factura: se crea UNA, entera ───────────────────────────
+      const manualId = buildStatManualId(address, stat);
+
+      // El manualId puede existir aunque el snapshot no la haya traído
+      // (p. ej. la factura quedó a nombre de otra dirección). Se comprueba
+      // siempre antes de crear para no chocar con ManualIdAlreadyExists.
+      try {
+        const [invFound, already] = await contract.getInvoiceByManualIdSafe(manualId);
+        if (already) {
+          // Solo se adopta si es de ESTE jugador. Adoptar una factura ajena
+          // le daría el control del saldo de otra persona.
+          if (String(invFound.owner).toLowerCase() !== address) {
+            console.error(`🚫 Stats sync [${stat}]: el manualId ${manualId} pertenece a ${invFound.owner} — no se toca`);
+            pendientes.push(stat);
             continue;
           }
-        } catch (_) {}
+          statsDoc.invoiceIds[stat] = Number(invFound.id);
+          statsDoc.manualIds[stat]  = String(invFound.manualId);
+          statsDoc[stat]            = clampStat(stat, Number(invFound.cantidad));
+          console.log(`♻️  Stats sync [${stat}]: manualId ya existía id=${invFound.id} qty=${invFound.cantidad}`);
+          continue;
+        }
+      } catch (_) {}
 
-        // Nunca crear con más de STAT_INITIAL_MAP (evita usar "available" corrupto por invoices fallidas)
-        if (createVal > (STAT_INITIAL_MAP[stat] || 0)) createVal = STAT_INITIAL_MAP[stat];
+      // Valor de nacimiento. Para exp se usa lo que ya tuviera el jugador
+      // (semilla desde nivel_exp), no el 0 del mapa.
+      let createVal = stat === 'exp'
+        ? Math.max(0, Math.round(Number(statsDoc.exp || 0)))
+        : (STAT_INITIAL_MAP[stat] || 0);
+      if (createVal > tipo.perInvoiceLimit) createVal = tipo.perInvoiceLimit;
 
-        try {
-          // Obtener nonce fresco para evitar colisión de nonces en TXs concurrentes
-          const freshNonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
-          console.log(`🆕 Creando factura [${stat}] para ${address} = ${createVal} (nonce=${freshNonce})`);
-          const tx = await contract.createInvoice(address, stat, createVal, manualId, { gasPrice, nonce: freshNonce });
-          const receipt = await tx.wait();
-          const iface = contract.interface;
-          let newId = null;
-          for (const log of receipt.logs) {
-            try { const p = iface.parseLog(log); if (p?.name === 'InvoiceCreated') { newId = Number(p.args.id); break; } } catch (_) {}
-          }
-          if (newId) {
-            statsDoc.invoiceIds[stat] = newId;
-            statsDoc.manualIds[stat]  = manualId;
-            statsDoc[stat]            = createVal;
-            console.log(`✅ Factura [${stat}] creada: id=${newId} qty=${createVal}`);
-          }
-        } catch (txErr) { console.error(`❌ Error creando factura [${stat}]:`, txErr.message); }
+      // Nunca una factura parcial: si tras asegurar el cupo la tabla sigue sin
+      // espacio para el valor completo, se deja para el próximo sync.
+      if (createVal > tipo.available) {
+        console.warn(`⏭️  Stats sync [${stat}]: cupo insuficiente (${tipo.available}/${createVal}) — NO se crea factura parcial`);
+        pendientes.push(stat);
+        continue;
+      }
+
+      try {
+        const freshNonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+        console.log(`🆕 Creando la factura de [${stat}] para ${address} = ${createVal} (nonce=${freshNonce})`);
+        const tx = await contract.createInvoice(address, stat, createVal, manualId, { gasPrice, nonce: freshNonce });
+        const receipt = await tx.wait();
+        let newId = null;
+        for (const log of receipt.logs) {
+          try { const p = contract.interface.parseLog(log); if (p?.name === 'InvoiceCreated') { newId = Number(p.args.id); break; } } catch (_) {}
+        }
+        if (newId) {
+          statsDoc.invoiceIds[stat] = newId;
+          statsDoc.manualIds[stat]  = manualId;
+          statsDoc[stat]            = clampStat(stat, createVal);
+          _tipoCheckCache.delete(stat); // el cupo del tipo cambió
+          console.log(`✅ Factura [${stat}] creada: id=${newId} qty=${createVal}`);
+        } else {
+          pendientes.push(stat);
+        }
+      } catch (txErr) {
+        console.error(`❌ Error creando la factura de [${stat}]:`, txErr.message);
+        pendientes.push(stat);
       }
     }
 
-    // Stats SIN factura en el contrato.
-    // FIX (personaje nuevo aparecía con vida/agua/comida en 0, sobre todo en
-    // móvil): antes se forzaba SIEMPRE a 0. Si la creación de la factura no
-    // alcanzó a confirmar en este sync (tx lenta, RPC intermitente, límite del
-    // tipo momentáneamente agotado) el jugador nuevo quedaba con 0% de vida,
-    // agua y comida — un estado que no es real, solo "aún no aprovisionado".
-    // Ahora: para las vitales (piso > 0) se conserva su valor inicial y se
-    // creará la factura en el próximo sync; para oro/plata (piso 0) sí es
-    // correcto dejar 0 (no regalar monedas).
-    // OJO con la escala: en juego las barras se muestran como porcentaje 0..100
-    // (el cliente pinta `${valor}%` sin dividir), así que aquí se usa 100 = lleno.
-    const VITALS_FULL = 100;
+    // Stats que se quedaron SIN factura en este sync (RPC caído, tx lenta,
+    // tabla sin cupo). No se inventa un valor: se conserva el que ya tenía el
+    // jugador en BD y se reintenta la creación en el siguiente sync. Forzar
+    // aquí un 100 fijo era lo que hacía que la barra dijera "lleno" mientras la
+    // cadena tenía otra cosa, y al refrescar el valor se desplomaba.
+    if (pendientes.length) {
+      console.warn(`⏳ Sin factura todavía para ${playerName}: ${pendientes.join(', ')} — se reintenta en el próximo sync`);
+    }
     for (const stat of STAT_TYPES_LIST) {
-      if (!statsDoc.invoiceIds[stat]) {
-        const esVital = (STAT_DEFAULTS_MAP[stat] || 0) > 0; // vida/agua/comida
-        statsDoc[stat] = esVital ? VITALS_FULL : 0;         // oro/plata → 0
-      }
+      statsDoc[stat] = clampStat(stat, statsDoc[stat]);
     }
 
     statsDoc.markModified('invoiceIds');
     statsDoc.markModified('manualIds');
     statsDoc.lastSync = new Date();
     await statsDoc.save();
-    _syncLocks.delete(lockKey);
-    return res.json({ stats: buildStatsResponse(statsDoc), source: 'chain' });
+    return res.json({
+      stats: buildStatsResponse(statsDoc),
+      source: 'chain',
+      pending: pendientes.length ? pendientes : undefined
+    });
 
   } catch (err) {
-    const lk = `sync_${(req.body?.address || '').toLowerCase()}`;
-    _syncLocks.delete(lk);
     console.error('POST /api/stats/sync error:', err);
     return res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    if (lockKey) _syncLocks.delete(lockKey);
   }
 });
 
@@ -8735,7 +9051,6 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
 
     const contract   = getStatsContract();
     const gasPrice   = await getSafeGasPriceStats();
-    const txOpts     = { gasPrice };
     const txErrors   = [];
 
     for (const stat of validKeys) {
@@ -8746,41 +9061,34 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
       const invId   = doc.invoiceIds[stat];
       if (newVal === oldVal) continue;
 
-      doc[stat] = newVal;
-
       if (!contract || !invId) {
-        console.log(`ℹ️  Update [${stat}] ${oldVal}→${newVal} (solo DB)`);
+        // Sin factura todavía: se guarda en BD y el próximo /sync la crea.
+        doc[stat] = newVal;
+        console.log(`ℹ️  Update [${stat}] ${oldVal}→${newVal} (solo BD, aún sin factura)`);
         continue;
       }
 
-      const delta = newVal - oldVal;
-      try {
-        // Para stats vitales: nunca bajar a 0 en el contrato (eliminaría la factura).
-        // Guardamos el valor real en DB y usamos mínimo 1 en blockchain.
-        const chainNewVal = Math.max(1, newVal);
-        const chainOldVal = Math.max(1, oldVal);
-        const chainDelta  = chainNewVal - chainOldVal;
+      // Una sola factura y un solo movimiento: applyStatOnChain calcula el
+      // delta contra la cantidad REAL de la factura, no contra `oldVal` de
+      // Mongo. Si los dos se habían separado (una TX anterior revirtió sin que
+      // nadie se enterara), la cadena converge igual al valor pedido en vez de
+      // arrastrar el desfase — que es lo que hacía que una recarga a 30
+      // apareciera como 12 al refrescar.
+      const r = await applyStatOnChain(contract, stat, invId, newVal, gasPrice);
 
-        if (chainDelta === 0) {
-          // Solo actualizar DB, sin TX (igual o ambos en mínimo 1)
-          console.log(`📝 [${stat}] sin cambio en chain (${oldVal}→${newVal}), solo DB`);
-        } else if (chainDelta > 0) {
-          const nonce1 = await provider.getTransactionCount(relayerWallet.address, 'pending');
-          console.log(`⬆️  increase [${stat}] id=${invId} +${chainDelta} (nonce=${nonce1})`);
-          const tx = await contract.increaseInvoiceQuantity(invId, chainDelta, { ...txOpts, nonce: nonce1 });
-          await tx.wait();
+      if (r.ok) {
+        // En la cadena hay como mínimo 1 por el piso anti-borrado; el valor
+        // real (que puede ser 0) vive en Mongo.
+        doc[stat] = newVal;
+      } else {
+        // Se responde lo que HAY en la cadena, no lo que el cliente pidió.
+        console.error(`❌ TX error [${stat}]:`, r.error);
+        txErrors.push({ stat, requested: newVal, error: r.error });
+        if (r.chainQty !== null && r.chainQty !== undefined) {
+          doc[stat] = clampStat(stat, r.chainQty);
         } else {
-          const dec = Math.abs(chainDelta);
-          const nonce2 = await provider.getTransactionCount(relayerWallet.address, 'pending');
-          console.log(`⬇️  decrease [${stat}] id=${invId} -${dec} (chain: ${chainOldVal}→${chainNewVal}, nonce=${nonce2})`);
-          const tx = await contract.decreaseInvoiceQuantity(invId, dec, { ...txOpts, nonce: nonce2 });
-          await tx.wait();
-          // Nota: nunca llega a 0 en chain, así que la factura nunca se elimina
+          doc[stat] = oldVal;
         }
-      } catch (txErr) {
-        console.error(`❌ TX error [${stat}]:`, txErr.message);
-        txErrors.push({ stat, error: txErr.message });
-        doc[stat] = oldVal;
       }
     }
 
@@ -8840,29 +9148,21 @@ app.post('/api/currency/exchange', apiLimiter, authMiddleware, csrfProtection, a
     const aplicados = [];
     const errores   = [];
 
-    // Aplica el nuevo valor de un stat a su factura on-chain.
+    // Aplica el nuevo valor de un stat a su ÚNICA factura on-chain.
+    // Mismo camino que /api/stats/update: applyStatOnChain es el único sitio
+    // que toca increase/decrease, así que las dos rutas no pueden divergir.
     const aplicar = async (stat, oldVal, newVal) => {
       const invId = doc.invoiceIds && doc.invoiceIds[stat];
       if (!contract || !invId) { doc[stat] = newVal; aplicados.push(stat); return; }
 
-      const chainNew = Math.max(1, newVal);      // nunca 0: la factura se borraría
-      const chainOld = Math.max(1, oldVal);
-      const delta    = chainNew - chainOld;
-      try {
-        if (delta > 0) {
-          const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
-          const tx = await contract.increaseInvoiceQuantity(invId, delta, { gasPrice, nonce });
-          await tx.wait();
-        } else if (delta < 0) {
-          const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
-          const tx = await contract.decreaseInvoiceQuantity(invId, Math.abs(delta), { gasPrice, nonce });
-          await tx.wait();
-        }
+      const r = await applyStatOnChain(contract, stat, invId, newVal, gasPrice);
+      if (r.ok) {
         doc[stat] = newVal;
         aplicados.push(stat);
-      } catch (e) {
-        console.error(`❌ exchange TX [${stat}]:`, e.message);
-        errores.push({ stat, error: e.message });
+      } else {
+        console.error(`❌ exchange TX [${stat}]:`, r.error);
+        if (r.chainQty !== null && r.chainQty !== undefined) doc[stat] = clampStat(stat, r.chainQty);
+        errores.push({ stat, error: r.error });
       }
     };
 
