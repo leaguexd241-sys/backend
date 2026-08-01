@@ -4338,7 +4338,7 @@ io.on("connection", (socket) => {
 
   // Eventos de salas y personajes COMPLETOS
   socket.on("joinRoom", async (data) => {
-    const { room, username, lastScene } = data;
+    const { room, username, lastScene, nivel, petLevel, dogName } = data;
     
     console.log(`🔵 joinRoom: ${socket.id} -> ${room}, último escena: ${lastScene}`);
     
@@ -4397,6 +4397,13 @@ io.on("connection", (socket) => {
       username: username || '---',
       direction: 'right',
       directionx: 'stop_right',
+      // Nivel del personaje y de la mascota ya desde el JOIN.
+      // Antes solo viajaban dentro de playerMove, así que un jugador que
+      // entraba y se quedaba QUIETO nunca emitía nada y los demás lo veían sin
+      // nivel hasta que se dignara a moverse.
+      nivel:    Number.isFinite(Number(nivel))    ? Number(nivel)    : 0,
+      petLevel: Number.isFinite(Number(petLevel)) ? Number(petLevel) : 1,
+      dogName:  typeof dogName === 'string' ? dogName : '',
       lastUpdate: Date.now()
     };
     
