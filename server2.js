@@ -5973,6 +5973,15 @@ app.post('/api/tree/lock',
         { upsert: true }
       );
 
+      // Avisar a TODOS los jugadores conectados de que ese árbol acaba de
+      // caer. Antes solo se guardaba en Mongo, y el estado del mapa únicamente
+      // se leía al entrar a la escena (loadTreeLockStates), así que los demás
+      // jugadores seguían viendo el árbol entero durante todo el respawn y solo
+      // veían el tronco si recargaban la página.
+      try {
+        io.emit('treeLocked', { treeKey, treeType, lockedUntil });
+      } catch (_) {}
+
       res.json({ success: true, treeKey, lockedUntil });
     } catch (error) {
       console.error('Error bloqueando árbol:', error);
@@ -6098,7 +6107,13 @@ app.post(
         { mineralType, lockedUntil },
         { upsert: true, new: true }
       );
- 
+
+      // Mismo caso que los árboles: los demás jugadores tienen que ver el
+      // mineral picado en el momento, no solo si recargan la página.
+      try {
+        io.emit('mineLocked', { mineKey, mineralType, lockedUntil });
+      } catch (_) {}
+
       return res.json({ success: true, mineKey, lockedUntil });
     } catch (error) {
       console.error('Error bloqueando mina:', error);
@@ -8232,17 +8247,27 @@ const STAT_CHAIN_FLOOR = 1;
 //   headroom        → cupo global libre por debajo del cual se considera que
 //                     la tabla se está quedando corta.
 //   autoRaise       → si el backend puede subir `limit` por su cuenta cuando se
-//                     queda sin cupo. true en vitales y exp (no son economía
-//                     transferible); false en oro/plata, donde el techo de
-//                     emisión es una decisión del dueño del contrato y subirlo
-//                     solo se avisa por log.
+//                     queda sin cupo.
+//
+// autoRaise está en true para las SEIS tablas. El fallo de "recargo 30 de agua
+// y al refrescar tengo 12" era una tabla sin cupo: increaseInvoiceQuantity
+// revertía y el valor se perdía en silencio. Ese mismo fallo puede pasarle a
+// oro, plata y exp, así que las seis se amplían solas.
+//
+// Nota sobre oro y plata: ampliar `limit` sube el techo de emisión de la
+// moneda. Se hace porque perder el oro de un jugador es peor que tener un techo
+// alto, pero cada ampliación queda registrada en el log con el prefijo
+// `setLimit[oro]` / `setLimit[plata]` para que se pueda auditar. Si en algún
+// momento querés congelar la emisión, poné autoRaise en false para esas dos:
+// el backend seguirá avisando por log cuando la tabla se quede corta, sin
+// tocar el contrato.
 const STAT_TIPO_CONFIG = {
-  vida:   { perInvoiceLimit: VITAL_MAX, headroom: 1_000_000,     autoRaise: true  },
-  agua:   { perInvoiceLimit: VITAL_MAX, headroom: 1_000_000,     autoRaise: true  },
-  comida: { perInvoiceLimit: VITAL_MAX, headroom: 1_000_000,     autoRaise: true  },
-  oro:    { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: false },
-  plata:  { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: false },
-  exp:    { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: true  },
+  vida:   { perInvoiceLimit: VITAL_MAX,     headroom: 1_000_000, autoRaise: true },
+  agua:   { perInvoiceLimit: VITAL_MAX,     headroom: 1_000_000, autoRaise: true },
+  comida: { perInvoiceLimit: VITAL_MAX,     headroom: 1_000_000, autoRaise: true },
+  oro:    { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: true },
+  plata:  { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: true },
+  exp:    { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: true },
 };
 
 // Al ampliar una tabla se deja bastante más margen del que dispara la ampliación
@@ -8268,7 +8293,7 @@ const TIPO_CACHE_TTL_MS = 5 * 60 * 1000;
  *
  * @returns {{exists:boolean, limit:number, perInvoiceLimit:number, totalQuantity:number, available:number}|null}
  */
-async function ensureStatTipo(contract, stat, gasPrice, { force = false } = {}) {
+async function ensureStatTipo(contract, stat, gasPrice, { force = false, minPerInvoice = 0 } = {}) {
   const cfg = STAT_TIPO_CONFIG[stat];
   if (!cfg) return null;
 
@@ -8276,6 +8301,11 @@ async function ensureStatTipo(contract, stat, gasPrice, { force = false } = {}) 
     const cached = _tipoCheckCache.get(stat);
     if (cached && (Date.now() - cached.at) < TIPO_CACHE_TTL_MS) return cached.info;
   }
+
+  // Techo por factura que hace falta de verdad. Normalmente es el de la config,
+  // pero si un jugador llegó a acumular más oro/plata/exp que ese techo, hay que
+  // subirlo por encima o su factura no podría volver a crecer nunca.
+  const perInvoiceObjetivo = Math.max(cfg.perInvoiceLimit, Math.ceil(minPerInvoice));
 
   let info;
   try {
@@ -8292,7 +8322,7 @@ async function ensureStatTipo(contract, stat, gasPrice, { force = false } = {}) 
   }
   info.available = info.limit > info.totalQuantity ? info.limit - info.totalQuantity : 0;
 
-  const needPerInvoice = info.perInvoiceLimit < cfg.perInvoiceLimit;
+  const needPerInvoice = info.perInvoiceLimit < perInvoiceObjetivo;
   const needHeadroom   = info.available       < cfg.headroom;
 
   if (info.exists && !needPerInvoice && !needHeadroom) {
@@ -8311,8 +8341,8 @@ async function ensureStatTipo(contract, stat, gasPrice, { force = false } = {}) 
     return info;
   }
 
-  const newPerInvoice = Math.max(cfg.perInvoiceLimit, info.perInvoiceLimit);
-  const newLimit      = Math.max(info.limit, info.totalQuantity + cfg.headroom * TIPO_RAISE_FACTOR);
+  const newPerInvoice = Math.max(perInvoiceObjetivo, info.perInvoiceLimit);
+  const newLimit      = Math.max(info.limit, info.totalQuantity + cfg.headroom * TIPO_RAISE_FACTOR, newPerInvoice);
 
   try {
     const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
@@ -8390,7 +8420,10 @@ async function applyStatOnChain(contract, stat, invId, target, gasPrice) {
     // y se reintenta UNA vez.
     if (/ExceedsTipoLimit|PerInvoiceLimit/i.test(msg)) {
       console.warn(`⚠️  [${stat}] sin cupo en la tabla — ampliando y reintentando`);
-      await ensureStatTipo(contract, stat, gasPrice, { force: true });
+      // `desired` va como techo mínimo por factura: si el jugador acumuló más
+      // oro/plata/exp del que admitía una sola factura, la tabla se amplía lo
+      // suficiente para que quepa en vez de quedarse atascada para siempre.
+      await ensureStatTipo(contract, stat, gasPrice, { force: true, minPerInvoice: desired });
       try {
         current = await readInvoiceQty(contract, invId);
         if (current === null) return { ok: false, chainQty: null, error: 'invoice_not_found_or_inactive' };
@@ -9665,6 +9698,10 @@ async function saveBattleResult(match, winnerKey, reason) {
       try {
         const nivelPet = computePetLevel(doc.wins || 0, doc.battles || 0);
         await GamePlayer.updateOne({ playerName: p.playerName }, { $set: { petLevel: nivelPet } });
+        // Avisar al jugador de su nuevo nivel de mascota. Sin esto el cliente
+        // solo lo leía en /api/load, así que el nivel del perro se quedaba
+        // congelado hasta recargar la página aunque ya hubieras ganado.
+        try { p.socket && p.socket.emit('petLevelUpdate', { petLevel: nivelPet }); } catch (_) {}
       } catch (e) {
         console.warn('⚠️  No se pudo actualizar petLevel:', e.message);
       }
