@@ -7070,21 +7070,60 @@ app.get('/api/relay/stats',
 );
 
 // --- RUTAS DE SEGURIDAD (ADMIN) ---
+/**
+ * Autenticación de administrador. Admite DOS formas:
+ *
+ *   1. CARTERA ADMIN (la recomendada, la que usan admin.html y misiones.html):
+ *      el admin entra con su wallet por el flujo normal de /api/auth/login
+ *      (nonce + firma) y queda con la cookie de sesión. Aquí se comprueba que
+ *      la dirección de esa sesión sea admin — por ADMIN_ADDRESSES o por el
+ *      isAdmin() del contrato. No hay que pegar ningún token a mano.
+ *
+ *   2. Bearer JWT con role 'admin' (lo de antes). Se mantiene para no romper
+ *      nada que ya lo estuviera usando.
+ */
 const adminAuth = async (req, res, next) => {
+  // ── 1. Cartera admin por cookie de sesión ────────────────────────────────
+  try {
+    const sessionToken = req.cookies && req.cookies.session;
+    if (sessionToken) {
+      const decoded = jwt.verify(sessionToken, JWT_SECRET, { algorithms: ['HS256'] });
+      const addr = String(decoded.address || '').toLowerCase();
+      if (addr && await isAdminAddress(addr)) {
+        req.admin = { address: addr, via: 'wallet', role: 'admin' };
+        req.user  = req.user || { address: addr };
+        return next();
+      }
+      // Sesión válida pero de alguien que no es admin: se dice claramente.
+      if (addr) {
+        console.warn(`🚫 Acceso admin denegado a ${addr.slice(0, 10)}…`);
+        return res.status(403).json({
+          error: 'not_admin',
+          message: 'Esta cartera no es administradora',
+          address: addr
+        });
+      }
+    }
+  } catch (_) { /* cookie ausente o inválida: se prueba el Bearer */ }
+
+  // ── 2. Bearer JWT de admin (compatibilidad) ──────────────────────────────
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  
+
   if (!token) {
-    return res.status(401).json({ error: 'Token de administrador requerido' });
+    return res.status(401).json({
+      error: 'admin_auth_required',
+      message: 'Conecta la cartera de administrador'
+    });
   }
-  
+
   try {
     const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
-    
+
     if (decoded.role !== 'admin' && decoded.role !== 'security_admin') {
       return res.status(403).json({ error: 'No autorizado para operaciones de seguridad' });
     }
-    
+
     req.admin = decoded;
     next();
   } catch (error) {
@@ -7473,6 +7512,11 @@ app.post('/api/save/:playerName',
         { connectedAt: new Date() },
         { upsert: true }
       );
+
+      // Tiempo jugado: cada guardado suma el hueco desde el anterior. Es la
+      // única señal periódica que ya existía mientras el jugador está dentro.
+      // No bloquea la respuesta: si falla, solo se pierde ese tramo.
+      registrarTiempoJugado(playerName, address).catch(() => {});
 
       // Respuesta con estadísticas de validación
       const response = { success: true };
@@ -7864,6 +7908,365 @@ app.delete('/api/admin/missions/daily/:npcId/:day', adminAuth, strictLimiter, as
 });
 
 console.log('✅ Admin missions routes: GET/PUT/DELETE /api/admin/missions/*');
+
+// =============================================================================
+// TIEMPO JUGADO  +  PANEL DE ADMINISTRACIÓN DE JUGADORES
+// =============================================================================
+//
+// NOTA HONESTA SOBRE EL TIEMPO JUGADO: hasta ahora el juego no guardaba en
+// ningún sitio cuánto tiempo pasaba dentro cada jugador (solo la fecha de alta
+// y el número de inicios de sesión). Esa medición EMPIEZA AQUÍ: el histórico
+// anterior a este cambio no existe y no se puede reconstruir. El panel muestra
+// las dos cosas por separado: la ANTIGÜEDAD de la cuenta (que sí se sabe desde
+// siempre) y el TIEMPO JUGADO medido (que arranca en 0 para todos).
+//
+// Cómo se mide: el cliente ya llama a /api/save periódicamente mientras juega.
+// Cada llamada suma el hueco desde la anterior, con un tope por tramo para que
+// una pestaña abierta toda la noche no cuente como partida.
+
+const playtimeSchema = new mongoose.Schema({
+  playerName:   { type: String, required: true, unique: true, index: true },
+  address:      { type: String, lowercase: true, index: true, default: null },
+  segundos:     { type: Number, default: 0 },     // total acumulado
+  sesiones:     { type: Number, default: 0 },     // tramos contados
+  primeraVez:   { type: Date,   default: Date.now },
+  ultimaVez:    { type: Date,   default: Date.now },
+}, { collection: 'player_playtime' });
+const PlayerPlaytime = mongoose.model('PlayerPlaytime', playtimeSchema);
+
+// Hueco máximo que se cuenta de una tacada. Si entre dos guardados pasan más
+// de 5 minutos, se asume que el jugador estuvo ausente (pestaña de fondo,
+// se fue a comer) y solo se cuenta un tramo corto.
+const PLAYTIME_MAX_GAP_S = 5 * 60;
+const PLAYTIME_GAP_FALLBACK_S = 30;
+
+async function registrarTiempoJugado(playerName, address) {
+  if (!playerName || playerName === '---') return;
+  try {
+    const ahora = new Date();
+    const doc = await PlayerPlaytime.findOne({ playerName });
+    if (!doc) {
+      await PlayerPlaytime.create({
+        playerName, address: address || null,
+        segundos: 0, sesiones: 1, primeraVez: ahora, ultimaVez: ahora
+      });
+      return;
+    }
+    const hueco = Math.floor((ahora - new Date(doc.ultimaVez)) / 1000);
+    let suma = 0;
+    let nuevaSesion = 0;
+    if (hueco > 0 && hueco <= PLAYTIME_MAX_GAP_S) {
+      suma = hueco;                       // seguía jugando
+    } else if (hueco > PLAYTIME_MAX_GAP_S) {
+      suma = PLAYTIME_GAP_FALLBACK_S;     // volvió tras una ausencia
+      nuevaSesion = 1;
+    }
+    await PlayerPlaytime.updateOne(
+      { playerName },
+      {
+        $inc: { segundos: suma, sesiones: nuevaSesion },
+        $set: { ultimaVez: ahora, ...(address ? { address: address.toLowerCase() } : {}) }
+      }
+    );
+  } catch (e) {
+    console.warn('⚠️  No se pudo registrar tiempo jugado:', e.message);
+  }
+}
+
+function formatearDuracion(segundos) {
+  const s = Math.max(0, Math.floor(Number(segundos) || 0));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+// ── Campos EDITABLES desde el panel ────────────────────────────────────────
+// Divididos a propósito en dos grupos:
+//   • seguros  → viven solo en Mongo, se escriben directo.
+//   • onchain  → son facturas del contrato. Editarlos solo en Mongo los
+//     desincronizaría (el siguiente /sync los revertiría), así que se aplican
+//     con applyStatOnChain y la factura se mueve de verdad.
+const ADMIN_CAMPOS_SEGUROS = [
+  'Username', 'petName', 'nivel', 'nivel_exp', 'mundo', 'lenguaje', 'tutorial',
+  'posicionplayerx', 'posicionplayery', 'speed', 'misiones', 'petLevel',
+  'mineria', 'mineria_exp', 'pesca', 'pesca_exp', 'cocina', 'cocina_exp',
+  'deforestacion', 'deforestacion_exp', 'fuerza', 'fuerza_exp',
+  'agricultura', 'agricultura_exp'
+];
+const ADMIN_CAMPOS_ONCHAIN = ['vida', 'agua', 'comida', 'oro', 'plata', 'exp'];
+
+// ── GET /api/admin/players ─────────────────────────────────────────────────
+// Lista paginada con búsqueda por dirección o nombre de personaje.
+app.get('/api/admin/players', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const q      = String(req.query.q || '').trim();
+    const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 25));
+    const page   = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const skip   = (page - 1) * limit;
+
+    let filtro = {};
+    if (q) {
+      // Búsqueda por dirección de cartera O por nombre (playerName o Username).
+      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filtro = { $or: [{ address: rx }, { playerName: rx }, { Username: rx }] };
+    }
+
+    const [total, totalGlobal, docs] = await Promise.all([
+      GamePlayer.countDocuments(filtro),
+      GamePlayer.countDocuments({}),
+      GamePlayer.find(filtro)
+        .select('playerName Username address nivel nivel_exp petName petLevel createdAt updatedAt tutorial mundo')
+        .sort({ createdAt: -1 })
+        .skip(skip).limit(limit).lean()
+    ]);
+
+    const nombres = docs.map(d => d.playerName);
+    const [tiempos, actividades, stats] = await Promise.all([
+      PlayerPlaytime.find({ playerName: { $in: nombres } }).lean(),
+      UserActivity.find({ playerName: { $in: nombres } }).select('playerName lastLogin loginCount').lean(),
+      PlayerStats.find({ playerName: { $in: nombres } }).select('playerName oro plata exp vida agua comida').lean()
+    ]);
+    const porNombre = (arr) => arr.reduce((m, x) => (m[x.playerName] = x, m), {});
+    const mapT = porNombre(tiempos), mapA = porNombre(actividades), mapS = porNombre(stats);
+
+    const ahora = Date.now();
+    const players = docs.map(d => {
+      const t = mapT[d.playerName], a = mapA[d.playerName], s = mapS[d.playerName];
+      const creado = d.createdAt ? new Date(d.createdAt) : null;
+      const antiguedadS = creado ? Math.floor((ahora - creado.getTime()) / 1000) : 0;
+      return {
+        playerName: d.playerName,
+        username:   d.Username || '---',
+        address:    d.address || null,
+        nivel:      d.nivel || 0,
+        exp:        d.nivel_exp || 0,
+        petName:    d.petName || '---',
+        petLevel:   d.petLevel || 1,
+        creadoEn:   creado,
+        antiguedadSegundos: antiguedadS,
+        antiguedad: creado ? formatearDuracion(antiguedadS) : '—',
+        jugadoSegundos: t ? t.segundos : 0,
+        jugado:     formatearDuracion(t ? t.segundos : 0),
+        sesiones:   t ? t.sesiones : 0,
+        ultimaVez:  t ? t.ultimaVez : (a ? a.lastLogin : null),
+        loginCount: a ? a.loginCount : 0,
+        oro:   s ? s.oro : 0,
+        plata: s ? s.plata : 0,
+        expOnchain: s ? (s.exp || 0) : 0
+      };
+    });
+
+    return res.json({ players, total, totalGlobal, page, limit, pages: Math.ceil(total / limit) });
+  } catch (e) {
+    console.error('GET /api/admin/players:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── GET /api/admin/players/:playerName ─────────────────────────────────────
+// Ficha completa de un jugador.
+app.get('/api/admin/players/:playerName', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const playerName = await resolvePlayerName(req.params.playerName);
+    const gp = await GamePlayer.findOne({ playerName }).lean();
+    if (!gp) return res.status(404).json({ error: 'player_not_found' });
+
+    const [t, act, st, skills, pet] = await Promise.all([
+      PlayerPlaytime.findOne({ playerName }).lean(),
+      UserActivity.findOne({ playerName }).lean(),
+      PlayerStats.findOne({ playerName }).lean(),
+      PlayerSkills.findOne({ playerName }).lean(),
+      PlayerPet.findOne({ playerName }).lean()
+    ]);
+
+    const creado = gp.createdAt ? new Date(gp.createdAt) : null;
+    const antiguedadS = creado ? Math.floor((Date.now() - creado.getTime()) / 1000) : 0;
+
+    return res.json({
+      player: gp,
+      resumen: {
+        creadoEn: creado,
+        antiguedad: creado ? formatearDuracion(antiguedadS) : '—',
+        jugado: formatearDuracion(t ? t.segundos : 0),
+        jugadoSegundos: t ? t.segundos : 0,
+        sesiones: t ? t.sesiones : 0,
+        ultimaVez: t ? t.ultimaVez : (act ? act.lastLogin : null),
+        loginCount: act ? act.loginCount : 0,
+        ip: act ? act.ip : null,
+        geo: act ? act.geo : null
+      },
+      stats: st || null,
+      skills: skills || null,
+      pet: pet || null,
+      inventarioCount: Array.isArray(gp.inventory) ? gp.inventory.length : 0,
+      cofreCount: Array.isArray(gp.chest) ? gp.chest.length : 0,
+      camposEditables: { seguros: ADMIN_CAMPOS_SEGUROS, onchain: ADMIN_CAMPOS_ONCHAIN }
+    });
+  } catch (e) {
+    console.error('GET /api/admin/players/:playerName:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── PATCH /api/admin/players/:playerName ───────────────────────────────────
+// Edita campos de la cuenta. Los de contrato pasan por la factura on-chain.
+app.patch('/api/admin/players/:playerName', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const playerName = await resolvePlayerName(req.params.playerName);
+    const gp = await GamePlayer.findOne({ playerName });
+    if (!gp) return res.status(404).json({ error: 'player_not_found' });
+
+    const cambios = req.body && typeof req.body.cambios === 'object' ? req.body.cambios : null;
+    if (!cambios) return res.status(400).json({ error: 'sin_cambios' });
+
+    const aplicados = [];
+    const errores   = [];
+
+    // 1. Campos que viven solo en Mongo
+    const setMongo = {};
+    for (const campo of ADMIN_CAMPOS_SEGUROS) {
+      if (cambios[campo] === undefined) continue;
+      const actual = gp[campo];
+      let valor = cambios[campo];
+      if (typeof actual === 'number') {
+        valor = Number(valor);
+        if (!Number.isFinite(valor) || valor < 0) { errores.push({ campo, error: 'valor_invalido' }); continue; }
+        valor = Math.floor(valor);
+      } else {
+        valor = String(valor).slice(0, 64);
+      }
+      setMongo[campo] = valor;
+      aplicados.push({ campo, de: actual, a: valor });
+    }
+    if (Object.keys(setMongo).length) {
+      await GamePlayer.updateOne({ playerName }, { $set: setMongo });
+    }
+
+    // 2. Campos que son FACTURAS del contrato
+    const pedidosOnchain = ADMIN_CAMPOS_ONCHAIN.filter(c => cambios[c] !== undefined);
+    if (pedidosOnchain.length) {
+      const doc = await PlayerStats.findOne({ playerName });
+      if (!doc) {
+        errores.push({ campo: pedidosOnchain.join(','), error: 'sin_stats_todavia_llama_a_sync' });
+      } else {
+        const contract = getStatsContract();
+        const gasPrice = contract ? await getSafeGasPriceStats() : null;
+        for (const stat of pedidosOnchain) {
+          const nuevo = clampStat(stat, Math.round(Number(cambios[stat])));
+          const viejo = Number(doc[stat] || 0);
+          if (nuevo === viejo) continue;
+          const invId = doc.invoiceIds && doc.invoiceIds[stat];
+          if (!contract || !invId) {
+            doc[stat] = nuevo;
+            aplicados.push({ campo: stat, de: viejo, a: nuevo, nota: 'solo BD (sin factura todavía)' });
+            continue;
+          }
+          const r = await applyStatOnChain(contract, stat, invId, nuevo, gasPrice);
+          if (r.ok) {
+            doc[stat] = nuevo;
+            aplicados.push({ campo: stat, de: viejo, a: nuevo, nota: 'factura on-chain actualizada' });
+          } else {
+            if (r.chainQty !== null && r.chainQty !== undefined) doc[stat] = clampStat(stat, r.chainQty);
+            errores.push({ campo: stat, error: r.error });
+          }
+        }
+        await doc.save();
+      }
+    }
+
+    console.log(`🛠️  [admin ${req.admin.address || req.admin.role}] editó ${playerName}: ${aplicados.map(a => a.campo).join(', ') || 'nada'}`);
+    return res.json({ ok: errores.length === 0, aplicados, errores: errores.length ? errores : undefined });
+  } catch (e) {
+    console.error('PATCH /api/admin/players:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── DELETE /api/admin/players/:playerName ──────────────────────────────────
+// Borra la cuenta de la base de datos. IRREVERSIBLE y exige confirmación
+// explícita con el nombre exacto, para que no se vaya una por un clic suelto.
+// OJO: NO toca las facturas del contrato — esas viven en la blockchain y no se
+// pueden borrar desde aquí; la cuenta se va de Mongo, los activos siguen en la
+// cadena a nombre de esa dirección.
+app.delete('/api/admin/players/:playerName', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const playerName = await resolvePlayerName(req.params.playerName);
+    const confirmacion = String((req.body && req.body.confirmar) || req.query.confirmar || '');
+    if (confirmacion !== playerName) {
+      return res.status(400).json({
+        error: 'confirmacion_requerida',
+        message: 'Manda { "confirmar": "<playerName exacto>" } para borrar.'
+      });
+    }
+
+    const gp = await GamePlayer.findOne({ playerName }).lean();
+    if (!gp) return res.status(404).json({ error: 'player_not_found' });
+
+    const borrados = {};
+    const borrar = async (modelo, nombre, filtro) => {
+      try { borrados[nombre] = (await modelo.deleteMany(filtro)).deletedCount || 0; }
+      catch (e) { borrados[nombre] = `error: ${e.message}`; }
+    };
+
+    await borrar(GamePlayer,          'gamePlayer',   { playerName });
+    await borrar(PlayerStats,         'stats',        { playerName });
+    await borrar(PlayerPlaytime,      'playtime',     { playerName });
+    await borrar(PlayerSkills,        'skills',       { playerName });
+    await borrar(PlayerPet,           'pet',          { playerName });
+    await borrar(UserActivity,        'actividad',    { playerName });
+    await borrar(MissionsPlayer,      'misiones',     { playerName });
+    await borrar(PlayerNotifications, 'notificaciones', { playerName });
+    await borrar(FurnaceState,        'horno',        { playerName });
+    if (gp.address) await borrar(PlayerAuth, 'auth', { address: String(gp.address).toLowerCase() });
+
+    console.warn(`🗑️  [admin ${req.admin.address || req.admin.role}] BORRÓ la cuenta ${playerName}`);
+    return res.json({
+      ok: true, playerName, borrados,
+      aviso: 'Las facturas del contrato NO se borran: siguen en la blockchain a nombre de esa dirección.'
+    });
+  } catch (e) {
+    console.error('DELETE /api/admin/players:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── GET /api/admin/overview ────────────────────────────────────────────────
+// Números de cabecera del panel.
+app.get('/api/admin/overview', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const hace24h = new Date(Date.now() - 24 * 3600 * 1000);
+    const hace7d  = new Date(Date.now() - 7 * 86400 * 1000);
+    const [totalCuentas, nuevas24h, nuevas7d, activos24h, conectados, agg] = await Promise.all([
+      GamePlayer.countDocuments({}),
+      GamePlayer.countDocuments({ createdAt: { $gte: hace24h } }),
+      GamePlayer.countDocuments({ createdAt: { $gte: hace7d } }),
+      PlayerPlaytime.countDocuments({ ultimaVez: { $gte: hace24h } }),
+      ConnectedUser.countDocuments({}),
+      PlayerPlaytime.aggregate([{ $group: { _id: null, total: { $sum: '$segundos' } } }])
+    ]);
+    const totalSeg = (agg && agg[0] && agg[0].total) || 0;
+    return res.json({
+      totalCuentas, nuevas24h, nuevas7d, activos24h, conectados,
+      tiempoTotalSegundos: totalSeg,
+      tiempoTotal: formatearDuracion(totalSeg),
+      adminAddress: req.admin.address || null
+    });
+  } catch (e) {
+    console.error('GET /api/admin/overview:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── GET /api/admin/whoami ──────────────────────────────────────────────────
+// Lo usa el panel para saber si la cartera conectada es admin.
+app.get('/api/admin/whoami', adminAuth, apiLimiter, (req, res) => {
+  res.json({ ok: true, address: req.admin.address || null, via: req.admin.via || 'token' });
+});
+
+console.log('✅ Admin players routes: /api/admin/players, /api/admin/overview, /api/admin/whoami');
 
 // Marketplace P2P — todas las rutas /api/marketplace/* viven en marketplace-routes.js
 // (se monta más abajo, después de que PlayerStats esté definido — ver "MARKETPLACE ROUTES MOUNT")
@@ -9587,7 +9990,10 @@ function battlePublicPlayer(p) {
     level: p.level,
     hp: p.hp,
     maxHp: p.maxHp,
-    isBot: !!p.isBot
+    isBot: !!p.isBot,
+    // Estados activos (veneno, escudo de espinas, aturdido…), para que la UI
+    // los muestre siempre junto a la barra de vida.
+    status: estadosPublicos(p)
   };
 }
 
@@ -9630,25 +10036,103 @@ function crearBotDeRonda(ronda, nivelJugador) {
 // el daño de cada uno se reduce con el escudo que el rival haya puesto ESE
 // mismo turno, así que hay decisión real (atacar fuerte vs. cubrirse).
 const BATTLE_ENERGY_PER_TURN = 3;
-const BATTLE_HAND_SIZE = 4;
+const BATTLE_HAND_SIZE = 5;          // antes 4: una carta más para decidir
+const BATTLE_MAX_ENERGY_BANK = 2;    // energía sin gastar que se guarda al turno siguiente
+
+// ── EFECTOS DE ESTADO ──────────────────────────────────────────────────────
+// Duran varios turnos y se resuelven al inicio de cada uno. Son lo que da
+// profundidad: ya no todo se decide en el intercambio de un solo turno.
+//   poison  → daño al inicio del turno, ignora el escudo
+//   stun    → el rival pierde 1 de energía el turno siguiente
+//   weak    → el rival pega un 35% menos el turno siguiente
+//   regen   → cura al inicio del turno
+//   thorns  → devuelve parte del daño recibido ese turno
+//   focus   → tu siguiente carta de ataque pega un 50% más
+const BATTLE_STATUS_TURNS = { poison: 3, stun: 1, weak: 2, regen: 3, thorns: 2, focus: 1 };
 
 const BATTLE_CARDS = {
+  // ── COMUNES (coste 1) ────────────────────────────────────────────────────
   zarpazo:    { id: 'zarpazo',   name: 'Claw',        emoji: '🐾', cost: 1, dmg: 1.00, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'common',
                 desc: 'A fast swipe. Cheap, reliable damage every turn.' },
-  mordisco:   { id: 'mordisco',  name: 'Bite',        emoji: '🦷', cost: 2, dmg: 1.85, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
-                desc: 'Sinks its fangs in for strong single-target damage.' },
-  embestida:  { id: 'embestida', name: 'Charge',      emoji: '💥', cost: 3, dmg: 2.90, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
-                desc: 'A full-power body slam. Huge damage, all your energy.' },
   guardia:    { id: 'guardia',   name: 'Guard',       emoji: '🛡️', cost: 1, dmg: 0.00, shield: 1.25, heal: 0.00, type: 'defense', rarity: 'common',
                 desc: 'Raises a shield that soaks the rival’s hit this turn.' },
+  colazo:     { id: 'colazo',    name: 'Tail Whip',   emoji: '🌀', cost: 1, dmg: 0.65, shield: 0.45, heal: 0.00, type: 'hybrid', rarity: 'common',
+                desc: 'Cheap poke that also chips in a little shield.' },
+  arania:     { id: 'arania',    name: 'Scratch',     emoji: '✳️', cost: 1, dmg: 0.80, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'common',
+                applies: 'weak',
+                desc: 'Light cut that leaves the rival weakened next turn.' },
+  gruñido:    { id: 'gruñido',   name: 'Growl',       emoji: '😾', cost: 1, dmg: 0.00, shield: 0.60, heal: 0.00, type: 'defense', rarity: 'common',
+                applies: 'weak',
+                desc: 'A menacing growl: small shield and the rival hits softer.' },
+  olfatear:   { id: 'olfatear',  name: 'Sniff Out',   emoji: '👃', cost: 1, dmg: 0.00, shield: 0.00, heal: 0.00, type: 'buff', rarity: 'common',
+                self: 'focus',
+                desc: 'Finds the weak spot: your next attack hits 50% harder.' },
+
+  // ── RARAS (coste 2) ──────────────────────────────────────────────────────
+  mordisco:   { id: 'mordisco',  name: 'Bite',        emoji: '🦷', cost: 2, dmg: 1.85, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
+                desc: 'Sinks its fangs in for strong single-target damage.' },
   aullido:    { id: 'aullido',   name: 'Howl',        emoji: '🌙', cost: 2, dmg: 0.70, shield: 0.85, heal: 0.00, type: 'hybrid', rarity: 'rare',
                 desc: 'Strikes and shields at once. Solid all-rounder.' },
   lamer:      { id: 'lamer',     name: 'Lick Wounds', emoji: '💚', cost: 2, dmg: 0.00, shield: 0.00, heal: 0.95, type: 'heal', rarity: 'rare',
                 desc: 'Licks its wounds and recovers a chunk of HP.' },
-  colazo:     { id: 'colazo',    name: 'Tail Whip',   emoji: '🌀', cost: 1, dmg: 0.65, shield: 0.45, heal: 0.00, type: 'hybrid', rarity: 'common',
-                desc: 'Cheap poke that also chips in a little shield.' }
+  colmillo:   { id: 'colmillo',  name: 'Venom Fang',  emoji: '🟢', cost: 2, dmg: 0.90, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
+                applies: 'poison',
+                desc: 'Poisons the rival: damage every turn that ignores shields.' },
+  sacudida:   { id: 'sacudida',  name: 'Head Slam',   emoji: '💫', cost: 2, dmg: 1.20, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
+                applies: 'stun',
+                desc: 'Dazes the rival: they get 1 less energy next turn.' },
+  espinas:    { id: 'espinas',   name: 'Bristle',     emoji: '🦔', cost: 2, dmg: 0.00, shield: 1.10, heal: 0.00, type: 'defense', rarity: 'rare',
+                self: 'thorns',
+                desc: 'Shield plus thorns: returns part of the damage you take.' },
+  siesta:     { id: 'siesta',    name: 'Cat Nap',     emoji: '😴', cost: 2, dmg: 0.00, shield: 0.40, heal: 0.35, type: 'heal', rarity: 'rare',
+                self: 'regen',
+                desc: 'Rests up: small shield and healing over the next turns.' },
+  robavida:   { id: 'robavida',  name: 'Leech Bite',  emoji: '🩸', cost: 2, dmg: 1.15, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
+                lifesteal: 0.5,
+                desc: 'Heals you for half of the damage it deals.' },
+
+  // ── ÉPICAS (coste 3) ─────────────────────────────────────────────────────
+  embestida:  { id: 'embestida', name: 'Charge',      emoji: '💥', cost: 3, dmg: 2.90, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
+                desc: 'A full-power body slam. Huge damage, all your energy.' },
+  furia:      { id: 'furia',     name: 'Frenzy',      emoji: '🔥', cost: 3, dmg: 2.20, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
+                applies: 'weak', self: 'focus',
+                desc: 'Wild assault: weakens the rival and sharpens your next hit.' },
+  muralla:    { id: 'muralla',   name: 'Bulwark',     emoji: '🧱', cost: 3, dmg: 0.00, shield: 2.60, heal: 0.30, type: 'defense', rarity: 'epic',
+                self: 'thorns',
+                desc: 'A wall of fur: huge shield, some healing and thorns.' },
+  colmillos:  { id: 'colmillos', name: 'Savage Maul', emoji: '🦴', cost: 3, dmg: 1.90, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
+                applies: 'poison', lifesteal: 0.35,
+                desc: 'Poisons and drains: damage over time plus life steal.' },
+  segundoaire:{ id: 'segundoaire', name: 'Second Wind', emoji: '🌬️', cost: 3, dmg: 0.00, shield: 0.70, heal: 1.60, type: 'heal', rarity: 'epic',
+                self: 'regen',
+                desc: 'Big heal, a shield and regeneration. The comeback card.' },
+  aluvion:    { id: 'aluvion',   name: 'Barrage',     emoji: '⚡', cost: 3, dmg: 1.60, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
+                applies: 'stun', energyNext: 1,
+                desc: 'Stuns the rival and leaves you 1 extra energy next turn.' }
 };
 const BATTLE_CARD_IDS = Object.keys(BATTLE_CARDS);
+
+// ── COMBOS ─────────────────────────────────────────────────────────────────
+// Jugar ciertas combinaciones EN EL MISMO TURNO da una bonificación. Es lo que
+// premia planear la mano en vez de tirar siempre la carta más cara.
+const BATTLE_COMBOS = [
+  { id: 'cazador',  name: 'Hunter',      emoji: '🎯', need: ['olfatear', 'mordisco'],  dmgMult: 1.35,
+    desc: 'Sniff Out + Bite: the killing blow lands 35% harder.' },
+  { id: 'fortaleza',name: 'Fortress',    emoji: '🏰', need: ['guardia', 'espinas'],    shieldMult: 1.40,
+    desc: 'Guard + Bristle: shields stack 40% stronger.' },
+  { id: 'ponzoña',  name: 'Plague',      emoji: '☠️', need: ['colmillo', 'colazo'],    poisonBoost: 2,
+    desc: 'Venom Fang + Tail Whip: the poison lasts 2 extra turns.' },
+  { id: 'vampiro',  name: 'Bloodthirst', emoji: '🧛', need: ['robavida', 'zarpazo'],   lifestealBonus: 0.35,
+    desc: 'Leech Bite + Claw: steals a lot more life.' },
+  { id: 'berserk',  name: 'Berserk',     emoji: '😤', need: ['gruñido', 'zarpazo', 'colazo'], dmgMult: 1.5,
+    desc: 'Growl + Claw + Tail Whip: three cheap cards become a storm.' }
+];
+
+/** Combos completos dentro de las cartas jugadas este turno. */
+function combosActivos(idsJugados) {
+  const set = new Set(idsJugados);
+  return BATTLE_COMBOS.filter(c => c.need.every(n => set.has(n)));
+}
 
 // Datos de la carta para el cliente. Si se pasa un jugador, se incluyen los
 // valores REALES (daño/escudo/cura) calculados con su ataque, para mostrarlos
@@ -9660,12 +10144,81 @@ function cartaPublica(id, jugador) {
     id: c.id, name: c.name, emoji: c.emoji, cost: c.cost,
     type: c.type, rarity: c.rarity, desc: c.desc
   };
+  // Efectos, para que el cliente los pinte como etiquetas en la carta.
+  if (c.applies)    out.applies    = c.applies;
+  if (c.self)       out.self       = c.self;
+  if (c.lifesteal)  out.lifesteal  = c.lifesteal;
+  if (c.energyNext) out.energyNext = c.energyNext;
   if (jugador && typeof jugador.attack === 'number') {
     out.dmg = c.dmg ? Math.round(jugador.attack * c.dmg) : 0;
     out.shield = c.shield ? Math.round(jugador.attack * c.shield) : 0;
     out.heal = c.heal ? Math.round(jugador.attack * c.heal) : 0;
   }
   return out;
+}
+
+// ── ESTADOS: aplicar, avanzar y consultar ──────────────────────────────────
+function iniciarEstados(p) {
+  if (!p.estados) p.estados = {};   // { poison: turnosRestantes, ... }
+  if (typeof p.energiaExtra !== 'number') p.energiaExtra = 0;
+  if (typeof p.energiaBanco  !== 'number') p.energiaBanco = 0;
+}
+
+function aplicarEstado(p, estado, turnosExtra = 0) {
+  if (!estado || !BATTLE_STATUS_TURNS[estado]) return;
+  iniciarEstados(p);
+  const dur = BATTLE_STATUS_TURNS[estado] + turnosExtra;
+  // Se refresca la duración (no se acumula sin límite).
+  p.estados[estado] = Math.max(p.estados[estado] || 0, dur);
+}
+
+function tieneEstado(p, estado) {
+  return !!(p.estados && p.estados[estado] > 0);
+}
+
+/**
+ * Resuelve los estados al INICIO del turno: veneno y regeneración.
+ * Devuelve el texto de lo que pasó, para el registro de la batalla.
+ */
+function tickEstados(p) {
+  iniciarEstados(p);
+  const notas = [];
+
+  if (p.estados.poison > 0) {
+    // El veneno ignora el escudo a propósito: es la vía para castigar a quien
+    // se limita a cubrirse todos los turnos.
+    const dano = Math.max(1, Math.round(p.maxHp * 0.05));
+    p.hp = Math.max(0, p.hp - dano);
+    notas.push(`🟢 ${p.petName} takes ${dano} poison`);
+  }
+  if (p.estados.regen > 0) {
+    const cura = Math.max(1, Math.round(p.maxHp * 0.06));
+    p.hp = Math.min(p.maxHp, p.hp + cura);
+    notas.push(`💚 ${p.petName} regenerates ${cura}`);
+  }
+
+  // Se descuenta un turno a todos los estados activos.
+  for (const k of Object.keys(p.estados)) {
+    if (p.estados[k] > 0) p.estados[k]--;
+    if (p.estados[k] <= 0) delete p.estados[k];
+  }
+  return notas;
+}
+
+/** Energía de la que dispone este turno (base + banco + extra − aturdimiento). */
+function energiaDelTurno(p) {
+  iniciarEstados(p);
+  let e = BATTLE_ENERGY_PER_TURN + (p.energiaBanco || 0) + (p.energiaExtra || 0);
+  if (tieneEstado(p, 'stun')) e -= 1;
+  return Math.max(1, e);   // nunca se queda sin poder jugar nada
+}
+
+/** Lista de estados activos para el cliente. */
+function estadosPublicos(p) {
+  if (!p.estados) return [];
+  return Object.entries(p.estados)
+    .filter(([, t]) => t > 0)
+    .map(([id, turnos]) => ({ id, turnos }));
 }
 
 function repartirMano() {
@@ -9684,80 +10237,155 @@ function repartirMano() {
   return mano;
 }
 
-// Valida la jugada del cliente: índices reales de su mano y energía suficiente
-function validarJugada(mano, indices) {
+// Valida la jugada del cliente: índices reales de su mano y energía suficiente.
+// El tope de energía ya NO es fijo: depende del banco, del aturdimiento y de
+// las cartas que dan energía extra (energiaDelTurno).
+function validarJugada(mano, indices, jugador) {
   const usados = new Set();
   const cartas = [];
   let energia = 0;
+  const tope = jugador ? energiaDelTurno(jugador) : BATTLE_ENERGY_PER_TURN;
 
   (Array.isArray(indices) ? indices : []).forEach(i => {
     const idx = parseInt(i, 10);
     if (isNaN(idx) || idx < 0 || idx >= mano.length || usados.has(idx)) return;
     const carta = BATTLE_CARDS[mano[idx]];
     if (!carta) return;
-    if (energia + carta.cost > BATTLE_ENERGY_PER_TURN) return; // no cabe
+    if (energia + carta.cost > tope) return; // no cabe
     usados.add(idx);
     energia += carta.cost;
     cartas.push(carta);
   });
 
-  return { cartas, indices: [...usados], energia };
+  // La energía que no se gasta se guarda para el turno siguiente (con tope).
+  // Así "pasar" tiene sentido táctico en vez de ser siempre malo.
+  if (jugador) {
+    jugador.energiaBanco = Math.min(BATTLE_MAX_ENERGY_BANK, tope - energia);
+  }
+
+  return { cartas, indices: [...usados], energia, tope };
 }
 
 // El bot juega: gasta toda la energía que pueda, priorizando curarse si está
 // bajo de vida y atacando fuerte cuanto más difícil es la ronda.
+// Ahora también valora los estados y busca combos.
 function elegirCartasBot(bot, mano) {
   const vidaBaja = bot.hp / bot.maxHp < 0.35;
-  const orden = [...mano.keys()].sort((i, j) => {
-    const ci = BATTLE_CARDS[mano[i]], cj = BATTLE_CARDS[mano[j]];
-    const valor = (c) => (vidaBaja ? c.heal * 3 + c.shield * 2 + c.dmg : c.dmg * (1 + (bot.astucia || 0.2)) + c.shield * 0.8 + c.heal);
-    return valor(cj) - valor(ci);
-  });
+  const astucia  = bot.astucia || 0.2;
 
+  const valor = (c) => {
+    let v = vidaBaja
+      ? c.heal * 3 + c.shield * 2 + c.dmg
+      : c.dmg * (1 + astucia) + c.shield * 0.8 + c.heal;
+    // Los estados valen más cuanto más listo es el bot (rondas altas).
+    if (c.applies === 'poison') v += 0.9 * (1 + astucia);
+    if (c.applies === 'stun')   v += 0.7 * (1 + astucia);
+    if (c.applies === 'weak')   v += 0.5 * (1 + astucia);
+    if (c.self === 'regen' && vidaBaja) v += 1.2;
+    if (c.self === 'thorns')    v += 0.4;
+    if (c.self === 'focus')     v += 0.5 * astucia;
+    if (c.lifesteal)            v += c.lifesteal * (vidaBaja ? 1.6 : 0.8);
+    if (c.energyNext)           v += 0.6;
+    return v;
+  };
+
+  const orden = [...mano.keys()].sort((i, j) => valor(BATTLE_CARDS[mano[j]]) - valor(BATTLE_CARDS[mano[i]]));
+
+  const tope = energiaDelTurno(bot);
   const elegidas = [];
   let energia = 0;
   orden.forEach(i => {
     const c = BATTLE_CARDS[mano[i]];
-    if (energia + c.cost <= BATTLE_ENERGY_PER_TURN) {
+    if (energia + c.cost <= tope) {
       elegidas.push(i);
       energia += c.cost;
     }
   });
+  bot.energiaBanco = Math.min(BATTLE_MAX_ENERGY_BANK, tope - energia);
   return elegidas;
 }
 
-// Resuelve el turno con las cartas de ambos lados.
-// Devuelve { dmgToA, dmgToB, curaA, curaB, escudoA, escudoB, texto }
+// Resuelve el turno con las cartas de ambos lados, ya con estados y combos.
+// Devuelve { dmgToA, dmgToB, curaA, curaB, escudoA, escudoB, texto, combos… }
 function resolverCartas(a, b, cartasA, cartasB) {
   const azar = (v) => Math.max(0, Math.round(v * (0.9 + Math.random() * 0.2)));
+  iniciarEstados(a); iniciarEstados(b);
 
-  const sumar = (jugador, cartas) => cartas.reduce((acc, c) => ({
-    dmg: acc.dmg + azar(jugador.attack * c.dmg),
-    shield: acc.shield + azar(jugador.attack * c.shield),
-    heal: acc.heal + azar(jugador.attack * c.heal)
-  }), { dmg: 0, shield: 0, heal: 0 });
+  // Suma de una mano, aplicando sus propios modificadores.
+  const sumar = (jugador, rival, cartas) => {
+    const combos = combosActivos(cartas.map(c => c.id));
+    const dmgMult    = combos.reduce((m, c) => m * (c.dmgMult    || 1), 1);
+    const shieldMult = combos.reduce((m, c) => m * (c.shieldMult || 1), 1);
+    const lifeBonus  = combos.reduce((s, c) => s + (c.lifestealBonus || 0), 0);
+    const venenoExtra= combos.reduce((s, c) => s + (c.poisonBoost   || 0), 0);
 
-  const A = sumar(a, cartasA);
-  const B = sumar(b, cartasB);
+    // 'focus' venía de un turno anterior: potencia el ataque de ESTE turno.
+    const focusMult = tieneEstado(jugador, 'focus') ? 1.5 : 1;
+    // 'weak' lo puso el rival: pega menos.
+    const weakMult  = tieneEstado(jugador, 'weak') ? 0.65 : 1;
+
+    let dmg = 0, shield = 0, heal = 0, lifesteal = 0, energyNext = 0;
+    for (const c of cartas) {
+      dmg    += azar(jugador.attack * c.dmg);
+      shield += azar(jugador.attack * c.shield);
+      heal   += azar(jugador.attack * c.heal);
+      if (c.lifesteal)  lifesteal = Math.max(lifesteal, c.lifesteal + lifeBonus);
+      if (c.energyNext) energyNext += c.energyNext;
+      // Estados que la carta pone AL RIVAL o A UNO MISMO (para el turno que viene)
+      if (c.applies) aplicarEstado(rival, c.applies, c.applies === 'poison' ? venenoExtra : 0);
+      if (c.self)    aplicarEstado(jugador, c.self);
+    }
+
+    dmg    = Math.round(dmg * dmgMult * focusMult * weakMult);
+    shield = Math.round(shield * shieldMult);
+    return { dmg, shield, heal, lifesteal, energyNext, combos };
+  };
+
+  const A = sumar(a, b, cartasA);
+  const B = sumar(b, a, cartasB);
 
   // El escudo del rival absorbe daño de ESTE turno
   const dmgToB = Math.max(0, A.dmg - B.shield);
   const dmgToA = Math.max(0, B.dmg - A.shield);
 
+  // Robo de vida sobre el daño REALMENTE hecho
+  const roboA = A.lifesteal ? Math.round(dmgToB * A.lifesteal) : 0;
+  const roboB = B.lifesteal ? Math.round(dmgToA * B.lifesteal) : 0;
+
+  // Espinas: devuelve el 25% del daño recibido, saltándose el escudo del que pega
+  const espinasA = tieneEstado(a, 'thorns') ? Math.round(dmgToA * 0.25) : 0;
+  const espinasB = tieneEstado(b, 'thorns') ? Math.round(dmgToB * 0.25) : 0;
+
+  // Energía guardada para el turno siguiente
+  a.energiaExtra = A.energyNext;
+  b.energiaExtra = B.energyNext;
+
   const nombres = (cartas) => cartas.length
     ? cartas.map(c => `${c.emoji} ${c.name}`).join(' + ')
     : 'nothing (no energy spent)';
 
+  const textoCombos = (combos, quien) =>
+    combos.length ? `  ${combos.map(c => `${c.emoji} ${quien} COMBO: ${c.name}!`).join(' ')}` : '';
+
   const texto =
     `${a.petName}: ${nombres(cartasA)} → ${dmgToB} dmg` +
-    (A.heal ? ` (+${A.heal} HP)` : '') +
+    (A.heal ? ` (+${A.heal} HP)` : '') + (roboA ? ` (drains ${roboA})` : '') +
+    textoCombos(A.combos, a.petName) +
     `  |  ${b.petName}: ${nombres(cartasB)} → ${dmgToA} dmg` +
-    (B.heal ? ` (+${B.heal} HP)` : '');
+    (B.heal ? ` (+${B.heal} HP)` : '') + (roboB ? ` (drains ${roboB})` : '') +
+    textoCombos(B.combos, b.petName) +
+    (espinasA ? `  🦔 ${b.petName} takes ${espinasA} from thorns` : '') +
+    (espinasB ? `  🦔 ${a.petName} takes ${espinasB} from thorns` : '');
 
   return {
-    dmgToA, dmgToB,
-    curaA: A.heal, curaB: B.heal,
+    // El daño de espinas se suma al del rival correspondiente
+    dmgToA: dmgToA + espinasB,
+    dmgToB: dmgToB + espinasA,
+    curaA: A.heal + roboA,
+    curaB: B.heal + roboB,
     escudoA: A.shield, escudoB: B.shield,
+    combosA: A.combos.map(c => ({ id: c.id, name: c.name, emoji: c.emoji })),
+    combosB: B.combos.map(c => ({ id: c.id, name: c.name, emoji: c.emoji })),
     texto
   };
 }
@@ -9904,6 +10532,22 @@ function startBattleTurn(match) {
   match.actions = { a: null, b: null };
   match.turn += 1;
 
+  // ── ESTADOS AL INICIO DEL TURNO ─────────────────────────────────────────
+  // Veneno y regeneración se resuelven ANTES de repartir. Si alguien cae por
+  // el veneno, la batalla termina aquí sin repartir mano.
+  const notasEstado = [...tickEstados(match.a), ...tickEstados(match.b)];
+  if (match.a.hp <= 0 || match.b.hp <= 0) {
+    const ganador = match.a.hp <= 0 && match.b.hp <= 0 ? null : (match.a.hp <= 0 ? 'b' : 'a');
+    ['a', 'b'].forEach(k => {
+      const p = match[k];
+      if (p && p.socket && notasEstado.length) {
+        p.socket.emit('battle:status', { turn: match.turn, notes: notasEstado });
+      }
+    });
+    endBattle(match, ganador, 'poison');
+    return;
+  }
+
   // Mano nueva para cada uno en cada turno
   match.hands = { a: repartirMano(), b: repartirMano() };
 
@@ -9914,10 +10558,18 @@ function startBattleTurn(match) {
         matchId: match.id,
         turn: match.turn,
         msToChoose: BATTLE_TURN_MS,
-        energy: BATTLE_ENERGY_PER_TURN,
+        // Energía REAL de este turno: base + banco + extra − aturdimiento.
+        energy: energiaDelTurno(p),
+        energyBase: BATTLE_ENERGY_PER_TURN,
+        energyBank: p.energiaBanco || 0,
         // Cada carta lleva ya sus valores reales para ESTE jugador (según su
         // ataque), así la UI muestra "Deal 24 / Shield 15" como en Axie.
         hand: match.hands[key].map(cid => cartaPublica(cid, p)),
+        // Estados activos de los dos lados, para pintarlos como iconos.
+        statusYou:   estadosPublicos(p),
+        statusRival: estadosPublicos(match[key === 'a' ? 'b' : 'a']),
+        statusNotes: notasEstado,
+        combos: BATTLE_COMBOS.map(c => ({ id: c.id, name: c.name, emoji: c.emoji, need: c.need, desc: c.desc })),
         you: battlePublicPlayer(p),
         rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
       });
@@ -9942,8 +10594,10 @@ async function resolveBattleTurn(match) {
   if (match.ended) return;
   clearBattleTurnTimer(match);
 
-  const jugadaA = validarJugada(match.hands.a, match.actions.a || []);
-  const jugadaB = validarJugada(match.hands.b, match.actions.b || []);
+  // Se pasa el jugador para que el tope de energía sea el REAL de este turno
+  // (con banco, energía extra y aturdimiento) y para guardar lo no gastado.
+  const jugadaA = validarJugada(match.hands.a, match.actions.a || [], match.a);
+  const jugadaB = validarJugada(match.hands.b, match.actions.b || [], match.b);
 
   const res = resolverCartas(match.a, match.b, jugadaA.cartas, jugadaB.cartas);
   const { dmgToA, dmgToB, texto } = res;
@@ -9968,6 +10622,11 @@ async function resolveBattleTurn(match) {
       shieldYou: key === 'a' ? res.escudoA : res.escudoB,
       shieldRival: key === 'a' ? res.escudoB : res.escudoA,
       log: texto,
+      // Combos y estados, para que la UI los pueda anunciar.
+      combosYou:   key === 'a' ? res.combosA : res.combosB,
+      combosRival: key === 'a' ? res.combosB : res.combosA,
+      statusYou:   estadosPublicos(p),
+      statusRival: estadosPublicos(rivalP),
       you: battlePublicPlayer(p),
       rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
     });
@@ -10084,6 +10743,19 @@ async function tryBattleMatchmaking() {
       construirJugadorDeSocket(sa),
       construirJugadorDeSocket(sb)
     ]);
+
+    // NUNCA emparejar a alguien consigo mismo. Pasa con dos pestañas abiertas
+    // (o al reconectar dejando el socket viejo en la cola): la partida salía
+    // "jugador vs jugador" pero el rival era uno mismo, con el nombre por
+    // defecto de la mascota, y parecía una batalla contra un bot.
+    if (a.playerName && a.playerName === b.playerName) {
+      console.log(`↩️  Cola: ${a.playerName} estaba dos veces; se descarta el socket viejo`);
+      // Se conserva el más reciente (sb) y se descarta el anterior.
+      try { sa.emit('battle:error', { error: 'duplicate_session' }); } catch (_) {}
+      battleQueue.unshift(sb);
+      continue;
+    }
+
     const match = {
       id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       a, b, turn: 0, ended: false, esBot: false,
@@ -10099,6 +10771,9 @@ async function tryBattleMatchmaking() {
       const p = match[key];
       p.socket.emit('battle:matched', {
         matchId: match.id,
+        // Se marca explícitamente el modo: así el cliente puede rechazar una
+        // partida que no sea la que pidió.
+        mode: 'pvp',
         you: battlePublicPlayer(p),
         rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
       });
