@@ -417,17 +417,38 @@ const SECURITY_CONFIG = {
     '66.132.153.126',
     '62.60.131.239'
   ] : [],
+  // Rutas REALES de esta API. Nunca son un escaneo, por mucho que su texto
+  // se parezca a un patrón sospechoso. Se comprueban ANTES que la lista de
+  // abajo (ver isSuspiciousPath).
+  //
+  // Por qué existe esto: la detección usa `includes()`, así que el patrón
+  // '/admin' marcaba como escáner a '/api/admin/whoami', '/api/admin/players'
+  // y '/api/admin/missions/...'. Abrir el panel de administración disparaba
+  // cinco "rutas sospechosas" en segundos y el sistema BLOQUEABA la IP del
+  // propio administrador.
+  SAFE_OWN_PATHS: [
+    '/api/admin/',        // panel de jugadores y editor de misiones
+    '/api/auth/',
+    '/api/relay/',
+    '/api/stats/',
+    '/api/security/',
+    '/api/access'
+  ],
   SUSPICIOUS_PATHS: [
     '/..', '/../', '/../../',
     '/.env', '/.git', '/.git/config',
     '/etc/passwd', '/etc/shadow',
     '/wp-admin', '/wp-login',
-    '/admin', '/administrator',
+    '/administrator',
     '/phpmyadmin', '/mysql',
     '/config', '/backup',
     '/shell', '/cmd',
-    '/api/v1/users/search',
-    'favicon.ico'
+    '/api/v1/users/search'
+    // 'favicon.ico' se quitó: TODOS los navegadores lo piden solos al abrir
+    //   una página. Contarlo como escaneo penalizaba a usuarios normales.
+    // '/admin' se quitó como patrón suelto: lo cubren '/wp-admin' y
+    //   '/administrator', que sí son sondas reales, sin arrastrar nuestras
+    //   propias rutas /api/admin/*.
   ],
   SUSPICIOUS_USER_AGENTS: [
     'nmap', 'nikto', 'sqlmap', 'hydra', 'metasploit',
@@ -1837,10 +1858,27 @@ class SecurityController {
     const ip = req.clientIp || req.ip;
     const path = req.path;
     const userAgent = req.headers['user-agent'] || '';
-    
+
     if (!ip || ip === 'undefined' || ip === '::1' || ip === '::ffff:127.0.0.1') {
       return next();
     }
+
+    // ── PUERTA DE ESCAPE DEL ADMINISTRADOR ───────────────────────────────────
+    // Si la petición trae una sesión válida de una cartera ADMIN, se deja pasar
+    // sin analizar. Sin esto se daba una situación sin salida: el sistema
+    // bloqueaba la IP del administrador, y para desbloquearla hay que llamar a
+    // /api/security/unblock-ip… que está detrás del mismo bloqueo.
+    // Un atacante no puede aprovecharlo: haría falta la firma de una cartera
+    // que ya sea admin.
+    try {
+      const ses = req.cookies && req.cookies.session;
+      if (ses) {
+        const dec = jwt.verify(ses, JWT_SECRET, { algorithms: ['HS256'] });
+        if (dec && dec.address && await isAdminAddressCached(dec.address)) {
+          return next();
+        }
+      }
+    } catch (_) { /* sin sesión o inválida: sigue el análisis normal */ }
     
     // En desarrollo, permitir todo a IPs locales
     if (NODE_ENV === 'development') {
@@ -1920,15 +1958,27 @@ class SecurityController {
 
   isSuspiciousPath(path) {
     const normalizedPath = path.toLowerCase();
-    
+
+    // 1. El recorrido de directorios se mira SIEMPRE, incluso dentro de
+    //    nuestras propias rutas: eso nunca es legítimo.
+    if (normalizedPath.includes('..') || normalizedPath.includes('%2e%2e')) {
+      return true;
+    }
+
+    // 2. Rutas propias de esta API: no son un escaneo. Va antes de la lista de
+    //    patrones porque la comparación es por `includes()` y un patrón corto
+    //    como '/admin' arrastraba a '/api/admin/whoami' (y bloqueaba al
+    //    administrador nada más abrir su panel).
+    for (const propia of (SECURITY_CONFIG.SAFE_OWN_PATHS || [])) {
+      if (normalizedPath.startsWith(propia.toLowerCase())) {
+        return false;
+      }
+    }
+
     for (const pattern of SECURITY_CONFIG.SUSPICIOUS_PATHS) {
       if (normalizedPath.includes(pattern.toLowerCase())) {
         return true;
       }
-    }
-    
-    if (normalizedPath.includes('..') || normalizedPath.includes('%2e%2e')) {
-      return true;
     }
     
     const dangerousExtensions = ['.php', '.asp', '.aspx', '.jsp', '.pl', '.cgi', '.sh'];
