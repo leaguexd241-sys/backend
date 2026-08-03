@@ -4544,6 +4544,11 @@ io.on("connection", (socket) => {
       x: 0,
       y: 0,
       username: username || '---',
+      // Identidad REAL del socket (no la que diga el cliente): la usa el
+      // submenú de jugador (perfil / verificador / reporte) para saber a quién
+      // se está señalando sin que nadie pueda suplantar a otro.
+      address:    socket.authenticatedAddress || null,
+      playerName: socket.authenticatedPlayer  || null,
       direction: 'right',
       directionx: 'stop_right',
       // Nivel del personaje y de la mascota ya desde el JOIN.
@@ -4575,9 +4580,15 @@ io.on("connection", (socket) => {
       ...rooms[room][socket.id],
       ...data,
       isMoving: data.isMoving || false,
+      // La identidad NO se toma de `data`: si no, cualquiera podría mandar
+      // otra address/playerName en playerMove y suplantar a otro jugador en el
+      // submenú de perfil/reporte.
+      id:         socket.id,
+      address:    socket.authenticatedAddress || rooms[room][socket.id].address || null,
+      playerName: socket.authenticatedPlayer  || rooms[room][socket.id].playerName || null,
       lastUpdate: Date.now()
     };
-    
+
     socket.to(room).emit("playerMoved", rooms[room][socket.id]);
   });
 
@@ -6081,11 +6092,20 @@ app.post('/api/tree/deforestation',
 // Configuración de tipos de árbol (debe coincidir con el frontend)
 // -----------------------------------------------------------------------------
 
+// RESPAWN (ajuste 2026-08-03): antes cada árbol quedaba 300 s (5 min) bloqueado
+// y, si la deforestación global llegaba al 100 %, se bloqueaba hasta el año
+// 3000 — literalmente siglos. Ahora el respawn base es de 60 s y el 100 % de
+// deforestación solo aplica una penalización TEMPORAL (RESPAWN_MAX_SECONDS),
+// nunca un bloqueo permanente.
 const TREE_TYPE_CONFIG = {
-  pinos:     { baseRespawn: 300, respawnMultiplier: 0 },   // 300 segundos = 5 minutos
-  arbustos:  { baseRespawn: 300, respawnMultiplier: 0 },
-  arbolx:    { baseRespawn: 300, respawnMultiplier: 0 }
+  pinos:     { baseRespawn: 60, respawnMultiplier: 0 },   // 60 segundos = 1 minuto
+  arbustos:  { baseRespawn: 60, respawnMultiplier: 0 },
+  arbolx:    { baseRespawn: 60, respawnMultiplier: 0 }
 };
+
+// Tope duro del respawn (en segundos). Ningún nodo — árbol o mineral — puede
+// quedar bloqueado más que esto, pase lo que pase con los porcentajes globales.
+const RESPAWN_MAX_SECONDS = 300; // 5 minutos como máximo absoluto
 
 // -----------------------------------------------------------------------------
 // Endpoint para bloquear un árbol (ya NO recibe lockedUntil del cliente)
@@ -6115,13 +6135,13 @@ app.post('/api/tree/lock',
         return res.status(400).json({ error: 'Tipo de árbol no válido' });
       }
 
-      let lockedUntil;
-      if (percent >= 100) {
-        lockedUntil = new Date('3000-01-01T00:00:00.000Z'); // bloqueo permanente
-      } else {
-        const respawnSeconds = config.baseRespawn + (percent * config.respawnMultiplier);
-        lockedUntil = new Date(Date.now() + respawnSeconds * 1000);
-      }
+      // Deforestación al 100 % ya NO bloquea el árbol para siempre: solo lo
+      // penaliza con el respawn máximo. Un bloqueo permanente dejaba el mapa
+      // muerto y era lo que el jugador veía como "siglos de respawn".
+      let respawnSeconds = config.baseRespawn + (percent * config.respawnMultiplier);
+      if (percent >= 100) respawnSeconds = RESPAWN_MAX_SECONDS;
+      respawnSeconds = Math.min(RESPAWN_MAX_SECONDS, Math.max(5, respawnSeconds));
+      const lockedUntil = new Date(Date.now() + respawnSeconds * 1000);
 
       await TreeLock.findOneAndUpdate(
         { treeKey },
@@ -6170,10 +6190,10 @@ app.get('/api/tree/deforestation/:treeType',
 // CONFIGURACIÓN DE TIPOS DE MINERAL (debe coincidir con el frontend)
 // -----------------------------------------------------------------------------
 const MINERAL_TYPE_CONFIG = {
-  piedra: { baseRespawn: 300, respawnMultiplier: 0 },   // 300s = 5 min
-  cobre:  { baseRespawn: 300, respawnMultiplier: 0 },
-  hierro: { baseRespawn: 300, respawnMultiplier: 0 },
-  carbon: { baseRespawn: 300, respawnMultiplier: 0 }
+  piedra: { baseRespawn: 60, respawnMultiplier: 0 },   // 60s = 1 min (ver RESPAWN_MAX_SECONDS)
+  cobre:  { baseRespawn: 60, respawnMultiplier: 0 },
+  hierro: { baseRespawn: 60, respawnMultiplier: 0 },
+  carbon: { baseRespawn: 60, respawnMultiplier: 0 }
 };
  
  
@@ -6249,15 +6269,13 @@ app.post(
       const depletion = await MineDepletion.findOne({ mineralType });
       const percent   = depletion ? depletion.percent : 0;
  
-      let lockedUntil;
-      if (percent >= 100) {
-        // Bloqueo permanente si el mineral está totalmente agotado
-        lockedUntil = new Date('3000-01-01T00:00:00.000Z');
-      } else {
-        const respawnSeconds = config.baseRespawn + (percent * config.respawnMultiplier);
-        lockedUntil = new Date(Date.now() + respawnSeconds * 1000);
-      }
- 
+      // Igual que con los árboles: el agotamiento al 100 % penaliza con el
+      // respawn máximo, nunca con un bloqueo permanente.
+      let respawnSeconds = config.baseRespawn + (percent * config.respawnMultiplier);
+      if (percent >= 100) respawnSeconds = RESPAWN_MAX_SECONDS;
+      respawnSeconds = Math.min(RESPAWN_MAX_SECONDS, Math.max(5, respawnSeconds));
+      const lockedUntil = new Date(Date.now() + respawnSeconds * 1000);
+
       await MineLock.findOneAndUpdate(
         { mineKey },
         { mineralType, lockedUntil },
@@ -6416,17 +6434,34 @@ const GATHER_TIPOS = new Set(Object.values(GATHER_REWARD_TIPO));
 
 // El servidor decide la recompensa (misma idea que el cliente, pero autoritativa):
 // herramienta baja (madera) → menos probabilidad; alta → +cantidad. Puede dar 0.
+// BOTÍN 1-3 POR SUERTE (2026-08-03): talar un árbol o picar un mineral entrega
+// entre 1 y 3 unidades. La herramienta inclina la suerte (mejor herramienta =
+// más probabilidad de 2 o 3), pero el rango sigue siendo 1..3 en todos los
+// casos. Debe coincidir con rollGatherAmount() del cliente (GameScene.js).
+function rollGatherAmount(toolId) {
+  const t = String(toolId || '').toLowerCase();
+  // [prob de 1, prob de 2, prob de 3]
+  let pesos = [0.70, 0.25, 0.05];              // sin herramienta reconocida
+  if (t.includes('_madera'))      pesos = [0.70, 0.25, 0.05];
+  else if (t.includes('_piedra')) pesos = [0.55, 0.33, 0.12];
+  else if (t.includes('_cobre'))  pesos = [0.42, 0.38, 0.20];
+  else if (t.includes('_hierro')) pesos = [0.30, 0.40, 0.30];
+
+  const r = Math.random();
+  if (r < pesos[0]) return 1;
+  if (r < pesos[0] + pesos[1]) return 2;
+  return 3;
+}
+
 function decideGatherReward(nodeType, toolId) {
   const tipo = GATHER_REWARD_TIPO[nodeType];
   if (!tipo) return { tipo: null, quantity: 0 };
   const t = String(toolId || '').toLowerCase();
-  let prob = 1.0, qty = 1;
-  if (t.includes('_madera'))      { prob = 0.6; }
-  else if (t.includes('_piedra')) { prob = 1.0; }
-  else if (t.includes('_cobre'))  { prob = 1.0; if (Math.random() < 0.20) qty += 1; }
-  else if (t.includes('_hierro')) { prob = 1.0; if (Math.random() < 0.40) qty += 1; }
+  // La herramienta de madera todavía puede fallar del todo; las demás siempre
+  // dan algo. Cuando da, la cantidad es 1-3 según la suerte.
+  const prob = t.includes('_madera') ? 0.6 : 1.0;
   if (Math.random() > prob) return { tipo, quantity: 0 }; // falló (herramienta baja)
-  return { tipo, quantity: qty };
+  return { tipo, quantity: rollGatherAmount(toolId) };
 }
 
 function gatherGasPrice() {
@@ -6520,7 +6555,8 @@ app.post('/api/gather/claim',
       _gatherLastByPlayer.set(address, now);
 
       // El nodo no debe estar ya bloqueado (en respawn).
-      const respawnSec = 300;
+      // 60 s, igual que TREE_TYPE_CONFIG / MINERAL_TYPE_CONFIG.
+      const respawnSec = 60;
       if (node.kind === 'tree') {
         const lock = await TreeLock.findOne({ treeKey: nodeKey });
         if (lock && lock.lockedUntil && lock.lockedUntil > new Date()) {
@@ -7830,13 +7866,33 @@ function sanearMisionesDelDia(missions) {
       };
     });
 
-    // El inglés es el idioma de respaldo del juego: si falta, se rellena con
-    // lo que haya en español, y si tampoco hay, con el propio itemId.
+    // NOMBRE BONITO POR DEFECTO (2026-08-03): antes, si el administrador no
+    // escribía el nombre visible, se dejaba el identificador crudo y en el
+    // panel del juego salía literalmente "madera_tronco". Ahora el respaldo es
+    // un nombre legible generado a partir del id ("Madera Tronco").
+    const bonito = (id) => String(id || '')
+      .replace(/[_-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/\b\p{L}/gu, c => c.toUpperCase());
+
+    // Se rellena el nombre visible en TODOS los idiomas que lo dejaron vacío,
+    // no solo en inglés: cualquier idioma sin nombre acababa enseñando el id.
+    MISSION_LANGS.forEach(lang => {
+      if (!salida.texts[lang].itemName) {
+        salida.texts[lang].itemName = salida.texts['es-419'].itemName || bonito(itemId);
+      }
+      if (salida.rewardItemId && !salida.texts[lang].rewardName) {
+        salida.texts[lang].rewardName = salida.texts['es-419'].rewardName || bonito(salida.rewardItemId);
+      }
+    });
+
+    // El inglés es el idioma de respaldo del juego: si falta el título, se
+    // rellena con lo que haya en español y, si tampoco hay, con el nombre
+    // legible del ítem (nunca con el identificador crudo).
     if (!salida.texts['en-US'].title) {
-      salida.texts['en-US'].title = salida.texts['es-419'].title || `Bring ${requiredAmount} ${itemId}`;
-    }
-    if (!salida.texts['en-US'].itemName) {
-      salida.texts['en-US'].itemName = salida.texts['es-419'].itemName || itemId;
+      salida.texts['en-US'].title = salida.texts['es-419'].title ||
+        `Bring ${requiredAmount} ${salida.texts['en-US'].itemName || bonito(itemId)}`;
     }
 
     return salida;
@@ -8317,6 +8373,616 @@ app.get('/api/admin/whoami', adminAuth, apiLimiter, (req, res) => {
 });
 
 console.log('✅ Admin players routes: /api/admin/players, /api/admin/overview, /api/admin/whoami');
+
+
+// =============================================================================
+// PERFILES PÚBLICOS, VERIFICADORES Y REPORTES ENTRE JUGADORES  (2026-08-03)
+// -----------------------------------------------------------------------------
+// Da soporte al submenú que sale al hacer CLIC DERECHO sobre otro jugador
+// dentro del juego (Profile / Send verifier / Report) y a la consola de
+// administración `consola-reportes.html`.
+//
+//   GET  /api/player/profile/:key      → ficha pública (key = playerName o 0x…)
+//   POST /api/verifier/send            → manda un verificador a otro jugador
+//   POST /api/verifier/answer          → el jugador responde su verificador
+//   POST /api/reports                  → reportar a un jugador
+//   GET  /api/admin/reports            → [admin] lista de reportes + filtros
+//   GET  /api/admin/reports/:id        → [admin] reporte + ficha del acusado
+//   POST /api/admin/reports/:id/warn   → [admin] advertencia al correo/buzón
+//   POST /api/admin/reports/:id/ban    → [admin] banear la cartera
+//   POST /api/admin/reports/:id/unban  → [admin] quitar el baneo
+//   DELETE /api/admin/reports/:id      → [admin] quitar de la lista sin sanción
+//   GET  /api/admin/verifiers          → [admin] verificadores enviados
+// =============================================================================
+
+// ── Modelos ────────────────────────────────────────────────────────────────
+const playerReportSchema = new mongoose.Schema({
+  reporterAddress: { type: String, required: true, lowercase: true, index: true },
+  reporterName:    { type: String, default: '---' },
+  targetAddress:   { type: String, required: true, lowercase: true, index: true },
+  targetName:      { type: String, default: '---' },
+  reason:          { type: String, required: true },   // categoría
+  details:         { type: String, default: '', maxlength: 1000 },
+  scene:           { type: String, default: '' },
+  posX:            { type: Number, default: 0 },
+  posY:            { type: Number, default: 0 },
+  status:          { type: String, enum: ['pending', 'warned', 'banned', 'dismissed'], default: 'pending', index: true },
+  adminAddress:    { type: String, default: '' },
+  adminNote:       { type: String, default: '', maxlength: 1000 },
+  handledAt:       { type: Date, default: null }
+}, { timestamps: true });
+playerReportSchema.index({ createdAt: -1 });
+playerReportSchema.index({ targetAddress: 1, createdAt: -1 });
+const PlayerReport = mongoose.model('PlayerReport', playerReportSchema);
+
+const verifierSchema = new mongoose.Schema({
+  fromAddress: { type: String, required: true, lowercase: true, index: true },
+  fromName:    { type: String, default: '---' },
+  toAddress:   { type: String, required: true, lowercase: true, index: true },
+  toName:      { type: String, default: '---' },
+  question:    { type: String, required: true },
+  answer:      { type: String, required: true },       // respuesta correcta
+  given:       { type: String, default: '' },          // lo que contestó
+  status:      { type: String, enum: ['sent', 'passed', 'failed', 'expired'], default: 'sent', index: true },
+  expiresAt:   { type: Date, required: true },
+  answeredAt:  { type: Date, default: null }
+}, { timestamps: true });
+verifierSchema.index({ createdAt: -1 });
+const PlayerVerifier = mongoose.model('PlayerVerifier', verifierSchema);
+
+const REPORT_REASONS = [
+  'botting', 'cheating', 'harassment', 'scam', 'spam',
+  'inappropriate_name', 'exploit_abuse', 'other'
+];
+
+// ── Utilidades ─────────────────────────────────────────────────────────────
+
+// Todos los sockets abiertos de una dirección (socket.io v4 expone el Map).
+function socketsOfAddress(address) {
+  const addr = String(address || '').toLowerCase();
+  const out = [];
+  if (!addr) return out;
+  try {
+    for (const s of io.sockets.sockets.values()) {
+      if (String(s.authenticatedAddress || '').toLowerCase() === addr) out.push(s);
+    }
+  } catch (_) {}
+  return out;
+}
+
+// Ficha pública de un jugador a partir de su address o playerName.
+async function buildPlayerProfile(key) {
+  const raw = String(key || '').trim();
+  if (!raw) return null;
+
+  const esDireccion = /^0x[0-9a-f]{40}$/i.test(raw);
+  const gp = esDireccion
+    ? await GamePlayer.findOne({ address: raw.toLowerCase() }).lean()
+    : await GamePlayer.findOne({ playerName: raw }).lean();
+  if (!gp) return null;
+
+  const playerName = gp.playerName;
+  const [tiempo, actividad, skills, pet, stats] = await Promise.all([
+    PlayerPlaytime.findOne({ playerName }).lean().catch(() => null),
+    UserActivity.findOne({ playerName }).lean().catch(() => null),
+    PlayerSkills.findOne({ playerName }).lean().catch(() => null),
+    PlayerPet.findOne({ playerName }).lean().catch(() => null),
+    PlayerStats.findOne({ playerName }).lean().catch(() => null)
+  ]);
+
+  const creado = gp.createdAt ? new Date(gp.createdAt) : null;
+  const antiguedadS = creado ? Math.floor((Date.now() - creado.getTime()) / 1000) : 0;
+  const jugadoS = tiempo ? (tiempo.segundos || 0) : 0;
+
+  // Las skills se devuelven tal cual estén guardadas (el esquema puede variar),
+  // sin campos internos de mongo.
+  let skillsPub = {};
+  if (skills) {
+    skillsPub = { ...skills };
+    delete skillsPub._id; delete skillsPub.__v;
+    delete skillsPub.playerName; delete skillsPub.createdAt; delete skillsPub.updatedAt;
+  }
+
+  return {
+    playerName,
+    username:  gp.Username || '---',
+    address:   gp.address || null,
+    nivel:     gp.nivel || 0,
+    exp:       gp.nivel_exp || 0,
+    mundo:     gp.mundo || '',
+    petName:   (pet && pet.petName) || gp.petName || '---',
+    petLevel:  gp.petLevel || 1,
+    creadoEn:  creado,
+    creadoTexto: creado ? creado.toISOString() : null,
+    antiguedadSegundos: antiguedadS,
+    antiguedad: creado ? formatearDuracion(antiguedadS) : '—',
+    jugadoSegundos: jugadoS,
+    jugado:    formatearDuracion(jugadoS),
+    sesiones:  tiempo ? (tiempo.sesiones || 0) : 0,
+    ultimaVez: tiempo ? tiempo.ultimaVez : (actividad ? actividad.lastLogin : null),
+    loginCount: actividad ? (actividad.loginCount || 0) : 0,
+    skills:    skillsPub,
+    oro:       stats ? (stats.oro || 0) : 0,
+    plata:     stats ? (stats.plata || 0) : 0,
+    online:    socketsOfAddress(gp.address).length > 0
+  };
+}
+
+// ── GET /api/player/profile/:key ───────────────────────────────────────────
+// Ficha pública que abre la opción "Profile" del submenú. Cualquier jugador
+// autenticado puede consultarla; NO devuelve nada sensible (ni correo, ni
+// inventario, ni sesión).
+app.get('/api/player/profile/:key', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const perfil = await buildPlayerProfile(req.params.key);
+    if (!perfil) return res.status(404).json({ error: 'player_not_found' });
+    return res.json({ ok: true, profile: perfil });
+  } catch (e) {
+    console.error('GET /api/player/profile:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── POST /api/verifier/send ────────────────────────────────────────────────
+// "Send verifier": manda al jugador señalado una comprobación rápida de que
+// hay una persona al teclado. Se entrega por socket y queda registrada para
+// que el administrador vea quién la pasó y quién no.
+const _verifierCooldown = new Map(); // address → timestamp
+app.post('/api/verifier/send',
+  apiLimiter,
+  authMiddleware,
+  csrfProtection,
+  [ body('target').isString().notEmpty() ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+      const fromAddress = String(req.user.address || '').toLowerCase();
+      const destino = await buildPlayerProfile(req.body.target);
+      if (!destino || !destino.address) return res.status(404).json({ error: 'player_not_found' });
+      if (destino.address.toLowerCase() === fromAddress) {
+        return res.status(400).json({ error: 'cannot_verify_yourself' });
+      }
+
+      // Un verificador por minuto y por remitente (anti-acoso).
+      const ahora = Date.now();
+      const ultimo = _verifierCooldown.get(fromAddress) || 0;
+      if (ahora - ultimo < 60000) {
+        return res.status(429).json({ error: 'verifier_cooldown', secondsRemaining: Math.ceil((60000 - (ahora - ultimo)) / 1000) });
+      }
+      _verifierCooldown.set(fromAddress, ahora);
+
+      // Reto sencillo pero distinto cada vez.
+      const a = Math.floor(Math.random() * 8) + 2;
+      const b = Math.floor(Math.random() * 8) + 2;
+      const question = `${a} + ${b} = ?`;
+      const answer = String(a + b);
+
+      const yo = await buildPlayerProfile(fromAddress);
+      const doc = await PlayerVerifier.create({
+        fromAddress,
+        fromName: (yo && (yo.username !== '---' ? yo.username : yo.playerName)) || '---',
+        toAddress: destino.address.toLowerCase(),
+        toName: destino.username !== '---' ? destino.username : destino.playerName,
+        question,
+        answer,
+        expiresAt: new Date(ahora + 120000) // 2 minutos para contestar
+      });
+
+      const sockets = socketsOfAddress(destino.address);
+      sockets.forEach(s => {
+        try {
+          s.emit('verifierChallenge', {
+            id: String(doc._id),
+            from: doc.fromName,
+            question,
+            expiresIn: 120
+          });
+        } catch (_) {}
+      });
+
+      return res.json({
+        ok: true,
+        id: String(doc._id),
+        delivered: sockets.length > 0,
+        message: sockets.length > 0
+          ? 'Verifier sent'
+          : 'Verifier registered — the player is offline right now'
+      });
+    } catch (e) {
+      console.error('POST /api/verifier/send:', e);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  }
+);
+
+// ── POST /api/verifier/answer ──────────────────────────────────────────────
+app.post('/api/verifier/answer',
+  apiLimiter,
+  authMiddleware,
+  csrfProtection,
+  [ body('id').isString().notEmpty(), body('answer').isString() ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+      const address = String(req.user.address || '').toLowerCase();
+      const doc = await PlayerVerifier.findById(req.body.id);
+      if (!doc) return res.status(404).json({ error: 'verifier_not_found' });
+      if (doc.toAddress !== address) return res.status(403).json({ error: 'not_your_verifier' });
+      if (doc.status !== 'sent') return res.status(409).json({ error: 'already_answered' });
+
+      const dado = String(req.body.answer || '').trim();
+      const aTiempo = doc.expiresAt.getTime() >= Date.now();
+      doc.given = dado.slice(0, 40);
+      doc.answeredAt = new Date();
+      doc.status = !aTiempo ? 'expired' : (dado === doc.answer ? 'passed' : 'failed');
+      await doc.save();
+
+      socketsOfAddress(doc.fromAddress).forEach(s => {
+        try {
+          s.emit('verifierResult', { id: String(doc._id), player: doc.toName, status: doc.status });
+        } catch (_) {}
+      });
+
+      return res.json({ ok: true, status: doc.status });
+    } catch (e) {
+      console.error('POST /api/verifier/answer:', e);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  }
+);
+
+// ── POST /api/reports ──────────────────────────────────────────────────────
+// Un jugador reporta a otro desde el submenú del juego.
+app.post('/api/reports',
+  apiLimiter,
+  authMiddleware,
+  csrfProtection,
+  [
+    body('target').isString().notEmpty(),
+    body('reason').isString().notEmpty(),
+    body('details').optional().isString().isLength({ max: 1000 })
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+      const reporterAddress = String(req.user.address || '').toLowerCase();
+      const destino = await buildPlayerProfile(req.body.target);
+      if (!destino || !destino.address) return res.status(404).json({ error: 'player_not_found' });
+      if (destino.address.toLowerCase() === reporterAddress) {
+        return res.status(400).json({ error: 'cannot_report_yourself' });
+      }
+
+      const reason = REPORT_REASONS.includes(req.body.reason) ? req.body.reason : 'other';
+
+      // Un mismo jugador no puede reportar al mismo objetivo más de una vez
+      // cada 10 minutos (evita inundar la consola de reportes).
+      const reciente = await PlayerReport.findOne({
+        reporterAddress,
+        targetAddress: destino.address.toLowerCase(),
+        createdAt: { $gte: new Date(Date.now() - 10 * 60000) }
+      }).lean();
+      if (reciente) return res.status(429).json({ error: 'report_cooldown' });
+
+      const yo = await buildPlayerProfile(reporterAddress);
+      const doc = await PlayerReport.create({
+        reporterAddress,
+        reporterName: (yo && (yo.username !== '---' ? yo.username : yo.playerName)) || '---',
+        targetAddress: destino.address.toLowerCase(),
+        targetName: destino.username !== '---' ? destino.username : destino.playerName,
+        reason,
+        details: String(req.body.details || '').slice(0, 1000),
+        scene: String(req.body.scene || '').slice(0, 60),
+        posX: Number(req.body.x) || 0,
+        posY: Number(req.body.y) || 0
+      });
+
+      console.warn(`🚩 Reporte nuevo: ${doc.reporterName} → ${doc.targetName} (${reason})`);
+      return res.json({ ok: true, id: String(doc._id) });
+    } catch (e) {
+      console.error('POST /api/reports:', e);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  }
+);
+
+// ── GET /api/admin/reports ─────────────────────────────────────────────────
+app.get('/api/admin/reports', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim();
+    const q      = String(req.query.q || '').trim();
+    const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 25));
+    const page   = Math.max(1, parseInt(req.query.page, 10) || 1);
+
+    const filtro = {};
+    if (['pending', 'warned', 'banned', 'dismissed'].includes(status)) filtro.status = status;
+    if (q) {
+      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filtro.$or = [
+        { targetAddress: rx }, { targetName: rx },
+        { reporterAddress: rx }, { reporterName: rx },
+        { reason: rx }, { details: rx }
+      ];
+    }
+
+    const [total, docs, counts, ac] = await Promise.all([
+      PlayerReport.countDocuments(filtro),
+      PlayerReport.find(filtro).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+      PlayerReport.aggregate([{ $group: { _id: '$status', n: { $sum: 1 } } }]),
+      getAccessControl()
+    ]);
+
+    const baneados = new Set((ac.banned || []).map(b => String(b.address).toLowerCase()));
+    const resumen = { pending: 0, warned: 0, banned: 0, dismissed: 0 };
+    counts.forEach(c => { if (c._id in resumen) resumen[c._id] = c.n; });
+
+    // Cuántas veces ha sido reportado cada acusado (señal de reincidencia).
+    const objetivos = [...new Set(docs.map(d => d.targetAddress))];
+    const totales = await PlayerReport.aggregate([
+      { $match: { targetAddress: { $in: objetivos } } },
+      { $group: { _id: '$targetAddress', n: { $sum: 1 } } }
+    ]);
+    const mapTotales = totales.reduce((m, x) => (m[x._id] = x.n, m), {});
+
+    const reports = docs.map(d => ({
+      id: String(d._id),
+      reporterAddress: d.reporterAddress,
+      reporterName: d.reporterName,
+      targetAddress: d.targetAddress,
+      targetName: d.targetName,
+      reason: d.reason,
+      details: d.details,
+      scene: d.scene,
+      posX: d.posX, posY: d.posY,
+      status: d.status,
+      adminAddress: d.adminAddress,
+      adminNote: d.adminNote,
+      handledAt: d.handledAt,
+      createdAt: d.createdAt,
+      isBanned: baneados.has(d.targetAddress),
+      totalReportsAgainstTarget: mapTotales[d.targetAddress] || 1
+    }));
+
+    return res.json({ ok: true, reports, total, page, limit, pages: Math.ceil(total / limit), resumen });
+  } catch (e) {
+    console.error('GET /api/admin/reports:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── GET /api/admin/reports/:id ─────────────────────────────────────────────
+// Reporte + ficha completa del acusado + su historial de reportes/verificadores.
+app.get('/api/admin/reports/:id', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const doc = await PlayerReport.findById(req.params.id).lean();
+    if (!doc) return res.status(404).json({ error: 'report_not_found' });
+
+    const [perfil, historial, verificadores, ac] = await Promise.all([
+      buildPlayerProfile(doc.targetAddress),
+      PlayerReport.find({ targetAddress: doc.targetAddress }).sort({ createdAt: -1 }).limit(25).lean(),
+      PlayerVerifier.find({ toAddress: doc.targetAddress }).sort({ createdAt: -1 }).limit(10).lean(),
+      getAccessControl()
+    ]);
+
+    const ban = (ac.banned || []).find(b => String(b.address).toLowerCase() === doc.targetAddress);
+
+    return res.json({
+      ok: true,
+      report: { ...doc, id: String(doc._id) },
+      profile: perfil,
+      isBanned: !!ban,
+      ban: ban || null,
+      history: historial.map(h => ({
+        id: String(h._id), reason: h.reason, details: h.details,
+        status: h.status, reporterName: h.reporterName, createdAt: h.createdAt
+      })),
+      verifiers: verificadores.map(v => ({
+        id: String(v._id), from: v.fromName, status: v.status,
+        question: v.question, given: v.given, createdAt: v.createdAt
+      }))
+    });
+  } catch (e) {
+    console.error('GET /api/admin/reports/:id:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── POST /api/admin/reports/:id/warn ───────────────────────────────────────
+// Advertencia: entra en el buzón del juego y, si hay SMTP configurado
+// (WARN_MAIL_* / SMTP_*), también sale por correo electrónico.
+app.post('/api/admin/reports/:id/warn', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const doc = await PlayerReport.findById(req.params.id);
+    if (!doc) return res.status(404).json({ error: 'report_not_found' });
+
+    const asunto = String(req.body?.subject || 'Official warning — Grassland Forest').slice(0, 140);
+    const cuerpo = String(req.body?.body || '').slice(0, 2000) ||
+      `Your account was reported for: ${doc.reason}. Repeated violations of the game rules will result in a ban.`;
+
+    // 1) Buzón dentro del juego (siempre).
+    let playerName = doc.targetName;
+    try {
+      const gp = await GamePlayer.findOne({ address: doc.targetAddress }).lean();
+      if (gp && gp.playerName) playerName = gp.playerName;
+    } catch (_) {}
+    try {
+      const store = getPlayerMail(playerName);
+      store.unshift({
+        id: Date.now().toString(),
+        subject: asunto,
+        body: cuerpo,
+        from: 'Moderation',
+        date: new Date().toISOString(),
+        read: false
+      });
+    } catch (_) {}
+
+    // 2) Aviso en vivo si está conectado.
+    socketsOfAddress(doc.targetAddress).forEach(s => {
+      try { s.emit('moderationWarning', { subject: asunto, body: cuerpo }); } catch (_) {}
+    });
+
+    // 3) Correo electrónico (solo si hay transporte configurado).
+    const envio = await enviarCorreoAdvertencia(doc.targetAddress, asunto, cuerpo);
+
+    doc.status = 'warned';
+    doc.adminAddress = req.admin.address || '';
+    doc.adminNote = String(req.body?.note || '').slice(0, 1000);
+    doc.handledAt = new Date();
+    await doc.save();
+
+    return res.json({ ok: true, status: doc.status, email: envio });
+  } catch (e) {
+    console.error('POST /api/admin/reports/:id/warn:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Envío de correo: opcional y perezoso. Si no hay nodemailer instalado o no hay
+// SMTP configurado, se informa y NO se rompe nada (la advertencia igual llega
+// al buzón del juego).
+async function enviarCorreoAdvertencia(address, asunto, cuerpo) {
+  const host = process.env.SMTP_HOST;
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM || user;
+  if (!host || !user || !pass) {
+    return { sent: false, reason: 'smtp_not_configured' };
+  }
+
+  // El correo del jugador solo existe si el juego lo guardó alguna vez.
+  let destino = null;
+  try {
+    const gp = await GamePlayer.findOne({ address: String(address).toLowerCase() }).lean();
+    destino = (gp && (gp.email || gp.correo)) || null;
+  } catch (_) {}
+  if (!destino) return { sent: false, reason: 'player_has_no_email' };
+
+  try {
+    const nodemailer = require('nodemailer');
+    const transporte = nodemailer.createTransport({
+      host,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
+      auth: { user, pass }
+    });
+    await transporte.sendMail({ from, to: destino, subject: asunto, text: cuerpo });
+    return { sent: true, to: destino };
+  } catch (e) {
+    console.warn('⚠️  No se pudo enviar el correo de advertencia:', e.message);
+    return { sent: false, reason: e.message };
+  }
+}
+
+// ── POST /api/admin/reports/:id/ban ────────────────────────────────────────
+// Banea la cartera del acusado reutilizando el mismo AccessControl que ya usa
+// puerta_login.html, y lo desconecta si está dentro.
+app.post('/api/admin/reports/:id/ban', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const doc = await PlayerReport.findById(req.params.id);
+    if (!doc) return res.status(404).json({ error: 'report_not_found' });
+
+    const motivo = String(req.body?.reason || `Reported for ${doc.reason}`).slice(0, 300);
+    const ac = await getAccessControl();
+    const banned = (ac.banned || []).filter(b => String(b.address).toLowerCase() !== doc.targetAddress);
+    banned.push({ address: doc.targetAddress, reason: motivo, date: new Date() });
+
+    await AccessControl.findOneAndUpdate({ _id: 'config' }, { $set: { banned } }, { upsert: true });
+    invalidateAccessCache();
+
+    // Expulsión inmediata de las sesiones abiertas.
+    socketsOfAddress(doc.targetAddress).forEach(s => {
+      try { s.emit('accountBanned', { reason: motivo }); s.disconnect(true); } catch (_) {}
+    });
+
+    doc.status = 'banned';
+    doc.adminAddress = req.admin.address || '';
+    doc.adminNote = String(req.body?.note || motivo).slice(0, 1000);
+    doc.handledAt = new Date();
+    await doc.save();
+
+    console.warn(`⛔ [admin ${req.admin.address}] BANEÓ ${doc.targetAddress} — ${motivo}`);
+    return res.json({ ok: true, status: doc.status });
+  } catch (e) {
+    console.error('POST /api/admin/reports/:id/ban:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── POST /api/admin/reports/:id/unban ──────────────────────────────────────
+app.post('/api/admin/reports/:id/unban', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const doc = await PlayerReport.findById(req.params.id);
+    if (!doc) return res.status(404).json({ error: 'report_not_found' });
+
+    const ac = await getAccessControl();
+    const banned = (ac.banned || []).filter(b => String(b.address).toLowerCase() !== doc.targetAddress);
+    await AccessControl.findOneAndUpdate({ _id: 'config' }, { $set: { banned } }, { upsert: true });
+    invalidateAccessCache();
+
+    doc.status = 'warned';
+    doc.adminAddress = req.admin.address || '';
+    doc.handledAt = new Date();
+    await doc.save();
+
+    return res.json({ ok: true, status: doc.status });
+  } catch (e) {
+    console.error('POST /api/admin/reports/:id/unban:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── DELETE /api/admin/reports/:id ──────────────────────────────────────────
+// "Quitar de la lista sin hacerle nada": por defecto marca el reporte como
+// descartado (queda el rastro). Con ?purge=1 se borra de verdad.
+app.delete('/api/admin/reports/:id', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const purgar = String(req.query.purge || '') === '1';
+    if (purgar) {
+      const r = await PlayerReport.findByIdAndDelete(req.params.id);
+      if (!r) return res.status(404).json({ error: 'report_not_found' });
+      return res.json({ ok: true, deleted: true });
+    }
+    const doc = await PlayerReport.findById(req.params.id);
+    if (!doc) return res.status(404).json({ error: 'report_not_found' });
+    doc.status = 'dismissed';
+    doc.adminAddress = req.admin.address || '';
+    doc.adminNote = String(req.body?.note || '').slice(0, 1000);
+    doc.handledAt = new Date();
+    await doc.save();
+    return res.json({ ok: true, status: doc.status });
+  } catch (e) {
+    console.error('DELETE /api/admin/reports/:id:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── GET /api/admin/verifiers ───────────────────────────────────────────────
+app.get('/api/admin/verifiers', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const docs = await PlayerVerifier.find({}).sort({ createdAt: -1 }).limit(limit).lean();
+    return res.json({
+      ok: true,
+      verifiers: docs.map(v => ({
+        id: String(v._id), from: v.fromName, fromAddress: v.fromAddress,
+        to: v.toName, toAddress: v.toAddress, question: v.question,
+        given: v.given, status: v.status, createdAt: v.createdAt, answeredAt: v.answeredAt
+      }))
+    });
+  } catch (e) {
+    console.error('GET /api/admin/verifiers:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+console.log('✅ Reportes/verificadores: /api/reports, /api/verifier/*, /api/admin/reports/*');
+
 
 // Marketplace P2P — todas las rutas /api/marketplace/* viven en marketplace-routes.js
 // (se monta más abajo, después de que PlayerStats esté definido — ver "MARKETPLACE ROUTES MOUNT")
@@ -9019,6 +9685,227 @@ require('./marketplace-routes')(app, {
   PlayerStats,
   Listing
 });
+
+
+// =============================================================================
+// LIQUIDACIÓN ON-CHAIN DEL MERCADO P2P  (2026-08-03)
+// -----------------------------------------------------------------------------
+// PROBLEMA: en market.html se publicaba, se compraba y se cancelaba, pero todo
+// se quedaba en el backend — los ítems nunca se movían de verdad en la
+// blockchain, así que el mercado no manipulaba los NFT/facturas del contrato.
+//
+// SOLUCIÓN: tres operaciones que el mercado llama justo después de que su
+// operación en base de datos sale bien:
+//
+//   escrow  → al PUBLICAR: quema en cadena las unidades del vendedor
+//             (decreaseInvoiceQuantity / deleteInvoice). El ítem sale de su
+//             cartera y queda "en depósito" del mercado.
+//   deliver → al COMPRAR: acuña esas unidades al comprador (createInvoice o
+//             increaseInvoiceQuantity).
+//   refund  → al CANCELAR: devuelve al vendedor lo que quedaba en depósito.
+//
+// CONSERVACIÓN: por cada publicación se lleva un libro (MarketSettlement) y
+// NUNCA se puede entregar/devolver más de lo que se quemó al publicar. Es
+// decir, el mercado no puede crear ítems de la nada aunque el cliente mienta.
+// Además cada operación es idempotente por (listingId, op, dirección, nonce).
+// =============================================================================
+
+const marketSettlementSchema = new mongoose.Schema({
+  listingId: { type: String, required: true, index: true },
+  op:        { type: String, enum: ['escrow', 'deliver', 'refund'], required: true },
+  address:   { type: String, required: true, lowercase: true },
+  itemId:    { type: String, required: true },
+  qty:       { type: Number, required: true, min: 1 },
+  txHash:    { type: String, default: '' },
+  idem:      { type: String, required: true, unique: true }
+}, { timestamps: true });
+const MarketSettlement = mongoose.model('MarketSettlement', marketSettlementSchema);
+
+// itemId del catálogo → `tipo` del contrato. Si un ítem no está aquí, no tiene
+// representación on-chain y su liquidación se omite sin error.
+const MARKET_ONCHAIN_TIPO = {
+  // recolección
+  madera_pinos: 'madera_pinos', madera_seca: 'madera_seca', madera_con_hojas: 'madera_con_hojas',
+  mineral_piedra: 'mineral_piedra', mineral_cobre: 'mineral_cobre',
+  mineral_hierro: 'mineral_hierro', carbon: 'carbon',
+  // cosechas
+  zanahoria_buena: 'zanahoria_buena', tomate_buena: 'tomate_buena',
+  trigo_buena: 'trigo_buena', calabaza_buena: 'calabaza_buena',
+  // semillas
+  Semillax: 'bolsa zanahorias', Semillax1: 'bolsa de tomates',
+  Semillax2: 'bolsa de trigo', Semillax3: 'bolsa de calabazas',
+  // herramientas / varios
+  Regaderax: 'Regaderax', Tijerasx: 'Tijerasx',
+  hacha_de_madera: 'hacha de madera', pico_de_madera: 'pico de madera',
+  balde_con_agua: 'balde_con_agua', balde_vacio: 'balde_vacio'
+};
+
+function marketOnchainTipo(itemId) {
+  return MARKET_ONCHAIN_TIPO[String(itemId || '')] || null;
+}
+
+// Quema `quantity` unidades de `tipo` repartidas entre las facturas activas de
+// la dirección. Devuelve cuántas se quemaron realmente.
+async function burnItemOnChain(address, tipo, quantity) {
+  if (!relayerWallet || quantity <= 0) return 0;
+  const c = new ethers.Contract(CONTRACTS.ITEMS_CONTRACT.address, CONTRACTS.ITEMS_CONTRACT.abi, relayerWallet);
+  const gasPrice = gatherGasPrice();
+
+  let facturas = [];
+  try {
+    const snap = await c.getUserInventorySnapshot(address);
+    for (const inv of snap) {
+      if (inv.active && String(inv.tipo) === tipo && Number(inv.cantidad) > 0) {
+        facturas.push({ id: Number(inv.id), cantidad: Number(inv.cantidad) });
+      }
+    }
+  } catch (e) {
+    console.warn('⚠️ market burn: no se pudo leer el inventario on-chain:', e.message);
+    return 0;
+  }
+
+  // Se empieza por las facturas más pequeñas: así se cierran stacks enteros y
+  // el inventario del contrato queda menos fragmentado.
+  facturas.sort((a, b) => a.cantidad - b.cantidad);
+
+  let restante = quantity;
+  let quemadas = 0;
+  for (const f of facturas) {
+    if (restante <= 0) break;
+    const aQuitar = Math.min(restante, f.cantidad);
+    try {
+      const nonce = await relayerNonceManager.getNextNonce();
+      const tx = (aQuitar >= f.cantidad)
+        ? await c.deleteInvoice(f.id, { gasPrice, nonce })
+        : await c.decreaseInvoiceQuantity(f.id, aQuitar, { gasPrice, nonce });
+      await tx.wait();
+      restante -= aQuitar;
+      quemadas += aQuitar;
+    } catch (e) {
+      console.error(`❌ market burn (factura ${f.id}):`, e.message);
+      try { await relayerNonceManager.resetNonce(); } catch (_) {}
+      break;
+    }
+  }
+  return quemadas;
+}
+
+// POST /api/marketplace/onchain/settle
+// body: { op: 'escrow'|'deliver'|'refund', listingId, itemId, qty }
+app.post('/api/marketplace/onchain/settle',
+  strictLimiter,
+  authMiddleware,
+  csrfProtection,
+  [
+    body('op').isIn(['escrow', 'deliver', 'refund']),
+    body('listingId').isString().notEmpty(),
+    body('itemId').isString().notEmpty(),
+    body('qty').isInt({ min: 1, max: 10000 })
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+      const address = String(req.user.address || '').toLowerCase();
+      const { op, listingId, itemId } = req.body;
+      const qty = parseInt(req.body.qty, 10);
+
+      const tipo = marketOnchainTipo(itemId);
+      if (!tipo) {
+        // Ítem sin representación on-chain: la operación de base de datos ya
+        // está hecha y aquí no hay nada que mover.
+        return res.json({ ok: true, onchain: false, reason: 'item_not_onchain' });
+      }
+      if (!relayerWallet) {
+        return res.status(503).json({ error: 'relayer_unavailable' });
+      }
+
+      // ── Idempotencia ────────────────────────────────────────────────────
+      const idem = `${op}:${listingId}:${address}:${itemId}:${qty}`;
+      const yaHecho = await MarketSettlement.findOne({ idem }).lean();
+      if (yaHecho) {
+        return res.json({ ok: true, onchain: true, alreadySettled: true, txHash: yaHecho.txHash || '' });
+      }
+
+      // ── Libro de la publicación ─────────────────────────────────────────
+      const movimientos = await MarketSettlement.find({ listingId }).lean();
+      const suma = (o) => movimientos.filter(m => m.op === o).reduce((n, m) => n + m.qty, 0);
+      const depositado = suma('escrow');
+      const entregado  = suma('deliver') + suma('refund');
+      const disponible = depositado - entregado;
+
+      if (op === 'escrow') {
+        // Solo el dueño de una publicación viva puede depositar, y solo por lo
+        // que esa publicación declara.
+        let listing = null;
+        try { listing = await Listing.findById(listingId).lean(); } catch (_) {}
+        if (!listing) return res.status(404).json({ error: 'listing_not_found' });
+        if (String(listing.owner).toLowerCase() !== address) {
+          return res.status(403).json({ error: 'not_listing_owner' });
+        }
+        if (String(listing.itemId) !== String(itemId)) {
+          return res.status(400).json({ error: 'item_mismatch' });
+        }
+        if (depositado + qty > Number(listing.qty)) {
+          return res.status(400).json({ error: 'escrow_exceeds_listing' });
+        }
+
+        const quemadas = await burnItemOnChain(address, tipo, qty);
+        if (quemadas <= 0) {
+          return res.status(409).json({ error: 'onchain_burn_failed' });
+        }
+        await MarketSettlement.create({ listingId, op, address, itemId, qty: quemadas, idem });
+        return res.json({ ok: true, onchain: true, burned: quemadas });
+      }
+
+      // deliver / refund solo pueden repartir lo que ya se depositó.
+      if (disponible <= 0) return res.status(409).json({ error: 'nothing_in_escrow' });
+      if (qty > disponible) return res.status(400).json({ error: 'exceeds_escrow', available: disponible });
+
+      if (op === 'refund') {
+        // Devolver solo al vendedor original (quien depositó).
+        const deposito = movimientos.find(m => m.op === 'escrow');
+        if (!deposito || deposito.address !== address) {
+          return res.status(403).json({ error: 'not_escrow_owner' });
+        }
+      }
+
+      const minted = await mintGatherReward(address, tipo, qty);
+      if (!minted) return res.status(409).json({ error: 'onchain_mint_failed' });
+
+      await MarketSettlement.create({ listingId, op, address, itemId, qty, idem });
+      return res.json({
+        ok: true, onchain: true,
+        invoiceId: minted.id, manualId: minted.manualId, newTotal: minted.cantidad
+      });
+    } catch (e) {
+      console.error('POST /api/marketplace/onchain/settle:', e);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  }
+);
+
+// Estado on-chain de una publicación (lo consulta market.html para saber si
+// una liquidación quedó pendiente y reintentarla).
+app.get('/api/marketplace/onchain/:listingId', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const movimientos = await MarketSettlement.find({ listingId: req.params.listingId }).lean();
+    const suma = (o) => movimientos.filter(m => m.op === o).reduce((n, m) => n + m.qty, 0);
+    return res.json({
+      ok: true,
+      escrowed: suma('escrow'),
+      delivered: suma('deliver'),
+      refunded: suma('refund'),
+      available: suma('escrow') - suma('deliver') - suma('refund')
+    });
+  } catch (e) {
+    console.error('GET /api/marketplace/onchain/:listingId:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+console.log('✅ Liquidación on-chain del mercado: /api/marketplace/onchain/settle');
 
 // manualId de LA factura de un stat. Usa la dirección COMPLETA: con los 8
 // primeros caracteres que se usaban antes, dos jugadores cuyas direcciones
