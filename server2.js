@@ -4659,7 +4659,15 @@ io.on("connection", (socket) => {
       socket.chatLastSent = now;
 
       const playerName = escapeHtml(payload.usernamex || socket.playerData.username || '---');
-      const text = escapeHtml(String(payload.text || '').trim()).slice(0, 500);
+
+      // RECORTE SEGURO PARA EMOJIS (2026-08-05): un emoji ocupa dos unidades
+      // UTF-16 (a veces más, si lleva modificadores). Con .slice(0, 500) a
+      // secas, un mensaje justo en el límite se cortaba por la mitad de un
+      // emoji y llegaba un carácter roto. Recortando por PUNTOS DE CÓDIGO
+      // ([...cadena]) el emoji entra entero o no entra.
+      const crudo = String(payload.text || '').trim();
+      const recortado = [...crudo].slice(0, 300).join('');
+      const text = escapeHtml(recortado);
       if (!text) return;
 
       const message = {
