@@ -636,6 +636,25 @@ async function checkGameAccess(address) {
   const ac = await getAccessControlCached();
   const ban = (ac.banned || []).find(b => String(b.address).toLowerCase() === addr);
   if (ban) return { allowed: false, error: 'banned', reason: ban.reason || '', date: ban.date || null };
+
+  // SUSPENSIÓN TEMPORAL (3 verificadores fallidos = 3 días, o puesta por un
+  // administrador). Caduca sola, así que no hay que acordarse de levantarla.
+  // Va detrás del baneo permanente porque ése manda sobre todo lo demás.
+  try {
+    const susp = await getActiveSuspension(addr);
+    if (susp.active) {
+      return {
+        allowed: false,
+        error: 'suspended',
+        reason: susp.reason || '',
+        date: susp.until || null
+      };
+    }
+  } catch (e) {
+    // Si la consulta falla no se deja fuera a nadie: se sigue con el resto.
+    console.warn('⚠️  No se pudo comprobar la suspensión:', e.message);
+  }
+
   if (ac.mode === 'whitelist') {
     const wl = (ac.whitelist || []).map(a => String(a).toLowerCase());
     if (!wl.includes(addr)) return { allowed: false, error: 'not_whitelisted' };
@@ -671,6 +690,15 @@ async function enforceGameAccess(req, res, next) {
         reason: access.reason || '',
         date: access.date || null,
         message: 'This account is banned'
+      });
+    }
+    if (access.error === 'suspended') {
+      return res.status(403).json({
+        error: 'suspended',
+        reason: access.reason || '',
+        until: access.date || null,
+        date: access.date || null,
+        message: 'This account is temporarily suspended'
       });
     }
     return res.status(403).json({ error: 'not_whitelisted', message: 'This wallet is not on the whitelist' });
@@ -3836,30 +3864,38 @@ class CropController {
         throw new Error('Tipo de semilla no válido');
       }
 
-      let adjustedChance;
-      
-      if (typeof successChance === 'string' || typeof successChance === 'number') {
-        adjustedChance = parseFloat(successChance);
-      } else {
-        adjustedChance = 50;
+      // DIFICULTAD DESDE EL SERVIDOR (2026-08-04)
+      // ---------------------------------------------------------------------
+      // Antes, la probabilidad venía en `successChance` DEL CLIENTE, y el
+      // cliente mandaba siempre 100 (calcularPosibilidad devolvía "100.00"),
+      // así que la siembra no tenía dificultad ninguna — y un cliente
+      // manipulado podía mandar lo que quisiera. Ahora manda la configuración
+      // editable en admin.html (FarmingConfig). El valor del cliente se ignora
+      // por completo; solo se conserva el parámetro por compatibilidad de firma.
+      let adjustedChance = 95;
+      let farmCfg = null;
+      try {
+        farmCfg = await getFarmingConfig();
+        adjustedChance = await successChanceParaSemilla(seedType);
+      } catch (e) {
+        console.warn('⚠️  No se pudo leer la configuración de siembra, se usa 95%:', e.message);
       }
-      
-      if (isNaN(adjustedChance) || !isFinite(adjustedChance)) {
-        adjustedChance = 50;
-      }
-      
-      if (adjustedChance >= 100) {
-        adjustedChance = 95;
-      }
-      
       adjustedChance = Math.max(1, Math.min(100, adjustedChance));
+
+      // Si el administrador desactivó las muertes, nada puede morir.
+      if (farmCfg && farmCfg.deathEnabled === false) adjustedChance = 100;
+
+      // El tiempo de crecimiento también es configurable.
+      const multCrecimiento = farmCfg && Number(farmCfg.growthMultiplier) > 0
+        ? Number(farmCfg.growthMultiplier) : 1;
+      const duracion = Math.max(5, Math.round(cropConfig.growthTime * multCrecimiento));
 
       const newCrop = new UserCrop({
         userId,
         plotId,
         cropType: seedType,
         seedType,
-        growthDuration: cropConfig.growthTime,
+        growthDuration: duracion,
         rewards: cropConfig.rewards,
         isWatered: false,
         growthStage: 1,
@@ -4074,9 +4110,18 @@ class CropController {
           if (!cropConfig) continue;
 
           crop.currentGrowthTime += 1;
-          
-          const growthPerStage = cropConfig.growthTime / cropConfig.growthStages;
-          
+
+          // DURACIÓN REAL DEL CULTIVO (2026-08-04): se usa la que quedó
+          // guardada al sembrar (`growthDuration`), no la de la tabla fija.
+          // Así el multiplicador de crecimiento que se pone en admin.html
+          // afecta de verdad: antes el cultivo se plantaba con una duración y
+          // luego maduraba con otra, y la barra del cliente no cuadraba.
+          const duracionReal = Number(crop.growthDuration) > 0
+            ? Number(crop.growthDuration)
+            : cropConfig.growthTime;
+
+          const growthPerStage = duracionReal / cropConfig.growthStages;
+
           let newStage = 1;
           if (crop.currentGrowthTime >= growthPerStage * 3) {
             newStage = 4;
@@ -4086,9 +4131,9 @@ class CropController {
             newStage = 2;
           }
 
-          const wasHalfway = crop.currentGrowthTime - 1 < cropConfig.growthTime / 2 && 
-                           crop.currentGrowthTime >= cropConfig.growthTime / 2;
-          const isNowCompleted = crop.currentGrowthTime >= cropConfig.growthTime;
+          const wasHalfway = crop.currentGrowthTime - 1 < duracionReal / 2 &&
+                           crop.currentGrowthTime >= duracionReal / 2;
+          const isNowCompleted = crop.currentGrowthTime >= duracionReal;
 
           let isDead = false;
           if (isNowCompleted && !crop.isCompleted) {
@@ -4111,7 +4156,7 @@ class CropController {
               isHalfway: wasHalfway,
               isCompleted: crop.isCompleted,
               isDead: crop.isDead,
-              timeRemaining: Math.max(0, cropConfig.growthTime - crop.currentGrowthTime),
+              timeRemaining: Math.max(0, duracionReal - crop.currentGrowthTime),
               cropConfig: cropConfig
             });
           }
@@ -5598,6 +5643,15 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
         if (access.error === 'banned') {
           console.log(`⛔ Login bloqueado (baneado): ${lcAddress.substring(0, 10)}…`);
           return res.status(403).json({ error: 'banned', reason: access.reason || '', date: access.date || null });
+        }
+        if (access.error === 'suspended') {
+          console.log(`⛔ Login bloqueado (suspendido): ${lcAddress.substring(0, 10)}…`);
+          return res.status(403).json({
+            error: 'suspended',
+            reason: access.reason || '',
+            until: access.date || null,
+            date: access.date || null
+          });
         }
         console.log(`⛔ Login bloqueado (sin whitelist): ${lcAddress.substring(0, 10)}…`);
         return res.status(403).json({ error: 'not_whitelisted' });
@@ -7500,12 +7554,18 @@ app.post('/api/save/:playerName',
       // de cambiarlo se ignora (se conserva el existente). Validación en
       // servidor para que no dependa del cliente.
       try {
+        // NOMBRES CON NÚMEROS Y HASTA 15 CARACTERES (2026-08-04).
+        // Antes solo se admitían letras y 10 caracteres, así que "Ana99" o
+        // "Jugador2026" se quedaban en "Ana" y "Jugador". Ahora entran letras
+        // Y dígitos (siguen fuera espacios, símbolos y etiquetas HTML, que es
+        // lo que de verdad importa para no romper nada ni permitir inyección).
+        // El límite debe coincidir con el del cliente (GameScene/tiendajuego).
         const sanitizeOneTimeName = (raw) => {
           if (typeof raw !== 'string') return null;
           let s = raw.normalize('NFC').trim().replace(/<[^>]*>/g, '');
-          try { s = s.replace(/[^\p{L}]/gu, ''); }
-          catch (e) { s = s.replace(/[^A-Za-zÁÉÍÓÚáéíóúÑñÜü]/g, ''); }
-          return s.slice(0, 10);
+          try { s = s.replace(/[^\p{L}\p{Nd}]/gu, ''); }
+          catch (e) { s = s.replace(/[^A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü]/g, ''); }
+          return s.slice(0, 15);
         };
 
         const existingGP = await GamePlayer.findOne({ playerName }).lean();
@@ -8430,6 +8490,135 @@ const verifierSchema = new mongoose.Schema({
 verifierSchema.index({ createdAt: -1 });
 const PlayerVerifier = mongoose.model('PlayerVerifier', verifierSchema);
 
+// ── SUSPENSIONES TEMPORALES ────────────────────────────────────────────────
+// Distinto del baneo de AccessControl, que es permanente y manual. Ésta caduca
+// sola: la usa el sistema de verificadores (3 fallos = 3 días fuera) y también
+// puede ponerla un administrador desde consola-reportes.html.
+const suspensionSchema = new mongoose.Schema({
+  address:   { type: String, required: true, lowercase: true, index: true },
+  playerName:{ type: String, default: '---' },
+  reason:    { type: String, default: '', maxlength: 300 },
+  until:     { type: Date, required: true, index: true },
+  days:      { type: Number, default: 3 },
+  source:    { type: String, enum: ['verifier', 'admin'], default: 'verifier' },
+  adminAddress: { type: String, default: '' },
+  liftedAt:  { type: Date, default: null }   // != null → levantada a mano
+}, { timestamps: true });
+suspensionSchema.index({ createdAt: -1 });
+const PlayerSuspension = mongoose.model('PlayerSuspension', suspensionSchema);
+
+// Reglas del verificador (2026-08-04, pedido del usuario):
+//   • 15 segundos para contestar, y si no se contesta cuenta como fallo.
+//   • 3 fallos = 3 días de suspensión de la cuenta.
+const VERIFIER_SECONDS       = 15;
+const VERIFIER_FAILS_TO_BAN  = 3;
+const VERIFIER_SUSPEND_DAYS  = 3;
+// Ventana en la que se cuentan los fallos. Sin ella, tres fallos repartidos a
+// lo largo de meses acabarían suspendiendo a alguien que no hizo nada raro.
+const VERIFIER_FAIL_WINDOW_DAYS = 7;
+
+/**
+ * ¿Tiene esta dirección una suspensión activa ahora mismo?
+ * @returns {Promise<{active:boolean, until?:Date, reason?:string, id?:string}>}
+ */
+async function getActiveSuspension(address) {
+  const addr = String(address || '').toLowerCase();
+  if (!addr) return { active: false };
+  const doc = await PlayerSuspension.findOne({
+    address: addr,
+    liftedAt: null,
+    until: { $gt: new Date() }
+  }).sort({ until: -1 }).lean();
+  if (!doc) return { active: false };
+  return { active: true, until: doc.until, reason: doc.reason, id: String(doc._id) };
+}
+
+/**
+ * Cierra los verificadores que se pasaron de los 15 segundos sin contestar.
+ * Se llama de forma perezosa (al enviar uno nuevo, al contestar y al consultar
+ * desde la consola de administración) para no depender de un temporizador que
+ * se pierda si el proceso se reinicia.
+ */
+async function caducarVerificadoresVencidos(address) {
+  const filtro = { status: 'sent', expiresAt: { $lte: new Date() } };
+  if (address) filtro.toAddress = String(address).toLowerCase();
+  const vencidos = await PlayerVerifier.find(filtro).lean();
+  if (!vencidos.length) return [];
+  await PlayerVerifier.updateMany(
+    { _id: { $in: vencidos.map(v => v._id) } },
+    { $set: { status: 'expired' } }
+  );
+  return vencidos;
+}
+
+/**
+ * Cuenta los fallos recientes de un jugador y, si llega al tope, lo suspende.
+ * Un verificador NO contestado cuenta igual que uno contestado mal: si no,
+ * bastaría con ignorarlos para no ser nunca sancionado.
+ * @returns {Promise<{suspended:boolean, fails:number, until?:Date}>}
+ */
+async function evaluarSuspensionPorVerificadores(address) {
+  const addr = String(address || '').toLowerCase();
+  if (!addr) return { suspended: false, fails: 0 };
+
+  const desde = new Date(Date.now() - VERIFIER_FAIL_WINDOW_DAYS * 86400000);
+
+  // Si ya está suspendido no se vuelve a suspender (ni se alarga solo).
+  const yaSuspendido = await getActiveSuspension(addr);
+  if (yaSuspendido.active) {
+    const n = await PlayerVerifier.countDocuments({
+      toAddress: addr, status: { $in: ['failed', 'expired'] }, createdAt: { $gte: desde }
+    });
+    return { suspended: true, fails: n, until: yaSuspendido.until };
+  }
+
+  // Solo cuentan los fallos POSTERIORES a la última suspensión: al cumplirla,
+  // el contador empieza de cero.
+  const ultima = await PlayerSuspension.findOne({ address: addr }).sort({ createdAt: -1 }).lean();
+  const corte = ultima && ultima.until > desde ? ultima.until : desde;
+
+  const fallos = await PlayerVerifier.countDocuments({
+    toAddress: addr,
+    status: { $in: ['failed', 'expired'] },
+    createdAt: { $gte: corte }
+  });
+
+  if (fallos < VERIFIER_FAILS_TO_BAN) return { suspended: false, fails: fallos };
+
+  const until = new Date(Date.now() + VERIFIER_SUSPEND_DAYS * 86400000);
+  let playerName = '---';
+  try {
+    const gp = await GamePlayer.findOne({ address: addr }).lean();
+    if (gp && gp.playerName) playerName = gp.playerName;
+  } catch (_) {}
+
+  await PlayerSuspension.create({
+    address: addr,
+    playerName,
+    reason: `${fallos} failed verifiers in ${VERIFIER_FAIL_WINDOW_DAYS} days`,
+    until,
+    days: VERIFIER_SUSPEND_DAYS,
+    source: 'verifier'
+  });
+  invalidateAccessCache();
+
+  console.warn(`⛔ Suspensión automática de ${addr} por ${fallos} verificadores fallidos (hasta ${until.toISOString()})`);
+
+  // Expulsión inmediata si está dentro.
+  socketsOfAddress(addr).forEach(s => {
+    try {
+      s.emit('accountSuspended', {
+        reason: `${VERIFIER_FAILS_TO_BAN} failed verifiers`,
+        until: until.toISOString(),
+        days: VERIFIER_SUSPEND_DAYS
+      });
+      s.disconnect(true);
+    } catch (_) {}
+  });
+
+  return { suspended: true, fails: fallos, until };
+}
+
 const REPORT_REASONS = [
   'botting', 'cheating', 'harassment', 'scam', 'spam',
   'inappropriate_name', 'exploit_abuse', 'other'
@@ -8553,6 +8742,23 @@ app.post('/api/verifier/send',
       }
       _verifierCooldown.set(fromAddress, ahora);
 
+      // Antes de nada: cerrar los verificadores del destinatario que ya se
+      // pasaron de tiempo, para que cuenten como fallo aunque los ignorara.
+      await caducarVerificadoresVencidos(destino.address);
+      await evaluarSuspensionPorVerificadores(destino.address);
+
+      // Un solo verificador vivo por jugador: si ya tiene uno sin contestar,
+      // no se le encima otro (si no, sería trivial reventarle la cuenta a
+      // alguien mandándole verificadores en cadena).
+      const enCurso = await PlayerVerifier.findOne({
+        toAddress: destino.address.toLowerCase(),
+        status: 'sent',
+        expiresAt: { $gt: new Date() }
+      }).lean();
+      if (enCurso) {
+        return res.status(409).json({ error: 'verifier_already_pending' });
+      }
+
       // Reto sencillo pero distinto cada vez.
       const a = Math.floor(Math.random() * 8) + 2;
       const b = Math.floor(Math.random() * 8) + 2;
@@ -8567,7 +8773,8 @@ app.post('/api/verifier/send',
         toName: destino.username !== '---' ? destino.username : destino.playerName,
         question,
         answer,
-        expiresAt: new Date(ahora + 120000) // 2 minutos para contestar
+        // 15 segundos para contestar (VERIFIER_SECONDS)
+        expiresAt: new Date(ahora + VERIFIER_SECONDS * 1000)
       });
 
       const sockets = socketsOfAddress(destino.address);
@@ -8577,14 +8784,45 @@ app.post('/api/verifier/send',
             id: String(doc._id),
             from: doc.fromName,
             question,
-            expiresIn: 120
+            expiresIn: VERIFIER_SECONDS,
+            failsToSuspend: VERIFIER_FAILS_TO_BAN,
+            suspendDays: VERIFIER_SUSPEND_DAYS
           });
         } catch (_) {}
       });
 
+      // Al cumplirse el plazo se cierra el reto y se revisa la suspensión, sin
+      // esperar a que nadie consulte. (El cierre perezoso de arriba sigue
+      // existiendo por si el proceso se reinicia justo en este hueco.)
+      setTimeout(async () => {
+        try {
+          const vigente = await PlayerVerifier.findById(doc._id);
+          if (!vigente || vigente.status !== 'sent') return;
+          vigente.status = 'expired';
+          await vigente.save();
+          socketsOfAddress(doc.fromAddress).forEach(s => {
+            try { s.emit('verifierResult', { id: String(doc._id), player: doc.toName, status: 'expired' }); } catch (_) {}
+          });
+          const r = await evaluarSuspensionPorVerificadores(doc.toAddress);
+          socketsOfAddress(doc.toAddress).forEach(s => {
+            try {
+              s.emit('verifierTimeout', {
+                id: String(doc._id),
+                fails: r.fails,
+                failsToSuspend: VERIFIER_FAILS_TO_BAN,
+                suspended: r.suspended
+              });
+            } catch (_) {}
+          });
+        } catch (e) {
+          console.warn('⚠️  No se pudo caducar el verificador:', e.message);
+        }
+      }, (VERIFIER_SECONDS + 2) * 1000).unref?.();
+
       return res.json({
         ok: true,
         id: String(doc._id),
+        seconds: VERIFIER_SECONDS,
         delivered: sockets.length > 0,
         message: sockets.length > 0
           ? 'Verifier sent'
@@ -8627,7 +8865,21 @@ app.post('/api/verifier/answer',
         } catch (_) {}
       });
 
-      return res.json({ ok: true, status: doc.status });
+      // Tras cada fallo (mal contestado o fuera de plazo) se revisa si toca
+      // suspender: 3 fallos = 3 días. Si pasa, evaluarSuspension… ya expulsa.
+      let sancion = { suspended: false, fails: 0 };
+      if (doc.status !== 'passed') {
+        sancion = await evaluarSuspensionPorVerificadores(address);
+      }
+
+      return res.json({
+        ok: true,
+        status: doc.status,
+        fails: sancion.fails,
+        failsToSuspend: VERIFIER_FAILS_TO_BAN,
+        suspended: !!sancion.suspended,
+        suspendedUntil: sancion.until || null
+      });
     } catch (e) {
       console.error('POST /api/verifier/answer:', e);
       return res.status(500).json({ error: 'internal_error' });
@@ -8981,7 +9233,544 @@ app.get('/api/admin/verifiers', adminAuth, apiLimiter, async (req, res) => {
   }
 });
 
+// ── GET /api/admin/suspensions ─────────────────────────────────────────────
+// Suspensiones temporales (las automáticas por verificadores y las manuales).
+app.get('/api/admin/suspensions', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    await caducarVerificadoresVencidos();
+    const soloActivas = String(req.query.active || '') === '1';
+    const filtro = soloActivas ? { liftedAt: null, until: { $gt: new Date() } } : {};
+    const docs = await PlayerSuspension.find(filtro).sort({ createdAt: -1 }).limit(200).lean();
+    const ahora = Date.now();
+    return res.json({
+      ok: true,
+      rules: {
+        seconds: VERIFIER_SECONDS,
+        failsToSuspend: VERIFIER_FAILS_TO_BAN,
+        suspendDays: VERIFIER_SUSPEND_DAYS,
+        failWindowDays: VERIFIER_FAIL_WINDOW_DAYS
+      },
+      suspensions: docs.map(s => ({
+        id: String(s._id),
+        address: s.address,
+        playerName: s.playerName,
+        reason: s.reason,
+        until: s.until,
+        days: s.days,
+        source: s.source,
+        adminAddress: s.adminAddress,
+        liftedAt: s.liftedAt,
+        active: !s.liftedAt && new Date(s.until).getTime() > ahora,
+        createdAt: s.createdAt
+      }))
+    });
+  } catch (e) {
+    console.error('GET /api/admin/suspensions:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── POST /api/admin/suspensions/:id/lift ───────────────────────────────────
+app.post('/api/admin/suspensions/:id/lift', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const doc = await PlayerSuspension.findById(req.params.id);
+    if (!doc) return res.status(404).json({ error: 'suspension_not_found' });
+    doc.liftedAt = new Date();
+    doc.adminAddress = req.admin.address || '';
+    await doc.save();
+    invalidateAccessCache();
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/admin/suspensions/:id/lift:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── POST /api/admin/reports/:id/suspend ────────────────────────────────────
+// Suspensión manual desde el expediente de un reporte.
+app.post('/api/admin/reports/:id/suspend', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const doc = await PlayerReport.findById(req.params.id);
+    if (!doc) return res.status(404).json({ error: 'report_not_found' });
+
+    const dias = Math.max(1, Math.min(365, parseInt(req.body?.days, 10) || VERIFIER_SUSPEND_DAYS));
+    const until = new Date(Date.now() + dias * 86400000);
+    const motivo = String(req.body?.reason || `Reported for ${doc.reason}`).slice(0, 300);
+
+    await PlayerSuspension.create({
+      address: doc.targetAddress,
+      playerName: doc.targetName,
+      reason: motivo,
+      until,
+      days: dias,
+      source: 'admin',
+      adminAddress: req.admin.address || ''
+    });
+    invalidateAccessCache();
+
+    socketsOfAddress(doc.targetAddress).forEach(s => {
+      try {
+        s.emit('accountSuspended', { reason: motivo, until: until.toISOString(), days: dias });
+        s.disconnect(true);
+      } catch (_) {}
+    });
+
+    doc.status = 'warned';
+    doc.adminAddress = req.admin.address || '';
+    doc.adminNote = `Suspended ${dias} day(s): ${motivo}`.slice(0, 1000);
+    doc.handledAt = new Date();
+    await doc.save();
+
+    return res.json({ ok: true, until, days: dias });
+  } catch (e) {
+    console.error('POST /api/admin/reports/:id/suspend:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 console.log('✅ Reportes/verificadores: /api/reports, /api/verifier/*, /api/admin/reports/*');
+
+
+// =============================================================================
+// COMPRA DE DINERO CON TOPE DIARIO  (2026-08-04)
+// -----------------------------------------------------------------------------
+// Paquetes fijos: 1 = 1 $, 10 = 10 $, 100 = 100 $.
+// Cada paquete tiene su PROPIO contador diario de 3 compras. Es decir: gastadas
+// las 3 de 1 $, todavía quedan las 3 de 10 $ y las 3 de 100 $ hasta mañana.
+// El contador vive en el SERVIDOR (nunca en el cliente) y el día se calcula en
+// UTC para que no se pueda reiniciar cambiando la hora del teléfono.
+// =============================================================================
+
+const CURRENCY_PACKS = {
+  1:   { gold: 1,   usd: 1   },
+  10:  { gold: 10,  usd: 10  },
+  100: { gold: 100, usd: 100 }
+};
+const CURRENCY_PACK_DAILY_LIMIT = 3;
+
+const currencyPurchaseSchema = new mongoose.Schema({
+  address: { type: String, required: true, lowercase: true, index: true },
+  pack:    { type: Number, required: true },            // 1 | 10 | 100
+  day:     { type: String, required: true },            // 'YYYY-MM-DD' en UTC
+  count:   { type: Number, default: 0, min: 0 },
+  lastAt:  { type: Date, default: null }
+}, { timestamps: true });
+currencyPurchaseSchema.index({ address: 1, pack: 1, day: 1 }, { unique: true });
+const CurrencyPurchase = mongoose.model('CurrencyPurchase', currencyPurchaseSchema);
+
+function diaUTC(d) {
+  const x = d ? new Date(d) : new Date();
+  return x.toISOString().slice(0, 10);
+}
+
+/** Cuántas compras quedan hoy de cada paquete. */
+async function estadoComprasDelDia(address) {
+  const addr = String(address || '').toLowerCase();
+  const day = diaUTC();
+  const docs = await CurrencyPurchase.find({ address: addr, day }).lean();
+  const porPack = docs.reduce((m, d) => (m[d.pack] = d.count, m), {});
+
+  const proximoReinicio = new Date();
+  proximoReinicio.setUTCHours(24, 0, 0, 0);
+
+  return {
+    day,
+    limit: CURRENCY_PACK_DAILY_LIMIT,
+    resetsAt: proximoReinicio.toISOString(),
+    packs: Object.keys(CURRENCY_PACKS).map(k => {
+      const pack = Number(k);
+      const usados = porPack[pack] || 0;
+      return {
+        pack,
+        gold: CURRENCY_PACKS[pack].gold,
+        usd:  CURRENCY_PACKS[pack].usd,
+        used: usados,
+        remaining: Math.max(0, CURRENCY_PACK_DAILY_LIMIT - usados)
+      };
+    })
+  };
+}
+
+// ── GET /api/currency/purchase/limits ──────────────────────────────────────
+app.get('/api/currency/purchase/limits', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    return res.json({ ok: true, ...(await estadoComprasDelDia(req.user.address)) });
+  } catch (e) {
+    console.error('GET /api/currency/purchase/limits:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── POST /api/currency/purchase ────────────────────────────────────────────
+// body: { pack: 1|10|100, txHash?: string }
+// El apunte del contador y la acuñación del oro los hace el SERVIDOR. El
+// cliente no puede saltarse el tope aunque manipule su copia del juego.
+app.post('/api/currency/purchase',
+  strictLimiter,
+  authMiddleware,
+  csrfProtection,
+  [ body('pack').isInt(), body('txHash').optional().isString().isLength({ max: 120 }) ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+      const address = String(req.user.address || '').toLowerCase();
+      const pack = parseInt(req.body.pack, 10);
+      const cfg = CURRENCY_PACKS[pack];
+      if (!cfg) return res.status(400).json({ error: 'invalid_pack' });
+
+      const day = diaUTC();
+
+      // Apunte ATÓMICO: el $inc con la condición del tope evita que dos
+      // peticiones a la vez cuelen una compra de más.
+      const doc = await CurrencyPurchase.findOneAndUpdate(
+        { address, pack, day, count: { $lt: CURRENCY_PACK_DAILY_LIMIT } },
+        { $inc: { count: 1 }, $set: { lastAt: new Date() } },
+        { new: true, upsert: false }
+      );
+
+      let apunte = doc;
+      if (!apunte) {
+        // O no existía todavía el documento de hoy, o ya llegó al tope.
+        const existente = await CurrencyPurchase.findOne({ address, pack, day }).lean();
+        if (existente && existente.count >= CURRENCY_PACK_DAILY_LIMIT) {
+          const estado = await estadoComprasDelDia(address);
+          return res.status(429).json({
+            error: 'daily_pack_limit_reached',
+            pack,
+            limit: CURRENCY_PACK_DAILY_LIMIT,
+            resetsAt: estado.resetsAt,
+            message: `You already bought the $${cfg.usd} pack ${CURRENCY_PACK_DAILY_LIMIT} times today`
+          });
+        }
+        try {
+          apunte = await CurrencyPurchase.create({ address, pack, day, count: 1, lastAt: new Date() });
+        } catch (dup) {
+          // Carrera con otra petición que lo creó primero: se reintenta el $inc.
+          apunte = await CurrencyPurchase.findOneAndUpdate(
+            { address, pack, day, count: { $lt: CURRENCY_PACK_DAILY_LIMIT } },
+            { $inc: { count: 1 }, $set: { lastAt: new Date() } },
+            { new: true }
+          );
+          if (!apunte) {
+            const estado = await estadoComprasDelDia(address);
+            return res.status(429).json({
+              error: 'daily_pack_limit_reached', pack,
+              limit: CURRENCY_PACK_DAILY_LIMIT, resetsAt: estado.resetsAt
+            });
+          }
+        }
+      }
+
+      // Acreditar el oro en la factura on-chain del jugador.
+      let acreditado = false;
+      let errorCredito = null;
+      try {
+        const gp = await GamePlayer.findOne({ address }).lean();
+        if (!gp || !gp.playerName) throw new Error('player_not_found');
+        const stats = await PlayerStats.findOne({ playerName: gp.playerName });
+        if (!stats) throw new Error('stats_not_found');
+
+        const nuevoOro = Number(stats.oro || 0) + cfg.gold;
+        const contract = getStatsContract();
+        const gasPrice = await getSafeGasPriceStats();
+        const invId = stats.invoiceIds && stats.invoiceIds.oro;
+
+        if (contract && invId) {
+          const r = await applyStatOnChain(contract, 'oro', invId, nuevoOro, gasPrice);
+          if (!r.ok) throw new Error(r.error || 'onchain_failed');
+        }
+        stats.oro = nuevoOro;
+        await stats.save();
+        acreditado = true;
+      } catch (e) {
+        errorCredito = e.message || String(e);
+        console.error('❌ No se pudo acreditar la compra de oro:', errorCredito);
+        // El apunte se DESHACE: si no se entregó el oro, esa compra no puede
+        // gastar el cupo del día.
+        try {
+          await CurrencyPurchase.updateOne(
+            { address, pack, day, count: { $gt: 0 } },
+            { $inc: { count: -1 } }
+          );
+        } catch (_) {}
+      }
+
+      const estado = await estadoComprasDelDia(address);
+      if (!acreditado) {
+        return res.status(502).json({ error: 'credit_failed', detail: errorCredito, ...estado });
+      }
+
+      console.log(`💵 ${address.slice(0, 10)}… compró el paquete de $${cfg.usd} (+${cfg.gold} oro)`);
+      return res.json({ ok: true, pack, gold: cfg.gold, usd: cfg.usd, ...estado });
+    } catch (e) {
+      console.error('POST /api/currency/purchase:', e);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  }
+);
+
+console.log('✅ Compra de dinero: /api/currency/purchase (3/día por paquete)');
+
+
+// =============================================================================
+// CONFIGURACIÓN DE SIEMBRA (editable desde admin.html)          (2026-08-04)
+// -----------------------------------------------------------------------------
+// Antes, la probabilidad de que un cultivo saliera bien la mandaba el CLIENTE
+// (`successChance` en el socket 'plantSeed'), y calcularPosibilidad() del juego
+// devolvía siempre 100. Es decir: ni había dificultad, ni se podía cambiar sin
+// tocar el código, y además un cliente manipulado podía mandar lo que quisiera.
+//
+// Ahora manda esta configuración del servidor: dificultad global, ajustes por
+// semilla, tiempo de crecimiento y probabilidad de que el cultivo muera.
+// =============================================================================
+
+const farmingConfigSchema = new mongoose.Schema({
+  _id:            { type: String, default: 'config' },
+  successChance:  { type: Number, default: 95, min: 1, max: 100 },   // dificultad global
+  perSeed:        { type: Map, of: Number, default: {} },            // Semillax → 20, …
+  growthMultiplier:{ type: Number, default: 1, min: 0.1, max: 10 },  // ×tiempo de crecimiento
+  waterCostMultiplier: { type: Number, default: 1, min: 0, max: 10 },
+  foodCostMultiplier:  { type: Number, default: 1, min: 0, max: 10 },
+  deathEnabled:   { type: Boolean, default: true },                  // ¿pueden morir?
+  updatedBy:      { type: String, default: '' }
+}, { timestamps: true, _id: false });
+const FarmingConfig = mongoose.model('FarmingConfig', farmingConfigSchema);
+
+// Caché de 30 s: plantSeed se llama muy a menudo y no puede ir a Mongo cada vez.
+const _farmingCache = { doc: null, at: 0 };
+async function getFarmingConfig() {
+  const ahora = Date.now();
+  if (_farmingCache.doc && (ahora - _farmingCache.at) < 30000) return _farmingCache.doc;
+  let doc = await FarmingConfig.findById('config').lean();
+  if (!doc) {
+    await FarmingConfig.create({ _id: 'config' });
+    doc = await FarmingConfig.findById('config').lean();
+  }
+  _farmingCache.doc = doc;
+  _farmingCache.at = ahora;
+  return doc;
+}
+function invalidateFarmingCache() { _farmingCache.doc = null; _farmingCache.at = 0; }
+
+/** Probabilidad final de éxito para una semilla, según la configuración. */
+async function successChanceParaSemilla(seedType) {
+  const cfg = await getFarmingConfig();
+  const perSeed = cfg.perSeed || {};
+  // Mongoose devuelve el Map como objeto plano con .lean()
+  const propia = perSeed instanceof Map ? perSeed.get(seedType) : perSeed[seedType];
+  const valor = Number(propia);
+  const base = Number.isFinite(valor) && valor > 0 ? valor : Number(cfg.successChance);
+  return Math.max(1, Math.min(100, Number.isFinite(base) ? base : 95));
+}
+
+// Lo consulta el juego para enseñar la dificultad real antes de sembrar.
+app.get('/api/farming-config', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const cfg = await getFarmingConfig();
+    const perSeed = cfg.perSeed instanceof Map ? Object.fromEntries(cfg.perSeed) : (cfg.perSeed || {});
+    return res.json({
+      ok: true,
+      successChance: cfg.successChance,
+      perSeed,
+      growthMultiplier: cfg.growthMultiplier,
+      waterCostMultiplier: cfg.waterCostMultiplier,
+      foodCostMultiplier: cfg.foodCostMultiplier,
+      deathEnabled: cfg.deathEnabled
+    });
+  } catch (e) {
+    console.error('GET /api/farming-config:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.get('/api/admin/farming-config', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const cfg = await getFarmingConfig();
+    const perSeed = cfg.perSeed instanceof Map ? Object.fromEntries(cfg.perSeed) : (cfg.perSeed || {});
+    return res.json({
+      ok: true,
+      config: {
+        successChance: cfg.successChance,
+        perSeed,
+        growthMultiplier: cfg.growthMultiplier,
+        waterCostMultiplier: cfg.waterCostMultiplier,
+        foodCostMultiplier: cfg.foodCostMultiplier,
+        deathEnabled: cfg.deathEnabled,
+        updatedBy: cfg.updatedBy,
+        updatedAt: cfg.updatedAt
+      },
+      seeds: Object.keys(cropController ? cropController.cropTypes : {})
+    });
+  } catch (e) {
+    console.error('GET /api/admin/farming-config:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.put('/api/admin/farming-config', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const update = { updatedBy: req.admin.address || '' };
+
+    const num = (v, min, max) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : null;
+    };
+
+    const sc = num(b.successChance, 1, 100);
+    if (sc !== null) update.successChance = sc;
+
+    const gm = num(b.growthMultiplier, 0.1, 10);
+    if (gm !== null) update.growthMultiplier = gm;
+
+    const wm = num(b.waterCostMultiplier, 0, 10);
+    if (wm !== null) update.waterCostMultiplier = wm;
+
+    const fm = num(b.foodCostMultiplier, 0, 10);
+    if (fm !== null) update.foodCostMultiplier = fm;
+
+    if (typeof b.deathEnabled === 'boolean') update.deathEnabled = b.deathEnabled;
+
+    if (b.perSeed && typeof b.perSeed === 'object') {
+      const limpio = {};
+      Object.keys(b.perSeed).slice(0, 40).forEach(k => {
+        const n = num(b.perSeed[k], 1, 100);
+        // 0 / vacío = "sin ajuste propio", se usa la dificultad global.
+        if (n !== null && String(b.perSeed[k]).trim() !== '') limpio[String(k).slice(0, 40)] = n;
+      });
+      update.perSeed = limpio;
+    }
+
+    await FarmingConfig.findByIdAndUpdate('config', { $set: update }, { upsert: true });
+    invalidateFarmingCache();
+
+    const cfg = await getFarmingConfig();
+    const perSeed = cfg.perSeed instanceof Map ? Object.fromEntries(cfg.perSeed) : (cfg.perSeed || {});
+    console.log(`🌱 [admin ${req.admin.address}] configuración de siembra actualizada (éxito ${cfg.successChance}%)`);
+    return res.json({ ok: true, config: { ...cfg, perSeed } });
+  } catch (e) {
+    console.error('PUT /api/admin/farming-config:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+console.log('✅ Configuración de siembra: /api/admin/farming-config');
+
+
+// =============================================================================
+// CONFIGURACIÓN DE LA TABLA DE CLASIFICACIÓN (admin.html)       (2026-08-04)
+// =============================================================================
+const leaderboardConfigSchema = new mongoose.Schema({
+  _id:          { type: String, default: 'config' },
+  enabled:      { type: Boolean, default: true },
+  topSize:      { type: Number, default: 20, min: 3, max: 100 },
+  minBattles:   { type: Number, default: 0, min: 0, max: 1000 },
+  hideBanned:   { type: Boolean, default: true },
+  hideSuspended:{ type: Boolean, default: true },
+  hideBots:     { type: Boolean, default: true },
+  seasonLabel:  { type: String, default: '', maxlength: 60 },
+  updatedBy:    { type: String, default: '' }
+}, { timestamps: true, _id: false });
+const LeaderboardConfig = mongoose.model('LeaderboardConfig', leaderboardConfigSchema);
+
+const _lbCache = { doc: null, at: 0 };
+async function getLeaderboardConfig() {
+  const ahora = Date.now();
+  if (_lbCache.doc && (ahora - _lbCache.at) < 30000) return _lbCache.doc;
+  let doc = await LeaderboardConfig.findById('config').lean();
+  if (!doc) {
+    await LeaderboardConfig.create({ _id: 'config' });
+    doc = await LeaderboardConfig.findById('config').lean();
+  }
+  _lbCache.doc = doc;
+  _lbCache.at = ahora;
+  return doc;
+}
+function invalidateLeaderboardCache() { _lbCache.doc = null; _lbCache.at = 0; }
+
+/**
+ * Direcciones que NO deben salir en la clasificación: baneadas y suspendidas.
+ * @returns {Promise<Set<string>>} direcciones en minúsculas
+ */
+async function direccionesExcluidasDeClasificacion(cfg) {
+  const fuera = new Set();
+  if (cfg.hideBanned) {
+    try {
+      const ac = await getAccessControlCached();
+      (ac.banned || []).forEach(b => fuera.add(String(b.address).toLowerCase()));
+    } catch (_) {}
+  }
+  if (cfg.hideSuspended) {
+    try {
+      const activas = await PlayerSuspension.find({
+        liftedAt: null, until: { $gt: new Date() }
+      }).select('address -_id').lean();
+      activas.forEach(s => fuera.add(String(s.address).toLowerCase()));
+    } catch (_) {}
+  }
+  return fuera;
+}
+
+/**
+ * Nombres de jugador excluidos. Hace falta además de las direcciones porque
+ * BattleScore guarda `address` solo si la tenía al registrar la puntuación:
+ * en las filas antiguas puede estar vacía, y solo con la dirección un baneado
+ * seguiría apareciendo en el podio.
+ */
+async function nombresExcluidosDeClasificacion(direcciones) {
+  if (!direcciones || direcciones.size === 0) return new Set();
+  try {
+    const docs = await GamePlayer.find({ address: { $in: [...direcciones] } })
+      .select('playerName -_id').lean();
+    return new Set(docs.map(d => d.playerName).filter(Boolean));
+  } catch (_) {
+    return new Set();
+  }
+}
+
+app.get('/api/admin/leaderboard-config', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const cfg = await getLeaderboardConfig();
+    const fuera = await direccionesExcluidasDeClasificacion(cfg);
+    return res.json({ ok: true, config: cfg, excludedCount: fuera.size });
+  } catch (e) {
+    console.error('GET /api/admin/leaderboard-config:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.put('/api/admin/leaderboard-config', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const update = { updatedBy: req.admin.address || '' };
+
+    if (typeof b.enabled === 'boolean')       update.enabled = b.enabled;
+    if (typeof b.hideBanned === 'boolean')    update.hideBanned = b.hideBanned;
+    if (typeof b.hideSuspended === 'boolean') update.hideSuspended = b.hideSuspended;
+    if (typeof b.hideBots === 'boolean')      update.hideBots = b.hideBots;
+
+    const ts = parseInt(b.topSize, 10);
+    if (Number.isFinite(ts)) update.topSize = Math.max(3, Math.min(100, ts));
+
+    const mb = parseInt(b.minBattles, 10);
+    if (Number.isFinite(mb)) update.minBattles = Math.max(0, Math.min(1000, mb));
+
+    if (typeof b.seasonLabel === 'string') update.seasonLabel = b.seasonLabel.slice(0, 60);
+
+    await LeaderboardConfig.findByIdAndUpdate('config', { $set: update }, { upsert: true });
+    invalidateLeaderboardCache();
+
+    console.log(`🏆 [admin ${req.admin.address}] configuración de clasificación actualizada`);
+    return res.json({ ok: true, config: await getLeaderboardConfig() });
+  } catch (e) {
+    console.error('PUT /api/admin/leaderboard-config:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+console.log('✅ Configuración de clasificación: /api/admin/leaderboard-config');
 
 
 // Marketplace P2P — todas las rutas /api/marketplace/* viven en marketplace-routes.js
@@ -10824,18 +11613,58 @@ const BATTLE_MIN_FOR_RANKING = 3;
 app.get('/api/battle/leaderboard', apiLimiter, authMiddleware, async (req, res) => {
   try {
     const season = await getCurrentBattleSeason();
-    const limit = Math.min(100, Math.max(5, parseInt(req.query.limit, 10) || 50));
 
-    const top = await BattleScore.find({
+    // CONFIGURACIÓN EDITABLE DESDE admin.html (2026-08-04): tamaño de la tabla,
+    // batallas mínimas y a quién se oculta. Si el administrador la desactiva,
+    // la tabla se devuelve vacía y el cliente muestra el aviso.
+    const lbCfg = await getLeaderboardConfig();
+    if (lbCfg.enabled === false) {
+      return res.json({
+        success: true,
+        disabled: true,
+        message: 'The leaderboard is temporarily disabled',
+        season: {
+          number: season.seasonNumber,
+          startedAt: season.startedAt,
+          endsAt: season.endsAt,
+          daysTotal: BATTLE_SEASON_DAYS,
+          msRemaining: Math.max(0, season.endsAt.getTime() - Date.now())
+        },
+        seasonLabel: lbCfg.seasonLabel || '',
+        minBattlesForRanking: lbCfg.minBattles,
+        rows: [],
+        me: null
+      });
+    }
+
+    const minBatallas = Number.isFinite(Number(lbCfg.minBattles))
+      ? Number(lbCfg.minBattles) : BATTLE_MIN_FOR_RANKING;
+    const limit = Math.min(100, Math.max(3, parseInt(req.query.limit, 10) || lbCfg.topSize || 50));
+
+    // JUGADORES EXCLUIDOS: baneados y suspendidos. Un tramposo baneado no debe
+    // seguir ocupando el podio. Se pide de más para poder rellenar los huecos
+    // que dejen los excluidos y que la tabla siga teniendo `limit` filas.
+    const excluidas = await direccionesExcluidasDeClasificacion(lbCfg);
+    const nombresFuera = await nombresExcluidosDeClasificacion(excluidas);
+
+    const crudos = await BattleScore.find({
       seasonNumber: season.seasonNumber,
-      battles: { $gte: BATTLE_MIN_FOR_RANKING }
+      battles: { $gte: minBatallas }
     })
       .sort({ points: -1, wins: -1, battles: 1 })
-      .limit(limit)
+      .limit(limit + excluidas.size + 20)
       .select('playerName address petName points wins losses battles bestStreak -_id')
       .lean();
 
-    const rows = top.map((r, i) => ({ rank: i + 1, ...r }));
+    const filtrados = crudos.filter(r => {
+      if (excluidas.has(String(r.address || '').toLowerCase())) return false;
+      if (nombresFuera.has(r.playerName)) return false;
+      // hideBots: el bot de entrenamiento no compite en la tabla.
+      if (lbCfg.hideBots && /^bot[_-]?/i.test(String(r.playerName || ''))) return false;
+      return true;
+    }).slice(0, limit);
+
+    const rows = filtrados.map((r, i) => ({ rank: i + 1, ...r }));
 
     // Fila del jugador que pregunta (aunque aún no llegue al mínimo).
     // El token solo trae la address; el playerName sale de PlayerAuth, igual
@@ -10859,19 +11688,23 @@ app.get('/api/battle/leaderboard', apiLimiter, authMiddleware, async (req, res) 
       if (mine) {
         const mejores = await BattleScore.countDocuments({
           seasonNumber: season.seasonNumber,
-          battles: { $gte: BATTLE_MIN_FOR_RANKING },
+          battles: { $gte: minBatallas },
           points: { $gt: mine.points }
         });
+        // Un jugador excluido (baneado/suspendido) tampoco ve su propio puesto.
+        const estoyFuera = excluidas.has(String(mine.address || '').toLowerCase()) ||
+                           nombresFuera.has(mine.playerName);
         me = {
           ...mine,
-          rank: mine.battles >= BATTLE_MIN_FOR_RANKING ? mejores + 1 : null,
-          missingBattles: Math.max(0, BATTLE_MIN_FOR_RANKING - mine.battles)
+          rank: (!estoyFuera && mine.battles >= minBatallas) ? mejores + 1 : null,
+          excluded: estoyFuera,
+          missingBattles: Math.max(0, minBatallas - mine.battles)
         };
       } else {
         me = {
           playerName: myName, address: '', petName: '---',
           points: 0, wins: 0, losses: 0, battles: 0, bestStreak: 0,
-          rank: null, missingBattles: BATTLE_MIN_FOR_RANKING
+          rank: null, excluded: false, missingBattles: minBatallas
         };
       }
     }
@@ -10885,7 +11718,8 @@ app.get('/api/battle/leaderboard', apiLimiter, authMiddleware, async (req, res) 
         daysTotal: BATTLE_SEASON_DAYS,
         msRemaining: Math.max(0, season.endsAt.getTime() - Date.now())
       },
-      minBattlesForRanking: BATTLE_MIN_FOR_RANKING,
+      seasonLabel: lbCfg.seasonLabel || '',
+      minBattlesForRanking: minBatallas,
       rows,
       me
     });
