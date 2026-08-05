@@ -3689,10 +3689,43 @@ class WaterCollectionController {
     }
   }
 
+  /**
+   * DESHACE una recolección ya apuntada.                        (2026-08-05)
+   *
+   * El pozo funciona en dos pasos: primero se APUNTA aquí (que es lo que
+   * impide sacar agua diez veces seguidas) y después el cliente cambia el balde
+   * vacío por el lleno con transacciones on-chain. Si esas transacciones no
+   * salen, el jugador se quedaba sin balde Y sin el turno del pozo: perdía una
+   * de las 5 recolecciones del día y encima tenía que esperar 10 minutos.
+   *
+   * Con esto, el cliente avisa del fallo y el turno se devuelve tal cual estaba.
+   */
+  async refundCollection(playerName) {
+    const record = await WaterCollection.findOne({ playerName });
+    if (!record) return { success: false, error: 'no_record' };
+
+    record.collectionCount       = Math.max(0, (record.collectionCount || 0) - 1);
+    record.totalCollectionsToday = Math.max(0, (record.totalCollectionsToday || 0) - 1);
+    record.collectionCycle       = ((record.collectionCycle || 0) + 4) % 5; // -1 en módulo 5
+    record.isDailyLimitReached   = record.totalCollectionsToday >= 5;
+    // Se puede volver a intentar de inmediato: el intento anterior no llegó a
+    // entregar nada.
+    record.nextAvailableTime     = null;
+    record.lastCollectionTime    = null;
+    await record.save();
+
+    console.log(`💧 Recolección devuelta a ${playerName} (quedan ${5 - record.totalCollectionsToday} hoy)`);
+    return {
+      success: true,
+      collectionsToday: record.totalCollectionsToday,
+      collectionCycle: record.collectionCycle
+    };
+  }
+
   async getWaterCollectionStatus(playerName) {
     try {
       let record = await WaterCollection.findOne({ playerName });
-      
+
       if (!record) {
         record = new WaterCollection({
           playerName,
@@ -6487,8 +6520,12 @@ function gatherNodeTypeFromKey(key) {
   if (k.includes('carbon'))            return { kind: 'mine', type: 'carbon' };
   return null;
 }
+// OJO CON LOS NOMBRES: el `tipo` tiene que ser EXACTAMENTE el de
+// ItemDefinitions en el cliente. Las maderas llevan ESPACIOS ("madera pinos"),
+// no guion bajo; aquí estaban con guion bajo, así que el modo servidor habría
+// acuñado a una tabla distinta de la que usa el inventario del jugador.
 const GATHER_REWARD_TIPO = {
-  pinos: 'madera_pinos', arbolx: 'madera_seca', arbustos: 'madera_con_hojas',
+  pinos: 'madera pinos', arbolx: 'madera seca', arbustos: 'madera con hojas',
   piedra: 'mineral_piedra', cobre: 'mineral_cobre', hierro: 'mineral_hierro', carbon: 'carbon'
 };
 // Conjunto de tipos que SOLO el servidor puede acuñar (recolección).
@@ -7790,10 +7827,37 @@ app.post('/api/water/collect',
       res.json(result);
     } catch (error) {
       console.error('Error recolectando agua:', error);
-      res.status(400).json({ 
-        success: false, 
-        error: error.message 
+      res.status(400).json({
+        success: false,
+        error: error.message
       });
+    }
+  }
+);
+
+// Devuelve el turno del pozo cuando el intercambio de baldes on-chain no llegó
+// a confirmarse (ver refundCollection). Sin esto, una transacción fallida le
+// costaba al jugador una de las 5 recolecciones del día.
+app.post('/api/water/collect/refund',
+  apiLimiter,
+  authMiddleware,
+  csrfProtection,
+  body('playerName').isString().notEmpty(),
+  async (req, res) => {
+    try {
+      const { playerName } = req.body;
+      const address = req.user.address.toLowerCase();
+
+      const auth = await PlayerAuth.findOne({ address }).exec();
+      if (!auth || auth.playerName !== playerName) {
+        return res.status(403).json({ error: 'No autorizado' });
+      }
+
+      const result = await waterCollectionController.refundCollection(playerName);
+      res.json(result);
+    } catch (error) {
+      console.error('Error devolviendo la recolección de agua:', error);
+      res.status(400).json({ success: false, error: error.message });
     }
   }
 );
@@ -7880,6 +7944,376 @@ async function getDailyMissionsHandler(req, res) {
 }
 app.get('/api/missions/daily/:npcId', apiLimiter, authMiddleware, getDailyMissionsHandler);
 app.get('/api/missions/daily/:npcId/:date', apiLimiter, authMiddleware, getDailyMissionsHandler);
+
+// ============================================================================
+// POST /api/missions/daily/complete — ENTREGAR UNA MISIÓN        (2026-08-05)
+// ----------------------------------------------------------------------------
+// ESTA RUTA NO EXISTÍA. El cliente (GameScene.completeMission) llevaba desde
+// siempre llamándola al pulsar "HAND IN", así que el botón SIEMPRE respondía
+// 404 → "Error completing mission. Please try again.".
+//
+// Y lo peor: el cliente quitaba los ítems del inventario ANTES de llamar y los
+// guardaba con /api/save. Como la llamada fallaba después, el jugador perdía
+// los materiales y no recibía nada (justo lo que se ve en las capturas: 5/5 →
+// 1/5 y ninguna recompensa).
+//
+// La ruta nueva es SERVIDOR-AUTORITATIVA de principio a fin:
+//   1. valida la misión y que no esté ya entregada,
+//   2. comprueba los materiales en el inventario GUARDADO (no en el que dice
+//      el cliente),
+//   3. los QUEMA en la cadena (burnItemOnChain) y los descuenta de Mongo,
+//   4. paga la experiencia en su factura (applyStatOnChain) y ACUÑA el ítem de
+//      recompensa,
+//   5. marca el progreso del día.
+// Si algo falla antes del paso 3 no se toca nada. El cliente ya no borra nada
+// por su cuenta: recarga el inventario desde aquí.
+// ============================================================================
+
+// itemId del juego → `tipo` del contrato. Copia EXACTA de ItemDefinitions en
+// Scenes/GameScene.js: si aquí se pusiera 'madera_pinos' en vez de
+// 'madera pinos', el servidor buscaría facturas que no existen y creería que el
+// jugador no tiene nada.
+const ITEM_TIPO_MAP = {
+  Semillax: 'bolsa zanahorias', Semillax1: 'bolsa de tomates',
+  Semillax2: 'bolsa de trigo',  Semillax3: 'bolsa de calabazas',
+
+  Regaderax: 'Regaderax', Tijerasx: 'Tijerasx',
+
+  mineral_piedra: 'mineral_piedra', mineral_cobre: 'mineral_cobre',
+  mineral_hierro: 'mineral_hierro', carbon: 'carbon',
+
+  palo: 'palo', tablon_de_madera: 'tablon_de_madera',
+  madera_pinos: 'madera pinos', madera_con_hojas: 'madera con hojas',
+  madera_seca: 'madera seca',
+
+  balde_vacio: 'balde_vacio', balde_con_agua: 'balde_con_agua',
+
+  hacha_de_madera: 'hacha de madera', hacha_de_piedra: 'hacha de piedra',
+  hacha_de_cobre:  'hacha de cobre',  hacha_de_hierro: 'hacha de hierro',
+  pico_de_madera:  'pico de madera',  pico_de_piedra:  'pico de piedra',
+  pico_de_cobre:   'pico de cobre',   pico_de_hierro:  'pico de hierro',
+
+  zanahoria_buena: 'zanahoria_buena', zanahoria_corta: 'zanahoria_corta', zanahoria_mala: 'zanahoria_mala',
+  tomate_buena:    'tomate_buena',    tomate_corta:    'tomate_corta',    tomate_mala:    'tomate_mala',
+  trigo_buena:     'trigo_buena',     trigo_corta:     'trigo_corta',     trigo_mala:     'trigo_mala',
+  calabaza_buena:  'calabaza_buena',  calabaza_corta:  'calabaza_corta',  calabaza_mala:  'calabaza_mala',
+};
+
+function itemTipoOnChain(itemId) {
+  return ITEM_TIPO_MAP[String(itemId || '')] || null;
+}
+
+// Tope de stack por ítem (mismo criterio que ItemDefinitions.maxStack). Se usa
+// para repartir la recompensa entre casillas del inventario guardado.
+const ITEM_MAX_STACK = {
+  Semillax: 50, Semillax1: 50, Semillax2: 50, Semillax3: 50,
+  Regaderax: 1, Tijerasx: 1,
+  mineral_piedra: 20, mineral_cobre: 20, mineral_hierro: 20, carbon: 20,
+  palo: 20, tablon_de_madera: 20,
+  madera_pinos: 50, madera_con_hojas: 50, madera_seca: 50,
+  balde_vacio: 5, balde_con_agua: 5,
+  hacha_de_madera: 5, hacha_de_piedra: 5, hacha_de_cobre: 5, hacha_de_hierro: 5,
+  pico_de_madera: 5, pico_de_piedra: 5, pico_de_cobre: 5, pico_de_hierro: 5,
+  zanahoria_buena: 20, zanahoria_corta: 20, zanahoria_mala: 20,
+  tomate_buena: 20, tomate_corta: 20, tomate_mala: 20,
+  trigo_buena: 20, trigo_corta: 20, trigo_mala: 20,
+  calabaza_buena: 20, calabaza_corta: 20, calabaza_mala: 20,
+};
+
+// itemId "suelto" de una misión → id real del inventario. Copia del
+// MISSION_ITEM_MAP del cliente, para que panel y servidor no discrepen.
+const MISSION_ITEM_ALIASES = {
+  zanahoria: 'zanahoria_buena', carrot: 'zanahoria_buena',
+  tomate: 'tomate_buena',       tomato: 'tomate_buena',
+  trigo: 'trigo_buena',         wheat:  'trigo_buena',
+  calabaza: 'calabaza_buena',   pumpkin:'calabaza_buena',
+  piedra: 'mineral_piedra',     stone:  'mineral_piedra',
+  cobre: 'mineral_cobre',       copper: 'mineral_cobre',
+  hierro: 'mineral_hierro',     iron:   'mineral_hierro',
+  carbon: 'carbon',             coal:   'carbon',
+  madera: 'madera_pinos',       wood:   'madera_pinos',
+};
+
+function resolveMissionItemId(itemId) {
+  const raw = String(itemId || '').trim();
+  return MISSION_ITEM_ALIASES[raw] || MISSION_ITEM_ALIASES[raw.toLowerCase()] || raw;
+}
+
+/** Suma cuántas unidades de `itemId` hay en un array guardado (inventory/chest). */
+function contarEnSlots(slots, itemId) {
+  if (!Array.isArray(slots)) return 0;
+  const objetivo = String(itemId).toLowerCase();
+  let total = 0;
+  for (const s of slots) {
+    if (!s || !s.objeto) continue;
+    if (String(s.objeto).toLowerCase() !== objetivo) continue;
+    total += Math.max(0, parseInt(s.cantidad, 10) || 0);
+  }
+  return total;
+}
+
+// OJO CON LA FORMA DE ESTOS ARRAYS. `GamePlayer.inventory` / `.chest` NO son
+// listas de 40 y 7 posiciones: /api/save descarta las casillas sin IDX y sin
+// Manualid, así que lo que queda guardado es una lista DISPERSA en la que cada
+// entrada lleva su número de casilla en `id`. Por eso "buscar una casilla
+// libre" es buscar un número de casilla que no esté usado, no un hueco `null`.
+const INV_SLOTS   = 40;
+const CHEST_SLOTS = 7;
+
+/**
+ * Descuenta `cantidad` unidades de `itemId` de los arrays guardados
+ * (primero el cofre/quickslots y luego el inventario, igual que el cliente).
+ * Las casillas que quedan a cero se ELIMINAN de la lista, para que su número
+ * vuelva a estar libre y no arrastren el IDX de una factura ya quemada.
+ *
+ * @returns {{descontadas:number, inventory:Array, chest:Array}} listas nuevas
+ */
+function descontarDeSlots(chest, inventory, itemId, cantidad) {
+  const objetivo = String(itemId).toLowerCase();
+  let restante = cantidad;
+
+  const barrer = (arr) => {
+    if (!Array.isArray(arr)) return [];
+    const salida = [];
+    for (const s of arr) {
+      if (!s || !s.objeto || restante <= 0 || String(s.objeto).toLowerCase() !== objetivo) {
+        salida.push(s);
+        continue;
+      }
+      const hay = Math.max(0, parseInt(s.cantidad, 10) || 0);
+      if (hay <= 0) continue; // casilla basura: se tira
+      const quitar = Math.min(hay, restante);
+      restante -= quitar;
+      const quedan = hay - quitar;
+      if (quedan > 0) { s.cantidad = quedan; salida.push(s); }
+      // quedan === 0 → la entrada desaparece y su número de casilla se libera
+    }
+    return salida;
+  };
+
+  const chestOut = barrer(chest);
+  const invOut   = barrer(inventory);
+  return { descontadas: cantidad - restante, inventory: invOut, chest: chestOut };
+}
+
+/**
+ * Mete `cantidad` unidades de `itemId` en el inventario guardado: primero
+ * completa stacks del mismo ítem y luego ocupa números de casilla libres.
+ *
+ * @returns {{metidas:number, inventory:Array}}
+ */
+function agregarASlots(inventory, itemId, cantidad, { invoiceId = null, manualId = null } = {}) {
+  const lista = Array.isArray(inventory) ? inventory.slice() : [];
+  if (cantidad <= 0) return { metidas: 0, inventory: lista };
+
+  const maxStack = ITEM_MAX_STACK[itemId] || 20;
+  const objetivo = String(itemId).toLowerCase();
+  let restante = cantidad;
+
+  // 1) Completar stacks que ya existen de ese ítem.
+  for (const s of lista) {
+    if (restante <= 0) break;
+    if (!s || !s.objeto || String(s.objeto).toLowerCase() !== objetivo) continue;
+    const hay = Math.max(0, parseInt(s.cantidad, 10) || 0);
+    const hueco = maxStack - hay;
+    if (hueco <= 0) continue;
+    const meter = Math.min(hueco, restante);
+    s.cantidad = hay + meter;
+    restante  -= meter;
+  }
+
+  // 2) Abrir stacks nuevos en los números de casilla que estén libres.
+  const ocupadas = new Set(lista.filter(s => s && s.objeto).map(s => Number(s.id)));
+  for (let i = 0; i < INV_SLOTS && restante > 0; i++) {
+    if (ocupadas.has(i)) continue;
+    const meter = Math.min(maxStack, restante);
+    lista.push({
+      id: i,
+      IDX: invoiceId,
+      Manualid: manualId,
+      objeto: itemId,
+      cantidad: meter,
+      tipo: 'inventario'
+    });
+    ocupadas.add(i);
+    restante -= meter;
+  }
+
+  return { metidas: cantidad - restante, inventory: lista };
+}
+
+app.post('/api/missions/daily/complete',
+  apiLimiter,
+  authMiddleware,
+  csrfProtection,
+  body('npcId').isString().notEmpty(),
+  body('missionId').isString().notEmpty(),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+      const address = req.user.address.toLowerCase();
+      const auth = await PlayerAuth.findOne({ address }).exec();
+      if (!auth || !auth.playerName) return res.status(404).json({ error: 'player_not_found' });
+      const playerName = auth.playerName;
+
+      const npcId     = String(req.body.npcId);
+      const missionId = String(req.body.missionId);
+      const day       = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.day || ''))
+        ? String(req.body.day)
+        : new Date().toISOString().split('T')[0];
+
+      if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'invalid_npc' });
+
+      // ── 1. La misión existe hoy ──────────────────────────────────────────
+      const daily = await DailyMission.findOne({ npcId, day }).lean();
+      if (!daily) return res.status(404).json({ error: 'no_missions_today' });
+
+      const mission = (daily.missions || []).find(m => m.missionId === missionId);
+      if (!mission) return res.status(404).json({ error: 'mission_not_found' });
+
+      // ── 2. ¿Ya estaba entregada? ─────────────────────────────────────────
+      let progress = await UserDailyProgress.findOne({ playerName, npcId, day });
+      if (!progress) progress = new UserDailyProgress({ playerName, npcId, day, completedMissions: [], completedCount: 0 });
+
+      if ((progress.completedMissions || []).some(m => m.missionId === missionId)) {
+        return res.status(409).json({ error: 'already_completed', completedCount: progress.completedCount });
+      }
+
+      // ── 3. ¿Tiene los materiales? (según el inventario GUARDADO) ─────────
+      const gp = await GamePlayer.findOne({ playerName });
+      if (!gp) return res.status(404).json({ error: 'player_not_found' });
+
+      const itemId   = resolveMissionItemId(mission.itemId);
+      const pedido   = Math.max(1, parseInt(mission.requiredAmount, 10) || 1);
+      // Copias propias: mongoose no detecta mutaciones dentro de un Array
+      // suelto, así que se trabaja aparte y al final se reasigna + markModified.
+      let inventory = Array.isArray(gp.inventory) ? gp.inventory.map(s => ({ ...s })) : [];
+      let chest     = Array.isArray(gp.chest)     ? gp.chest.map(s => ({ ...s }))     : [];
+
+      const tiene = contarEnSlots(inventory, itemId) + contarEnSlots(chest, itemId);
+      if (tiene < pedido) {
+        return res.status(400).json({
+          error: 'not_enough_items',
+          message: `No tienes los items requeridos (${itemId})`,
+          itemId, required: pedido, have: tiene
+        });
+      }
+
+      // ── 4. Quemar los materiales EN LA CADENA ────────────────────────────
+      // Primero la cadena y solo después Mongo: si la quema falla, el jugador
+      // conserva sus materiales y la misión sigue sin entregar.
+      const tipoEntrega = itemTipoOnChain(itemId);
+      if (tipoEntrega) {
+        const quemadas = await burnItemOnChain(address, tipoEntrega, pedido);
+        if (quemadas < pedido) {
+          console.error(`❌ misión ${missionId}: solo se quemaron ${quemadas}/${pedido} de ${tipoEntrega}`);
+          // Lo ya quemado se descuenta igualmente del inventario guardado, para
+          // que Mongo no muestre unos ítems que en la cadena ya no existen.
+          if (quemadas > 0) {
+            const parcial = descontarDeSlots(chest, inventory, itemId, quemadas);
+            gp.inventory = parcial.inventory; gp.chest = parcial.chest;
+            gp.markModified('inventory'); gp.markModified('chest');
+            await gp.save();
+          }
+          return res.status(502).json({ error: 'burn_failed', burned: quemadas, required: pedido });
+        }
+      } else {
+        console.warn(`⚠️  misión ${missionId}: '${itemId}' no tiene tipo on-chain, se descuenta solo en BD`);
+      }
+
+      const gasto = descontarDeSlots(chest, inventory, itemId, pedido);
+      inventory = gasto.inventory;
+      chest     = gasto.chest;
+
+      // ── 5. Recompensas ───────────────────────────────────────────────────
+      const expReward = Math.max(0, parseInt(mission.expReward, 10) || 0);
+      const rewardId  = mission.rewardItemId ? String(mission.rewardItemId) : null;
+      const rewardQty = rewardId ? Math.max(1, parseInt(mission.rewardAmount, 10) || 1) : 0;
+
+      const avisos = [];
+
+      // 5a. Experiencia — a su factura (misma vía que el resto del juego).
+      let expTotal = Math.max(0, Math.round(Number(gp.nivel_exp || 0)));
+      if (expReward > 0) {
+        expTotal += expReward;
+        gp.nivel_exp = expTotal;
+        try {
+          const statsDoc = await PlayerStats.findOne({ playerName });
+          if (statsDoc) {
+            const contract = getStatsContract();
+            const invId    = statsDoc.invoiceIds && statsDoc.invoiceIds.exp;
+            if (contract && invId) {
+              const gasPrice = await getSafeGasPriceStats();
+              const r = await applyStatOnChain(contract, 'exp', invId, expTotal, gasPrice);
+              statsDoc.exp = r.ok ? expTotal : clampStat('exp', r.chainQty ?? statsDoc.exp);
+              if (!r.ok) avisos.push('exp_chain_failed');
+            } else {
+              statsDoc.exp = expTotal; // sin factura todavía: la creará /sync
+            }
+            await statsDoc.save();
+          }
+        } catch (e) {
+          console.warn('⚠️  misión: no se pudo llevar la exp a la cadena:', e.message);
+          avisos.push('exp_chain_failed');
+        }
+      }
+
+      // 5b. Ítem de recompensa — se ACUÑA y luego entra en el inventario.
+      let entregadas = 0;
+      if (rewardId && rewardQty > 0) {
+        const tipoPremio = itemTipoOnChain(rewardId);
+        let acunado = null;
+        if (tipoPremio) {
+          acunado = await mintGatherReward(address, tipoPremio, rewardQty);
+          if (!acunado) avisos.push('reward_mint_failed');
+        }
+        if (!tipoPremio || acunado) {
+          const puesto = agregarASlots(inventory, rewardId, rewardQty, {
+            invoiceId: acunado ? acunado.id : null,
+            manualId:  acunado ? acunado.manualId : null
+          });
+          inventory  = puesto.inventory;
+          entregadas = puesto.metidas;
+          if (entregadas < rewardQty) avisos.push('inventory_full');
+        }
+      }
+
+      gp.inventory = inventory;
+      gp.chest     = chest;
+      gp.misiones  = Math.max(0, Number(gp.misiones || 0)) + 1;
+      gp.markModified('inventory');
+      gp.markModified('chest');
+      await gp.save();
+
+      // ── 6. Marcar el progreso del día ────────────────────────────────────
+      progress.completedMissions.push({ missionId, completedAt: new Date(), claimedReward: true });
+      progress.completedCount  = progress.completedMissions.length;
+      progress.lastInteraction = new Date();
+      await progress.save();
+
+      console.log(`🎯 ${playerName} entregó '${missionId}' (${npcId}/${day}): -${pedido} ${itemId}, +${expReward} exp` +
+                  (rewardId ? `, +${entregadas} ${rewardId}` : ''));
+
+      return res.json({
+        success: true,
+        missionId,
+        completedCount: progress.completedCount,
+        rewards: {
+          exp: expReward,
+          item: rewardId ? { id: rewardId, amount: entregadas } : null
+        },
+        warnings: avisos.length ? avisos : undefined
+      });
+
+    } catch (error) {
+      console.error('❌ Error completando misión diaria:', error);
+      return res.status(500).json({ error: 'internal_server_error' });
+    }
+  }
+);
+console.log('✅ Missions route: POST /api/missions/daily/complete');
 
 // ============================================================================
 // ADMIN: CARGA DE LAS MISIONES DIARIAS (panel misiones.html)
@@ -10203,6 +10637,20 @@ const playerStatsSchema = new mongoose.Schema({
     plata:  { type: String, default: null },
     exp:    { type: String, default: null },
   },
+  // Marca de tiempo de la ÚLTIMA regeneración pasiva de vitales aplicada.
+  // La regeneración se calcula por diferencia de tiempo (ver
+  // applyGhostVitalRegen), así que también cuenta el rato que el jugador estuvo
+  // DESCONECTADO sin necesidad de ningún temporizador por jugador.
+  lastVitalRegen: { type: Date, default: null },
+  // DEUDA CON LA CADENA (liquidación agrupada, 2026-08-05).
+  // Lista de stats cuyo valor en Mongo ya está cobrado pero todavía no se ha
+  // escrito en su factura. El liquidador (liquidarPendientesDeCadena) las
+  // convierte en UNA transacción por barra cada minuto. Vive en la BASE DE
+  // DATOS a propósito: si el jugador recarga o cierra el navegador, la deuda
+  // sigue aquí y se liquida igual — no hay forma de escaparse gastando y
+  // recargando la página.
+  chainPending:      { type: [String], default: [] },
+  chainPendingSince: { type: Date, default: null },
   lastSync:    { type: Date, default: null },
   lastUpdated: { type: Date, default: Date.now },
   createdAt:   { type: Date, default: Date.now },
@@ -10228,11 +10676,219 @@ const STAT_DEFAULTS_MAP  = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX
 const STAT_INITIAL_MAP   = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 1000, plata: 1000, exp: 0 };
 
 const isVitalStat = (stat) => stat === 'vida' || stat === 'agua' || stat === 'comida';
+const VITAL_STATS = ['vida', 'agua', 'comida'];
 // Acota un stat a su rango válido: las vitales a 0..100; oro/plata/exp solo a >= 0.
 function clampStat(stat, value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return 0;
   return isVitalStat(stat) ? Math.min(VITAL_MAX, n) : n;
+}
+
+// =============================================================================
+// REGENERACIÓN PASIVA DE VITALES — "MODO FANTASMA"            (2026-08-05)
+// -----------------------------------------------------------------------------
+// Pedido: vida, agua y comida suben cada minuto, esté el jugador conectado o no.
+//
+// Hacerlo con una transacción por minuto y por jugador es inviable (miles de
+// transacciones al día por cuenta, casi todas para sumar 1). Así que la subida
+// se lleva en MODO FANTASMA: vive solo en Mongo y se calcula por DIFERENCIA DE
+// TIEMPO contra `lastVitalRegen`. Ventajas:
+//
+//   • No hace falta ningún temporizador por jugador: el valor correcto se
+//     obtiene en el momento en que alguien lo lee.
+//   • El tiempo DESCONECTADO cuenta igual que el conectado (es la misma resta).
+//   • Cero transacciones mientras solo se regenera.
+//
+// La cadena se pone al día SOLA en el primer movimiento real del jugador
+// (gastar, recargar, sincronizar): applyStatOnChain calcula el delta contra la
+// cantidad REAL de la factura, así que al escribir el valor ya regenerado la
+// factura salta directamente al número correcto con UNA sola transacción.
+//
+// Regla de convergencia: el fantasma solo SUMA. Por eso, cuando Mongo va por
+// delante de la cadena en una vital, gana Mongo (es regeneración pendiente de
+// materializar); cuando va por detrás, gana la cadena (hubo un gasto).
+// =============================================================================
+const VITAL_REGEN_PER_MINUTE = 1;
+// Tope de acumulación: aunque la cuenta lleve meses parada, como mucho se
+// aplican los minutos necesarios para llenar las barras desde cero.
+const VITAL_REGEN_MAX_MINUTES = Math.ceil(VITAL_MAX / VITAL_REGEN_PER_MINUTE);
+
+/**
+ * Aplica al documento (en memoria, sin guardar ni tocar la cadena) la
+ * regeneración acumulada desde `lastVitalRegen`.
+ *
+ * El reloj avanza SIEMPRE que pase al menos un minuto, aunque las barras ya
+ * estuvieran llenas; si no, un jugador con todo al 100 % acumularía "crédito"
+ * infinito y al gastar se le rellenaría al instante.
+ *
+ * @returns {{changed:boolean, minutes:number, gain:number}}
+ */
+function applyGhostVitalRegen(doc, now = new Date()) {
+  if (!doc) return { changed: false, minutes: 0, gain: 0 };
+
+  const ahora = now.getTime();
+  if (!doc.lastVitalRegen) {
+    // Primera vez que se ve a este jugador: se arranca el reloj, sin regalar nada.
+    doc.lastVitalRegen = now;
+    return { changed: false, minutes: 0, gain: 0 };
+  }
+
+  const desde   = new Date(doc.lastVitalRegen).getTime();
+  const minutos = Math.floor((ahora - desde) / 60000);
+  if (minutos <= 0) return { changed: false, minutes: 0, gain: 0 };
+
+  // El resto de segundos NO se pierde: el reloj avanza solo los minutos enteros
+  // consumidos, así que los segundos sobrantes cuentan para el próximo minuto.
+  doc.lastVitalRegen = new Date(desde + minutos * 60000);
+
+  const ganancia = Math.min(minutos, VITAL_REGEN_MAX_MINUTES) * VITAL_REGEN_PER_MINUTE;
+  let changed = false;
+  for (const stat of VITAL_STATS) {
+    const actual = clampStat(stat, doc[stat]);
+    const nuevo  = clampStat(stat, actual + ganancia);
+    if (nuevo !== doc[stat]) { doc[stat] = nuevo; changed = true; }
+  }
+  return { changed, minutes: minutos, gain: ganancia };
+}
+
+/**
+ * Igual que applyGhostVitalRegen, pero además persiste en Mongo si hubo algún
+ * cambio (incluido el avance del reloj). NO manda transacciones: la cadena se
+ * pone al día en el siguiente movimiento real.
+ */
+async function regenerarVitalesEnBD(doc, now = new Date()) {
+  const r = applyGhostVitalRegen(doc, now);
+  if (r.minutes > 0) {
+    try { await doc.save(); }
+    catch (e) { console.warn('⚠️  No se pudo guardar la regeneración fantasma:', e.message); }
+  }
+  return r;
+}
+
+// =============================================================================
+// LIQUIDACIÓN AGRUPADA DE VITALES — 1 TRANSACCIÓN POR BARRA   (2026-08-05)
+// -----------------------------------------------------------------------------
+// PROBLEMA de la versión anterior: /consume escribía en la cadena EN EL ACTO,
+// una transacción por barra y por golpe. Talar un árbol de 7 golpes = 14
+// transacciones, y encima el jugador esperaba cada una. Absurdo: la barra de
+// agua es UN número, no hace falta escribirlo 7 veces para bajarlo 7 puntos.
+//
+// AHORA hay dos tiempos distintos:
+//
+//   1. COBRO (instantáneo, autoritativo).  /consume comprueba el saldo y lo
+//      descuenta en Mongo al momento. El jugador no espera a ninguna cadena, y
+//      el servidor ya decidió: si no había saldo, la acción no ocurre.
+//
+//   2. LIQUIDACIÓN (agrupada, cada minuto). Un trabajador de fondo coge lo que
+//      esté marcado en `chainPending` y escribe el valor ACTUAL de cada barra
+//      en su factura: UNA transacción por barra, por mucho que el jugador haya
+//      dado 50 golpes en ese minuto. applyStatOnChain calcula el delta contra
+//      la cantidad real de la factura, así que un solo movimiento la deja en el
+//      número correcto.
+//
+// POR QUÉ LA DEUDA VIVE EN MONGO Y NO EN EL NAVEGADOR: si el jugador recarga la
+// página, cierra la pestaña o se le va internet justo después de gastar, la
+// marca sigue en la base de datos y el trabajador la liquida igual. No se puede
+// "huir" de un consumo recargando el navegador. Y si se reinicia el servidor,
+// el arranque hace una pasada de liquidación con lo que quedara pendiente.
+// =============================================================================
+
+// Cuánto espera una deuda antes de escribirse en la cadena.
+const CHAIN_SETTLE_DELAY_MS   = 60 * 1000;
+// Cada cuánto mira el trabajador si hay algo que liquidar.
+const CHAIN_SETTLE_TICK_MS    = 20 * 1000;
+// Cuántos jugadores se liquidan por ronda (para no saturar el relayer).
+const CHAIN_SETTLE_BATCH      = 25;
+
+/** Apunta que estos stats han cambiado en Mongo y deben escribirse en la cadena. */
+function marcarPendienteDeCadena(doc, stats) {
+  if (!doc) return;
+  const lista = new Set(Array.isArray(doc.chainPending) ? doc.chainPending : []);
+  let añadido = false;
+  for (const s of [].concat(stats || [])) {
+    if (STAT_TYPES_LIST.includes(s) && !lista.has(s)) { lista.add(s); añadido = true; }
+  }
+  if (!añadido) return;
+  doc.chainPending = Array.from(lista);
+  if (!doc.chainPendingSince) doc.chainPendingSince = new Date();
+  doc.markModified('chainPending');
+}
+
+/**
+ * Escribe en la cadena TODOS los stats pendientes de un jugador: una sola
+ * transacción por stat, con el valor que tenga Mongo en este momento.
+ *
+ * Un stat solo se saca de la lista si su transacción salió bien; si falla
+ * (nodo caído, sin cupo) se queda pendiente y se reintenta en la ronda
+ * siguiente, así que la deuda nunca se pierde en silencio.
+ *
+ * @returns {{liquidados:string[], fallidos:string[]}}
+ */
+async function liquidarPendientesDeCadena(doc) {
+  const pendientes = Array.isArray(doc.chainPending) ? doc.chainPending.slice() : [];
+  if (!pendientes.length) return { liquidados: [], fallidos: [] };
+
+  const contract = getStatsContract();
+  if (!contract) return { liquidados: [], fallidos: pendientes };
+
+  const gasPrice   = await getSafeGasPriceStats();
+  const liquidados = [];
+  const fallidos   = [];
+
+  for (const stat of pendientes) {
+    const invId = doc.invoiceIds && doc.invoiceIds[stat];
+    if (!invId) {
+      // Todavía no hay factura: la creará /sync con el valor de Mongo, así que
+      // esta deuda ya está cubierta y deja de estar pendiente.
+      liquidados.push(stat);
+      continue;
+    }
+    const objetivo = clampStat(stat, doc[stat]);
+    const r = await applyStatOnChain(contract, stat, invId, objetivo, gasPrice);
+    if (r.ok) {
+      liquidados.push(stat);
+    } else {
+      console.error(`❌ liquidación [${stat}] de ${doc.playerName}:`, r.error);
+      fallidos.push(stat);
+    }
+  }
+
+  doc.chainPending      = fallidos;
+  doc.chainPendingSince = fallidos.length ? (doc.chainPendingSince || new Date()) : null;
+  doc.markModified('chainPending');
+  try { await doc.save(); }
+  catch (e) { console.warn('⚠️  No se pudo guardar tras liquidar:', e.message); }
+
+  if (liquidados.length) {
+    console.log(`⛓️  Liquidado [${liquidados.join(', ')}] de ${doc.playerName} ` +
+                `(vida=${doc.vida} agua=${doc.agua} comida=${doc.comida})`);
+  }
+  return { liquidados, fallidos };
+}
+
+// Evita que dos rondas se pisen si una tarda más que el intervalo.
+let _liquidacionEnCurso = false;
+
+async function rondaDeLiquidacion({ inmediato = false } = {}) {
+  if (_liquidacionEnCurso) return;
+  if (!relayerWallet) return;
+  _liquidacionEnCurso = true;
+  try {
+    const limite = new Date(Date.now() - (inmediato ? 0 : CHAIN_SETTLE_DELAY_MS));
+    const docs = await PlayerStats.find({
+      'chainPending.0':  { $exists: true },
+      chainPendingSince: { $lte: limite }
+    }).limit(CHAIN_SETTLE_BATCH);
+
+    for (const doc of docs) {
+      try { await liquidarPendientesDeCadena(doc); }
+      catch (e) { console.error(`❌ Error liquidando ${doc.playerName}:`, e.message); }
+    }
+  } catch (e) {
+    console.error('❌ Error en la ronda de liquidación:', e.message);
+  } finally {
+    _liquidacionEnCurso = false;
+  }
 }
 
 // =============================================================================
@@ -10483,6 +11139,28 @@ require('./marketplace-routes')(app, {
   Listing
 });
 
+// ── GF WALLET SDK — login social + wallet embebida ──────────────────────────
+// Añade /api/wallet/* (config, OAuth de Google/Facebook/Apple y la bóveda de
+// las medias claves). NO toca el login del juego: una wallet embebida entra por
+// /api/auth/nonce + /api/auth/login exactamente igual que MetaMask, porque lo
+// único que el backend verifica es una firma válida de una dirección.
+//
+// Si faltan las variables de entorno (GF_WALLET_VAULT_KEY, GF_WALLET_SUB_PEPPER
+// y los client id de los proveedores), las rutas responden 503 y el juego sigue
+// funcionando con MetaMask como hasta ahora. Ver gf-wallet-sdk/docs/BACKEND.md.
+try {
+  require('./gf-wallet-sdk/server/gf-wallet-routes')(app, {
+    mongoose,
+    apiLimiter,
+    strictLimiter,
+    csrfProtection,
+    authMiddleware,
+    JWT_SECRET
+  });
+} catch (e) {
+  console.warn('⚠️  [gf-wallet] no se pudieron montar las rutas:', e.message);
+}
+
 
 // =============================================================================
 // LIQUIDACIÓN ON-CHAIN DEL MERCADO P2P  (2026-08-03)
@@ -10520,25 +11198,15 @@ const MarketSettlement = mongoose.model('MarketSettlement', marketSettlementSche
 
 // itemId del catálogo → `tipo` del contrato. Si un ítem no está aquí, no tiene
 // representación on-chain y su liquidación se omite sin error.
-const MARKET_ONCHAIN_TIPO = {
-  // recolección
-  madera_pinos: 'madera_pinos', madera_seca: 'madera_seca', madera_con_hojas: 'madera_con_hojas',
-  mineral_piedra: 'mineral_piedra', mineral_cobre: 'mineral_cobre',
-  mineral_hierro: 'mineral_hierro', carbon: 'carbon',
-  // cosechas
-  zanahoria_buena: 'zanahoria_buena', tomate_buena: 'tomate_buena',
-  trigo_buena: 'trigo_buena', calabaza_buena: 'calabaza_buena',
-  // semillas
-  Semillax: 'bolsa zanahorias', Semillax1: 'bolsa de tomates',
-  Semillax2: 'bolsa de trigo', Semillax3: 'bolsa de calabazas',
-  // herramientas / varios
-  Regaderax: 'Regaderax', Tijerasx: 'Tijerasx',
-  hacha_de_madera: 'hacha de madera', pico_de_madera: 'pico de madera',
-  balde_con_agua: 'balde_con_agua', balde_vacio: 'balde_vacio'
-};
-
+//
+// FIX (2026-08-05): esta tabla tenía su propia copia de los nombres y NO
+// coincidía con la del juego — las maderas estaban como 'madera_pinos' cuando
+// en ItemDefinitions son 'madera pinos' (con espacio) y faltaban las hachas y
+// picos de piedra/cobre/hierro. Resultado: al publicar madera en el mercado, la
+// quema on-chain no encontraba ninguna factura y el ítem se movía solo en la
+// base de datos. Ahora se usa la ÚNICA tabla buena, ITEM_TIPO_MAP.
 function marketOnchainTipo(itemId) {
-  return MARKET_ONCHAIN_TIPO[String(itemId || '')] || null;
+  return itemTipoOnChain(itemId);
 }
 
 // Quema `quantity` unidades de `tipo` repartidas entre las facturas activas de
@@ -11093,8 +11761,12 @@ app.get('/api/stats/:playerName', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    let doc = await PlayerStats.findOne({ playerName }).lean();
+    // Sin .lean(): esta lectura también APLICA la regeneración fantasma (solo
+    // Mongo, sin transacciones) para que el jugador vea el valor al día tanto
+    // si acaba de entrar como si lleva la partida abierta.
+    let doc = await PlayerStats.findOne({ playerName });
     if (!doc) return res.json({ stats: { ...STAT_DEFAULTS_MAP, invoiceIds: { vida: null, agua: null, comida: null, oro: null, plata: null, exp: null } } });
+    await regenerarVitalesEnBD(doc);
     return res.json({ stats: buildStatsResponse(doc) });
   } catch (err) { console.error('GET /api/stats error:', err); return res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -11163,6 +11835,12 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
       }
     }
 
+    // Regeneración fantasma ANTES de reconciliar con la cadena: el sync es el
+    // momento típico de "acabo de volver tras horas fuera", y así el rato
+    // desconectado entra en el valor que se va a comparar (y a materializar)
+    // contra la factura, en vez de perderse.
+    applyGhostVitalRegen(statsDoc);
+
     if (!contract) {
       await statsDoc.save();
       return res.json({ stats: buildStatsResponse(statsDoc), source: 'db' });
@@ -11208,12 +11886,42 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
         //   • Mongo dice 0        → es el 0 real, se respeta (no se sube a 1).
         // Para cualquier otro valor la CADENA es la fuente de verdad.
         const dbQty = Number(statsDoc[stat] || 0);
-        if (chainQty === STAT_CHAIN_FLOOR && dbQty > STAT_CHAIN_FLOOR) {
+        const tieneDeuda = Array.isArray(statsDoc.chainPending) && statsDoc.chainPending.includes(stat);
+
+        if (tieneDeuda) {
+          // Hay un consumo (o una recarga) ya cobrado en Mongo que todavía no se
+          // ha escrito en la factura. Aquí manda SIEMPRE Mongo: si dejáramos
+          // ganar a la cadena, bastaría con recargar la página nada más gastar
+          // para que el sync devolviera el valor viejo y el gasto se esfumara.
+          const r = await applyStatOnChain(contract, stat, existing.id, dbQty, gasPrice);
+          if (r.ok) {
+            statsDoc[stat] = clampStat(stat, dbQty);
+            statsDoc.chainPending = statsDoc.chainPending.filter(s => s !== stat);
+            statsDoc.markModified('chainPending');
+            console.log(`⛓️  Deuda de [${stat}] liquidada en el sync: ${chainQty}→${dbQty}`);
+          } else {
+            // Sigue debiéndose: se conserva el valor de Mongo y la marca, y lo
+            // reintenta el liquidador.
+            statsDoc[stat] = clampStat(stat, dbQty);
+            console.warn(`⚠️  [${stat}] sigue pendiente de liquidar:`, r.error);
+          }
+        } else if (chainQty === STAT_CHAIN_FLOOR && dbQty > STAT_CHAIN_FLOOR) {
           const r = await applyStatOnChain(contract, stat, existing.id, dbQty, gasPrice);
           statsDoc[stat] = clampStat(stat, r.ok ? dbQty : (r.chainQty ?? chainQty));
           if (!r.ok) console.warn(`⚠️  No se pudo restaurar [${stat}] a ${dbQty}:`, r.error);
         } else if (chainQty === STAT_CHAIN_FLOOR && dbQty === 0) {
           statsDoc[stat] = 0;
+        } else if (isVitalStat(stat) && dbQty > chainQty) {
+          // REGENERACIÓN FANTASMA PENDIENTE. En las vitales el modo fantasma
+          // solo SUMA, así que "Mongo por encima de la cadena" solo puede venir
+          // de minutos regenerados que todavía no se han materializado. Se
+          // escriben ahora en la factura (una sola transacción, no una por
+          // minuto). Si el gasto fuera al revés (cadena por encima), manda la
+          // cadena, que es la rama de abajo.
+          const r = await applyStatOnChain(contract, stat, existing.id, dbQty, gasPrice);
+          statsDoc[stat] = clampStat(stat, r.ok ? dbQty : (r.chainQty ?? chainQty));
+          if (r.ok) console.log(`🌙 [${stat}] regeneración fantasma materializada: ${chainQty}→${dbQty}`);
+          else      console.warn(`⚠️  No se pudo materializar la regeneración de [${stat}]:`, r.error);
         } else {
           statsDoc[stat] = clampStat(stat, chainQty);
         }
@@ -11296,6 +12004,11 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
       statsDoc[stat] = clampStat(stat, statsDoc[stat]);
     }
 
+    // Si ya no queda nada debiéndose, se apaga el reloj de la deuda.
+    if (Array.isArray(statsDoc.chainPending) && statsDoc.chainPending.length === 0) {
+      statsDoc.chainPendingSince = null;
+    }
+
     statsDoc.markModified('invoiceIds');
     statsDoc.markModified('manualIds');
     statsDoc.lastSync = new Date();
@@ -11332,6 +12045,11 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
     let doc = await PlayerStats.findOne({ playerName });
     if (!doc) return res.status(404).json({ error: 'Player stats not found. Call /sync first.' });
 
+    // Se aplica primero la regeneración fantasma (solo Mongo). Así el reloj de
+    // regeneración avanza aunque esta petición venga a BAJAR una vital, y los
+    // stats que el cliente no toque quedan al día en la respuesta.
+    applyGhostVitalRegen(doc);
+
     const contract   = getStatsContract();
     const gasPrice   = await getSafeGasPriceStats();
     const txErrors   = [];
@@ -11343,6 +12061,18 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
       const oldVal  = doc[stat] || 0;
       const invId   = doc.invoiceIds[stat];
       if (newVal === oldVal) continue;
+
+      // VITALES: se guardan en Mongo al momento y su escritura en la factura se
+      // agrupa (una transacción por barra cada minuto, ver el liquidador). Las
+      // barras cambian docenas de veces por minuto mientras se juega; mandar
+      // una transacción por cada cambio era lo que disparaba el gasto.
+      // El dinero y la experiencia NO se aplazan: ahí sí interesa que la cadena
+      // vaya al día en el acto.
+      if (isVitalStat(stat)) {
+        doc[stat] = newVal;
+        marcarPendienteDeCadena(doc, stat);
+        continue;
+      }
 
       if (!contract || !invId) {
         // Sin factura todavía: se guarda en BD y el próximo /sync la crea.
@@ -11381,6 +12111,89 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
     return res.json({ stats: buildStatsResponse(doc), errors: txErrors.length ? txErrors : undefined });
 
   } catch (err) { console.error('POST /api/stats/update error:', err); return res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── POST /api/stats/:playerName/consume ─────────────────────────────────────
+// GASTO DE VITALES: COBRO INSTANTÁNEO, TRANSACCIÓN AGRUPADA      (2026-08-05)
+// -----------------------------------------------------------------------------
+// Cuando una acción cuesta vida, agua o comida, el conteo del jugador se cobra
+// AQUÍ y ANTES que nada más. El cliente espera esta respuesta y solo sigue con
+// el resto (talar, minar, comprar, craftear…) si dice que sí.
+//
+// Lo que NO se espera es la blockchain. La barra de agua es UN número: no tiene
+// sentido escribirlo en la cadena una vez por golpe de hacha. El cobro es
+// inmediato en Mongo (que es la fuente autoritativa del saldo) y la escritura
+// en la factura se marca como pendiente; el liquidador la agrupa y manda UNA
+// transacción por barra cada minuto, por muchos golpes que hayan pasado.
+//
+// La deuda vive en la base de datos, no en el navegador: recargar la página o
+// cerrar el juego no la borra.
+//
+// body: { costs: { vida?, agua?, comida? }, reason?: 'chop'|'mine'|... }
+app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const playerName  = await resolvePlayerName(req.params.playerName);
+    const reqAddress  = (req.user.address || '').toLowerCase();
+    const ownerGP     = await GamePlayer.findOne({ playerName }).lean();
+    if (ownerGP && ownerGP.address && ownerGP.address.toLowerCase() !== reqAddress) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const costsRaw = (req.body && req.body.costs) || {};
+    const reason   = String((req.body && req.body.reason) || 'action').slice(0, 40);
+
+    // Normalizar: solo vitales, solo enteros positivos, tope razonable.
+    const costs = {};
+    for (const stat of VITAL_STATS) {
+      const n = Math.round(Number(costsRaw[stat] || 0));
+      if (Number.isFinite(n) && n > 0) costs[stat] = Math.min(n, VITAL_MAX);
+    }
+    if (!Object.keys(costs).length) return res.status(400).json({ error: 'no_costs' });
+
+    const doc = await PlayerStats.findOne({ playerName });
+    if (!doc) return res.status(404).json({ error: 'stats_not_found. Call /sync first' });
+
+    // 1. Regeneración pendiente (modo fantasma) antes de cobrar.
+    applyGhostVitalRegen(doc);
+
+    // 2. ¿Alcanza para TODO el coste? Es todo o nada: media tala no existe.
+    const faltan = [];
+    for (const [stat, coste] of Object.entries(costs)) {
+      if (clampStat(stat, doc[stat]) < coste) faltan.push(stat);
+    }
+    if (faltan.length) {
+      // Se guarda igualmente lo regenerado (el reloj ya avanzó) y se responde
+      // con los valores reales para que el cliente pinte las barras al día.
+      try { await doc.save(); } catch (_) {}
+      return res.status(409).json({
+        error: 'insufficient_vitals',
+        missing: faltan,
+        stats: buildStatsResponse(doc)
+      });
+    }
+
+    // 3. Cobro en Mongo (instantáneo) + apunte de la deuda con la cadena.
+    for (const [stat, coste] of Object.entries(costs)) {
+      doc[stat] = clampStat(stat, clampStat(stat, doc[stat]) - coste);
+    }
+    marcarPendienteDeCadena(doc, Object.keys(costs));
+    await doc.save();
+
+    console.log(`🍖 Consumo [${reason}] de ${playerName}: ${JSON.stringify(costs)} → ` +
+                `vida=${doc.vida} agua=${doc.agua} comida=${doc.comida} (pendiente de liquidar)`);
+
+    return res.json({
+      ok: true,
+      spent: costs,
+      stats: buildStatsResponse(doc),
+      // Informativo: cuándo se escribirá en la cadena.
+      settlesInMs: CHAIN_SETTLE_DELAY_MS
+    });
+
+  } catch (err) {
+    console.error('POST /api/stats/consume error:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
 });
 
 // ── POST /api/currency/exchange — CAMBIO DE MONEDA (1000 plata = 1 oro) ──────
@@ -12778,7 +13591,18 @@ server.listen(PORT, HOST, () => {
   console.log(`🛡️  Protección Gas Drain: ACTIVADA`);
   console.log(`⏰ Sistema Time-Lock: DISPONIBLE`);
   console.log(`⛽ Gas price fijo: ${FIXED_GAS_PRICE_GWEI ? FIXED_GAS_PRICE_GWEI + ' gwei' : 'No (dinámico)'}`);
+  console.log(`⛓️  Liquidador de vitales: cada ${CHAIN_SETTLE_TICK_MS / 1000}s (espera ${CHAIN_SETTLE_DELAY_MS / 1000}s)`);
   console.log(`=================================`);
+
+  // LIQUIDADOR DE VITALES (2026-08-05). Escribe en la cadena, agrupadas, las
+  // barras que se cobraron en Mongo: UNA transacción por barra y jugador.
+  //
+  // La primera pasada es INMEDIATA y sin esperar el minuto: si el proceso se
+  // reinició (o se cayó) con deudas apuntadas, se saldan al arrancar. Así, ni
+  // recargar el navegador ni tirar el servidor sirven para escaparse de un
+  // consumo ya cobrado.
+  setTimeout(() => { rondaDeLiquidacion({ inmediato: true }).catch(() => {}); }, 8000);
+  setInterval(() => { rondaDeLiquidacion().catch(() => {}); }, CHAIN_SETTLE_TICK_MS);
 });
 
 // --- GRACEFUL SHUTDOWN ---
