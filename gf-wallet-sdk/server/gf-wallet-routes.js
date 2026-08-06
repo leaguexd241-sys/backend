@@ -158,6 +158,17 @@ module.exports = function mountGfWalletRoutes(app, deps) {
       ct:   String
     },
 
+    // CLAVE PERSONAL (opcional). Es el CÓDIGO DE RECUPERACIÓN cifrado con una
+    // llave derivada de la clave que eligió el jugador. El servidor no conoce
+    // esa clave, así que para él este campo es ruido: no puede sacar el código
+    // ni, por tanto, la clave privada. Solo sirve para que el jugador use algo
+    // corto y memorizable en vez del código largo.
+    passphraseEnc: {
+      salt: String,
+      iv:   String,
+      ct:   String
+    },
+
     keyFingerprint: { type: String, default: '' },
     rotations:      { type: Number, default: 0 },
     lastUnlockAt:   { type: Date, default: null },
@@ -568,6 +579,74 @@ Puedes cerrar esta ventana.</body>`);
   app.post('/api/wallet/vault/link', strictLimiter, siActivo, csrfProtection, vincularDispositivo);
   // Alias del nombre viejo, por si algún navegador tiene cacheado el SDK anterior.
   app.post('/api/wallet/vault/rotate', strictLimiter, siActivo, csrfProtection, vincularDispositivo);
+
+  // ── 5-bis. Clave personal (código ⇄ clave) ──────────────────────────────
+  // El jugador cambia el código largo por una clave suya. Aquí solo se guarda
+  // el SOBRE (el código cifrado con esa clave); el servidor nunca ve ninguna
+  // de las dos cosas en claro y no puede abrirlo.
+  app.get('/api/wallet/passphrase', apiLimiter, siActivo, async (req, res) => {
+    try {
+      const t = verificarTicket(req.query.ticket, 'vault');
+      if (!t) return res.status(401).json({ error: 'invalid_ticket' });
+
+      const doc = await SocialWallet.findOne({ subHash: t.s }).lean();
+      if (!doc) return res.status(404).json({ error: 'vault_not_found' });
+
+      const tiene = !!(doc.passphraseEnc && doc.passphraseEnc.ct);
+      if (String(req.query.reveal) === '1' && tiene) {
+        return res.json({
+          exists: true,
+          salt: doc.passphraseEnc.salt,
+          iv:   doc.passphraseEnc.iv,
+          ct:   doc.passphraseEnc.ct
+        });
+      }
+      return res.json({ exists: tiene });
+    } catch (e) {
+      console.error('❌ [gf-wallet] leer clave personal:', e.message);
+      res.status(500).json({ error: 'passphrase_read_failed' });
+    }
+  });
+
+  app.post('/api/wallet/passphrase', strictLimiter, siActivo, csrfProtection, async (req, res) => {
+    try {
+      const { ticket, salt, iv, ct } = req.body || {};
+      const t = verificarTicket(ticket, 'vault');
+      if (!t) return res.status(401).json({ error: 'invalid_ticket' });
+      if (!salt || !iv || !ct) return res.status(400).json({ error: 'invalid_envelope' });
+
+      const doc = await SocialWallet.findOne({ subHash: t.s });
+      if (!doc) return res.status(404).json({ error: 'vault_not_found' });
+
+      doc.passphraseEnc = { salt: String(salt), iv: String(iv), ct: String(ct) };
+      doc.markModified('passphraseEnc');
+      await doc.save();
+
+      console.log(`🔐 [gf-wallet] clave personal configurada para ${doc.address.slice(0, 10)}…`);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('❌ [gf-wallet] guardar clave personal:', e.message);
+      res.status(500).json({ error: 'passphrase_save_failed' });
+    }
+  });
+
+  app.delete('/api/wallet/passphrase', strictLimiter, siActivo, csrfProtection, async (req, res) => {
+    try {
+      const t = verificarTicket((req.body && req.body.ticket) || req.query.ticket, 'vault');
+      if (!t) return res.status(401).json({ error: 'invalid_ticket' });
+
+      const doc = await SocialWallet.findOne({ subHash: t.s });
+      if (!doc) return res.status(404).json({ error: 'vault_not_found' });
+
+      doc.passphraseEnc = undefined;
+      doc.markModified('passphraseEnc');
+      await doc.save();
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('❌ [gf-wallet] borrar clave personal:', e.message);
+      res.status(500).json({ error: 'passphrase_delete_failed' });
+    }
+  });
 
   // ── 6. Ticket nuevo con la sesión del juego ya iniciada ─────────────────
   // Sirve para reabrir la wallet al recargar la página sin repetir el OAuth:

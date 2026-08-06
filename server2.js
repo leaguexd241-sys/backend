@@ -4485,6 +4485,40 @@ io.on("connection", (socket) => {
     socket.emit('plantLockStatus', estado);
   });
 
+  // ── COMPROBACIÓN PREVIA DE SIEMBRA                        (2026-08-05) ──
+  // El cliente QUEMA la semilla en la cadena antes de mandar 'plantSeed'. Si el
+  // servidor la rechazaba después (bloqueo antispam, cuadro ocupado, nivel
+  // insuficiente…), la semilla ya no existía y no se sembraba nada: el jugador
+  // la perdía. Esto le deja preguntar ANTES, sin efectos secundarios, para que
+  // no llegue a quemarla si de todos modos se le va a decir que no.
+  //
+  // Ojo: usa isPlantLocked, que solo LEE. checkAndTrackPlantSpam sí registra el
+  // intento, así que llamarlo aquí penalizaría al jugador por preguntar.
+  socket.on('plantCheck', async (data, ack) => {
+    const responder = (r) => { if (typeof ack === 'function') ack(r); };
+    try {
+      const { userId, plotId } = data || {};
+      if (!assertCropOwner(userId, 'plantError', plotId)) {
+        return responder({ ok: false, error: 'not_your_plot' });
+      }
+
+      const bloqueo = isPlantLocked(userId);
+      if (bloqueo.locked) {
+        const min = Math.ceil(bloqueo.secondsRemaining / 60);
+        return responder({
+          ok: false,
+          error: `Planting is temporarily locked. Try again in ${min} minute(s).`
+        });
+      }
+
+      return responder({ ok: true });
+    } catch (e) {
+      // Ante la duda se deja pasar: esto es una ayuda, no la validación real
+      // (la de verdad sigue estando en 'plantSeed').
+      return responder({ ok: true });
+    }
+  });
+
   socket.on('plantSeed', async (data) => {
     try {
       const { userId, plotId, seedType, userStats, successChance } = data;
@@ -11136,7 +11170,12 @@ require('./marketplace-routes')(app, {
   strictLimiter,
   GamePlayer,
   PlayerStats,
-  Listing
+  Listing,
+  // Quién puede crear lotes limitados. Se pasa la versión CACHEADA porque el
+  // mercado la consulta en cada listado y sin caché serían lecturas on-chain
+  // constantes. Si no se pasara, el marketplace trata a todo el mundo como no
+  // administrador (nadie podría crear lotes, que es el fallo seguro).
+  isAdminAddress: isAdminAddressCached
 });
 
 // ── GF WALLET SDK — login social + wallet embebida ──────────────────────────
