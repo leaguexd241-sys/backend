@@ -60,11 +60,21 @@ module.exports = function mountGfWalletRoutes(app, deps) {
     google:   { clientId: process.env.GF_GOOGLE_CLIENT_ID   || '' },
     facebook: { appId:    process.env.GF_FACEBOOK_APP_ID    || '',
                 appSecret: process.env.GF_FACEBOOK_APP_SECRET || '' },
+    // APPLE: solo hacen falta el Services ID y la URL de retorno.
+    //
+    // El .p8 (con TEAM_ID y KEY_ID) sirve para firmar el `client_secret` que
+    // Apple pide al CANJEAR un código por un token. Aquí no se canjea nada:
+    // se pide `response_type=code id_token`, así que Apple manda el id_token
+    // directamente en el form_post y se verifica su firma contra el JWKS
+    // público de Apple. Nunca se llama al endpoint de tokens.
+    //
+    // Se dejan leídas por si algún día hace falta revocación de tokens
+    // (server-to-server), pero NO son obligatorias para que el login funcione.
     apple:    { clientId: process.env.GF_APPLE_CLIENT_ID    || '',
+                redirectUri: process.env.GF_APPLE_REDIRECT_URI || '',
                 teamId:   process.env.GF_APPLE_TEAM_ID      || '',
                 keyId:    process.env.GF_APPLE_KEY_ID       || '',
-                privateKey: (process.env.GF_APPLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
-                redirectUri: process.env.GF_APPLE_REDIRECT_URI || '' }
+                privateKey: (process.env.GF_APPLE_PRIVATE_KEY || '').replace(/\\n/g, '\n') }
   };
 
   // Pimienta para el HMAC de los identificadores sociales.
@@ -86,10 +96,15 @@ module.exports = function mountGfWalletRoutes(app, deps) {
   const VAULT_KEY = claveBoveda();
   const SECRET    = JWT_SECRET || process.env.JWT_SECRET || '';
 
+  // Un proveedor solo se anuncia como disponible si tiene TODO lo que su flujo
+  // necesita de verdad. Ni de más (pedir variables que no se usan deja el botón
+  // apagado sin motivo) ni de menos: a Apple le faltaba comprobar `redirectUri`,
+  // que sí se usa para construir la URL de autorización — sin él, el botón
+  // aparecía y Apple respondía `invalid_request`.
   const CONFIGURADO = {
     google:   !!CFG.google.clientId,
     facebook: !!(CFG.facebook.appId && CFG.facebook.appSecret),
-    apple:    !!(CFG.apple.clientId && CFG.apple.teamId && CFG.apple.keyId && CFG.apple.privateKey)
+    apple:    !!(CFG.apple.clientId && CFG.apple.redirectUri)
   };
 
   if (!VAULT_KEY)  console.warn('⚠️  [gf-wallet] Falta GF_WALLET_VAULT_KEY (32 bytes) — las rutas de la wallet quedan DESACTIVADAS');
@@ -107,11 +122,33 @@ module.exports = function mountGfWalletRoutes(app, deps) {
     provider: { type: String, required: true, enum: ['google', 'facebook', 'apple'] },
     address:  { type: String, required: true, lowercase: true, index: true },
 
-    // Mitad del servidor, cifrada en reposo (AES-256-GCM).
+    // UNA MITAD DE SERVIDOR POR DISPOSITIVO             (arreglado 2026-08-05)
+    // -------------------------------------------------------------------
+    // Antes esto era UNA sola mitad para toda la cuenta, y era un fallo grave:
+    // la clave se reparte con XOR contra la mitad del DISPOSITIVO, así que
+    // cada dispositivo necesita su propia pareja. Al vincular un móvil se
+    // sobrescribía la mitad del PC y el PC dejaba de abrir la bóveda
+    // ("La clave reconstruida no coincide con la cuenta registrada").
+    //
+    // Ahora cada dispositivo tiene su entrada: vincular uno nuevo NO toca a
+    // los demás. La clave privada sigue sin estar entera en ningún sitio.
+    deviceShares: [{
+      deviceId:   { type: String, required: true },
+      enc: {
+        iv:  { type: String, required: true },
+        ct:  { type: String, required: true },
+        tag: { type: String, required: true }
+      },
+      createdAt:  { type: Date, default: Date.now },
+      lastUsedAt: { type: Date, default: Date.now }
+    }],
+
+    // Mitad única de las cuentas creadas ANTES del arreglo. Solo se lee para
+    // migrarla a `deviceShares` la primera vez; nunca se vuelve a escribir.
     serverShareEnc: {
-      iv:  { type: String, required: true },
-      ct:  { type: String, required: true },
-      tag: { type: String, required: true }
+      iv:  { type: String },
+      ct:  { type: String },
+      tag: { type: String }
     },
 
     // Clave entera cifrada con el código de recuperación del jugador.
@@ -368,16 +405,25 @@ module.exports = function mountGfWalletRoutes(app, deps) {
 Puedes cerrar esta ventana.</body>`);
   });
 
+  // Tope de dispositivos vinculados por cuenta. Al pasarse se echa el que lleve
+  // más tiempo sin usarse: así una cuenta no engorda sin límite y el jugador
+  // que va cambiando de móvil no se queda bloqueado.
+  const MAX_DISPOSITIVOS = 10;
+
+  const idDispositivoValido = (v) => /^[0-9a-f]{32}$/.test(String(v || ''));
+
   // ── 3. Crear la bóveda (primera vez) ────────────────────────────────────
   app.post('/api/wallet/vault', strictLimiter, siActivo, csrfProtection, async (req, res) => {
     try {
-      const { ticket, address, serverShare, recovery, keyFingerprint } = req.body || {};
+      const { ticket, address, deviceId, serverShare, recovery, keyFingerprint } = req.body || {};
       const t = verificarTicket(ticket, 'vault');
       if (!t) return res.status(401).json({ error: 'invalid_ticket' });
 
       if (!/^0x[0-9a-fA-F]{40}$/.test(String(address || ''))) {
         return res.status(400).json({ error: 'invalid_address' });
       }
+      if (!idDispositivoValido(deviceId)) return res.status(400).json({ error: 'invalid_device_id' });
+
       const shareBuf = Buffer.from(String(serverShare || ''), 'base64');
       if (shareBuf.length !== 32) return res.status(400).json({ error: 'invalid_share' });
 
@@ -388,7 +434,12 @@ Puedes cerrar esta ventana.</body>`);
         subHash: t.s,
         provider: t.p,
         address: String(address).toLowerCase(),
-        serverShareEnc: cifrarEnReposo(shareBuf, 'gf-wallet:' + t.s),
+        deviceShares: [{
+          deviceId: String(deviceId),
+          enc: cifrarEnReposo(shareBuf, 'gf-wallet:' + t.s + ':' + deviceId),
+          createdAt: new Date(),
+          lastUsedAt: new Date()
+        }],
         recoveryEnc: recovery && recovery.ct
           ? { salt: String(recovery.salt), iv: String(recovery.iv), ct: String(recovery.ct) }
           : undefined,
@@ -396,7 +447,7 @@ Puedes cerrar esta ventana.</body>`);
         lastUnlockAt: new Date()
       });
 
-      console.log(`🆕 [gf-wallet] bóveda creada para ${String(address).slice(0, 10)}… (${t.p})`);
+      console.log('🆕 [gf-wallet] bóveda creada para ' + String(address).slice(0, 10) + '… (' + t.p + ')');
       res.json({ ok: true, address: String(address).toLowerCase() });
     } catch (e) {
       console.error('❌ [gf-wallet] crear bóveda:', e.message);
@@ -404,7 +455,12 @@ Puedes cerrar esta ventana.</body>`);
     }
   });
 
-  // ── 4. Leer la mitad del servidor ───────────────────────────────────────
+  // ── 4. Leer la mitad de ESTE dispositivo ────────────────────────────────
+  // Ya no existe "la" mitad del servidor: hay una por dispositivo. Si el que
+  // pregunta no está vinculado se responde `deviceLinked:false` y el cliente
+  // pide el código de recuperación, en vez de devolver la mitad de OTRO
+  // dispositivo — que era exactamente lo que rompía la reconstrucción de la
+  // clave ("La clave reconstruida no coincide con la cuenta registrada").
   app.get('/api/wallet/vault', apiLimiter, siActivo, async (req, res) => {
     try {
       const t = verificarTicket(req.query.ticket, 'vault');
@@ -413,13 +469,28 @@ Puedes cerrar esta ventana.</body>`);
       const doc = await SocialWallet.findOne({ subHash: t.s });
       if (!doc) return res.status(404).json({ error: 'vault_not_found' });
 
-      const share = descifrarEnReposo(doc.serverShareEnc, 'gf-wallet:' + t.s);
+      const deviceId = String(req.query.deviceId || '');
+      const salida = { address: doc.address, deviceLinked: false };
 
-      const salida = {
-        address: doc.address,
-        serverShare: share.toString('base64'),
-        rotations: doc.rotations
-      };
+      let entrada = null;
+      if (idDispositivoValido(deviceId)) {
+        entrada = (doc.deviceShares || []).find(d => d.deviceId === deviceId) || null;
+      }
+
+      if (entrada) {
+        salida.serverShare = descifrarEnReposo(entrada.enc, 'gf-wallet:' + t.s + ':' + deviceId).toString('base64');
+        salida.deviceLinked = true;
+        entrada.lastUsedAt = new Date();
+        doc.markModified('deviceShares');
+      } else if (!deviceId && doc.serverShareEnc && doc.serverShareEnc.ct) {
+        // MIGRACIÓN de las cuentas creadas antes del arreglo: todavía tienen la
+        // mitad única y su navegador no conoce ningún deviceId. Se le entrega
+        // esa mitad UNA vez; el cliente reconstruye la clave y acto seguido
+        // llama a /link con un deviceId nuevo, que ya queda en deviceShares.
+        salida.serverShare = descifrarEnReposo(doc.serverShareEnc, 'gf-wallet:' + t.s).toString('base64');
+        salida.deviceLinked = true;
+        salida.legacy = true;
+      }
 
       // La copia de recuperación solo se manda si se pide explícitamente
       // (dispositivo nuevo). Sin el código del jugador es ruido, pero cuanto
@@ -438,12 +509,16 @@ Puedes cerrar esta ventana.</body>`);
     }
   });
 
-  // ── 5. Rotar la mitad del servidor (dispositivo nuevo) ──────────────────
-  app.post('/api/wallet/vault/rotate', strictLimiter, siActivo, csrfProtection, async (req, res) => {
+  // ── 5. Vincular ESTE dispositivo ────────────────────────────────────────
+  // Añade (o reemplaza) la mitad de UN dispositivo sin tocar la de los demás.
+  // Antes esto era /rotate y machacaba la única mitad que había: por eso
+  // vincular el móvil dejaba el PC fuera de su propia cuenta.
+  const vincularDispositivo = async (req, res) => {
     try {
-      const { ticket, serverShare } = req.body || {};
+      const { ticket, deviceId, serverShare } = req.body || {};
       const t = verificarTicket(ticket, 'vault');
       if (!t) return res.status(401).json({ error: 'invalid_ticket' });
+      if (!idDispositivoValido(deviceId)) return res.status(400).json({ error: 'invalid_device_id' });
 
       const shareBuf = Buffer.from(String(serverShare || ''), 'base64');
       if (shareBuf.length !== 32) return res.status(400).json({ error: 'invalid_share' });
@@ -451,18 +526,48 @@ Puedes cerrar esta ventana.</body>`);
       const doc = await SocialWallet.findOne({ subHash: t.s });
       if (!doc) return res.status(404).json({ error: 'vault_not_found' });
 
-      doc.serverShareEnc = cifrarEnReposo(shareBuf, 'gf-wallet:' + t.s);
-      doc.rotations      = (doc.rotations || 0) + 1;
-      doc.lastUnlockAt   = new Date();
+      const enc = cifrarEnReposo(shareBuf, 'gf-wallet:' + t.s + ':' + deviceId);
+      if (!Array.isArray(doc.deviceShares)) doc.deviceShares = [];
+
+      const existente = doc.deviceShares.find(d => d.deviceId === String(deviceId));
+      if (existente) {
+        existente.enc = enc;
+        existente.lastUsedAt = new Date();
+      } else {
+        doc.deviceShares.push({
+          deviceId: String(deviceId), enc, createdAt: new Date(), lastUsedAt: new Date()
+        });
+      }
+
+      // Si se pasa del tope, fuera el que lleve más tiempo sin usarse.
+      if (doc.deviceShares.length > MAX_DISPOSITIVOS) {
+        doc.deviceShares.sort((a, b) => new Date(a.lastUsedAt) - new Date(b.lastUsedAt));
+        doc.deviceShares.splice(0, doc.deviceShares.length - MAX_DISPOSITIVOS);
+      }
+
+      // Migrada la cuenta vieja, la mitad única ya no pinta nada.
+      if (doc.serverShareEnc && doc.serverShareEnc.ct) {
+        doc.serverShareEnc = undefined;
+        doc.markModified('serverShareEnc');
+      }
+
+      doc.rotations    = (doc.rotations || 0) + 1;
+      doc.lastUnlockAt = new Date();
+      doc.markModified('deviceShares');
       await doc.save();
 
-      console.log(`🔄 [gf-wallet] mitad rotada para ${doc.address.slice(0, 10)}… (rotación ${doc.rotations})`);
-      res.json({ ok: true, rotations: doc.rotations });
+      console.log('🔗 [gf-wallet] dispositivo vinculado a ' + doc.address.slice(0, 10) +
+                  '… (' + doc.deviceShares.length + ' dispositivo(s))');
+      res.json({ ok: true, devices: doc.deviceShares.length });
     } catch (e) {
-      console.error('❌ [gf-wallet] rotar:', e.message);
-      res.status(500).json({ error: 'vault_rotate_failed' });
+      console.error('❌ [gf-wallet] vincular dispositivo:', e.message);
+      res.status(500).json({ error: 'vault_link_failed' });
     }
-  });
+  };
+
+  app.post('/api/wallet/vault/link', strictLimiter, siActivo, csrfProtection, vincularDispositivo);
+  // Alias del nombre viejo, por si algún navegador tiene cacheado el SDK anterior.
+  app.post('/api/wallet/vault/rotate', strictLimiter, siActivo, csrfProtection, vincularDispositivo);
 
   // ── 6. Ticket nuevo con la sesión del juego ya iniciada ─────────────────
   // Sirve para reabrir la wallet al recargar la página sin repetir el OAuth:
