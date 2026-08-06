@@ -648,6 +648,41 @@ Puedes cerrar esta ventana.</body>`);
     }
   });
 
+  // ── 5-ter. ¿Quién soy? — para OTRO ORIGEN (el juego)  (2026-08-05) ──────
+  // El login vive en app.grasslandforest.com y el juego en
+  // game.grasslandforest.com. IndexedDB es POR ORIGEN, así que la mitad del
+  // dispositivo guardada al iniciar sesión NO existe en el juego y allí la
+  // wallet nunca podía abrirse: el panel enseñaba el mensaje de MetaMask a
+  // gente que había entrado con Google.
+  //
+  // Esto lo arregla: con la cookie de sesión (que sí es compartida por
+  // COOKIE_DOMAIN=.grasslandforest.com), el juego pregunta "¿esta cuenta tiene
+  // wallet embebida?" y recibe su identificador y su dirección. Con eso puede
+  // pedir un ticket y usar todo lo que NO necesita la clave (saldo, actividad,
+  // recibir). Para enviar o ver la clave privada se pide el código/clave, que
+  // reconstruye la clave sin depender del dispositivo.
+  app.get('/api/wallet/whoami', apiLimiter, siActivo, authMiddleware, async (req, res) => {
+    try {
+      const address = String((req.user && req.user.address) || '').toLowerCase();
+      if (!address) return res.json({ embedded: false });
+
+      const doc = await SocialWallet.findOne({ address }).lean();
+      if (!doc) return res.json({ embedded: false });
+
+      res.json({
+        embedded: true,
+        address: doc.address,
+        walletId: doc.subHash,
+        provider: doc.provider,
+        hasPassphrase: !!(doc.passphraseEnc && doc.passphraseEnc.ct),
+        devices: Array.isArray(doc.deviceShares) ? doc.deviceShares.length : 0
+      });
+    } catch (e) {
+      console.error('❌ [gf-wallet] whoami:', e.message);
+      res.status(500).json({ embedded: false, error: 'whoami_failed' });
+    }
+  });
+
   // ── 6. Ticket nuevo con la sesión del juego ya iniciada ─────────────────
   // Sirve para reabrir la wallet al recargar la página sin repetir el OAuth:
   // la cookie de sesión del juego demuestra que ya se verificó la identidad, y

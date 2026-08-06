@@ -12242,6 +12242,115 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
 // de 1, para que la factura no se borre y siga siendo movible.
 const SILVER_PER_GOLD = 1000;
 
+// ── REGALO SEMANAL DE MONEDA                                  (2026-08-05) ──
+// Dos botones en el hub de moneda: "Get Gold" y "Get Silver". Cada uno se puede
+// reclamar UNA VEZ CADA 7 DÍAS, por separado. Es una red de seguridad para que
+// nadie se quede tirado sin dinero mientras la economía arranca.
+//
+// El contador vive en Mongo, no en el navegador: recargar la página, cambiar de
+// dispositivo o tocar la hora del móvil no lo reinicia. Y la entrega usa el
+// MISMO camino que el resto del dinero (applyStatOnChain sobre la factura), así
+// que el oro regalado es tan real como el ganado jugando.
+const WEEKLY_GIFTS = {
+  gold:   { stat: 'oro',   amount: 2000, label: 'Gold'   },
+  silver: { stat: 'plata', amount: 1000, label: 'Silver' }
+};
+const WEEKLY_GIFT_MS = 7 * 24 * 60 * 60 * 1000;
+
+const weeklyGiftSchema = new mongoose.Schema({
+  playerName: { type: String, required: true, index: true },
+  address:    { type: String, lowercase: true, index: true },
+  kind:       { type: String, enum: ['gold', 'silver'], required: true },
+  claimedAt:  { type: Date, default: Date.now }
+}, { collection: 'weekly_gifts' });
+weeklyGiftSchema.index({ playerName: 1, kind: 1 }, { unique: true });
+
+const WeeklyGift = mongoose.models.WeeklyGift || mongoose.model('WeeklyGift', weeklyGiftSchema);
+
+// GET — cuánto falta para poder reclamar cada uno.
+app.get('/api/currency/weekly', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const address = (req.user.address || '').toLowerCase();
+    const gp = await GamePlayer.findOne({ address }).lean();
+    if (!gp) return res.status(404).json({ error: 'player_not_found' });
+
+    const filas = await WeeklyGift.find({ playerName: gp.playerName }).lean();
+    const porTipo = new Map(filas.map(f => [f.kind, f]));
+    const ahora = Date.now();
+
+    const salida = {};
+    for (const [kind, cfg] of Object.entries(WEEKLY_GIFTS)) {
+      const f = porTipo.get(kind);
+      const listo = !f || (ahora - new Date(f.claimedAt).getTime()) >= WEEKLY_GIFT_MS;
+      salida[kind] = {
+        amount: cfg.amount,
+        available: listo,
+        msLeft: listo ? 0 : WEEKLY_GIFT_MS - (ahora - new Date(f.claimedAt).getTime())
+      };
+    }
+    return res.json({ gifts: salida, periodMs: WEEKLY_GIFT_MS });
+  } catch (err) {
+    console.error('GET /api/currency/weekly error:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// POST — reclamar. body: { kind: 'gold' | 'silver' }
+app.post('/api/currency/weekly/claim', strictLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const kind = String((req.body && req.body.kind) || '');
+    const cfg = WEEKLY_GIFTS[kind];
+    if (!cfg) return res.status(400).json({ error: 'invalid_kind' });
+
+    const address = (req.user.address || '').toLowerCase();
+    const gp = await GamePlayer.findOne({ address }).lean();
+    if (!gp || !gp.playerName) return res.status(404).json({ error: 'player_not_found' });
+
+    const doc = await PlayerStats.findOne({ playerName: gp.playerName });
+    if (!doc) return res.status(404).json({ error: 'stats_not_found. Call /sync first' });
+
+    const limite = new Date(Date.now() - WEEKLY_GIFT_MS);
+
+    // RESERVA ATÓMICA. El upsert solo pasa si no hay fila o si la que hay ya
+    // cumplió los 7 días: dos pulsaciones a la vez no pueden cobrar dos veces.
+    let reserva;
+    try {
+      reserva = await WeeklyGift.findOneAndUpdate(
+        { playerName: gp.playerName, kind, claimedAt: { $lte: limite } },
+        { $set: { claimedAt: new Date(), address } },
+        { new: true, upsert: true, setDefaultsOnInsert: true }
+      ).exec();
+    } catch (e) {
+      // Índice único: ya existe una fila reciente → todavía no toca.
+      if (e && e.code === 11000) {
+        const f = await WeeklyGift.findOne({ playerName: gp.playerName, kind }).lean();
+        const restante = f ? WEEKLY_GIFT_MS - (Date.now() - new Date(f.claimedAt).getTime()) : WEEKLY_GIFT_MS;
+        return res.status(429).json({ error: 'already_claimed', msLeft: Math.max(0, restante) });
+      }
+      throw e;
+    }
+    if (!reserva) return res.status(429).json({ error: 'already_claimed', msLeft: WEEKLY_GIFT_MS });
+
+    // Entrega por el camino de siempre: Mongo al momento y la factura después
+    // (el liquidador agrupa la transacción, igual que con las vitales).
+    applyGhostVitalRegen(doc);
+    const nuevo = clampStat(cfg.stat, Number(doc[cfg.stat] || 0) + cfg.amount);
+    doc[cfg.stat] = nuevo;
+    marcarPendienteDeCadena(doc, cfg.stat);
+    await doc.save();
+
+    console.log(`🎁 Regalo semanal (${cfg.label}) para ${gp.playerName}: +${cfg.amount} → ${nuevo}`);
+    return res.json({
+      ok: true, kind, amount: cfg.amount,
+      stats: buildStatsResponse(doc),
+      msLeft: WEEKLY_GIFT_MS
+    });
+  } catch (err) {
+    console.error('POST /api/currency/weekly/claim error:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
 app.post('/api/currency/exchange', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
   try {
     const address = (req.user.address || '').toLowerCase();
