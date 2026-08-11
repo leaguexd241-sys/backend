@@ -1323,6 +1323,19 @@ const UserCropSchema = new mongoose.Schema({
   isHarvested: { type: Boolean, default: false },
   successChance: { type: Number, default: 100 },
   isDead: { type: Boolean, default: false },
+
+  // ── CADUCIDAD DE LA COSECHA (mecánica oculta) ──────────────────────────────
+  // Cuando el cultivo termina de crecer se le pone aquí una fecha límite
+  // aleatoria de entre 2 y 4 horas. Si el jugador no lo recoge antes, se pudre
+  // y pasa a isDead (se lleva la recompensa mala, no la buena).
+  //
+  // `select: false` es DELIBERADO: el jugador no debe conocer su plazo, es
+  // parte del mecanismo. Con esto el campo no sale en ninguna consulta normal,
+  // así que no puede colarse en la respuesta de /api/crops ni en los eventos de
+  // socket aunque alguien haga un `...crop.toObject()`. Quien lo necesita lo
+  // pide a mano con .select('+expiresAt').
+  expiresAt: { type: Date, default: null, select: false },
+
   rewards: {
     item: String,
     quantity: Number,
@@ -1332,6 +1345,8 @@ const UserCropSchema = new mongoose.Schema({
     deadQuantity: Number
   }
 });
+// Índice para el barrido de caducados: filtra por estado y ordena por fecha.
+UserCropSchema.index({ isCompleted: 1, isHarvested: 1, isDead: 1, expiresAt: 1 });
 const UserCrop = mongoose.model('UserCrop', UserCropSchema);
 
 const CropHistorySchema = new mongoose.Schema({
@@ -3759,10 +3774,37 @@ class WaterCollectionController {
   }
 }
 
+// =============================================================================
+// CADUCIDAD DE LAS COSECHAS — MECÁNICA OCULTA                   (2026-08-11)
+// -----------------------------------------------------------------------------
+// Una cosecha que queda lista y NO se recoge se pudre. El plazo es distinto en
+// cada parcela y en cada siembra: se sortea entre 2 y 4 horas en el momento en
+// que el cultivo termina de crecer.
+//
+// Que sea aleatorio y por parcela es lo que hace que el jugador no pueda
+// calcular "vuelvo dentro de X y llego justo": tiene que atender el huerto de
+// verdad. Por eso el plazo NO se le comunica nunca (el campo `expiresAt` es
+// select:false y no viaja en ningún evento ni respuesta).
+//
+// Se decide en el SERVIDOR, así que no se puede tocar desde el cliente.
+// =============================================================================
+const CROP_EXPIRE_MIN_H = 2;
+const CROP_EXPIRE_MAX_H = 4;
+
+/** Fecha límite aleatoria para recoger una cosecha que acaba de estar lista. */
+function nuevaFechaDeCaducidad(desde = Date.now()) {
+  const minMs = CROP_EXPIRE_MIN_H * 60 * 60 * 1000;
+  const maxMs = CROP_EXPIRE_MAX_H * 60 * 60 * 1000;
+  // crypto.randomInt da una distribución uniforme de verdad y no es predecible
+  // desde fuera (Math.random sí lo sería si alguien estudiara el patrón).
+  const margen = crypto.randomInt(0, Math.max(1, maxMs - minMs));
+  return new Date(desde + minMs + margen);
+}
+
 class CropController {
   constructor(io) {
     this.io = io;
-    
+
     this.cropTypes = {
       Semillax: {
         id: 'Semillax',
@@ -3883,6 +3925,8 @@ class CropController {
     };
     
     this.startGrowthTimers();
+    // Barrido de cosechas abandonadas (mecánica oculta de caducidad).
+    this.startExpiryTimer();
   }
 
   async plantSeed(userId, plotId, seedType, userStats, successChance) {
@@ -4128,6 +4172,68 @@ class CropController {
     });
   }
 
+  /**
+   * Barrido de cosechas abandonadas.
+   *
+   * Corre aparte del temporizador de crecimiento a propósito: aquel filtra por
+   * `isCompleted: false`, así que en cuanto un cultivo está listo SALE de su
+   * consulta y ya nadie lo vuelve a mirar. Ahí es justo donde tiene que
+   * empezar a contar el plazo.
+   *
+   * Cada minuto busca las cosechas que ya pasaron su fecha límite y las pudre:
+   * `isDead = true`, con lo que al recogerlas dan la recompensa mala
+   * (deadReward) en vez de la buena, y el cliente pinta el sprite de planta
+   * muerta que ya existía (`tierra_muerta_plant4`).
+   *
+   * Un minuto de resolución es de sobra para un plazo de 2–4 horas y cuesta una
+   * consulta indexada por minuto.
+   */
+  async startExpiryTimer() {
+    setInterval(async () => {
+      try {
+        const ahora = new Date();
+
+        // .select('+expiresAt') porque el campo es select:false (oculto al jugador).
+        const caducadas = await UserCrop.find({
+          isCompleted: true,
+          isHarvested: false,
+          isDead:      false,
+          expiresAt:   { $ne: null, $lte: ahora }
+        }).select('+expiresAt');
+
+        if (!caducadas.length) return;
+
+        for (const crop of caducadas) {
+          crop.isDead = true;
+          await crop.save();
+
+          const cropConfig = this.cropTypes[crop.cropType];
+
+          // Se avisa al cliente con el MISMO evento que usa el crecimiento, para
+          // que la escena repinte la parcela sin necesitar código nuevo.
+          if (this.io) {
+            this.io.emit('cropGrowth', {
+              userId:      crop.userId,
+              plotId:      crop.plotId,
+              growthStage: crop.growthStage,
+              currentGrowthTime: crop.currentGrowthTime,
+              isHalfway:   false,
+              isCompleted: true,
+              isDead:      true,
+              timeRemaining: 0,
+              cropConfig:  cropConfig
+              // OJO: aquí no va expiresAt. El plazo no se le enseña al jugador.
+            });
+          }
+
+          console.log(`🥀 Cosecha perdida por abandono: ${crop.userId} / parcela ${crop.plotId} (${crop.cropType})`);
+        }
+      } catch (error) {
+        console.error('Error en el barrido de cosechas caducadas:', error);
+      }
+    }, 60 * 1000);
+  }
+
   async startGrowthTimers() {
     setInterval(async () => {
       try {
@@ -4172,11 +4278,14 @@ class CropController {
           if (isNowCompleted && !crop.isCompleted) {
             const random = Math.random() * 100;
             isDead = random > crop.successChance;
-            
+
             if (isDead) {
               crop.isDead = true;
             } else {
               crop.isCompleted = true;
+              // La cosecha queda lista: empieza a correr su plazo para
+              // recogerla. Ver CROP_EXPIRE_MIN_H / MAX_H.
+              crop.expiresAt = nuevaFechaDeCaducidad();
             }
           }
 
@@ -10685,6 +10794,26 @@ const playerStatsSchema = new mongoose.Schema({
   // recargando la página.
   chainPending:      { type: [String], default: [] },
   chainPendingSince: { type: Date, default: null },
+
+  // ── RESTO FRACCIONARIO DE LOS COSTES ───────────────────────────────────────
+  // Las barras vitales son NÚMEROS ENTEROS, pero varias acciones cuestan
+  // fracciones: sembrar vale 0,2 de comida y regar 0,5 de agua.
+  //
+  // BUG QUE ESTO ARREGLA: /consume hacía `Math.round(coste)` y descartaba lo
+  // que diera 0. O sea que 0,2 de comida se convertía en 0 y sembrar NUNCA ha
+  // costado comida, mientras que 0,5 de agua se redondeaba a 1 y regar costaba
+  // el DOBLE de lo definido.
+  //
+  // Ahora el sobrante se guarda aquí y se arrastra a la siguiente acción:
+  // sembrar cinco veces (5 × 0,2) cobra 1 de comida, que es justo lo que la
+  // tabla de cultivos quería decir. Vive en la base de datos para que no se
+  // pueda tirar recargando la página.
+  vitalFractions: {
+    vida:   { type: Number, default: 0 },
+    agua:   { type: Number, default: 0 },
+    comida: { type: Number, default: 0 }
+  },
+
   lastSync:    { type: Date, default: null },
   lastUpdated: { type: Date, default: Date.now },
   createdAt:   { type: Date, default: Date.now },
@@ -10721,9 +10850,10 @@ function clampStat(stat, value) {
 // =============================================================================
 // REGENERACIÓN PASIVA DE VITALES — "MODO FANTASMA"            (2026-08-05)
 // -----------------------------------------------------------------------------
-// Pedido: vida, agua y comida suben cada minuto, esté el jugador conectado o no.
+// Pedido: vida, agua y comida suben cada 3 MINUTOS, esté el jugador conectado
+// o no. (Antes era cada minuto; se bajó el ritmo a un tercio.)
 //
-// Hacerlo con una transacción por minuto y por jugador es inviable (miles de
+// Hacerlo con una transacción por tic y por jugador es inviable (miles de
 // transacciones al día por cuenta, casi todas para sumar 1). Así que la subida
 // se lleva en MODO FANTASMA: vive solo en Mongo y se calcula por DIFERENCIA DE
 // TIEMPO contra `lastVitalRegen`. Ventajas:
@@ -10742,20 +10872,27 @@ function clampStat(stat, value) {
 // delante de la cadena en una vital, gana Mongo (es regeneración pendiente de
 // materializar); cuando va por detrás, gana la cadena (hubo un gasto).
 // =============================================================================
-const VITAL_REGEN_PER_MINUTE = 1;
+// RITMO DE REGENERACIÓN.
+// Cada "tic" suma VITAL_REGEN_PER_TICK puntos a cada barra vital.
+// El tic dura VITAL_REGEN_TICK_MS: 3 minutos (antes era 1).
+// Llenar una barra desde cero pasa de 100 min a 300 min (5 h).
+const VITAL_REGEN_TICK_MS   = 3 * 60 * 1000;
+const VITAL_REGEN_PER_TICK  = 1;
 // Tope de acumulación: aunque la cuenta lleve meses parada, como mucho se
-// aplican los minutos necesarios para llenar las barras desde cero.
-const VITAL_REGEN_MAX_MINUTES = Math.ceil(VITAL_MAX / VITAL_REGEN_PER_MINUTE);
+// aplican los tics necesarios para llenar las barras desde cero.
+const VITAL_REGEN_MAX_TICKS = Math.ceil(VITAL_MAX / VITAL_REGEN_PER_TICK);
 
 /**
  * Aplica al documento (en memoria, sin guardar ni tocar la cadena) la
  * regeneración acumulada desde `lastVitalRegen`.
  *
- * El reloj avanza SIEMPRE que pase al menos un minuto, aunque las barras ya
+ * El reloj avanza SIEMPRE que pase al menos un tic, aunque las barras ya
  * estuvieran llenas; si no, un jugador con todo al 100 % acumularía "crédito"
  * infinito y al gastar se le rellenaría al instante.
  *
  * @returns {{changed:boolean, minutes:number, gain:number}}
+ *   `minutes` conserva el nombre por compatibilidad con quien lo lee, pero
+ *   ahora cuenta TICS de VITAL_REGEN_TICK_MS, no minutos.
  */
 function applyGhostVitalRegen(doc, now = new Date()) {
   if (!doc) return { changed: false, minutes: 0, gain: 0 };
@@ -10767,22 +10904,22 @@ function applyGhostVitalRegen(doc, now = new Date()) {
     return { changed: false, minutes: 0, gain: 0 };
   }
 
-  const desde   = new Date(doc.lastVitalRegen).getTime();
-  const minutos = Math.floor((ahora - desde) / 60000);
-  if (minutos <= 0) return { changed: false, minutes: 0, gain: 0 };
+  const desde = new Date(doc.lastVitalRegen).getTime();
+  const tics  = Math.floor((ahora - desde) / VITAL_REGEN_TICK_MS);
+  if (tics <= 0) return { changed: false, minutes: 0, gain: 0 };
 
-  // El resto de segundos NO se pierde: el reloj avanza solo los minutos enteros
-  // consumidos, así que los segundos sobrantes cuentan para el próximo minuto.
-  doc.lastVitalRegen = new Date(desde + minutos * 60000);
+  // El resto NO se pierde: el reloj avanza solo los tics enteros consumidos,
+  // así que los segundos sobrantes cuentan para el próximo tic.
+  doc.lastVitalRegen = new Date(desde + tics * VITAL_REGEN_TICK_MS);
 
-  const ganancia = Math.min(minutos, VITAL_REGEN_MAX_MINUTES) * VITAL_REGEN_PER_MINUTE;
+  const ganancia = Math.min(tics, VITAL_REGEN_MAX_TICKS) * VITAL_REGEN_PER_TICK;
   let changed = false;
   for (const stat of VITAL_STATS) {
     const actual = clampStat(stat, doc[stat]);
     const nuevo  = clampStat(stat, actual + ganancia);
     if (nuevo !== doc[stat]) { doc[stat] = nuevo; changed = true; }
   }
-  return { changed, minutes: minutos, gain: ganancia };
+  return { changed, minutes: tics, gain: ganancia };
 }
 
 /**
@@ -11554,6 +11691,63 @@ async function resolvePlayerName(param) {
   return param; // ya es un playerName normal
 }
 
+// =============================================================================
+// COMPROBACIÓN DE PROPIEDAD — ANTI-IDOR
+// -----------------------------------------------------------------------------
+// Las rutas /api/<algo>/:playerName llevan el nombre del jugador en la URL. El
+// authMiddleware confirma que QUIEN llama tiene sesión, pero no que ese nombre
+// sea SUYO. Sin esta comprobación, cualquier usuario con sesión válida podía
+// pasar el nombre de otro y leer o escribir sus datos.
+//
+// El patrón que había en algunas rutas era:
+//     if (gp && gp.address && gp.address.toLowerCase() !== reqAddr) → 403
+// que se SALTA la comprobación cuando el GamePlayer todavía no existe (gp es
+// null): permitía escribir sobre cualquier nombre aún no registrado y, con el
+// `upsert: true` de esas rutas, dejarlo ocupado antes que su dueño.
+//
+// Aquí la regla es al revés: solo se pasa si se puede DEMOSTRAR la propiedad.
+// =============================================================================
+
+/**
+ * ¿La dirección `reqAddr` es la dueña de `playerName`?
+ * @returns {Promise<boolean>}
+ */
+async function esDuenoDe(reqAddr, playerName) {
+  if (!reqAddr || !playerName) return false;
+
+  const addr   = String(reqAddr).toLowerCase();
+  const target = String(playerName);
+
+  // 1) El "nombre" es su propia dirección (jugadores que aún no eligieron nick).
+  if (target.toLowerCase() === addr) return true;
+
+  // 2) El nombre está registrado en GamePlayer: debe apuntar a su dirección.
+  const gp = await GamePlayer.findOne({ playerName: target }).select('address').lean();
+  if (gp && gp.address) return String(gp.address).toLowerCase() === addr;
+
+  // 3) Aún sin GamePlayer: se compara con el nombre de su cuenta de acceso,
+  //    que es lo que /api/auth/me le devolvió al cliente.
+  const pa = await PlayerAuth.findOne({ address: addr }).select('playerName').lean();
+  if (pa && pa.playerName) return String(pa.playerName).toLowerCase() === target.toLowerCase();
+
+  // Nombre ajeno o inexistente: no se puede demostrar la propiedad.
+  return false;
+}
+
+/**
+ * Guarda de ruta: responde 403 y devuelve false si el que llama no es el dueño.
+ * Uso:  if (!await requireOwner(req, res, playerName)) return;
+ */
+async function requireOwner(req, res, playerName) {
+  const ok = await esDuenoDe(req.user && req.user.address, playerName);
+  if (!ok) {
+    console.warn(`🚫 IDOR bloqueado: ${(req.user && req.user.address) || 'sin-sesión'} intentó acceder a "${playerName}"`);
+    res.status(403).json({ error: 'Forbidden' });
+    return false;
+  }
+  return true;
+}
+
 
 
 
@@ -11571,6 +11765,8 @@ const PlayerSkills = mongoose.model('PlayerSkills', skillsSchema);
 app.get('/api/skills/:playerName', authMiddleware, async (req, res) => {
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
+    // FIX IDOR: no comprobaba dueño — filtraba las habilidades de cualquiera.
+    if (!await requireOwner(req, res, playerName)) return;
     const doc = await PlayerSkills.findOne({ playerName }).lean();
     return res.json({ skills: doc ? doc.skills : {}, skillPoints: doc ? doc.skillPoints : 0 });
   } catch (err) { return res.status(500).json({ error: 'Internal server error' }); }
@@ -11579,10 +11775,10 @@ app.get('/api/skills/:playerName', authMiddleware, async (req, res) => {
 app.post('/api/skills/:playerName', authMiddleware, csrfProtection, async (req, res) => {
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
-    const reqAddr = (req.user.address || '').toLowerCase();
-    const gp = await GamePlayer.findOne({ playerName }).lean();
-    if (gp && gp.address && gp.address.toLowerCase() !== reqAddr)
-      return res.status(403).json({ error: 'Forbidden' });
+    // FIX: la comprobación anterior (`if (gp && gp.address && …)`) se saltaba
+    // cuando el GamePlayer no existía todavía, y con `upsert:true` permitía
+    // crear habilidades sobre nombres ajenos aún no registrados.
+    if (!await requireOwner(req, res, playerName)) return;
     const { skills, skillPoints } = req.body;
     if (!skills || typeof skills !== 'object') return res.status(400).json({ error: 'Invalid' });
     await PlayerSkills.findOneAndUpdate(
@@ -11615,6 +11811,8 @@ const PlayerPet = mongoose.model('PlayerPet', petSchema);
 app.get('/api/pet/:playerName', authMiddleware, async (req, res) => {
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
+    // FIX IDOR: no comprobaba dueño.
+    if (!await requireOwner(req, res, playerName)) return;
     const doc = await PlayerPet.findOne({ playerName }).lean();
     return res.json({ pet: doc ? doc.pet : { type: 'perro', visible: true, equipped: true, level: 1 } });
   } catch (err) { return res.status(500).json({ error: 'Internal server error' }); }
@@ -11624,10 +11822,8 @@ app.get('/api/pet/:playerName', authMiddleware, async (req, res) => {
 app.post('/api/pet/:playerName', authMiddleware, csrfProtection, async (req, res) => {
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
-    const reqAddr = (req.user.address || '').toLowerCase();
-    const gp = await GamePlayer.findOne({ playerName }).lean();
-    if (gp && gp.address && gp.address.toLowerCase() !== reqAddr)
-      return res.status(403).json({ error: 'Forbidden' });
+    // FIX: misma laguna que en skills — se saltaba si no existía el GamePlayer.
+    if (!await requireOwner(req, res, playerName)) return;
     const { pet } = req.body;
     if (!pet || typeof pet !== 'object') return res.status(400).json({ error: 'Invalid pet data' });
     await PlayerPet.findOneAndUpdate(
@@ -11646,7 +11842,27 @@ console.log('✅ Pet routes loaded: /api/pet/:playerName');
 // =============================================================================
 // Simple in-memory mail store keyed by playerName.
 // Replace with DB calls (e.g. db.collection('mail')) as needed.
+//
+// FIX SEGURIDAD (IDOR + agotamiento de memoria):
+//   Estas cinco rutas no comprobaban NADA salvo que hubiera sesión. Cualquier
+//   usuario autenticado podía:
+//     • leer el correo de otro           GET    /api/mail/<víctima>
+//     • borrárselo entero                DELETE /api/mail/<víctima>/clear
+//     • borrarle mensajes sueltos        DELETE /api/mail/<víctima>/<id>
+//     • marcárselo como leído            POST   /api/mail/<víctima>/read-all
+//     • ENVIARLE correo falsificando el remitente (`from` venía del cliente),
+//       que es suplantación directa      POST   /api/mail/<víctima>
+//   Además getPlayerMail() creaba una entrada nueva por CADA nombre que se
+//   pidiera, sin caducidad: un bucle pidiendo nombres al azar llenaba la RAM
+//   del servidor.
+//
+//   Ahora toda ruta exige ser el dueño (requireOwner), así que solo se crean
+//   buzones de jugadores reales, y el remitente lo pone el SERVIDOR.
 if (!global._mailStore) global._mailStore = {};
+
+// Tope de mensajes guardados por jugador: el buzón es un array en memoria, sin
+// límite crecía para siempre en cuentas muy activas.
+const MAIL_MAX_POR_JUGADOR = 100;
 
 function getPlayerMail(player) {
   if (!global._mailStore[player]) global._mailStore[player] = [];
@@ -11654,25 +11870,28 @@ function getPlayerMail(player) {
 }
 
 // GET /api/mail/:playerName — list mails
-app.get('/api/mail/:playerName', authMiddleware, (req, res) => {
-  const mails = getPlayerMail(req.params.playerName);
-  res.json({ mails });
+app.get('/api/mail/:playerName', authMiddleware, async (req, res) => {
+  if (!await requireOwner(req, res, req.params.playerName)) return;
+  res.json({ mails: getPlayerMail(req.params.playerName) });
 });
 
 // POST /api/mail/:playerName/read-all — mark all read
-app.post('/api/mail/:playerName/read-all', authMiddleware, csrfProtection, (req, res) => {
+app.post('/api/mail/:playerName/read-all', authMiddleware, csrfProtection, async (req, res) => {
+  if (!await requireOwner(req, res, req.params.playerName)) return;
   getPlayerMail(req.params.playerName).forEach(m => { m.read = true; });
   res.json({ ok: true });
 });
 
 // DELETE /api/mail/:playerName/clear — delete all
-app.delete('/api/mail/:playerName/clear', authMiddleware, csrfProtection, (req, res) => {
+app.delete('/api/mail/:playerName/clear', authMiddleware, csrfProtection, async (req, res) => {
+  if (!await requireOwner(req, res, req.params.playerName)) return;
   global._mailStore[req.params.playerName] = [];
   res.json({ ok: true });
 });
 
 // DELETE /api/mail/:playerName/:mailId — delete one
-app.delete('/api/mail/:playerName/:mailId', authMiddleware, csrfProtection, (req, res) => {
+app.delete('/api/mail/:playerName/:mailId', authMiddleware, csrfProtection, async (req, res) => {
+  if (!await requireOwner(req, res, req.params.playerName)) return;
   const store = getPlayerMail(req.params.playerName);
   const idx = store.findIndex(m => String(m.id) === String(req.params.mailId));
   if (idx !== -1) store.splice(idx, 1);
@@ -11680,10 +11899,28 @@ app.delete('/api/mail/:playerName/:mailId', authMiddleware, csrfProtection, (req
 });
 
 // POST /api/mail/:playerName — send a mail (internal use or admin)
-app.post('/api/mail/:playerName', authMiddleware, csrfProtection, (req, res) => {
-  const { subject, body, from } = req.body || {};
-  const mail = { id: Date.now().toString(), subject, body, from, date: new Date().toISOString(), read: false };
-  getPlayerMail(req.params.playerName).unshift(mail);
+app.post('/api/mail/:playerName', authMiddleware, csrfProtection, async (req, res) => {
+  if (!await requireOwner(req, res, req.params.playerName)) return;
+
+  const { subject, body } = req.body || {};
+  // El remitente lo decide el SERVIDOR a partir de la sesión. Antes venía del
+  // cuerpo de la petición, así que se podía firmar como cualquiera.
+  const from = (req.user && req.user.address) || 'system';
+
+  const mail = {
+    id: Date.now().toString(),
+    // Longitudes acotadas: sin esto un solo mensaje podía ocupar megas.
+    subject: String(subject == null ? '' : subject).slice(0, 120),
+    body:    String(body    == null ? '' : body).slice(0, 2000),
+    from,
+    date: new Date().toISOString(),
+    read: false
+  };
+
+  const store = getPlayerMail(req.params.playerName);
+  store.unshift(mail);
+  if (store.length > MAIL_MAX_POR_JUGADOR) store.length = MAIL_MAX_POR_JUGADOR;
+
   res.json({ ok: true, mail });
 });
 
@@ -11732,6 +11969,8 @@ const PlayerNotifications = mongoose.model('PlayerNotifications', notifSchema);
 app.get('/api/furnace/:playerName', authMiddleware, async (req, res) => {
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
+    // FIX IDOR: no comprobaba dueño — se podía leer el horno de cualquiera.
+    if (!await requireOwner(req, res, playerName)) return;
     const doc = await FurnaceState.findOne({ playerName }).lean();
     if (!doc) return res.json({ oreItem: null, coalItem: null, timestamp: 0 });
     return res.json(doc);
@@ -11742,6 +11981,9 @@ app.get('/api/furnace/:playerName', authMiddleware, async (req, res) => {
 app.post('/api/furnace/:playerName', authMiddleware, csrfProtection, async (req, res) => {
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
+    // FIX IDOR: no comprobaba dueño — se podía sobrescribir (y sabotear) el
+    // horno de cualquier otro jugador, incluido su resultado en curso.
+    if (!await requireOwner(req, res, playerName)) return;
     const { oreItem, coalItem, timestamp } = req.body;
     await FurnaceState.findOneAndUpdate(
       { playerName },
@@ -11756,10 +11998,8 @@ app.post('/api/furnace/:playerName', authMiddleware, csrfProtection, async (req,
 app.get('/api/notifications/:playerName', authMiddleware, async (req, res) => {
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
-    const reqAddr = (req.user.address || '').toLowerCase();
-    const gp = await GamePlayer.findOne({ playerName }).lean();
-    if (gp && gp.address && gp.address.toLowerCase() !== reqAddr)
-      return res.status(403).json({ error: 'Forbidden' });
+    // FIX: misma laguna que en skills/pet — se saltaba sin GamePlayer.
+    if (!await requireOwner(req, res, playerName)) return;
     const doc = await PlayerNotifications.findOne({ playerName }).lean();
     return res.json({ notifications: doc ? doc.notifications : [] });
   } catch (err) { return res.status(500).json({ error: 'Internal server error' }); }
@@ -11769,10 +12009,8 @@ app.get('/api/notifications/:playerName', authMiddleware, async (req, res) => {
 app.post('/api/notifications/:playerName', authMiddleware, csrfProtection, async (req, res) => {
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
-    const reqAddr = (req.user.address || '').toLowerCase();
-    const gp = await GamePlayer.findOne({ playerName }).lean();
-    if (gp && gp.address && gp.address.toLowerCase() !== reqAddr)
-      return res.status(403).json({ error: 'Forbidden' });
+    // FIX: misma laguna que en skills/pet — se saltaba sin GamePlayer.
+    if (!await requireOwner(req, res, playerName)) return;
     const { notifications } = req.body;
     if (!Array.isArray(notifications)) return res.status(400).json({ error: 'Invalid notifications' });
     await PlayerNotifications.findOneAndUpdate(
@@ -12181,19 +12419,51 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
     const costsRaw = (req.body && req.body.costs) || {};
     const reason   = String((req.body && req.body.reason) || 'action').slice(0, 40);
 
-    // Normalizar: solo vitales, solo enteros positivos, tope razonable.
-    const costs = {};
+    // Normalizar: solo vitales, solo positivos, tope razonable.
+    // FIX: antes esto hacía Math.round() y descartaba lo que diera 0, así que
+    // los costes fraccionarios de la tabla de cultivos se perdían (0,2 de
+    // comida al sembrar nunca se cobraba) o se duplicaban (0,5 de agua al
+    // regar pasaba a 1). Ahora se conserva el decimal y el redondeo se hace
+    // más abajo arrastrando el sobrante.
+    const costesPedidos = {};
     for (const stat of VITAL_STATS) {
-      const n = Math.round(Number(costsRaw[stat] || 0));
-      if (Number.isFinite(n) && n > 0) costs[stat] = Math.min(n, VITAL_MAX);
+      const n = Number(costsRaw[stat] || 0);
+      if (Number.isFinite(n) && n > 0) costesPedidos[stat] = Math.min(n, VITAL_MAX);
     }
-    if (!Object.keys(costs).length) return res.status(400).json({ error: 'no_costs' });
+    if (!Object.keys(costesPedidos).length) return res.status(400).json({ error: 'no_costs' });
 
     const doc = await PlayerStats.findOne({ playerName });
     if (!doc) return res.status(404).json({ error: 'stats_not_found. Call /sync first' });
 
     // 1. Regeneración pendiente (modo fantasma) antes de cobrar.
     applyGhostVitalRegen(doc);
+
+    // 1-bis. Convertir los costes decimales en enteros arrastrando el resto de
+    // la vez anterior. Ejemplo con 0,2 de comida: las cuatro primeras siembras
+    // cobran 0 y acumulan (0,2 → 0,4 → 0,6 → 0,8); la quinta llega a 1,0 y
+    // cobra 1 de comida. En cinco siembras se paga exactamente 1, que es lo
+    // que dice la tabla.
+    if (!doc.vitalFractions) doc.vitalFractions = { vida: 0, agua: 0, comida: 0 };
+
+    const costs         = {};   // lo que se cobra AHORA (entero)
+    const restosNuevos  = {};   // lo que queda pendiente para la próxima
+    for (const [stat, pedido] of Object.entries(costesPedidos)) {
+      const acumulado = Number(doc.vitalFractions[stat] || 0) + pedido;
+      const entero    = Math.floor(acumulado + 1e-9);   // margen anti-error de coma flotante
+      restosNuevos[stat] = Number((acumulado - entero).toFixed(4));
+      if (entero > 0) costs[stat] = Math.min(entero, VITAL_MAX);
+    }
+
+    // Si todo el coste se fue al acumulador (p. ej. la primera siembra), no hay
+    // nada que cobrar: se guarda el resto y se responde OK. La acción es válida.
+    if (!Object.keys(costs).length) {
+      for (const [stat, resto] of Object.entries(restosNuevos)) doc.vitalFractions[stat] = resto;
+      doc.markModified('vitalFractions');
+      try { await doc.save(); } catch (_) {}
+      // Misma forma de respuesta que el camino normal, para que el cliente no
+      // tenga que distinguir los dos casos.
+      return res.json({ ok: true, spent: {}, stats: buildStatsResponse(doc) });
+    }
 
     // 2. ¿Alcanza para TODO el coste? Es todo o nada: media tala no existe.
     const faltan = [];
@@ -12215,6 +12485,12 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
     for (const [stat, coste] of Object.entries(costs)) {
       doc[stat] = clampStat(stat, clampStat(stat, doc[stat]) - coste);
     }
+    // El sobrante decimal se guarda SOLO aquí, cuando el cobro se ha hecho de
+    // verdad. Si la petición se rechazó por falta de vitales (409) no se toca:
+    // la acción no ocurrió, así que tampoco debe acumular deuda fraccionaria.
+    for (const [stat, resto] of Object.entries(restosNuevos)) doc.vitalFractions[stat] = resto;
+    doc.markModified('vitalFractions');
+
     marcarPendienteDeCadena(doc, Object.keys(costs));
     await doc.save();
 
