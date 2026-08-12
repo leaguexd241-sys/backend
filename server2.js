@@ -1176,6 +1176,13 @@ const dailyMissionSchema = new mongoose.Schema({
     expReward: { type: Number, required: true, min: 0 },
     rewardItemId: { type: String },
     rewardAmount: { type: Number, min: 1 },
+    // ── RECOMPENSA EN MONEDAS (2026-08-11) ─────────────────────────────────
+    // Faltaba: una misión solo podía dar experiencia y un ítem. Ahora también
+    // puede pagar en oro o en plata, que se entregan por la MISMA vía que la
+    // experiencia (PlayerStats + factura on-chain), así que cuentan igual que
+    // cualquier otra moneda del juego. 0 = no da esa moneda.
+    goldReward:   { type: Number, default: 0, min: 0 },
+    silverReward: { type: Number, default: 0, min: 0 },
     texts: {
       'en-US': {
         title: String,
@@ -2487,10 +2494,28 @@ class RelayManager {
       this.processingLock = true;
       
       try {
-        // Procesar hasta 5 transacciones por intervalo
+        // Procesar hasta 5 transacciones por intervalo.
+        //
+        // FIX: antes esto hacía `splice(0, 5)` a secas, sin mirar `timestamp`.
+        // El reintento de abajo escribe `item.timestamp = ahora + 5s/10s/15s`
+        // para espaciar los intentos, pero nadie leía ese campo: el elemento
+        // volvía a procesarse en el tic siguiente (1 s después) y la espera
+        // creciente no ocurría nunca. Con el nodo caído eso son tres golpes
+        // seguidos al RPC en tres segundos en vez de repartidos en 30.
+        // Ahora solo entran los que ya cumplieron su espera.
+        const ahora = Date.now();
         const batchSize = 5;
-        const itemsToProcess = this.transactionQueue.splice(0, batchSize);
-        
+        const itemsToProcess = [];
+        for (let i = 0; i < this.transactionQueue.length && itemsToProcess.length < batchSize; i++) {
+          const it = this.transactionQueue[i];
+          if (!it.timestamp || it.timestamp <= ahora) {
+            itemsToProcess.push(it);
+            this.transactionQueue.splice(i, 1);
+            i--;
+          }
+        }
+        if (itemsToProcess.length === 0) return;
+
         for (const item of itemsToProcess) {
           try {
             await this.processTransaction(item.data);
@@ -2516,18 +2541,37 @@ class RelayManager {
   }
   
   shouldRetry(error) {
+    // Solo causas TRANSITORIAS: cosas que probablemente funcionen al segundo
+    // intento sin que nadie tenga que arreglar nada.
+    //
+    // FIX: 'insufficient funds' estaba en esta lista y NO pertenece aquí. Si el
+    // relayer se queda sin saldo, reintentar no lo arregla: se queman los tres
+    // intentos y se retrasa el aviso del problema real. Ahora se trata como
+    // error definitivo, que es lo que es (checkRelayerBalance ya vigila el
+    // saldo y avisa).
     const retryableErrors = [
       'nonce too low',
+      'nonce has already been used',
       'replacement transaction underpriced',
       'transaction underpriced',
-      'insufficient funds',
       'network error',
-      'timeout'
+      'timeout',
+      'econnreset',
+      'etimedout',
+      'socket hang up',
+      'server_error',
+      'bad response',
+      'could not detect network'
     ];
-    
-    return retryableErrors.some(msg => 
-      error.message?.toLowerCase().includes(msg.toLowerCase())
-    );
+
+    const msg = (error && (error.message || error.reason || '')).toLowerCase();
+    if (!msg) return false;
+
+    // Un revert del contrato nunca se reintenta: la transacción está mal, y
+    // repetirla solo gasta gas para volver a fallar igual.
+    if (msg.includes('execution reverted') || msg.includes('call_exception')) return false;
+
+    return retryableErrors.some(m => msg.includes(m));
   }
   
   // PROTECCIÓN CONTRA GAS DRAIN
@@ -4550,10 +4594,11 @@ io.on("connection", (socket) => {
   socket.on('collectWater', async (data) => {
     try {
       const { playerName } = data;
-      // FIX: Verificar que el playerName corresponde al socket autenticado
-      if (socket.authenticatedPlayer && socket.authenticatedPlayer !== playerName) {
-        return socket.emit('collectWaterError', { error: 'No autorizado: playerName no coincide' });
-      }
+      // Misma laguna que en assertCropOwner: el `&&` dejaba pasar a cualquiera
+      // que no hubiera emitido joinRoom, y también a los sockets anónimos.
+      // Se reutiliza el guardián único (está declarado más abajo en este mismo
+      // ámbito, así que el hoisting lo hace visible aquí).
+      if (!assertCropOwner(playerName, 'collectWaterError')) return;
       const result = await waterCollectionController.collectWater(playerName);
       socket.emit('collectWaterSuccess', result);
     } catch (error) {
@@ -4564,6 +4609,9 @@ io.on("connection", (socket) => {
   socket.on('getWaterCollectionStatus', async (data) => {
     try {
       const { playerName } = data;
+      // No tenía NINGUNA comprobación: se podía consultar el estado de
+      // recolección de agua de cualquier jugador con solo poner su nombre.
+      if (!assertCropOwner(playerName, 'waterStatusError')) return;
       const status = await waterCollectionController.getWaterCollectionStatus(playerName);
       socket.emit('waterCollectionStatus', status);
     } catch (error) {
@@ -4575,14 +4623,48 @@ io.on("connection", (socket) => {
   socket.emit('cropConfig', cropController.getCropConfig());
 
   // Helper interno: verifica que el userId del evento coincide con el jugador autenticado
+  /**
+   * ¿El `userId` del mensaje es de quien lo manda?
+   *
+   * AGUJERO REPARADO (2026-08-11): la comprobación era
+   *     if (socket.authenticatedPlayer && socket.authenticatedPlayer !== userId)
+   * o sea que se SALTABA cuando `authenticatedPlayer` valía null. Y ese campo
+   * arranca SIEMPRE en null (lo pone el middleware de io.use) y solo se rellena
+   * dentro de joinRoom. Bastaba con conectar el socket y NO emitir joinRoom
+   * para que todas estas comprobaciones devolvieran true: desde ahí se podía
+   * sembrar, regar, cosechar y talar cultivos de CUALQUIER jugador pasando su
+   * userId. Un socket anónimo (sin sesión) tenía exactamente el mismo poder.
+   *
+   * Ahora hay que DEMOSTRAR la identidad: sin sesión no se pasa, y el userId
+   * tiene que coincidir con la dirección del token o con el nombre de jugador
+   * ya verificado en joinRoom. El cliente manda `userId: this.currentAccount`,
+   * que es la dirección de la cartera, así que la comparación natural es con
+   * `authenticatedAddress`.
+   */
   function assertCropOwner(userId, emitEvent, plotId = null) {
-    if (socket.authenticatedPlayer && socket.authenticatedPlayer !== userId) {
-      const payload = { error: 'No autorizado: userId no coincide con el jugador autenticado' };
+    const fallar = (motivo) => {
+      const payload = { error: 'No autorizado: ' + motivo };
       if (plotId !== null) payload.plotId = plotId;
       socket.emit(emitEvent, payload);
+      console.warn(`🚫 Socket ${socket.id} rechazado en '${emitEvent}': ${motivo} (userId=${userId})`);
       return false;
-    }
-    return true;
+    };
+
+    if (!userId) return fallar('falta el userId');
+
+    // 1) Sin sesión válida no se toca nada.
+    if (!socket.authenticatedAddress) return fallar('socket sin sesión');
+
+    const pedido = String(userId).toLowerCase();
+
+    // 2) Coincide con la dirección del token (el caso normal).
+    if (pedido === String(socket.authenticatedAddress).toLowerCase()) return true;
+
+    // 3) O con el nombre de jugador que joinRoom ya verificó contra la BD.
+    if (socket.authenticatedPlayer &&
+        pedido === String(socket.authenticatedPlayer).toLowerCase()) return true;
+
+    return fallar('el userId no pertenece a este socket');
   }
 
   // Consulta previa (sin efectos secundarios) para que el cliente sepa si
@@ -4834,7 +4916,12 @@ io.on("connection", (socket) => {
       }
       socket.chatLastSent = now;
 
-      const playerName = escapeHtml(payload.usernamex || socket.playerData.username || '---');
+      // SUPLANTACIÓN REPARADA (2026-08-11): el nombre que se mostraba salía de
+      // `payload.usernamex`, o sea del propio mensaje. Cualquiera podía mandar
+      // el nombre de otro jugador y hablar por él en el chat público. El nombre
+      // ahora sale de `socket.playerData`, que lo rellenó joinRoom tras
+      // verificarlo contra la base de datos; el del cuerpo se ignora.
+      const playerName = escapeHtml(socket.playerData.username || '---');
 
       // RECORTE SEGURO PARA EMOJIS (2026-08-05): un emoji ocupa dos unidades
       // UTF-16 (a veces más, si lleva modificadores). Con .slice(0, 500) a
@@ -6211,23 +6298,33 @@ app.post('/api/auth/set-playerName', authMiddleware, strictLimiter, csrfProtecti
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
-    // Verificar si el playerName ya está en uso
-    const existingAuth = await PlayerAuth.findOne({ 
-      playerName: playerName,
-      address: { $ne: address }
-    });
-    
-    if (existingAuth) {
-      return res.status(400).json({ error: 'PlayerName ya está en uso por otro usuario' });
-    }
+    // ── NOMBRE ÚNICO, SIN DISTINGUIR MAYÚSCULAS ──────────────────────────
+    // La comprobación anterior era una igualdad exacta, o sea SENSIBLE a
+    // mayúsculas: "Pepe", "pepe" y "PEPE" se consideraban tres nombres
+    // distintos y los tres podían coexistir. Eso es el vector clásico de
+    // suplantación — en el chat y en la clasificación nadie distingue a
+    // "Kuro" de "kuro".
+    //
+    // Ahora se compara con una expresión regular anclada e insensible a
+    // mayúsculas. Se escapan los metacaracteres del nombre: sin eso, un nombre
+    // con '(' o '*' rompería la consulta, y uno construido a mala idea podría
+    // colgar el servidor con un patrón catastrófico.
+    const nombreEscapado = String(playerName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const mismoNombre = { $regex: '^' + nombreEscapado + '$', $options: 'i' };
 
-    const existingGamePlayer = await GamePlayer.findOne({ 
-      playerName: playerName,
-      address: { $ne: address }
-    });
-    
-    if (existingGamePlayer) {
-      return res.status(400).json({ error: 'PlayerName ya está en uso en el juego por otro jugador' });
+    const [existingAuth, existingGamePlayer] = await Promise.all([
+      PlayerAuth.findOne({ playerName: mismoNombre, address: { $ne: address } }).lean(),
+      GamePlayer.findOne({ playerName: mismoNombre, address: { $ne: address } }).lean()
+    ]);
+
+    // Mensajes en inglés, como el resto de la interfaz del juego. `code` va
+    // aparte para que el cliente pueda reaccionar sin depender del texto.
+    if (existingAuth || existingGamePlayer) {
+      return res.status(409).json({
+        error: 'name_taken',
+        code:  'NAME_TAKEN',
+        message: 'That name is already taken. Please choose a different one.'
+      });
     }
 
     // Actualizar playerName
@@ -7084,9 +7181,39 @@ app.post('/api/relay/transaction',
         sessionId: req.cookies?.session?.split('.')[0] || 'unknown'
       };
       
-      // Añadir a la cola de procesamiento
-      const result = await relayManager.processTransaction(transactionData);
-      
+      // ── ENVÍO, CON LA COLA COMO RED DE SEGURIDAD ─────────────────────────
+      // La cola (addToQueue + startQueueProcessor) existía completa desde hacía
+      // tiempo pero NADIE la llamaba: era código muerto. Aquí se activa.
+      //
+      // El camino feliz NO cambia: se intenta enviar en el acto y el cliente
+      // sigue recibiendo su txHash igual que siempre. Lo que cambia es el
+      // fallo: si el envío se cae por algo TRANSITORIO (nodo RPC caído, nonce
+      // pisado, gas mal calculado en una avalancha de transacciones), en vez de
+      // devolver un 500 y perder la transacción, se encola y el procesador la
+      // reintenta con espera creciente (5 s, 10 s, 15 s).
+      //
+      // Así la cola absorbe justo lo que tiene que absorber — los picos de
+      // transacciones masivas y las caídas del nodo — sin tocar el contrato de
+      // la API cuando todo va bien.
+      let result;
+      try {
+        result = await relayManager.processTransaction(transactionData);
+      } catch (envioError) {
+        if (relayManager.shouldRetry(envioError)) {
+          const queueId = await relayManager.addToQueue(transactionData);
+          console.warn(`🕓 Envío fallido por causa transitoria — encolado para reintento: ${envioError.message}`);
+
+          return res.status(202).json({
+            success: true,
+            queued: true,
+            queueId,
+            message: 'Transaction queued for retry',
+            reason: envioError.message
+          });
+        }
+        throw envioError;   // error real del contrato: sube al catch de abajo
+      }
+
       // Emitir evento de Socket.io si está disponible
       if (global.io) {
         global.io.emit('relay_transaction_sent', {
@@ -7741,6 +7868,10 @@ app.post('/api/save/:playerName',
       // sola vez: cuando el valor guardado ya NO es '---', cualquier intento
       // de cambiarlo se ignora (se conserva el existente). Validación en
       // servidor para que no dependa del cliente.
+      //
+      // Nombres que se rechazaron por estar ya cogidos. Viaja en la respuesta
+      // para que el cliente pueda avisar al jugador (mensajes en inglés).
+      const nombresRechazados = [];
       try {
         // NOMBRES CON NÚMEROS Y HASTA 15 CARACTERES (2026-08-04).
         // Antes solo se admitían letras y 10 caracteres, así que "Ana99" o
@@ -7759,6 +7890,7 @@ app.post('/api/save/:playerName',
         const existingGP = await GamePlayer.findOne({ playerName }).lean();
 
         for (const field of ['Username', 'petName']) {
+          // (nombresRechazados se declara fuera del try, más arriba)
           if (update[field] === undefined) continue;
 
           const current = existingGP && typeof existingGP[field] === 'string'
@@ -7779,8 +7911,39 @@ app.post('/api/save/:playerName',
             // Vacío o inválido: mantener '---' (no cuenta como fijado)
             update[field] = '---';
           } else {
-            update[field] = clean;
-            if (clean !== '---') console.log(`✅ ${field} fijado para ${playerName}: '${clean}' (definitivo)`);
+            // ── NOMBRE ÚNICO ENTRE JUGADORES ────────────────────────────
+            // Faltaba por completo: este bloque sanitizaba el nombre y lo
+            // hacía inmutable, pero NUNCA miraba si otro jugador ya lo tenía.
+            // Dos cuentas podían llamarse igual — y con `petName` igual, que
+            // es lo que se muestra en las batallas y en la clasificación.
+            //
+            // La comparación no distingue mayúsculas a propósito: "Kuro" y
+            // "kuro" son el mismo nombre para cualquiera que los lea. Se
+            // escapan los metacaracteres para que un nombre con símbolos no
+            // rompa la consulta.
+            const esc = clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const yaExiste = await GamePlayer.findOne({
+              [field]: { $regex: '^' + esc + '$', $options: 'i' },
+              playerName: { $ne: playerName }
+            }).select('_id').lean();
+
+            if (yaExiste) {
+              // No se fija: se deja en '---' para que el jugador pueda
+              // reintentar con otro. El aviso viaja en la respuesta.
+              update[field] = '---';
+              nombresRechazados.push({
+                field: field,
+                requested: clean,
+                code: 'NAME_TAKEN',
+                message: field === 'petName'
+                  ? 'That pet name is already taken. Please choose a different one.'
+                  : 'That username is already taken. Please choose a different one.'
+              });
+              console.log(`🚫 ${field} '${clean}' rechazado para ${playerName}: ya lo tiene otro jugador`);
+            } else {
+              update[field] = clean;
+              console.log(`✅ ${field} fijado para ${playerName}: '${clean}' (definitivo)`);
+            }
           }
         }
       } catch (nameErr) {
@@ -7864,6 +8027,11 @@ app.post('/api/save/:playerName',
         inventory: validInventoryCount,
         chest: validChestCount
       };
+
+      // Nombres que se pidieron pero ya los tenía otro jugador. El cliente los
+      // usa para mostrar el aviso; los mensajes vienen ya redactados en inglés
+      // desde el servidor, así que no hay que traducir nada en el cliente.
+      if (nombresRechazados.length) response.nameConflicts = nombresRechazados;
 
       return res.json(response);
     } catch (e) {
@@ -8403,6 +8571,49 @@ app.post('/api/missions/daily/complete',
         }
       }
 
+      // 5a-bis. MONEDAS — misma vía que la experiencia: se suma al total del
+      // jugador y se lleva a su factura on-chain. No se "acuñan" como los
+      // ítems porque el oro y la plata son estadísticas con factura, no
+      // objetos de inventario.
+      const oroPremio   = Math.max(0, parseInt(mission.goldReward,   10) || 0);
+      const plataPremio = Math.max(0, parseInt(mission.silverReward, 10) || 0);
+
+      if (oroPremio > 0 || plataPremio > 0) {
+        try {
+          const statsDoc = await PlayerStats.findOne({ playerName });
+          if (statsDoc) {
+            const contract = getStatsContract();
+            const gasPrice = (contract) ? await getSafeGasPriceStats() : null;
+
+            for (const [clave, cantidad] of [['oro', oroPremio], ['plata', plataPremio]]) {
+              if (cantidad <= 0) continue;
+
+              const total = Math.max(0, Math.round(Number(statsDoc[clave] || 0))) + cantidad;
+              const invId = statsDoc.invoiceIds && statsDoc.invoiceIds[clave];
+
+              if (contract && invId) {
+                const r = await applyStatOnChain(contract, clave, invId, total, gasPrice);
+                statsDoc[clave] = r.ok ? total : (r.chainQty ?? statsDoc[clave]);
+                if (!r.ok) avisos.push(clave + '_chain_failed');
+              } else {
+                // Sin factura todavía: se guarda en Mongo y /sync la creará.
+                statsDoc[clave] = total;
+              }
+
+              // GamePlayer guarda una copia para el HUD; se mantiene al día.
+              if (clave === 'oro')   gp.moneda       = statsDoc.oro;
+              if (clave === 'plata') gp.moneda_plata = statsDoc.plata;
+            }
+            await statsDoc.save();
+          } else {
+            avisos.push('stats_missing');
+          }
+        } catch (e) {
+          console.warn('⚠️  misión: no se pudieron entregar las monedas:', e.message);
+          avisos.push('coins_failed');
+        }
+      }
+
       // 5b. Ítem de recompensa — se ACUÑA y luego entra en el inventario.
       let entregadas = 0;
       if (rewardId && rewardQty > 0) {
@@ -8445,7 +8656,12 @@ app.post('/api/missions/daily/complete',
         completedCount: progress.completedCount,
         rewards: {
           exp: expReward,
-          item: rewardId ? { id: rewardId, amount: entregadas } : null
+          item: rewardId ? { id: rewardId, amount: entregadas } : null,
+          // Monedas entregadas (0 si la misión no pagaba en esa moneda). El
+          // cliente las usa para el aviso de "has recibido…" y para refrescar
+          // el HUD sin tener que volver a pedir las estadísticas.
+          gold:   oroPremio,
+          silver: plataPremio
         },
         warnings: avisos.length ? avisos : undefined
       });
@@ -8492,7 +8708,15 @@ function sanearMisionesDelDia(missions) {
     const requiredAmount = Math.max(1, Math.min(9999, parseInt(m.requiredAmount, 10) || 1));
     const expReward = Math.max(0, Math.min(100000, parseInt(m.expReward, 10) || 0));
 
-    const salida = { missionId, itemId, requiredAmount, expReward, texts: {} };
+    // RECOMPENSA EN MONEDAS. El tope es deliberadamente bajo comparado con la
+    // experiencia: el oro son DÓLARES reales (1 oro = 1 USD) y la plata son
+    // centavos. Un cero de más en el panel de administración al teclear no
+    // puede convertirse en un regalo de miles de dólares, así que se acota
+    // aquí, en el servidor, no solo en el formulario.
+    const goldReward   = Math.max(0, Math.min(1000,   parseInt(m.goldReward,   10) || 0));
+    const silverReward = Math.max(0, Math.min(100000, parseInt(m.silverReward, 10) || 0));
+
+    const salida = { missionId, itemId, requiredAmount, expReward, goldReward, silverReward, texts: {} };
 
     const rewardItemId = limpiarTexto(m.rewardItemId, 60);
     if (rewardItemId) {
@@ -9018,6 +9242,205 @@ app.get('/api/admin/whoami', adminAuth, apiLimiter, (req, res) => {
 });
 
 console.log('✅ Admin players routes: /api/admin/players, /api/admin/overview, /api/admin/whoami');
+
+// =============================================================================
+// BANDEJA DE ERRORES DEL CLIENTE + FALLOS DE RELAY               (2026-08-11)
+// -----------------------------------------------------------------------------
+// Da servicio a reporter.html. Todo pasa por adminAuth, o sea que solo entra
+// quien tenga sesión con una cartera de administrador — la misma que ya usa
+// admin.html. No hay contraseñas ni tokens que guardar en el navegador.
+//
+// OJO con la diferencia entre las dos colecciones:
+//   • ErrorReport        → fallos de JavaScript en el cliente (esto).
+//   • Report (más abajo) → denuncias de un jugador contra otro. No se mezclan.
+// =============================================================================
+
+// ── GET /api/admin/client-errors ───────────────────────────────────────────
+app.get('/api/admin/client-errors', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const limite  = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100));
+    const salto   = Math.max(0, parseInt(req.query.skip, 10) || 0);
+    const busca   = String(req.query.q || '').trim().slice(0, 120);
+    const tipo    = String(req.query.type || '').trim().slice(0, 40);
+
+    const filtro = {};
+    if (tipo) filtro.type = tipo;
+    if (busca) {
+      // Se escapan los metacaracteres: sin esto una búsqueda con '(' o '*'
+      // rompe la consulta, y un patrón malicioso puede colgar el servidor.
+      const seguro = busca.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      filtro.$or = [
+        { message: { $regex: seguro, $options: 'i' } },
+        { scene:   { $regex: seguro, $options: 'i' } },
+        { file:    { $regex: seguro, $options: 'i' } }
+      ];
+    }
+
+    const [items, total, tipos] = await Promise.all([
+      ErrorReport.find(filtro).sort({ lastSeen: -1 }).skip(salto).limit(limite).lean(),
+      ErrorReport.countDocuments(filtro),
+      ErrorReport.distinct('type')
+    ]);
+
+    // Suma de ocurrencias reales (no de fichas): con la deduplicación una sola
+    // ficha puede representar cientos de fallos.
+    const agg = await ErrorReport.aggregate([
+      { $match: filtro },
+      { $group: { _id: null, ocurrencias: { $sum: '$count' } } }
+    ]);
+
+    res.json({
+      ok: true,
+      items, total,
+      ocurrencias: (agg[0] && agg[0].ocurrencias) || 0,
+      tipos: tipos.filter(Boolean).sort()
+    });
+  } catch (e) {
+    console.error('GET /api/admin/client-errors:', e);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// ── DELETE /api/admin/client-errors/:id ────────────────────────────────────
+app.delete('/api/admin/client-errors/:id', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const id = String(req.params.id || '');
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ ok: false, error: 'invalid_id' });
+    }
+    const r = await ErrorReport.deleteOne({ _id: id });
+    res.json({ ok: true, borrados: r.deletedCount || 0 });
+  } catch (e) {
+    console.error('DELETE /api/admin/client-errors/:id:', e);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// ── DELETE /api/admin/client-errors  (vaciar la bandeja) ───────────────────
+// Pide confirm=YES en la URL a propósito: es irreversible y no debe poder
+// dispararse por un clic accidental ni por una petición suelta.
+app.delete('/api/admin/client-errors', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    if (String(req.query.confirm) !== 'YES') {
+      return res.status(400).json({ ok: false, error: 'confirmation_required' });
+    }
+    const r = await ErrorReport.deleteMany({});
+    console.warn(`🗑️  ${req.admin.address} vació la bandeja de errores (${r.deletedCount} fichas)`);
+    res.json({ ok: true, borrados: r.deletedCount || 0 });
+  } catch (e) {
+    console.error('DELETE /api/admin/client-errors:', e);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// ── GET /api/admin/relay-failures ──────────────────────────────────────────
+// Fallos de relay que NO son un revert del contrato.
+//
+// Un revert es una respuesta NORMAL de la cadena: el contrato dijo que no
+// (sin saldo, sin permiso, requisito incumplido). Eso no es una avería y
+// llenaría la bandeja de ruido. Lo que interesa aquí es lo ANORMAL: el nodo
+// caído, el nonce pisado, un timeout, el gas mal estimado — cosas que apuntan
+// a un problema de infraestructura y que sí hay que mirar.
+app.get('/api/admin/relay-failures', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const limite = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100));
+    const salto  = Math.max(0, parseInt(req.query.skip, 10) || 0);
+
+    const patronesDeRevert = /execution reverted|call_exception|revert/i;
+
+    const filtro = {
+      status: { $in: ['failed'] },        // 'reverted' queda fuera por definición
+      $and: [
+        { $or: [ { revertReason: { $in: [null, ''] } }, { revertReason: { $exists: false } } ] },
+        { $or: [ { error: { $exists: false } }, { error: { $not: patronesDeRevert } } ] }
+      ]
+    };
+
+    const [items, total] = await Promise.all([
+      RelayedTransaction.find(filtro)
+        .sort({ createdAt: -1 }).skip(salto).limit(limite)
+        .select('playerName contractName functionName status error txHash createdAt retryCount')
+        .lean(),
+      RelayedTransaction.countDocuments(filtro)
+    ]);
+
+    res.json({ ok: true, items, total });
+  } catch (e) {
+    console.error('GET /api/admin/relay-failures:', e);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+console.log('✅ Reporter routes: /api/admin/client-errors, /api/admin/relay-failures');
+
+// =============================================================================
+// PREFERENCIAS DE GRÁFICOS DEL JUGADOR                           (2026-08-11)
+// -----------------------------------------------------------------------------
+// Los ajustes de calidad y distancia de visión vivían en localStorage. Pedido:
+// nada en el navegador, todo en el servidor. Ventaja real además de la
+// preferencia: el jugador conserva su configuración al cambiar de navegador o
+// de ordenador, y se puede consultar desde el panel de administración cuando
+// alguien reporta que le va lento.
+//
+// Se guardan POR JUGADOR (no por dispositivo). Es una simplificación asumida:
+// si alguien juega en un móvil flojo y en un PC potente tendrá que ajustarlo al
+// cambiar. A cambio no hay nada en el navegador, que es lo que se pidió.
+// =============================================================================
+const graphicsPrefsSchema = new mongoose.Schema({
+  playerName: { type: String, required: true, unique: true, index: true },
+  // Se validan contra listas cerradas al escribir; aquí solo el tipo.
+  calidad: { type: String, default: 'alta' },
+  chunks:  { type: Number, default: 12, min: 2, max: 16 },
+  updatedAt: { type: Date, default: Date.now }
+}, { collection: 'player_graphics_prefs' });
+const GraphicsPrefs = mongoose.model('GraphicsPrefs', graphicsPrefsSchema);
+
+const CALIDADES_VALIDAS = ['alta', 'media', 'baja'];
+
+// ── GET /api/graphics/:playerName ──────────────────────────────────────────
+app.get('/api/graphics/:playerName', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const playerName = await resolvePlayerName(req.params.playerName);
+    if (!await requireOwner(req, res, playerName)) return;
+
+    const doc = await GraphicsPrefs.findOne({ playerName }).lean();
+    // Sin fila todavía: se devuelven los valores por defecto, no un 404. El
+    // cliente no tiene que distinguir "nunca lo configuró" de "no hay nada".
+    return res.json({
+      ok: true,
+      calidad: (doc && CALIDADES_VALIDAS.includes(doc.calidad)) ? doc.calidad : 'alta',
+      chunks:  (doc && typeof doc.chunks === 'number') ? doc.chunks : 12
+    });
+  } catch (err) {
+    console.error('GET /api/graphics:', err);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// ── POST /api/graphics/:playerName ─────────────────────────────────────────
+app.post('/api/graphics/:playerName', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const playerName = await resolvePlayerName(req.params.playerName);
+    if (!await requireOwner(req, res, playerName)) return;
+
+    const calidadPedida = String((req.body && req.body.calidad) || '').toLowerCase();
+    const calidad = CALIDADES_VALIDAS.includes(calidadPedida) ? calidadPedida : 'alta';
+    const chunks  = Math.max(2, Math.min(16, Math.round(Number(req.body && req.body.chunks) || 12)));
+
+    await GraphicsPrefs.findOneAndUpdate(
+      { playerName },
+      { calidad, chunks, updatedAt: new Date() },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    return res.json({ ok: true, calidad, chunks });
+  } catch (err) {
+    console.error('POST /api/graphics:', err);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+console.log('✅ Graphics prefs routes: GET/POST /api/graphics/:playerName');
 
 
 // =============================================================================
@@ -10362,7 +10785,12 @@ console.log('✅ Configuración de clasificación: /api/admin/leaderboard-config
 // (se monta más abajo, después de que PlayerStats esté definido — ver "MARKETPLACE ROUTES MOUNT")
 
 // Error Reports
-app.post('/api/report-error', async (req, res) => {
+// `apiLimiter` añadido al conectar el reporte de errores del cliente
+// (GameScene.errorReporter). Hasta ahora la ruta no recibía nada porque el
+// reportero nunca arrancaba; ahora sí, y un cliente atrapado en un bucle de
+// errores podría inundar la colección de reportes él solo. El limitador corta
+// eso sin afectar al uso normal, que son unos pocos reportes por sesión.
+app.post('/api/report-error', apiLimiter, async (req, res) => {
     const safeLog = (...args) => {
         if (typeof process !== 'undefined' && process.stdout) {
             process.stdout.write('[ERROR-REPORTER] ' + args.join(' ') + '\n');
@@ -10406,26 +10834,52 @@ app.post('/api/report-error', async (req, res) => {
                 }
                 
                 const errorId = generateErrorId(error);
-                
-                const nuevoError = new ErrorReport({
-                    errorId: errorId,
-                    type: error.type || 'unknown',
-                    message: (error.message || 'Sin mensaje').substring(0, 800),
-                    url: error.url || 'unknown',
-                    scene: error.scene || 'unknown',
-                    userAgent: error.userAgent || 'unknown',
-                    phaserVersion: error.phaserVersion || 'unknown',
-                    timestamp: new Date(error.timestamp || Date.now()),
-                    line: error.line || 'unknown',
-                    column: error.column || 'unknown',
-                    file: error.file || 'unknown',
-                    stack: error.stack ? error.stack.substring(0, 1500) : undefined,
-                    count: 1,
-                    lastSeen: new Date()
-                });
-                
-                await nuevoError.save();
-                guardadosNuevos++;
+
+                // ── SIN DUPLICADOS ────────────────────────────────────────
+                // Antes esto hacía `new ErrorReport(...).save()`. Como
+                // `errorId` es único, el mismo error repetido reventaba con un
+                // error de clave duplicada que se tragaba el catch de abajo: no
+                // se duplicaba la fila, pero tampoco se registraba que había
+                // vuelto a pasar. Los campos `count` y `lastSeen` del esquema
+                // estaban ahí sin que nadie los usara.
+                //
+                // Ahora es un upsert: la primera vez crea la ficha; las
+                // siguientes solo suman al contador y actualizan la última vez
+                // que se vio. Así la bandeja muestra CADA error UNA sola vez,
+                // con cuántas veces ha ocurrido — que es la información que
+                // de verdad sirve para priorizar.
+                const res$ = await ErrorReport.findOneAndUpdate(
+                    { errorId: errorId },
+                    {
+                        $inc: { count: 1 },
+                        $set: {
+                            lastSeen: new Date(),
+                            // Los datos de la ÚLTIMA vez que ocurrió: si el
+                            // mismo fallo aparece ahora en otra escena o a otro
+                            // jugador, interesa ver el caso más reciente.
+                            scene:      error.scene    || 'unknown',
+                            url:        error.url      || 'unknown',
+                            userAgent:  error.userAgent|| 'unknown',
+                            playerName: error.playerName || 'unknown'
+                        },
+                        $setOnInsert: {
+                            errorId: errorId,
+                            type:    error.type || 'unknown',
+                            message: (error.message || 'Sin mensaje').substring(0, 800),
+                            phaserVersion: error.phaserVersion || 'unknown',
+                            timestamp: new Date(error.timestamp || Date.now()),
+                            line:   error.line   || 'unknown',
+                            column: error.column || 'unknown',
+                            file:   error.file   || 'unknown',
+                            stack:  error.stack ? error.stack.substring(0, 1500) : undefined
+                        }
+                    },
+                    { upsert: true, new: false, setDefaultsOnInsert: true }
+                );
+
+                // `new: false` devuelve el documento ANTERIOR: si es null, esta
+                // es la primera vez que se ve este error.
+                if (!res$) guardadosNuevos++;
                 procesados++;
                 
             } catch (dbError) {
@@ -12390,6 +12844,57 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
   } catch (err) { console.error('POST /api/stats/update error:', err); return res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// =============================================================================
+// TABLA DE COSTES DE LAS ACCIONES — AUTORIDAD DEL SERVIDOR       (2026-08-11)
+// -----------------------------------------------------------------------------
+// Lo que cuesta cada acción en vitales se decide AQUÍ y solo aquí. El cliente
+// dice qué hace, nunca cuánto paga.
+//
+// Talar y minar cuestan medio punto de cada barra por golpe. Eso equivale al
+// "una barra sí, otra no" que hace el cliente al alternar, pero sin necesidad
+// de recordar de quién era el turno: el acumulador de fracciones de /consume
+// (doc.vitalFractions) convierte dos golpes en 1 de agua + 1 de comida
+// exactos. Menos estado que mantener y el mismo resultado.
+//
+// Sembrar y regar salen de la tabla de cultivos del propio servidor
+// (cropController.cropTypes), que es la que ya manda en el crecimiento. Así no
+// hay dos verdades sobre lo que cuesta una semilla.
+// =============================================================================
+const COSTE_POR_GOLPE = { agua: 0.5, comida: 0.5 };
+
+/**
+ * Coste en vitales de una acción.
+ * @returns {object|null} mapa de coste, {} si es gratis, o null si la acción
+ *                        no existe (petición inválida o manipulada).
+ */
+function costesDeAccion(reason, seedType, units) {
+  if (reason === 'chop' || reason === 'mine') {
+    return { agua: COSTE_POR_GOLPE.agua, comida: COSTE_POR_GOLPE.comida };
+  }
+
+  if (reason === 'plant' || reason === 'water') {
+    const tabla = (cropController && cropController.cropTypes) || {};
+    const cfg = tabla[seedType];
+    // Semilla desconocida: se rechaza en vez de cobrar 0. Si se dejara pasar,
+    // bastaría con mandar un seedType inventado para sembrar gratis.
+    if (!cfg) return null;
+
+    if (reason === 'water') {
+      const c = Number(cfg.wateringCost) || 0;
+      return c > 0 ? { agua: c } : {};
+    }
+
+    const salida = {};
+    const agua   = (Number(cfg.waterCost) || 0) * units;
+    const comida = (Number(cfg.foodCost)  || 0) * units;
+    if (agua   > 0) salida.agua   = agua;
+    if (comida > 0) salida.comida = comida;
+    return salida;
+  }
+
+  return null;   // acción no reconocida
+}
+
 // ── POST /api/stats/:playerName/consume ─────────────────────────────────────
 // GASTO DE VITALES: COBRO INSTANTÁNEO, TRANSACCIÓN AGRUPADA      (2026-08-05)
 // -----------------------------------------------------------------------------
@@ -12416,21 +12921,33 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const costsRaw = (req.body && req.body.costs) || {};
+    // ── EL COSTE LO DECIDE EL SERVIDOR ────────────────────────────────────
+    // ANTES: el coste llegaba en `req.body.costs`. El servidor solo comprobaba
+    // que el jugador tuviera saldo suficiente para lo que ÉL MISMO decía que
+    // costaba la acción. Un cliente modificado mandaba `{ agua: 0 }` y talaba,
+    // minaba, sembraba y regaba gratis para siempre. Era el agujero
+    // anti-trampa más grande que quedaba, y encima toca dinero real porque las
+    // vitales limitan cuánto se puede producir por hora.
+    //
+    // AHORA: el cliente solo dice QUÉ acción hace (`reason`) y, cuando aplica,
+    // sobre qué semilla y cuántas unidades. El coste sale de la tabla de este
+    // archivo — la misma que ya usa el controlador de cultivos — así que el
+    // cliente no tiene ninguna voz en lo que paga. `costs` se ignora por
+    // completo si viene.
     const reason   = String((req.body && req.body.reason) || 'action').slice(0, 40);
+    const seedType = String((req.body && req.body.seedType) || '').slice(0, 40);
+    const units    = Math.max(1, Math.min(100, Math.floor(Number(req.body && req.body.units) || 1)));
 
-    // Normalizar: solo vitales, solo positivos, tope razonable.
-    // FIX: antes esto hacía Math.round() y descartaba lo que diera 0, así que
-    // los costes fraccionarios de la tabla de cultivos se perdían (0,2 de
-    // comida al sembrar nunca se cobraba) o se duplicaban (0,5 de agua al
-    // regar pasaba a 1). Ahora se conserva el decimal y el redondeo se hace
-    // más abajo arrastrando el sobrante.
-    const costesPedidos = {};
-    for (const stat of VITAL_STATS) {
-      const n = Number(costsRaw[stat] || 0);
-      if (Number.isFinite(n) && n > 0) costesPedidos[stat] = Math.min(n, VITAL_MAX);
+    const costesPedidos = costesDeAccion(reason, seedType, units);
+    if (costesPedidos === null) {
+      return res.status(400).json({ error: 'unknown_action', reason });
     }
-    if (!Object.keys(costesPedidos).length) return res.status(400).json({ error: 'no_costs' });
+    if (!Object.keys(costesPedidos).length) {
+      // Acción real pero gratuita (p. ej. una semilla sin coste configurado).
+      // Sin `stats` a propósito: el documento todavía no se ha leído y el
+      // cliente ya contempla que la respuesta no lo traiga.
+      return res.json({ ok: true, spent: {} });
+    }
 
     const doc = await PlayerStats.findOne({ playerName });
     if (!doc) return res.status(404).json({ error: 'stats_not_found. Call /sync first' });
@@ -12984,6 +13501,107 @@ const socketMatch = new Map();       // socket.id → matchId
 const BATTLE_TURN_MS = 20000;        // tiempo máximo para elegir acción
 const BATTLE_MAX_TURNS = 30;         // corte de seguridad
 
+// =============================================================================
+// PURGA DE LOS MAPAS EN MEMORIA                                 (2026-08-11)
+// -----------------------------------------------------------------------------
+// FUGA DE MEMORIA REPARADA AQUÍ.
+//
+// El servidor guarda varios Map con una entrada POR JUGADOR (anti-spam de
+// siembra, enfriamiento de recolección, enfriamiento del verificador, caché de
+// administradores, combates en curso). Todos hacían `.set()` y ninguno borraba
+// nunca. En un proceso que no se reinicia eso crece sin techo: cada jugador que
+// pasa por el servidor deja su entrada para siempre, aunque no vuelva jamás.
+// Con decenas de miles de cuentas es RAM que no se recupera.
+//
+// Ninguno de esos datos tiene valor pasado un rato: son ventanas de minutos.
+// Este barrido corre cada 10 minutos y borra lo que ya no puede influir en
+// ninguna decisión. Es deliberadamente conservador — usa márgenes muy por
+// encima de la ventana real de cada mecanismo — para que sea imposible que
+// borre algo que todavía estuviera en uso.
+// =============================================================================
+const PURGA_INTERVALO_MS = 10 * 60 * 1000;   // cada 10 minutos
+const PURGA_EDAD_MS      = 60 * 60 * 1000;   // se borra lo que lleve 1 h inactivo
+
+/** Purga un Map cuyos valores son marcas de tiempo (número). */
+function purgarMapaDeTiempos(mapa, ahora, edadMs) {
+  let borrados = 0;
+  for (const [clave, ts] of mapa) {
+    if (typeof ts !== 'number' || ahora - ts > edadMs) { mapa.delete(clave); borrados++; }
+  }
+  return borrados;
+}
+
+function purgarMapasEnMemoria() {
+  const ahora = Date.now();
+  const stats = {};
+
+  // ── Anti-spam de siembra ──────────────────────────────────────────────────
+  // La ventana real son segundos y la sanción máxima 20 min. Se conserva
+  // mientras el bloqueo siga vivo o haya habido actividad en la última hora.
+  let n = 0;
+  for (const [userId, estado] of plantSpamTracker) {
+    if (!estado) { plantSpamTracker.delete(userId); n++; continue; }
+    const bloqueoVivo = estado.lockedUntil && estado.lockedUntil > ahora;
+    const reciente    = estado.lastPlantAt && (ahora - estado.lastPlantAt) <= PURGA_EDAD_MS;
+    if (!bloqueoVivo && !reciente) { plantSpamTracker.delete(userId); n++; }
+  }
+  stats.plantSpamTracker = n;
+
+  // ── Enfriamientos (valor = marca de tiempo) ───────────────────────────────
+  stats._gatherLastByPlayer = purgarMapaDeTiempos(_gatherLastByPlayer, ahora, PURGA_EDAD_MS);
+  stats._verifierCooldown   = purgarMapaDeTiempos(_verifierCooldown,   ahora, PURGA_EDAD_MS);
+
+  // ── Caché de administradores ({ value, at }) ──────────────────────────────
+  // Caduca a los ACCESS_CACHE_MS (30 s); pasado un minuto ya no sirve a nadie.
+  n = 0;
+  for (const [dir, entrada] of _adminAddrCache) {
+    if (!entrada || typeof entrada.at !== 'number' || ahora - entrada.at > 60000) {
+      _adminAddrCache.delete(dir); n++;
+    }
+  }
+  stats._adminAddrCache = n;
+
+  // ── Combates huérfanos ────────────────────────────────────────────────────
+  // Un combate dura como mucho BATTLE_MAX_TURNS × BATTLE_TURN_MS (10 min). Si
+  // los dos jugadores se caen a la vez, nadie llega a borrarlo y se queda
+  // colgado con su temporizador. Se da un margen del triple antes de tocarlo.
+  const topeCombate = BATTLE_MAX_TURNS * BATTLE_TURN_MS * 3;
+  n = 0;
+  for (const [id, match] of battleMatches) {
+    // El id lleva dentro la marca de creación: 'm_<ms>_xxxx' | 'b_<ms>_xxxx'
+    const nacido = Number(String(id).split('_')[1]);
+    const viejo  = Number.isFinite(nacido) && (ahora - nacido) > topeCombate;
+    if (match && match.ended === true) {
+      if (match.turnTimer) { try { clearTimeout(match.turnTimer); } catch (e) {} }
+      battleMatches.delete(id); n++;
+    } else if (viejo) {
+      if (match && match.turnTimer) { try { clearTimeout(match.turnTimer); } catch (e) {} }
+      battleMatches.delete(id); n++;
+    }
+  }
+  stats.battleMatches = n;
+
+  // ── Punteros socket → combate que ya no existe ────────────────────────────
+  n = 0;
+  for (const [socketId, matchId] of socketMatch) {
+    if (!battleMatches.has(matchId)) { socketMatch.delete(socketId); n++; }
+  }
+  stats.socketMatch = n;
+
+  const total = Object.values(stats).reduce((a, b) => a + b, 0);
+  if (total > 0) {
+    console.log('🧹 Purga de memoria:', JSON.stringify(stats),
+                `| vivos: siembra=${plantSpamTracker.size} recolecta=${_gatherLastByPlayer.size} ` +
+                `verificador=${_verifierCooldown.size} admin=${_adminAddrCache.size} ` +
+                `combates=${battleMatches.size} sockets=${socketMatch.size}`);
+  }
+  return stats;
+}
+
+// `unref()` para que este temporizador no impida al proceso terminar.
+const _purgaTimer = setInterval(purgarMapasEnMemoria, PURGA_INTERVALO_MS);
+if (typeof _purgaTimer.unref === 'function') _purgaTimer.unref();
+
 function battleStatsForLevel(nivel) {
   const lvl = Math.max(1, Number(nivel) || 1);
   return {
@@ -13124,7 +13742,54 @@ const BATTLE_CARDS = {
                 desc: 'Big heal, a shield and regeneration. The comeback card.' },
   aluvion:    { id: 'aluvion',   name: 'Barrage',     emoji: '⚡', cost: 3, dmg: 1.60, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
                 applies: 'stun', energyNext: 1,
-                desc: 'Stuns the rival and leaves you 1 extra energy next turn.' }
+                desc: 'Stuns the rival and leaves you 1 extra energy next turn.' },
+
+  // ── AMPLIACIÓN (2026-08-11) ──────────────────────────────────────────────
+  // Ocho cartas nuevas para que la mano dé más juego. Se han construido SOLO
+  // con mecánicas que el motor de batalla ya resuelve (dmg / shield / heal /
+  // applies / self / lifesteal / energyNext), así que no hacen falta cambios ni
+  // en el resolutor ni en el cliente: BattleScene pinta la carta con el emoji,
+  // el nombre y la descripción que manda el servidor.
+  //
+  // Lo que aportan de verdad, más allá de "más cartas":
+  //   • Veneno barato (Spit) — antes envenenar costaba 2 de energía sí o sí,
+  //     así que abrir con veneno era imposible. Ahora hay una apertura real.
+  //   • Defensas que preparan ataque (Sidestep, Roar) — defenderse dejaba de
+  //     construir nada. Ahora aguantar un turno también avanza tu plan.
+  //   • Rematadores (Executioner, Tempest) — dan una vía para cerrar partidas
+  //     largas contra alguien que se atrinchera a base de escudos.
+  // Los valores siguen la misma escala que las cartas de arriba: ~1 punto de
+  // valor por energía en comunes, ~1.85 en raras y ~2.9 en épicas.
+
+  // Comunes nuevas (coste 1)
+  escupir:    { id: 'escupir',   name: 'Spit',        emoji: '💧', cost: 1, dmg: 0.55, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'common',
+                applies: 'poison',
+                desc: 'A cheap glob of venom. Weak hit, but the poison ticks.' },
+  esquivar:   { id: 'esquivar',  name: 'Sidestep',    emoji: '💨', cost: 1, dmg: 0.00, shield: 0.75, heal: 0.00, type: 'defense', rarity: 'common',
+                self: 'focus',
+                desc: 'Slips aside: small shield and your next attack hits harder.' },
+
+  // Raras nuevas (coste 2)
+  zarpazo2:   { id: 'zarpazo2',  name: 'Double Slash',emoji: '⚔️', cost: 2, dmg: 1.45, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
+                self: 'focus',
+                desc: 'Two quick cuts that set up an even bigger next hit.' },
+  rugido:     { id: 'rugido',    name: 'Roar',        emoji: '🗣️', cost: 2, dmg: 0.00, shield: 0.90, heal: 0.00, type: 'defense', rarity: 'rare',
+                applies: 'stun',
+                desc: 'A deafening roar: you brace up and the rival loses energy.' },
+  lengua:     { id: 'lengua',    name: 'Lash',        emoji: '👅', cost: 2, dmg: 1.00, shield: 0.00, heal: 0.50, type: 'hybrid', rarity: 'rare',
+                applies: 'weak',
+                desc: 'Strikes, feeds and leaves the rival hitting softer.' },
+
+  // Épicas nuevas (coste 3)
+  tormenta:   { id: 'tormenta',  name: 'Tempest',     emoji: '🌪️', cost: 3, dmg: 2.40, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
+                applies: 'weak', energyNext: 1,
+                desc: 'A storm of blows that weakens the rival and keeps you going.' },
+  verdugo:    { id: 'verdugo',   name: 'Executioner', emoji: '🪓', cost: 3, dmg: 2.50, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
+                lifesteal: 0.50,
+                desc: 'Brutal finisher that drains half the damage back as HP.' },
+  renacer:    { id: 'renacer',   name: 'Rebirth',     emoji: '🌱', cost: 3, dmg: 0.00, shield: 1.20, heal: 1.40, type: 'heal', rarity: 'epic',
+                self: 'regen', energyNext: 1,
+                desc: 'Comes back swinging: shield, big heal, regen and extra energy.' }
 };
 const BATTLE_CARD_IDS = Object.keys(BATTLE_CARDS);
 
@@ -13141,7 +13806,21 @@ const BATTLE_COMBOS = [
   { id: 'vampiro',  name: 'Bloodthirst', emoji: '🧛', need: ['robavida', 'zarpazo'],   lifestealBonus: 0.35,
     desc: 'Leech Bite + Claw: steals a lot more life.' },
   { id: 'berserk',  name: 'Berserk',     emoji: '😤', need: ['gruñido', 'zarpazo', 'colazo'], dmgMult: 1.5,
-    desc: 'Growl + Claw + Tail Whip: three cheap cards become a storm.' }
+    desc: 'Growl + Claw + Tail Whip: three cheap cards become a storm.' },
+
+  // ── COMBOS NUEVOS (2026-08-11) ───────────────────────────────────────────
+  // Cada uno premia una forma DISTINTA de jugar la mano, para que no haya una
+  // única línea buena:
+  { id: 'plaga',    name: 'Outbreak',    emoji: '🦠', need: ['escupir', 'colmillo'],   poisonBoost: 3,
+    desc: 'Spit + Venom Fang: the poison digs in for 3 extra turns.' },
+  { id: 'danza',    name: 'War Dance',   emoji: '🩰', need: ['esquivar', 'zarpazo2'],  dmgMult: 1.45,
+    desc: 'Sidestep + Double Slash: dodge, then cut 45% deeper.' },
+  { id: 'titan',    name: 'Titan',       emoji: '🗿', need: ['rugido', 'muralla'],     shieldMult: 1.55,
+    desc: 'Roar + Bulwark: an unbreakable wall of fur.' },
+  { id: 'sanguijuela', name: 'Bloodfeast', emoji: '🧟', need: ['verdugo', 'robavida'], lifestealBonus: 0.40,
+    desc: 'Executioner + Leech Bite: nearly every point of damage comes back as HP.' },
+  { id: 'ciclon',   name: 'Cyclone',     emoji: '🌀', need: ['tormenta', 'aluvion'],   dmgMult: 1.30,
+    desc: 'Tempest + Barrage: the rival never gets a turn to breathe.' }
 ];
 
 /** Combos completos dentro de las cartas jugadas este turno. */
