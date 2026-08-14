@@ -511,6 +511,23 @@ const RateLimit = mongoose.model('RateLimit', rateLimitSchema);
 // Game data model (Player)
 const gamePlayerSchema = new mongoose.Schema({
   playerName: { type: String, required: true, unique: true },
+
+  // ── ÚLTIMA ESCRITURA DEL MARKETPLACE EN EL INVENTARIO ──────────────────────
+  // BUG QUE ESTO ARREGLA — "compré algo en el market y nunca me lo dieron":
+  //
+  // El market (market.html) es una PÁGINA APARTE. Al comprar, el servidor mete
+  // el ítem en GamePlayer.inventory con un $push directo, y hasta ahí bien.
+  // Pero la pestaña del juego tiene su PROPIA copia del inventario en memoria,
+  // cargada antes de la compra, y cada vez que guarda hace
+  // `update.inventory = inventory` — sobrescribe el array ENTERO. Así que el
+  // primer guardado del juego después de la compra borraba el ítem recién
+  // comprado. El jugador pagaba y no recibía nada.
+  //
+  // Aquí se apunta CUÁNDO tocó el market el inventario. /api/save compara esa
+  // marca con el momento en que el cliente cargó su copia: si el market
+  // escribió después, el guardado NO pisa el inventario y se le pide al
+  // cliente que recargue.
+  marketWriteAt: { type: Date, default: null },
   posicionplayerx: { type: Number, default: 2097 },
   posicionplayery: { type: Number, default: 2359 },
   vidaPorcentaje: { type: Number, default: 100000 },
@@ -7859,9 +7876,47 @@ app.post('/api/save/:playerName',
       }
 
       const update = Object.assign({}, req.body, { address });
-      // Sobrescribir con los arrays ya validados
-      if (inventory) update.inventory = inventory;
-      if (chest) update.chest = chest;
+
+      // ── PROTECCIÓN CONTRA BORRAR UNA COMPRA DEL MARKET ────────────────────
+      // El juego manda SIEMPRE el inventario entero, así que un guardado con
+      // una copia vieja borra lo que el market metió mientras tanto. Aquí se
+      // compara cuándo escribió el market con cuándo cargó el cliente su copia.
+      //
+      // `inventoryLoadedAt` lo manda el cliente. Si no viene (cliente antiguo,
+      // todavía sin actualizar) se aplica un margen de seguridad: si el market
+      // tocó el inventario en los últimos 10 minutos, tampoco se pisa. Es
+      // preferible perder unos segundos de cambios del juego —que se rehacen
+      // solos al recoger o craftear— que perder un ítem comprado con dinero.
+      let inventarioObsoleto = false;
+      try {
+        const gpActual = await GamePlayer.findOne({ playerName }).select('marketWriteAt').lean();
+        const marketAt = gpActual && gpActual.marketWriteAt ? new Date(gpActual.marketWriteAt).getTime() : 0;
+
+        if (marketAt > 0) {
+          const cargadoEn = Date.parse(req.body && req.body.inventoryLoadedAt);
+          if (Number.isFinite(cargadoEn)) {
+            inventarioObsoleto = marketAt > cargadoEn;
+          } else {
+            inventarioObsoleto = (Date.now() - marketAt) < 10 * 60 * 1000;
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ save: no se pudo comprobar marketWriteAt:', e.message);
+      }
+
+      if (inventarioObsoleto) {
+        // NO se tocan inventario ni baúl: manda lo que hay en la base de datos.
+        delete update.inventory;
+        delete update.chest;
+        console.log(`🛡️  save de ${playerName}: inventario NO sobrescrito (el market escribió después de que el cliente cargara)`);
+      } else {
+        // Sobrescribir con los arrays ya validados
+        if (inventory) update.inventory = inventory;
+        if (chest) update.chest = chest;
+      }
+
+      // El cliente no debe poder escribir esta marca a mano.
+      delete update.marketWriteAt;
 
       // ── REGLA DE NOMBRE ÚNICO (personaje y mascota) ─────────────────────
       // Ambos nombres nacen como '---'. El jugador puede fijar cada uno UNA
@@ -7963,12 +8018,36 @@ app.post('/api/save/:playerName',
           update.vidaPorcentaje   = pStats.vida   ?? update.vidaPorcentaje   ?? 0;
           update.aguaPorcentaje   = pStats.agua   ?? update.aguaPorcentaje   ?? 0;
           update.comidaPorcentaje = pStats.comida ?? update.comidaPorcentaje ?? 0;
-          // exp: igual que oro/plata, la factura manda. Solo se impone cuando
-          // la factura ya existe; si todavía no se creó, se deja pasar el valor
-          // del cliente para no borrarle la experiencia al jugador (el /sync la
-          // usará como semilla al crear la factura).
+          // ── EXPERIENCIA: SE QUEDA LA MAYOR, NUNCA SE RETROCEDE ────────────
+          // BUG QUE ESTO ARREGLA — "el personaje no pasa de nivel 4":
+          //
+          // Antes esto era `update.nivel_exp = pStats.exp`, o sea que la cadena
+          // se imponía SIEMPRE. El problema es que la exp del cliente viaja a la
+          // cadena por _syncExp(), que no hace nada si `_statsReady` es false, y
+          // la escritura on-chain puede además fallar (hay caminos que lo
+          // marcan como `exp_chain_failed`). Cuando eso pasa, `pStats.exp` deja
+          // de crecer… y CADA guardado devolvía al jugador a ese valor viejo.
+          // La experiencia quedaba congelada y con ella el nivel. Nivel 4 son
+          // 1600 de exp acumulada con la curva del juego: justo donde se
+          // quedaban clavados.
+          //
+          // La experiencia solo SUBE: nunca hay una razón legítima para que
+          // baje. Así que se guarda la mayor de las dos. Si la cadena va por
+          // delante (otro dispositivo), gana la cadena; si el cliente va por
+          // delante (escritura pendiente o fallida), gana el cliente y su
+          // progreso no se pierde — el siguiente _syncExp lo empujará.
+          //
+          // Es la misma regla de convergencia que ya usan las vitales con la
+          // regeneración fantasma: el que solo suma, manda cuando va por
+          // delante.
           if (pStats.invoiceIds && pStats.invoiceIds.exp) {
-            update.nivel_exp = pStats.exp ?? update.nivel_exp ?? 0;
+            const expCadena  = Math.max(0, Math.round(Number(pStats.exp) || 0));
+            const expCliente = Math.max(0, Math.round(Number(update.nivel_exp) || 0));
+            update.nivel_exp = Math.max(expCadena, expCliente);
+
+            if (expCliente > expCadena) {
+              console.log(`📈 ${playerName}: exp del cliente (${expCliente}) por delante de la cadena (${expCadena}) — se conserva la del cliente`);
+            }
           }
         }
       } catch (psErr) {
@@ -8032,6 +8111,10 @@ app.post('/api/save/:playerName',
       // usa para mostrar el aviso; los mensajes vienen ya redactados en inglés
       // desde el servidor, así que no hay que traducir nada en el cliente.
       if (nombresRechazados.length) response.nameConflicts = nombresRechazados;
+
+      // Avisa al cliente de que su inventario quedó obsoleto y debe recargarlo:
+      // el market metió algo mientras tanto y su copia ya no vale.
+      if (inventarioObsoleto) response.inventoryStale = true;
 
       return res.json(response);
     } catch (e) {
@@ -13682,7 +13765,25 @@ const BATTLE_MAX_ENERGY_BANK = 2;    // energía sin gastar que se guarda al tur
 //   regen   → cura al inicio del turno
 //   thorns  → devuelve parte del daño recibido ese turno
 //   focus   → tu siguiente carta de ataque pega un 50% más
-const BATTLE_STATUS_TURNS = { poison: 3, stun: 1, weak: 2, regen: 3, thorns: 2, focus: 1 };
+// ── ESTADOS Y SU DURACIÓN EN TURNOS ─────────────────────────────────────────
+// `armor` y `expose` son nuevos (2026-08-12):
+//   • armor  (3 turnos) — reduce a la MITAD el daño recibido. Es la "armadura
+//     de varios turnos": a diferencia del escudo, que se gasta de un golpe y
+//     hay que rehacerlo cada turno, ésta aguanta y premia invertir un turno en
+//     defenderse.
+//   • expose (2 turnos) — anula el efecto de armor y reduce a la mitad los
+//     escudos que se levanten. Es la RESPUESTA al juego defensivo: antes, si
+//     el rival se atrincheraba a base de escudo, no había forma de romperlo.
+const BATTLE_STATUS_TURNS = {
+  poison: 3, stun: 1, weak: 2, regen: 3, thorns: 2, focus: 1,
+  armor: 3, expose: 2
+};
+
+// Qué estados son BUENOS para quien los lleva y cuáles son malos. Lo usan las
+// cartas de limpieza (te quitas los malos) y de disipación (le quitas los
+// buenos al rival).
+const BATTLE_ESTADOS_BUENOS = ['regen', 'thorns', 'focus', 'armor'];
+const BATTLE_ESTADOS_MALOS  = ['poison', 'stun', 'weak', 'expose'];
 
 const BATTLE_CARDS = {
   // ── COMUNES (coste 1) ────────────────────────────────────────────────────
@@ -13789,7 +13890,30 @@ const BATTLE_CARDS = {
                 desc: 'Brutal finisher that drains half the damage back as HP.' },
   renacer:    { id: 'renacer',   name: 'Rebirth',     emoji: '🌱', cost: 3, dmg: 0.00, shield: 1.20, heal: 1.40, type: 'heal', rarity: 'epic',
                 self: 'regen', energyNext: 1,
-                desc: 'Comes back swinging: shield, big heal, regen and extra energy.' }
+                desc: 'Comes back swinging: shield, big heal, regen and extra energy.' },
+
+  // ── ARMADURA Y ROTURA DE ESTADOS (2026-08-12) ────────────────────────────
+  // Cierran los dos huecos que quedaban: no había defensa que durase más de un
+  // turno, y no había forma de quitarse un veneno ni de romper a alguien
+  // atrincherado. Ahora cada estrategia tiene su respuesta.
+  caparazon:  { id: 'caparazon', name: 'Carapace',    emoji: '🐢', cost: 2, dmg: 0.00, shield: 0.60, heal: 0.00, type: 'defense', rarity: 'rare',
+                self: 'armor',
+                desc: 'Hardens its hide: halves the damage you take for 3 turns.' },
+  sacudirse:  { id: 'sacudirse', name: 'Shake It Off',emoji: '🌀', cost: 1, dmg: 0.00, shield: 0.35, heal: 0.25, type: 'defense', rarity: 'common',
+                cleanse: true,
+                desc: 'Shrugs off poison, weakness and every bad effect on you.' },
+  quebrar:    { id: 'quebrar',   name: 'Shatter',     emoji: '🔨', cost: 2, dmg: 1.05, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
+                applies: 'expose',
+                desc: 'Cracks the rival open: their armor and shields are halved.' },
+  disipar:    { id: 'disipar',   name: 'Dispel',      emoji: '✨', cost: 2, dmg: 0.70, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
+                dispel: true,
+                desc: 'Strips every buff the rival has built up.' },
+  bastion:    { id: 'bastion',   name: 'Bastion',     emoji: '🏯', cost: 3, dmg: 0.00, shield: 1.40, heal: 0.60, type: 'defense', rarity: 'epic',
+                self: 'armor', cleanse: true,
+                desc: 'Cleanses you, shields you and armors you for 3 turns.' },
+  demoledor:  { id: 'demoledor', name: 'Wrecker',     emoji: '💣', cost: 3, dmg: 2.10, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
+                applies: 'expose', dispel: true,
+                desc: 'Smashes through: strips the rival buffs and exposes them.' }
 };
 const BATTLE_CARD_IDS = Object.keys(BATTLE_CARDS);
 
@@ -13916,13 +14040,57 @@ function estadosPublicos(p) {
     .map(([id, turnos]) => ({ id, turnos }));
 }
 
-function repartirMano() {
+/**
+ * Reparte una mano PONDERADA POR EL NIVEL DE LA MASCOTA.
+ *
+ * Antes se sorteaba plano sobre BATTLE_CARD_IDS: una mascota de nivel 1 sacaba
+ * épicas con la misma probabilidad que una de nivel 50, así que subir de nivel
+ * no se notaba en la baraja y las mejores cartas salían igual de a menudo
+ * desde el primer combate.
+ *
+ * Ahora cada rareza tiene un peso que se mueve con el nivel: las comunes van
+ * perdiendo sitio y las raras y épicas lo van ganando. Los pesos son relativos,
+ * así que siempre puede salir de todo — una mascota de nivel 1 puede tener
+ * suerte y una de nivel 50 sigue viendo comunes. Lo que cambia es la
+ * frecuencia, que es lo que hace que subir de nivel se note.
+ *
+ *   nivel 1   → común 70 %, rara 25 %, épica  5 %
+ *   nivel 25  → común 45 %, rara 35 %, épica 20 %
+ *   nivel 50+ → común 25 %, rara 40 %, épica 35 %
+ */
+function pesosPorNivel(nivel) {
+  // 0 en el nivel 1, 1 a partir del 50.
+  const t = Math.max(0, Math.min(1, ((Number(nivel) || 1) - 1) / 49));
+  return {
+    common: 70 - 45 * t,
+    rare:   25 + 15 * t,
+    epic:    5 + 30 * t
+  };
+}
+
+function cartaAleatoriaPorNivel(nivel) {
+  const pesos = pesosPorNivel(nivel);
+
+  // Se sortea primero la RAREZA y después una carta de esa rareza. Así el
+  // reparto no depende de cuántas cartas haya de cada tipo: añadir cartas
+  // nuevas no desequilibra las probabilidades.
+  const total = pesos.common + pesos.rare + pesos.epic;
+  let r = Math.random() * total;
+  let rareza = 'common';
+  if ((r -= pesos.common) >= 0) rareza = ((r - pesos.rare) >= 0) ? 'epic' : 'rare';
+
+  const candidatas = BATTLE_CARD_IDS.filter(id => BATTLE_CARDS[id].rarity === rareza);
+  const lista = candidatas.length ? candidatas : BATTLE_CARD_IDS;
+  return lista[Math.floor(Math.random() * lista.length)];
+}
+
+function repartirMano(nivel = 1) {
   const mano = [];
   // Siempre al menos una carta de 1 de energía, para que nunca haya una mano
   // imposible de jugar.
   mano.push(Math.random() < 0.5 ? 'zarpazo' : 'colazo');
   while (mano.length < BATTLE_HAND_SIZE) {
-    mano.push(BATTLE_CARD_IDS[Math.floor(Math.random() * BATTLE_CARD_IDS.length)]);
+    mano.push(cartaAleatoriaPorNivel(nivel));
   }
   // Mezclar
   for (let i = mano.length - 1; i > 0; i--) {
@@ -14029,19 +14197,40 @@ function resolverCartas(a, b, cartasA, cartasB) {
       // Estados que la carta pone AL RIVAL o A UNO MISMO (para el turno que viene)
       if (c.applies) aplicarEstado(rival, c.applies, c.applies === 'poison' ? venenoExtra : 0);
       if (c.self)    aplicarEstado(jugador, c.self);
+
+      // ── ROMPER ESTADOS ─────────────────────────────────────────────────
+      // `cleanse` te quita TUS estados malos; `dispel` le quita al rival los
+      // suyos buenos. Es lo que faltaba para poder responder a un veneno o a
+      // alguien atrincherado. Se resuelven en el momento de jugar la carta.
+      if (c.cleanse && jugador.estados) {
+        BATTLE_ESTADOS_MALOS.forEach(e => { jugador.estados[e] = 0; });
+      }
+      if (c.dispel && rival.estados) {
+        BATTLE_ESTADOS_BUENOS.forEach(e => { rival.estados[e] = 0; });
+      }
     }
 
     dmg    = Math.round(dmg * dmgMult * focusMult * weakMult);
-    shield = Math.round(shield * shieldMult);
+
+    // 'expose' del rival: los escudos que levanta valen la mitad.
+    shield = Math.round(shield * shieldMult * (tieneEstado(jugador, 'expose') ? 0.5 : 1));
+
     return { dmg, shield, heal, lifesteal, energyNext, combos };
   };
 
   const A = sumar(a, b, cartasA);
   const B = sumar(b, a, cartasB);
 
-  // El escudo del rival absorbe daño de ESTE turno
-  const dmgToB = Math.max(0, A.dmg - B.shield);
-  const dmgToA = Math.max(0, B.dmg - A.shield);
+  // ARMADURA: reduce a la mitad el daño que se recibe y dura varios turnos,
+  // al contrario que el escudo, que se gasta en el turno. `expose` la anula:
+  // ésa es la forma de romper a alguien que se atrinchera.
+  const reduccionPorArmadura = (defensor) =>
+    (tieneEstado(defensor, 'armor') && !tieneEstado(defensor, 'expose')) ? 0.5 : 1;
+
+  // El escudo del rival absorbe daño de ESTE turno; la armadura recorta lo que
+  // se cuela después.
+  const dmgToB = Math.round(Math.max(0, A.dmg - B.shield) * reduccionPorArmadura(b));
+  const dmgToA = Math.round(Math.max(0, B.dmg - A.shield) * reduccionPorArmadura(a));
 
   // Robo de vida sobre el daño REALMENTE hecho
   const roboA = A.lifesteal ? Math.round(dmgToB * A.lifesteal) : 0;
@@ -14243,8 +14432,12 @@ function startBattleTurn(match) {
     return;
   }
 
-  // Mano nueva para cada uno en cada turno
-  match.hands = { a: repartirMano(), b: repartirMano() };
+  // Mano nueva para cada uno en cada turno, ponderada por el nivel de SU
+  // mascota: cuanto más alta, más a menudo salen cartas raras y épicas.
+  match.hands = {
+    a: repartirMano(match.a && match.a.level),
+    b: repartirMano(match.b && match.b.level)
+  };
 
   ['a', 'b'].forEach(key => {
     const p = match[key];
