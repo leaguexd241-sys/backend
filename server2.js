@@ -2846,6 +2846,13 @@ class RelayManager {
       // está apagado.
       await this.blockClientGatherMint(contract, functionName, parameters);
 
+      // 3.7. CUPO DE LA TABLA DEL ÍTEM. Ver ensureItemTipoOnChain: si el tipo
+      // que se va a acuñar no existe todavía en el contrato, o se quedó sin
+      // cupo, el relayer (que es admin) lo prepara ANTES de firmar. Sin esto la
+      // transacción revierte y el jugador pierde lo que acababa de recolectar.
+      // Es la causa del "al minar carbón fallan las transacciones".
+      await ensureItemTipoParaTransaccion(contract, functionName, parameters);
+
       // 4. Obtener nonce
       const nonce = await relayerNonceManager.getNextNonce();
       relayTx.nonce = nonce;
@@ -6834,6 +6841,10 @@ async function mintGatherReward(address, tipo, quantity) {
   const c = new ethers.Contract(CONTRACTS.ITEMS_CONTRACT.address, CONTRACTS.ITEMS_CONTRACT.abi, relayerWallet);
   const gasPrice = gatherGasPrice();
 
+  // Misma red de seguridad que en el relay: si la tabla del tipo no existe o se
+  // quedó sin cupo, prepararla antes de acuñar (ver ensureItemTipoOnChain).
+  await ensureItemTipoOnChain(c, tipo, quantity);
+
   // Límite por factura del tipo (para saber si podemos aumentar una existente).
   let perInvoiceLimit = 50;
   try {
@@ -8054,6 +8065,59 @@ app.post('/api/save/:playerName',
         console.warn('⚠️  No se pudo leer PlayerStats para save:', psErr.message);
       }
 
+      // ── EL TUTORIAL Y LAS HABILIDADES SOLO SUBEN ─────────────────────────
+      // BUG QUE ESTO ARREGLA — "el tutorial retrocede al entrar y salir de la
+      // tienda" y "las skills se ponen a cero solas":
+      //
+      // El juego tiene TRES escenas que llaman a este endpoint (GameScene,
+      // tiendajuego y LoadingScenegame) y cada una guarda TODO su estado, no
+      // solo lo que cambió. Cuando dos de ellas se solapan —cosa que pasa en
+      // cada cambio de escena, porque el guardado del que se va no se espera— la
+      // que llega segunda puede traer una copia más vieja y pisar el progreso.
+      //
+      // Estos tres campos comparten una propiedad que lo resuelve de raíz: no
+      // existe ninguna jugada legítima que los haga BAJAR. El tutorial avanza
+      // 0…7 → 20 → 21 → 22 (y ≥8 significa "terminado" para las cuentas
+      // antiguas), y las habilidades solo suman experiencia. Así que aquí se
+      // conserva siempre el valor más alto entre lo guardado y lo que llega.
+      //
+      // Es la misma regla que ya se aplicaba a `nivel_exp` unas líneas más
+      // arriba, extendida a todo lo que es progreso acumulado.
+      try {
+        const CAMPOS_MONOTONOS = [
+          'tutorial',
+          'nivel',
+          'agricultura', 'agricultura_exp',
+          'mineria',     'mineria_exp',
+          'deforestacion', 'deforestacion_exp',
+          'pesca',   'pesca_exp',
+          'cocina',  'cocina_exp',
+          'fuerza',  'fuerza_exp'
+        ];
+
+        const previo = await GamePlayer.findOne({ playerName })
+          .select(CAMPOS_MONOTONOS.join(' ')).lean();
+
+        if (previo) {
+          for (const campo of CAMPOS_MONOTONOS) {
+            if (update[campo] === undefined) continue;      // no se toca lo que no llega
+
+            const entrante = Number(update[campo]);
+            const guardado = Number(previo[campo]);
+
+            if (!Number.isFinite(entrante)) { delete update[campo]; continue; }
+            if (!Number.isFinite(guardado)) continue;
+
+            if (entrante < guardado) {
+              console.log(`⏪ ${playerName}: se ignora ${campo}=${entrante} (guardado ${guardado} — este campo no retrocede)`);
+              update[campo] = guardado;
+            }
+          }
+        }
+      } catch (monoErr) {
+        console.warn('⚠️  No se pudo aplicar la regla de progreso monótono:', monoErr.message);
+      }
+
       await GamePlayer.findOneAndUpdate(
         { playerName },
         { $set: update },
@@ -8413,6 +8477,165 @@ const ITEM_MAX_STACK = {
   trigo_buena: 20, trigo_corta: 20, trigo_mala: 20,
   calabaza_buena: 20, calabaza_corta: 20, calabaza_mala: 20,
 };
+
+// =============================================================================
+// CUPO DE LAS TABLAS DE ÍTEM EN EL CONTRATO
+// -----------------------------------------------------------------------------
+// BUG QUE ESTO ARREGLA — "al minar carbón fallan las transacciones":
+//
+// En el ItemContract cada `tipo` (carbon, mineral_hierro, "madera pinos"…) es
+// una TABLA con dos topes: `limit` (cuántas unidades pueden existir en total en
+// todo el juego) y `perInvoiceLimit` (cuántas caben en una sola factura). Si la
+// tabla no está dada de alta o se quedó sin cupo, `createInvoice` trunca la
+// cantidad y `increaseInvoiceQuantity` revierte con ExceedsTipoLimit.
+//
+// Para las barras del jugador (vida, agua, comida, oro, plata, exp) esto ya se
+// vigilaba con ensureStatTipo() — de hecho fue justo el fallo que dejaba a la
+// gente con "agua 12 %". Para los ÍTEMS no lo vigilaba NADIE. Los tipos que se
+// dieron de alta a mano al desplegar funcionan; los que se quedaron fuera (o los
+// que agoten su cupo con el tiempo) fallan siempre, y desde el juego se ve como
+// "Could not confirm the on-chain transaction" cada vez que se pica ese
+// mineral. El carbón es el caso que se nota porque solo sale de dos rocas.
+//
+// Aquí se hace lo mismo que con las barras: antes de firmar una acuñación, se
+// mira la tabla y, si hace falta, el relayer (que es admin del contrato) la
+// prepara con setLimit. Es idempotente y se cachea, así que en marcha normal no
+// añade ni una lectura.
+//
+// SEGURIDAD: solo se preparan tipos de la LISTA BLANCA (los valores de
+// ITEM_TIPO_MAP, que son los ítems reales del juego). Un cliente manipulado que
+// pida acuñar un tipo inventado no consigue que se le dé de alta: la
+// transacción sigue su curso y revierte como antes.
+// =============================================================================
+const ITEM_TIPO_CACHE_TTL_MS = 5 * 60 * 1000;
+const ITEM_TIPO_HEADROOM     = 1_000_000;  // unidades libres que se quieren tener
+const ITEM_TIPO_RAISE_FACTOR = 10;         // al ampliar se deja headroom × esto
+const _itemTipoCache = new Map();          // tipo → { at: ms, ok: bool }
+let _tiposItemPermitidos = null;
+
+function tiposDeItemPermitidos() {
+  if (!_tiposItemPermitidos) {
+    _tiposItemPermitidos = new Set(Object.values(ITEM_TIPO_MAP));
+  }
+  return _tiposItemPermitidos;
+}
+
+/** maxStack del ítem cuyo `tipo` on-chain es el dado (50 por defecto). */
+function stackMaximoDelTipo(tipo) {
+  for (const [itemId, t] of Object.entries(ITEM_TIPO_MAP)) {
+    if (t === tipo) return Number(ITEM_MAX_STACK[itemId]) || 50;
+  }
+  return 50;
+}
+
+/**
+ * Se asegura de que la tabla `tipo` exista y tenga cupo para acuñar `cantidad`.
+ * No lanza nunca: si algo falla, se registra y la transacción sigue su camino
+ * (fallará como fallaba antes, pero no por culpa de esta comprobación).
+ */
+async function ensureItemTipoOnChain(contract, tipo, cantidad) {
+  if (!relayerWallet || !tipo) return;
+  if (!tiposDeItemPermitidos().has(tipo)) return;      // lista blanca
+  if (typeof contract.getTipoStats !== 'function') return;
+
+  const cache = _itemTipoCache.get(tipo);
+  if (cache && cache.ok && (Date.now() - cache.at) < ITEM_TIPO_CACHE_TTL_MS) return;
+
+  const perInvoiceObjetivo = Math.max(stackMaximoDelTipo(tipo), 50);
+  const necesitaAhora      = Math.max(Number(cantidad) || 0, 1);
+
+  let info;
+  try {
+    const ts = await contract.getTipoStats(tipo);
+    info = {
+      totalQuantity:   Number(ts.totalQuantity   ?? ts[0] ?? 0),
+      limit:           Number(ts.limit           ?? ts[1] ?? 0),
+      perInvoiceLimit: Number(ts.perInvoiceLimit ?? ts[2] ?? 0),
+      exists:          Boolean(ts.exists !== undefined ? ts.exists : ts[5])
+    };
+  } catch (e) {
+    console.warn(`⚠️  ensureItemTipoOnChain[${tipo}]: getTipoStats falló:`, e.message);
+    return;
+  }
+
+  const libre            = info.limit > info.totalQuantity ? info.limit - info.totalQuantity : 0;
+  const faltaPerInvoice  = info.perInvoiceLimit < perInvoiceObjetivo;
+  const faltaCupoGlobal  = libre < Math.max(necesitaAhora, ITEM_TIPO_HEADROOM / 100);
+
+  if (info.exists && !faltaPerInvoice && !faltaCupoGlobal) {
+    _itemTipoCache.set(tipo, { at: Date.now(), ok: true });
+    return;
+  }
+
+  if (typeof contract.setLimit !== 'function') {
+    console.warn(`⚠️  Tabla [${tipo}] corta y el ABI no expone setLimit — no se puede ampliar`);
+    return;
+  }
+
+  const nuevoPerInvoice = Math.max(perInvoiceObjetivo, info.perInvoiceLimit);
+  const nuevoLimit      = Math.max(
+    info.limit,
+    info.totalQuantity + ITEM_TIPO_HEADROOM * ITEM_TIPO_RAISE_FACTOR,
+    nuevoPerInvoice
+  );
+
+  try {
+    const nonce = await relayerNonceManager.getNextNonce();
+    console.log(
+      `🧾 setLimit[${tipo}]: limit ${info.limit}→${nuevoLimit}, ` +
+      `perInvoice ${info.perInvoiceLimit}→${nuevoPerInvoice}` +
+      (info.exists ? '' : ' (tabla NUEVA — nunca se había dado de alta)')
+    );
+    const tx = await contract.setLimit(tipo, nuevoLimit, nuevoPerInvoice, {
+      gasPrice: gatherGasPrice(), nonce
+    });
+    await tx.wait();
+    console.log(`✅ Tabla de ítem [${tipo}] lista: limit=${nuevoLimit} perInvoice=${nuevoPerInvoice}`);
+    _itemTipoCache.set(tipo, { at: Date.now(), ok: true });
+  } catch (e) {
+    // Lo más probable: el relayer no es admin del contrato. Se avisa claro,
+    // porque es una intervención manual (setLimit desde el owner).
+    console.error(
+      `❌ setLimit[${tipo}] falló (¿el relayer es admin del ItemContract?):`, e.message
+    );
+    try { await relayerNonceManager.resetNonce(); } catch (_) {}
+    _itemTipoCache.set(tipo, { at: Date.now(), ok: false });
+  }
+}
+
+/**
+ * Extrae el `tipo` y la cantidad de la transacción que va a firmar el relay y,
+ * si es una acuñación, prepara su tabla. Cualquier otra función pasa de largo.
+ */
+async function ensureItemTipoParaTransaccion(contract, functionName, parameters) {
+  try {
+    const args = Array.isArray(parameters) ? parameters : Object.values(parameters || {});
+    let tipo = null;
+    let cantidad = 0;
+
+    if (functionName === 'createInvoice') {
+      // createInvoice(owner, tipo, cantidad, manualId)
+      tipo     = String(args[1] || '');
+      cantidad = Number(args[2]) || 0;
+    } else if (functionName === 'increaseInvoiceQuantity') {
+      // increaseInvoiceQuantity(id, cantidad) → el tipo hay que leerlo
+      cantidad = Number(args[1]) || 0;
+      const id = Number(args[0]);
+      if (id > 0) {
+        try {
+          const inv = await contract.getInvoice(id);
+          tipo = String(inv.tipo || '');
+        } catch (_) { /* si no se puede leer, se sigue sin preparar nada */ }
+      }
+    } else {
+      return;
+    }
+
+    if (tipo) await ensureItemTipoOnChain(contract, tipo, cantidad);
+  } catch (e) {
+    console.warn('⚠️  ensureItemTipoParaTransaccion:', e.message);
+  }
+}
 
 // itemId "suelto" de una misión → id real del inventario. Copia del
 // MISSION_ITEM_MAP del cliente, para que panel y servidor no discrepen.
@@ -12318,12 +12541,39 @@ app.post('/api/skills/:playerName', authMiddleware, csrfProtection, async (req, 
     if (!await requireOwner(req, res, playerName)) return;
     const { skills, skillPoints } = req.body;
     if (!skills || typeof skills !== 'object') return res.status(400).json({ error: 'Invalid' });
+
+    // LAS HABILIDADES SOLO SUBEN. Este endpoint es un ESPEJO del panel, y el
+    // panel puede mandar una foto vieja (se abre, el jugador sigue jugando y
+    // pulsa "Save" cinco minutos después). Si se guardara tal cual, esa foto
+    // borraría el progreso hecho mientras tanto. Se conserva el mayor de los
+    // dos, igual que en /api/save.
+    const previo  = await PlayerSkills.findOne({ playerName }).lean();
+    const anterior = (previo && previo.skills) || {};
+
+    const mayor = (a, b) => {
+      const x = Number(a), y = Number(b);
+      if (!Number.isFinite(x)) return Number.isFinite(y) ? y : 0;
+      if (!Number.isFinite(y)) return x;
+      return Math.max(x, y);
+    };
+
+    const fusion = { exp: {} };
+    const claves = new Set([...Object.keys(anterior), ...Object.keys(skills)]);
+    claves.delete('exp');
+    claves.forEach(k => { fusion[k] = mayor(skills[k], anterior[k]); });
+
+    const expNueva = (skills.exp && typeof skills.exp === 'object') ? skills.exp : {};
+    const expVieja = (anterior.exp && typeof anterior.exp === 'object') ? anterior.exp : {};
+    new Set([...Object.keys(expVieja), ...Object.keys(expNueva)]).forEach(k => {
+      fusion.exp[k] = mayor(expNueva[k], expVieja[k]);
+    });
+
     await PlayerSkills.findOneAndUpdate(
       { playerName },
-      { skills, skillPoints: skillPoints || 0, updatedAt: new Date() },
+      { skills: fusion, skillPoints: skillPoints || 0, updatedAt: new Date() },
       { upsert: true, new: true }
     );
-    return res.json({ success: true });
+    return res.json({ success: true, skills: fusion });
   } catch (err) { return res.status(500).json({ error: 'Internal server error' }); }
 });
 console.log('✅ Skills routes loaded');
