@@ -4614,6 +4614,26 @@ io.on("connection", (socket) => {
     ip: clientIp
   };
 
+  // ── SANEADO ANTI-INYECCIÓN EN EL CANAL DE SOCKETS ────────────────────────
+  // El middleware que limpia las peticiones HTTP (ver sanearClavesMongo, arriba)
+  // NO cubre Socket.IO: los mensajes del socket no pasan por Express. Y por aquí
+  // entra buena parte del juego —sembrar, regar, cosechar, talar, chat,
+  // batallas— con datos que acaban en consultas a la base de datos.
+  //
+  // Se aplica exactamente la misma regla: se eliminan las claves que empiecen
+  // por '$' o que lleven un punto, que es lo que convierte un dato en un
+  // operador de Mongo. Los valores no se tocan, así que ningún mensaje legítimo
+  // cambia.
+  socket.use((paquete, next) => {
+    try {
+      for (let i = 1; i < paquete.length; i++) {
+        const arg = paquete[i];
+        if (arg && typeof arg === 'object') sanearClavesMongo(arg, 0);
+      }
+    } catch (_) { /* nunca debe cortar el mensaje */ }
+    next();
+  });
+
   // Eventos de recolección de agua
   socket.on('collectWater', async (data) => {
     try {
@@ -5046,6 +5066,66 @@ app.use(compression());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
+
+// =============================================================================
+// SANEADO ANTI-INYECCIÓN DE MONGO
+// -----------------------------------------------------------------------------
+// VULNERABILIDAD QUE ESTO CIERRA (clase entera, no un caso concreto):
+//
+// express.json() acepta CUALQUIER JSON, así que un campo que el código espera
+// como texto puede llegar como objeto. Si ese valor termina dentro de un filtro
+// de Mongo, el atacante deja de mandar un dato y pasa a mandar un OPERADOR:
+//
+//     { "playerName": { "$ne": null } }   → "cualquier jugador"
+//     { "address":    { "$gt": "" } }     → coincide con todos
+//     { "nonce":      { "$regex": "^a" } } → adivinar valores letra a letra
+//
+// Con eso se pueden saltar comprobaciones de propiedad, leer datos ajenos o
+// hacer un ataque de fuerza bruta sobre un nonce. El servidor no traía ninguna
+// defensa general contra esto (no hay express-mongo-sanitize instalado) y sí
+// tiene decenas de consultas construidas a partir del cuerpo de la petición.
+//
+// Este middleware quita, de forma recursiva, cualquier clave que empiece por
+// '$' (operadores) o que contenga un punto (rutas anidadas, usadas para escribir
+// campos que no tocan). Los VALORES no se tocan: un texto sigue llegando tal
+// cual, así que nada del juego cambia — ninguna petición legítima del cliente
+// usa claves con '$' o '.'.
+//
+// El límite de profundidad evita que un JSON muy anidado consuma CPU aquí.
+function sanearClavesMongo(obj, profundidad) {
+  if (!obj || typeof obj !== 'object' || profundidad > 8) return 0;
+  let quitadas = 0;
+
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) quitadas += sanearClavesMongo(obj[i], profundidad + 1);
+    return quitadas;
+  }
+
+  for (const clave of Object.keys(obj)) {
+    if (clave.charCodeAt(0) === 36 /* $ */ || clave.indexOf('.') !== -1) {
+      delete obj[clave];
+      quitadas++;
+      continue;
+    }
+    quitadas += sanearClavesMongo(obj[clave], profundidad + 1);
+  }
+  return quitadas;
+}
+
+app.use((req, res, next) => {
+  try {
+    let quitadas = 0;
+    // req.query y req.params son de solo lectura en Express 5; se sanean in situ
+    // solo si se puede. El cuerpo es el vector que de verdad importa.
+    quitadas += sanearClavesMongo(req.body, 0);
+    quitadas += sanearClavesMongo(req.query, 0);
+
+    if (quitadas > 0) {
+      console.warn(`🛡️  Petición saneada: ${quitadas} clave(s) con '$' o '.' eliminadas — ${req.method} ${req.path} desde ${req.ip}`);
+    }
+  } catch (_) { /* nunca debe tumbar la petición */ }
+  next();
+});
 
 if (NODE_ENV === 'production') {
   // En producción: confiar en loopback (127.0.0.1) y el IP de tu proxy/load balancer real.
@@ -6055,7 +6135,13 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
 });
 
 // Refresh token - CORREGIDO
-app.post('/api/auth/refresh', async (req, res) => {
+// LÍMITE DE PETICIONES QUE FALTABA: esta ruta era la ÚNICA del bloque de
+// autenticación sin limitador. Verifica un JWT y consulta la base de datos en
+// cada llamada, así que sin freno servía tanto para tumbar el servidor a base
+// de peticiones como para probar tokens de refresco a ciegas. `apiLimiter` la
+// deja en 200 por minuto y por IP, de sobra para el uso real (una renovación
+// cada 4,5 minutos por jugador).
+app.post('/api/auth/refresh', apiLimiter, async (req, res) => {
   console.log('🔄 Solicitud de refresh recibida');
   
   try {
@@ -8083,10 +8169,45 @@ app.post('/api/save/:playerName',
       //
       // Es la misma regla que ya se aplicaba a `nivel_exp` unas líneas más
       // arriba, extendida a todo lo que es progreso acumulado.
+      // ── CAMPOS QUE EL CLIENTE NO PUEDE ESCRIBIR ──────────────────────────
+      // VULNERABILIDAD QUE ESTO CIERRA: /api/save hace
+      // `Object.assign({}, req.body)`, así que TODO campo del esquema que llegue
+      // en el cuerpo se guardaba. Dos de ellos tienen consecuencias reales:
+      //
+      //   • `nivel`    → decide vida y ataque en las batallas PvP
+      //                  (battleStatsForLevel) y la rareza de las cartas
+      //                  (pesosPorNivel). Mandar {"nivel":150} daba 1.880 de
+      //                  vida y 310 de ataque contra los 128/18 de un jugador
+      //                  legítimo. Ahora se CALCULA desde la experiencia, que
+      //                  está respaldada por el contrato.
+      //
+      //   • `petLevel` → lo calcula el servidor tras cada batalla
+      //                  (computePetLevel a partir de victorias y combates).
+      //                  Que el cliente pudiera sobrescribirlo dejaba el
+      //                  contador en manos del jugador.
+      //
+      // Los dos se quitan del cuerpo ANTES de tocar la base de datos.
+      delete update.petLevel;
+      {
+        const expParaNivel = (update.nivel_exp !== undefined)
+          ? update.nivel_exp
+          : null;
+        if (expParaNivel !== null) {
+          update.nivel = nivelPorExperiencia(expParaNivel);
+        } else {
+          delete update.nivel;   // sin experiencia que lo justifique, no se toca
+        }
+      }
+
       try {
+        // `nivel` NO va en esta lista: ya no lo escribe el cliente, se deriva de
+        // la experiencia unas líneas más arriba. Y como la experiencia solo
+        // sube, el nivel derivado ya es monótono por construcción. Dejarlo aquí
+        // además congelaría para siempre el nivel inflado de cualquier cuenta
+        // que hubiera abusado del fallo antiguo; así se corrige sola en el
+        // siguiente guardado.
         const CAMPOS_MONOTONOS = [
           'tutorial',
-          'nivel',
           'agricultura', 'agricultura_exp',
           'mineria',     'mineria_exp',
           'deforestacion', 'deforestacion_exp',
@@ -11240,7 +11361,12 @@ function generateErrorId(error) {
 }
 
 // Socket status
-app.get('/api/socket/status', (req, res) => {
+// FUGA DE INFORMACIÓN QUE ESTO TAPA: esta ruta era pública y sin límite, y
+// devolvía el número exacto de jugadores conectados y los nombres de las salas
+// activas. Es justo el reconocimiento previo que busca alguien antes de atacar
+// (saber cuándo hay poca gente, qué salas existen). Ahora pide sesión y va
+// limitada, igual que el resto de la API.
+app.get('/api/socket/status', apiLimiter, authMiddleware, (req, res) => {
   res.json({
     connectedSockets: io.engine.clientsCount,
     activeRooms: Object.keys(rooms).filter(room => Object.keys(rooms[room]).length > 0),
@@ -13943,6 +14069,44 @@ function battleStatsForLevel(nivel) {
   };
 }
 
+// =============================================================================
+// EL NIVEL DEL PERSONAJE LO CALCULA EL SERVIDOR
+// -----------------------------------------------------------------------------
+// VULNERABILIDAD QUE ESTO CIERRA — rompía las batallas PvP por completo:
+//
+// `GamePlayer.nivel` llegaba del CLIENTE en el cuerpo de /api/save y se
+// guardaba tal cual. Y ese mismo número alimenta battleStatsForLevel(), que
+// decide la vida y el ataque en combate, y pesosPorNivel(), que decide con qué
+// frecuencia salen cartas épicas. Un cliente modificado solo tenía que mandar
+// `{"nivel": 150}` una vez para entrar a PvP con 1.880 de vida y 310 de ataque
+// contra los 128/18 de un jugador legítimo de nivel 4. Imposible de perder.
+//
+// La experiencia (`nivel_exp`) SÍ es de fiar: vive en su propia factura del
+// contrato y se sincroniza contra la cadena. Así que el nivel se DERIVA de ella
+// aquí y el número que mande el cliente se ignora.
+//
+// La curva es la misma que usa el cliente para pintar la barra
+// (GameScene._expTotalParaNivel): mínimo entre la curva vieja exponencial —que
+// manda hasta el nivel 4, para no bajarle el nivel a nadie— y la nueva
+// polinómica 100·n²+100·n, que es la que hace que la progresión siga siendo
+// posible más allá del nivel 5. Si se cambia una, hay que cambiar la otra.
+const MAX_LEVEL_PERSONAJE = 150;
+
+function expTotalParaNivel(n) {
+  const L = Math.max(1, Math.round(Number(n) || 1));
+  const vieja = 200 * Math.pow(2, Math.min(L - 1, 40));
+  const nueva = 100 * L * L + 100 * L;
+  return Math.min(vieja, nueva);
+}
+
+/** Nivel que corresponde a `exp` puntos de experiencia acumulada. */
+function nivelPorExperiencia(exp) {
+  const e = Math.max(0, Math.round(Number(exp) || 0));
+  let nivel = 0;
+  while (nivel < MAX_LEVEL_PERSONAJE && e >= expTotalParaNivel(nivel + 1)) nivel++;
+  return nivel;
+}
+
 function shortAddress(addr) {
   if (!addr || typeof addr !== 'string' || addr.length < 10) return '';
   return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
@@ -14835,9 +14999,13 @@ async function construirJugadorDeSocket(socket) {
 
   let nivel = 1, petName = 'Pet';
   try {
-    const gp = await GamePlayer.findOne({ playerName }).select('nivel petName').lean();
+    const gp = await GamePlayer.findOne({ playerName }).select('nivel nivel_exp petName').lean();
     if (gp) {
-      nivel = gp.nivel || 1;
+      // ANTI-TRAMPA: el nivel de combate se DERIVA de la experiencia, que está
+      // respaldada por el contrato, en vez de leer `gp.nivel` — que hasta ahora
+      // lo escribía el cliente y bastaba para entrar a PvP con estadísticas de
+      // nivel 150. Ver nivelPorExperiencia().
+      nivel = Math.max(1, nivelPorExperiencia(gp.nivel_exp));
       petName = gp.petName && gp.petName !== '---' ? gp.petName : 'Pet';
     }
   } catch (e) { /* valores por defecto */ }
