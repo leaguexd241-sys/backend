@@ -12751,6 +12751,67 @@ app.post('/api/pet/:playerName', authMiddleware, csrfProtection, async (req, res
 console.log('✅ Pet routes loaded: /api/pet/:playerName');
 
 // =============================================================================
+// SOULBOUND CHARACTER ROUTES  — /api/soulbound/:playerName
+// =============================================================================
+//
+// Qué guarda: QUÉ personaje lleva equipado el jugador. Nada más. Los sprites
+// viven en el cliente (Game/Sprites/Soulbound/<personaje>/…) y se descubren
+// solos; aquí solo se recuerda la elección para que le siga al jugador cuando
+// entre desde otro navegador u otro ordenador.
+//
+// Se valida el nombre contra [A-Za-z0-9_-]{1,40} porque ese valor vuelve al
+// cliente y se usa para COMPONER UNA RUTA de sprites. Sin este filtro, un
+// "../../algo" guardado aquí saldría del directorio Soulbound al construir la
+// URL en el navegador. El cliente vuelve a validarlo por su cuenta, pero la
+// comprobación tiene que estar también en el servidor: el cliente se puede
+// saltar, esto no.
+//
+// Se usa colección propia (igual que las mascotas) en vez de añadir un campo a
+// GamePlayer: así /api/save —que reescribe el documento entero del jugador— no
+// puede pisar la elección de personaje por un guardado con datos viejos.
+const NOMBRE_SOULBOUND_VALIDO = /^[A-Za-z0-9_-]{1,40}$/;
+
+const soulboundSchema = new mongoose.Schema({
+  playerName: { type: String, required: true, unique: true, index: true },
+  character:  { type: String, default: 'personaje1' },
+  updatedAt:  { type: Date,   default: Date.now }
+}, { collection: 'player_soulbound' });
+const PlayerSoulbound = mongoose.model('PlayerSoulbound', soulboundSchema);
+
+// GET /api/soulbound/:playerName
+app.get('/api/soulbound/:playerName', authMiddleware, async (req, res) => {
+  try {
+    const playerName = await resolvePlayerName(req.params.playerName);
+    if (!await requireOwner(req, res, playerName)) return;
+    const doc = await PlayerSoulbound.findOne({ playerName }).lean();
+    const character = (doc && NOMBRE_SOULBOUND_VALIDO.test(doc.character || ''))
+      ? doc.character
+      : 'personaje1';
+    return res.json({ character });
+  } catch (err) { return res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// POST /api/soulbound/:playerName   body: { character: 'personaje2' }
+app.post('/api/soulbound/:playerName', authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const playerName = await resolvePlayerName(req.params.playerName);
+    if (!await requireOwner(req, res, playerName)) return;
+    const { character } = req.body;
+    if (typeof character !== 'string' || !NOMBRE_SOULBOUND_VALIDO.test(character)) {
+      return res.status(400).json({ error: 'Invalid character name' });
+    }
+    await PlayerSoulbound.findOneAndUpdate(
+      { playerName },
+      { character, updatedAt: new Date() },
+      { upsert: true, new: true }
+    );
+    return res.json({ success: true, character });
+  } catch (err) { return res.status(500).json({ error: 'Internal server error' }); }
+});
+
+console.log('✅ Soulbound routes loaded: /api/soulbound/:playerName');
+
+// =============================================================================
 // MAIL ROUTES  — /api/mail/:playerName
 // =============================================================================
 // Simple in-memory mail store keyed by playerName.
