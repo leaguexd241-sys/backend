@@ -4437,6 +4437,93 @@ const rooms = {
   'tienda': {}
 };
 
+// =============================================================================
+// CANALES  (10 canales de 50 jugadores)
+// =============================================================================
+//
+// QUÉ SON: copias paralelas del mundo. Dos jugadores solo se ven, se hablan por
+// el chat y aparecen en la clasificación del otro si están en el MISMO canal.
+//
+// CÓMO SE APOYA EN LO QUE YA HABÍA: el juego ya separaba a la gente por "salas"
+// ('game' y 'tienda') y el chat ya iba con io.to(room). El canal se añade al
+// nombre de la sala:
+//
+//      game#c1     tienda#c1      <- canal 1
+//      game#c2     tienda#c2      <- canal 2
+//
+// Así el chat y el movimiento quedan separados por canal sin tocar nada de esa
+// lógica, y a la vez se conserva la separación mapa/tienda que ya existía.
+//
+// CUÁNDO SE ASIGNA: UNA SOLA VEZ, al conectar el socket (más abajo, en
+// io.on('connection')). No al entrar en una escena. Ese es justo el punto: si se
+// asignara al cargar cada escena, pasar del mapa a la tienda podría meterte en
+// otro canal si el tuyo se hubiera llenado entretanto, y perderías de vista a la
+// gente con la que estabas jugando. Como window.globalSocket se crea una vez por
+// pestaña y sobrevive a los cambios de escena, el canal dura toda la sesión.
+//
+// DÓNDE VIVE: solo en memoria del servidor (socket.playerData.canal). No se
+// guarda en la base de datos ni en el navegador.
+const CANALES_TOTAL = 10;
+const CANAL_CUPO    = 50;
+
+/** Cuántos jugadores hay ahora en cada canal. Índice 0 sin usar. */
+function ocupacionCanales() {
+  const cuenta = new Array(CANALES_TOTAL + 1).fill(0);
+  try {
+    for (const [, s] of io.of('/').sockets) {
+      const c = s.playerData && s.playerData.canal;
+      if (Number.isInteger(c) && c >= 1 && c <= CANALES_TOTAL) cuenta[c]++;
+    }
+  } catch (_) {}
+  return cuenta;
+}
+
+/** Resumen para el cliente: [{canal, jugadores, cupo, lleno}, …] */
+function resumenCanales() {
+  const cuenta = ocupacionCanales();
+  const lista = [];
+  for (let c = 1; c <= CANALES_TOTAL; c++) {
+    lista.push({ canal: c, jugadores: cuenta[c], cupo: CANAL_CUPO, lleno: cuenta[c] >= CANAL_CUPO });
+  }
+  return lista;
+}
+
+/**
+ * Primer canal con hueco: el 1 si cabe, si no el 2, y así sucesivamente.
+ * Si estuvieran los diez llenos devuelve null y quien llama decide qué hacer
+ * (no se mete a nadie a la fuerza en un canal lleno).
+ */
+function primerCanalLibre() {
+  const cuenta = ocupacionCanales();
+  for (let c = 1; c <= CANALES_TOTAL; c++) {
+    if (cuenta[c] < CANAL_CUPO) return c;
+  }
+  return null;
+}
+
+/** Nombre de sala con canal: 'game' + 3 -> 'game#c3'. */
+function salaConCanal(sala, canal) {
+  return `${sala}#c${canal}`;
+}
+
+/** Sala base sin el canal: 'game#c3' -> 'game'. Para las comprobaciones. */
+function salaBase(sala) {
+  return String(sala || '').split('#')[0];
+}
+
+/** playerNames conectados AHORA en un canal. Lo usa la clasificación. */
+function jugadoresDelCanal(canal) {
+  const nombres = new Set();
+  try {
+    for (const [, s] of io.of('/').sockets) {
+      if (s.playerData && s.playerData.canal === canal && s.authenticatedPlayer) {
+        nombres.add(s.authenticatedPlayer);
+      }
+    }
+  } catch (_) {}
+  return nombres;
+}
+
 function escapeHtml(text = '') {
   return String(text)
     .replace(/&/g, '&amp;')
@@ -4564,6 +4651,13 @@ function checkAndTrackPlantSpam(userId, seedType) {
 }
 
 // Socket.IO handlers COMPLETOS
+// Nombre de personaje Soulbound admitido. Se declara AQUÍ, antes del primer
+// manejador de sockets, porque lo usan las dos partes: el joinRoom (más abajo)
+// y las rutas /api/soulbound. El valor viaja al cliente y allí se usa para
+// COMPONER UNA RUTA de sprites, así que sin este filtro un "../.." se saldría
+// de la carpeta Soulbound.
+const NOMBRE_SOULBOUND_VALIDO = /^[A-Za-z0-9_-]{1,40}$/;
+
 io.on("connection", (socket) => {
   console.log(`🔗 Nueva conexión Socket.io: ${socket.id} desde IP: ${socket.handshake.address}`);
 
@@ -4611,8 +4705,72 @@ io.on("connection", (socket) => {
     room: null,
     username: '---',
     lastScene: null,
-    ip: clientIp
+    ip: clientIp,
+    // Canal: se fija AQUÍ, al conectar, y ya no cambia salvo que el jugador lo
+    // pida a mano. Ver el bloque de CANALES arriba para el porqué.
+    canal: null
   };
+
+  // ── ASIGNACIÓN DE CANAL (una sola vez por conexión) ──────────────────────
+  socket.playerData.canal = primerCanalLibre() || CANALES_TOTAL;
+  socket.emit('canalAsignado', {
+    canal: socket.playerData.canal,
+    total: CANALES_TOTAL,
+    cupo:  CANAL_CUPO,
+    canales: resumenCanales()
+  });
+
+  /** Estado de los 10 canales, para pintar el panel. */
+  socket.on('canalesEstado', () => {
+    socket.emit('canalesEstado', {
+      canal: socket.playerData.canal,
+      total: CANALES_TOTAL,
+      cupo:  CANAL_CUPO,
+      canales: resumenCanales()
+    });
+  });
+
+  /**
+   * Cambio de canal a petición del jugador.
+   * Se le saca de la sala del canal viejo y se le mete en la del nuevo, para
+   * que deje de ver —y de hablar con— a los del canal anterior al instante.
+   */
+  socket.on('canalCambiar', (data) => {
+    try {
+      const destino = Number(data && data.canal);
+      if (!Number.isInteger(destino) || destino < 1 || destino > CANALES_TOTAL) {
+        return socket.emit('canalError', { motivo: 'invalido' });
+      }
+      if (destino === socket.playerData.canal) {
+        return socket.emit('canalCambiado', { canal: destino, canales: resumenCanales() });
+      }
+      const cuenta = ocupacionCanales();
+      if (cuenta[destino] >= CANAL_CUPO) {
+        return socket.emit('canalError', { motivo: 'lleno', canal: destino, canales: resumenCanales() });
+      }
+
+      // Salir de la sala actual (si estaba en alguna) avisando a los que quedan.
+      const salaVieja = socket.playerData.room;
+      const base = salaVieja ? salaBase(salaVieja) : null;
+      if (salaVieja && rooms[salaVieja]) {
+        delete rooms[salaVieja][socket.id];
+        socket.leave(salaVieja);
+        io.to(salaVieja).emit('playerLeft', { id: socket.id, reason: 'changed_channel' });
+        io.to(salaVieja).emit('playerCount', Object.keys(rooms[salaVieja]).length);
+      }
+
+      socket.playerData.canal = destino;
+      socket.playerData.room  = null;   // el cliente rehará el join en el canal nuevo
+
+      socket.emit('canalCambiado', {
+        canal: destino,
+        salaBase: base,
+        canales: resumenCanales()
+      });
+    } catch (_) {
+      socket.emit('canalError', { motivo: 'error' });
+    }
+  });
 
   // ── SANEADO ANTI-INYECCIÓN EN EL CANAL DE SOCKETS ────────────────────────
   // El middleware que limpia las peticiones HTTP (ver sanearClavesMongo, arriba)
@@ -4834,14 +4992,27 @@ io.on("connection", (socket) => {
 
   // Eventos de salas y personajes COMPLETOS
   socket.on("joinRoom", async (data) => {
-    const { room, username, lastScene, nivel, petLevel, dogName } = data;
-    
-    console.log(`🔵 joinRoom: ${socket.id} -> ${room}, último escena: ${lastScene}`);
-    
-    if (!room || !username) {
+    const { room: salaPedida, username, lastScene, nivel, petLevel, dogName, soulbound } = data;
+
+    if (!salaPedida || !username) {
       socket.emit("error", { message: "Datos de sala inválidos" });
       return;
     }
+
+    // EL CANAL SE AÑADE AQUÍ, EN EL SERVIDOR, NO LO ELIGE EL CLIENTE.
+    // El cliente sigue pidiendo 'game' o 'tienda' como toda la vida; el
+    // servidor lo convierte en 'game#c3' según el canal que le asignó al
+    // conectar. De este modo:
+    //   · el chat y el movimiento (que ya usaban io.to(room)) quedan separados
+    //     por canal sin tocar una línea de esa lógica;
+    //   · un cliente manipulado no puede colarse en el canal que le apetezca,
+    //     porque el número no viaja en el mensaje.
+    // A partir de aquí `room` es la sala completa, con canal, y el resto del
+    // manejador funciona exactamente igual que antes.
+    const canal = socket.playerData.canal || 1;
+    const room  = salaConCanal(salaBase(salaPedida), canal);
+
+    console.log(`🔵 joinRoom: ${socket.id} -> ${room}, último escena: ${lastScene}`);
 
     // FIX: Si el socket tiene dirección autenticada, verificar que el username
     // corresponde a un jugador real vinculado a esa dirección.
@@ -4905,9 +5076,15 @@ io.on("connection", (socket) => {
       nivel:    Number.isFinite(Number(nivel))    ? Number(nivel)    : 0,
       petLevel: Number.isFinite(Number(petLevel)) ? Number(petLevel) : 1,
       dogName:  typeof dogName === 'string' ? dogName : '',
+      // Personaje Soulbound de ESTE jugador. Viaja en el join para que los
+      // demás lo vean con su aspecto correcto desde el primer momento, incluso
+      // si se queda quieto y nunca llega a emitir un playerMove.
+      // Se valida aquí porque el cliente lo usa para COMPONER UNA RUTA de
+      // sprites: sin filtro, un "../.." se saldría de la carpeta Soulbound.
+      soulbound: NOMBRE_SOULBOUND_VALIDO.test(String(soulbound || '')) ? String(soulbound) : null,
       lastUpdate: Date.now()
     };
-    
+
     socket.join(room);
     console.log(`✅ ${socket.id} unido a ${room} como ${username}`);
     
@@ -4937,6 +5114,23 @@ io.on("connection", (socket) => {
     };
 
     socket.to(room).emit("playerMoved", rooms[room][socket.id]);
+  });
+
+  // Cambio de personaje Soulbound en caliente.
+  //
+  // playerMove ya arrastra el campo `soulbound` del registro de la sala, así
+  // que un jugador que se mueve propaga su cambio solo. Este evento cubre el
+  // caso que se quedaría colgado: cambiar de personaje QUIETO — los demás lo
+  // seguirían viendo con el anterior hasta que diera un paso.
+  socket.on('cambioSoulbound', (data) => {
+    try {
+      const room = socket.playerData && socket.playerData.room;
+      if (!room || !rooms[room] || !rooms[room][socket.id]) return;
+      const id = String((data && data.soulbound) || '');
+      if (!NOMBRE_SOULBOUND_VALIDO.test(id)) return;
+      rooms[room][socket.id].soulbound = id;
+      socket.to(room).emit('cambioSoulbound', { id: socket.id, soulbound: id });
+    } catch (_) {}
   });
 
   // chatTyping — rebroadcast to room so others see typing dots
@@ -12769,8 +12963,6 @@ console.log('✅ Pet routes loaded: /api/pet/:playerName');
 // Se usa colección propia (igual que las mascotas) en vez de añadir un campo a
 // GamePlayer: así /api/save —que reescribe el documento entero del jugador— no
 // puede pisar la elección de personaje por un guardado con datos viejos.
-const NOMBRE_SOULBOUND_VALIDO = /^[A-Za-z0-9_-]{1,40}$/;
-
 const soulboundSchema = new mongoose.Schema({
   playerName: { type: String, required: true, unique: true, index: true },
   character:  { type: String, default: 'personaje1' },
@@ -13938,11 +14130,40 @@ app.get('/api/battle/leaderboard', apiLimiter, authMiddleware, async (req, res) 
       .select('playerName address petName points wins losses battles bestStreak -_id')
       .lean();
 
+    // ── CLASIFICACIÓN DEL CANAL ──────────────────────────────────────────────
+    // La tabla se limita a los jugadores que están AHORA MISMO en tu mismo
+    // canal, igual que el chat y que los personajes que ves por el mapa: un
+    // canal es una copia del mundo y su clasificación es la de esa copia.
+    //
+    // El canal NO se toma de la petición: se busca el socket del jugador que
+    // pregunta y se lee de ahí. Si viniera en la URL, cualquiera podría pedir
+    // la tabla de otro canal cambiando un número.
+    //
+    // Si el jugador no tiene socket vivo (pidió la tabla justo al recargar, o
+    // se cayó la conexión) no se filtra nada y se devuelve la tabla global:
+    // más vale enseñar de más que una tabla vacía sin explicación.
+    let canalDelQuePregunta = null;
+    let nombresDelCanal = null;
+    try {
+      const addrQ = req.user && req.user.address ? req.user.address.toLowerCase() : null;
+      if (addrQ) {
+        for (const [, s] of io.of('/').sockets) {
+          if (s.authenticatedAddress && String(s.authenticatedAddress).toLowerCase() === addrQ) {
+            canalDelQuePregunta = s.playerData && s.playerData.canal;
+            break;
+          }
+        }
+      }
+      if (canalDelQuePregunta) nombresDelCanal = jugadoresDelCanal(canalDelQuePregunta);
+    } catch (_) { /* sin filtro de canal */ }
+
     const filtrados = crudos.filter(r => {
       if (excluidas.has(String(r.address || '').toLowerCase())) return false;
       if (nombresFuera.has(r.playerName)) return false;
       // hideBots: el bot de entrenamiento no compite en la tabla.
       if (lbCfg.hideBots && /^bot[_-]?/i.test(String(r.playerName || ''))) return false;
+      // Solo los de mi canal.
+      if (nombresDelCanal && !nombresDelCanal.has(r.playerName)) return false;
       return true;
     }).slice(0, limit);
 
@@ -14002,6 +14223,8 @@ app.get('/api/battle/leaderboard', apiLimiter, authMiddleware, async (req, res) 
       },
       seasonLabel: lbCfg.seasonLabel || '',
       minBattlesForRanking: minBatallas,
+      // Canal al que corresponde esta tabla (null = tabla global, sin socket vivo).
+      canal: canalDelQuePregunta || null,
       rows,
       me
     });
