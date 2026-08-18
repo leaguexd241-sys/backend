@@ -1333,6 +1333,10 @@ if (!ERROR_PASSWORD) {
 }
 
 // Crops System
+// Minutos que aguanta una planta recién sembrada SIN regar antes de secarse.
+// Se elige uno al azar de esta lista en cada siembra.
+const MINUTOS_PARA_REGAR = [20, 30, 40];
+
 const UserCropSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
   plotId: { type: String, required: true },
@@ -1360,6 +1364,20 @@ const UserCropSchema = new mongoose.Schema({
   // pide a mano con .select('+expiresAt').
   expiresAt: { type: Date, default: null, select: false },
 
+  // ── SED: PLAZO PARA REGAR ──────────────────────────────────────────────────
+  // Al sembrar se fija aquí una hora límite aleatoria de 20, 30 o 40 minutos.
+  // Si el jugador no riega antes, la planta se seca y pasa a isDead — igual que
+  // una cosecha abandonada, así que al recogerla da la recompensa mala y se
+  // pinta con el sprite de planta muerta que ya existía.
+  //
+  // Al regar se pone a null: a partir de ahí manda el temporizador de
+  // crecimiento y, cuando termine, el plazo de recogida (expiresAt).
+  //
+  // `select: false` por el mismo motivo que expiresAt: el plazo exacto es parte
+  // de la mecánica y no se le enseña al jugador, así que no puede colarse en
+  // ninguna respuesta aunque alguien haga un `...crop.toObject()`.
+  sedientaHasta: { type: Date, default: null, select: false },
+
   rewards: {
     item: String,
     quantity: Number,
@@ -1371,6 +1389,8 @@ const UserCropSchema = new mongoose.Schema({
 });
 // Índice para el barrido de caducados: filtra por estado y ordena por fecha.
 UserCropSchema.index({ isCompleted: 1, isHarvested: 1, isDead: 1, expiresAt: 1 });
+// Índice para el barrido de plantas sin regar.
+UserCropSchema.index({ isWatered: 1, isHarvested: 1, isDead: 1, sedientaHasta: 1 });
 const UserCrop = mongoose.model('UserCrop', UserCropSchema);
 
 const CropHistorySchema = new mongoose.Schema({
@@ -3995,6 +4015,9 @@ class CropController {
     this.startGrowthTimers();
     // Barrido de cosechas abandonadas (mecánica oculta de caducidad).
     this.startExpiryTimer();
+    // Barrido de plantas recién sembradas que nadie riega: se secan a los
+    // 20, 30 o 40 minutos según lo que les tocara al sembrarlas.
+    this.startThirstTimer();
   }
 
   async plantSeed(userId, plotId, seedType, userStats, successChance) {
@@ -4045,7 +4068,12 @@ class CropController {
         isWatered: false,
         growthStage: 1,
         successChance: adjustedChance,
-        isDead: false
+        isDead: false,
+        // Plazo para regar: 20, 30 o 40 minutos, al azar. Que no sea siempre el
+        // mismo evita que se pueda apurar al segundo y obliga a estar pendiente.
+        sedientaHasta: new Date(Date.now() + MINUTOS_PARA_REGAR[
+          Math.floor(Math.random() * MINUTOS_PARA_REGAR.length)
+        ] * 60 * 1000)
       });
 
       await newCrop.save();
@@ -4087,6 +4115,9 @@ class CropController {
       }
 
       crop.isWatered = true;
+      // Regada a tiempo: se cancela el plazo de sed y a partir de aquí manda el
+      // temporizador de crecimiento.
+      crop.sedientaHasta = null;
       await crop.save();
 
       const cropConfig = this.cropTypes[crop.cropType];
@@ -4298,6 +4329,65 @@ class CropController {
         }
       } catch (error) {
         console.error('Error en el barrido de cosechas caducadas:', error);
+      }
+    }, 60 * 1000);
+  }
+
+  /**
+   * BARRIDO DE PLANTAS SIN REGAR.
+   *
+   * Va aparte del temporizador de crecimiento porque aquel solo mira cultivos
+   * con `isWatered: true` — las que nadie ha regado no entran en su consulta y
+   * por eso, hasta ahora, se quedaban indefinidamente esperando un riego que
+   * podía no llegar nunca.
+   *
+   * Cada minuto busca las que pasaron su plazo (20, 30 o 40 min según la
+   * siembra) y las seca: `isDead = true`. Al recogerlas dan la recompensa mala
+   * (deadReward) y el cliente pinta el sprite de planta muerta, exactamente
+   * igual que con una cosecha abandonada — no hace falta código nuevo en el
+   * juego.
+   */
+  async startThirstTimer() {
+    setInterval(async () => {
+      try {
+        const ahora = new Date();
+
+        // .select('+sedientaHasta') porque el campo es select:false.
+        const secas = await UserCrop.find({
+          isWatered:     false,
+          isHarvested:   false,
+          isDead:        false,
+          isCompleted:   false,
+          sedientaHasta: { $ne: null, $lte: ahora }
+        }).select('+sedientaHasta');
+
+        if (!secas.length) return;
+
+        for (const crop of secas) {
+          crop.isDead = true;
+          crop.sedientaHasta = null;
+          await crop.save();
+
+          const cropConfig = this.cropTypes[crop.cropType];
+
+          if (this.io) {
+            this.io.emit('cropGrowth', {
+              userId:      crop.userId,
+              plotId:      crop.plotId,
+              growthStage: crop.growthStage,
+              currentGrowthTime: crop.currentGrowthTime,
+              isHalfway:   false,
+              isCompleted: false,
+              isDead:      true,
+              timeRemaining: 0,
+              cropConfig:  cropConfig
+            });
+          }
+
+          console.log(`🥀 Planta seca por falta de riego: ${crop.userId} / parcela ${crop.plotId} (${crop.cropType})`);
+        }
+      } catch (error) {
+        console.error('Error en el barrido de plantas sin regar:', error);
       }
     }, 60 * 1000);
   }
@@ -9199,9 +9289,31 @@ app.post('/api/missions/daily/complete',
       const oroPremio   = Math.max(0, parseInt(mission.goldReward,   10) || 0);
       const plataPremio = Math.max(0, parseInt(mission.silverReward, 10) || 0);
 
+      // LO PROMETIDO vs LO ENTREGADO.
+      // Antes la respuesta devolvía `oroPremio`/`plataPremio` —lo que la misión
+      // DECÍA pagar— pasara lo que pasara por debajo. Si la entrega fallaba
+      // (sin PlayerStats, sin factura, la cadena rechazando), el jugador veía
+      // "success" y un aviso de recompensa que nunca llegó a su saldo: "me
+      // quita los requisitos y no me da nada". Ahora se cuenta lo que de
+      // verdad se sumó y es ESO lo que se responde.
+      let oroEntregado = 0, plataEntregado = 0;
+
       if (oroPremio > 0 || plataPremio > 0) {
         try {
-          const statsDoc = await PlayerStats.findOne({ playerName });
+          // SI NO EXISTE EL DOCUMENTO, SE CREA.
+          // Antes un findOne a secas: si el jugador todavía no tenía fila en
+          // PlayerStats (cuenta nueva, o creada antes de que existiera esta
+          // colección) el premio se descartaba con un 'stats_missing' y el
+          // jugador se quedaba sin nada tras haber entregado los materiales.
+          // Crearla con los valores por defecto es exactamente lo que hace
+          // /sync la primera vez, así que no inventa nada: solo evita perder
+          // la recompensa por un documento que aún no estaba.
+          let statsDoc = await PlayerStats.findOne({ playerName });
+          if (!statsDoc) {
+            statsDoc = new PlayerStats({ playerName, address });
+            await statsDoc.save();
+            console.log(`ℹ️  misión: PlayerStats creado al vuelo para ${playerName}`);
+          }
           if (statsDoc) {
             const contract = getStatsContract();
             const gasPrice = (contract) ? await getSafeGasPriceStats() : null;
@@ -9219,6 +9331,13 @@ app.post('/api/missions/daily/complete',
               } else {
                 // Sin factura todavía: se guarda en Mongo y /sync la creará.
                 statsDoc[clave] = total;
+              }
+
+              // Solo cuenta como entregado si el total subió de verdad.
+              const subio = Math.max(0, Math.round(Number(statsDoc[clave] || 0))) >= total;
+              if (subio) {
+                if (clave === 'oro')   oroEntregado   = cantidad;
+                if (clave === 'plata') plataEntregado = cantidad;
               }
 
               // GamePlayer guarda una copia para el HUD; se mantiene al día.
@@ -9252,6 +9371,11 @@ app.post('/api/missions/daily/complete',
           inventory  = puesto.inventory;
           entregadas = puesto.metidas;
           if (entregadas < rewardQty) avisos.push('inventory_full');
+        } else {
+          // El acuñado falló: la misión se da por entregada (los materiales ya
+          // se quemaron) pero el ítem NO llega. Antes esto pasaba en silencio.
+          console.error(`❌ misión ${missionId}: no se pudo acuñar la recompensa ` +
+                        `${rewardQty}x ${rewardId} (tipo ${tipoPremio}) para ${playerName}`);
         }
       }
 
@@ -9281,8 +9405,12 @@ app.post('/api/missions/daily/complete',
           // Monedas entregadas (0 si la misión no pagaba en esa moneda). El
           // cliente las usa para el aviso de "has recibido…" y para refrescar
           // el HUD sin tener que volver a pedir las estadísticas.
-          gold:   oroPremio,
-          silver: plataPremio
+          gold:   oroEntregado,
+          silver: plataEntregado,
+          // Lo que la misión prometía, para que el cliente pueda avisar de la
+          // diferencia en vez de callársela.
+          goldPrometido:   oroPremio,
+          silverPrometido: plataPremio
         },
         warnings: avisos.length ? avisos : undefined
       });
@@ -9489,6 +9617,131 @@ app.post('/api/admin/missions/copy', adminAuth, strictLimiter, async (req, res) 
 });
 
 // Borrar las misiones de un día
+// ============================================================================
+// ADMIN: HISTORIAL DE MISIONES  (panel misiones.html)
+// ============================================================================
+// Quién ha entregado más misiones, con su cuenta, su nombre y su nivel.
+//
+// De dónde salen los datos:
+//   · GamePlayer.misiones      → contador acumulado de misiones entregadas.
+//   · UserDailyProgress        → el detalle por día y NPC (para la actividad
+//                                reciente y para poder borrar el historial).
+//   · PlayerAuth               → la dirección de la cuenta.
+//
+// Se ordena por el acumulado, que es lo que pide el panel ("quién cumplió
+// más"), y se completa con la última entrega para poder ver quién sigue activo.
+
+app.get('/api/admin/missions/history', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const limite  = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 100));
+    const buscar  = String(req.query.search || '').trim();
+
+    const filtro = {};
+    if (buscar) {
+      // Búsqueda por nombre de jugador, nombre visible o dirección. Se escapa
+      // el texto: sin esto, un '(' o un '*' del buscador rompería la consulta,
+      // y una expresión rebuscada podría bloquear el servidor.
+      const esc = buscar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const rx  = new RegExp(esc, 'i');
+      filtro.$or = [{ playerName: rx }, { Username: rx }, { address: rx }];
+    }
+
+    const jugadores = await GamePlayer.find(filtro)
+      .select('playerName Username nivel misiones address updatedAt -_id')
+      .sort({ misiones: -1, nivel: -1 })
+      .limit(limite)
+      .lean();
+
+    const nombres = jugadores.map(j => j.playerName);
+
+    // Última entrega y total de días con actividad, en UNA consulta.
+    const actividad = await UserDailyProgress.aggregate([
+      { $match: { playerName: { $in: nombres } } },
+      { $group: {
+          _id: '$playerName',
+          ultima: { $max: '$lastInteraction' },
+          dias:   { $sum: 1 },
+          entregas: { $sum: '$completedCount' }
+      } }
+    ]);
+    const porNombre = new Map(actividad.map(a => [a._id, a]));
+
+    const filas = jugadores.map(j => {
+      const a = porNombre.get(j.playerName) || {};
+      return {
+        playerName: j.playerName,
+        username:   j.Username && j.Username !== '---' ? j.Username : null,
+        address:    j.address || null,
+        nivel:      Number(j.nivel || 0),
+        // Acumulado histórico (no se borra al pasar el día).
+        misiones:   Number(j.misiones || 0),
+        // Lo que queda registrado día a día; es lo que se puede limpiar.
+        entregasRegistradas: Number(a.entregas || 0),
+        diasConActividad:    Number(a.dias || 0),
+        ultimaEntrega:       a.ultima || null
+      };
+    });
+
+    return res.json({ success: true, total: filas.length, rows: filas });
+  } catch (e) {
+    console.error('GET /api/admin/missions/history:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// Borrar el historial de UN jugador.
+//
+// OJO CON EL EFECTO EN EL JUEGO: al borrar su progreso del DÍA DE HOY, ese
+// jugador puede volver a entregar las misiones de hoy y cobrarlas otra vez. Es
+// lo que se espera de un "limpiar" (deja la cuenta como si no hubiera jugado),
+// pero conviene tenerlo presente. El panel lo avisa antes de pedir confirmación.
+app.delete('/api/admin/missions/history/:playerName', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const playerName = String(req.params.playerName || '').trim();
+    if (!playerName) return res.status(400).json({ error: 'playerName requerido' });
+
+    const borrados = await UserDailyProgress.deleteMany({ playerName });
+    const upd = await GamePlayer.updateOne({ playerName }, { $set: { misiones: 0 } });
+
+    console.log(`🧹 admin: historial de misiones borrado para ${playerName} ` +
+                `(${borrados.deletedCount} registros)`);
+    return res.json({
+      success: true,
+      playerName,
+      registrosBorrados: borrados.deletedCount,
+      contadorReiniciado: upd.modifiedCount > 0
+    });
+  } catch (e) {
+    console.error('DELETE /api/admin/missions/history/:playerName:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// Borrar el historial COMPLETO. Pide confirm=BORRAR en el cuerpo para que no
+// se pueda disparar por accidente con una petición suelta.
+app.delete('/api/admin/missions/history', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    if (String((req.body || {}).confirm || '') !== 'BORRAR') {
+      return res.status(400).json({ error: 'confirmacion_requerida' });
+    }
+    const borrados = await UserDailyProgress.deleteMany({});
+    const upd = await GamePlayer.updateMany({ misiones: { $gt: 0 } }, { $set: { misiones: 0 } });
+
+    console.log(`🧹 admin: historial de misiones borrado ENTERO ` +
+                `(${borrados.deletedCount} registros, ${upd.modifiedCount} contadores)`);
+    return res.json({
+      success: true,
+      registrosBorrados: borrados.deletedCount,
+      contadoresReiniciados: upd.modifiedCount
+    });
+  } catch (e) {
+    console.error('DELETE /api/admin/missions/history:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+console.log('✅ Missions history: GET/DELETE /api/admin/missions/history');
+
 app.delete('/api/admin/missions/daily/:npcId/:day', adminAuth, strictLimiter, async (req, res) => {
   try {
     const { npcId, day } = req.params;
