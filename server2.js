@@ -4010,6 +4010,38 @@ class CropController {
           deadQuantity: 1
         }
       },
+      // Fresa. Cultivo de nivel 3: la bolsa se vende a 20 de plata en la
+      // tienda y solo aparece a partir de ese nivel. Las claves de imagen
+      // tienen que existir en el preload de GameScene.js.
+      Semillax4: {
+        id: 'Semillax4',
+        name: 'Strawberry',
+        type: 'semilla4',
+        growthStages: 4,
+        growthTime: 300,
+        waterRequired: true,
+        waterCost: 1,
+        foodCost: 0.2,
+        wateringCost: 0.5,
+        agricultureReq: 0,
+        strengthReq: 0,
+        levelReq: 3,
+        images: {
+          stage1: 'tierra_seca_plant_fresa',
+          stage2: 'tierra_mojada_plant_fresa',
+          stage3: 'tierra_mojada_plant2_fresa',
+          stage4: 'tierra_mojada_plant3_fresa',
+          stage5: 'tierra_muerta_plant4_fresa'
+        },
+        rewards: {
+          item: 'fresa_buena',
+          quantity: 1,
+          progress_reward: 'fresa_corta',
+          progress_quantity: 1,
+          deadReward: 'fresa_mala',
+          deadQuantity: 1
+        }
+      },
     };
     
     this.startGrowthTimers();
@@ -8908,6 +8940,7 @@ app.get('/api/missions/daily/:npcId/:date', apiLimiter, authMiddleware, getDaily
 const ITEM_TIPO_MAP = {
   Semillax: 'bolsa zanahorias', Semillax1: 'bolsa de tomates',
   Semillax2: 'bolsa de trigo',  Semillax3: 'bolsa de calabazas',
+  Semillax4: 'bolsa_de_fresas',
 
   Regaderax: 'Regaderax', Tijerasx: 'Tijerasx',
 
@@ -8929,6 +8962,7 @@ const ITEM_TIPO_MAP = {
   tomate_buena:    'tomate_buena',    tomate_corta:    'tomate_corta',    tomate_mala:    'tomate_mala',
   trigo_buena:     'trigo_buena',     trigo_corta:     'trigo_corta',     trigo_mala:     'trigo_mala',
   calabaza_buena:  'calabaza_buena',  calabaza_corta:  'calabaza_corta',  calabaza_mala:  'calabaza_mala',
+  fresa_buena:     'fresa_buena',     fresa_corta:     'fresa_corta',     fresa_mala:     'fresa_mala',
 };
 
 function itemTipoOnChain(itemId) {
@@ -8938,7 +8972,7 @@ function itemTipoOnChain(itemId) {
 // Tope de stack por ítem (mismo criterio que ItemDefinitions.maxStack). Se usa
 // para repartir la recompensa entre casillas del inventario guardado.
 const ITEM_MAX_STACK = {
-  Semillax: 50, Semillax1: 50, Semillax2: 50, Semillax3: 50,
+  Semillax: 50, Semillax1: 50, Semillax2: 50, Semillax3: 50, Semillax4: 50,
   Regaderax: 1, Tijerasx: 1,
   mineral_piedra: 20, mineral_cobre: 20, mineral_hierro: 20, carbon: 20,
   palo: 20, tablon_de_madera: 20,
@@ -8950,6 +8984,7 @@ const ITEM_MAX_STACK = {
   tomate_buena: 20, tomate_corta: 20, tomate_mala: 20,
   trigo_buena: 20, trigo_corta: 20, trigo_mala: 20,
   calabaza_buena: 20, calabaza_corta: 20, calabaza_mala: 20,
+  fresa_buena: 20, fresa_corta: 20, fresa_mala: 20,
 };
 
 // =============================================================================
@@ -9118,6 +9153,7 @@ const MISSION_ITEM_ALIASES = {
   tomate: 'tomate_buena',       tomato: 'tomate_buena',
   trigo: 'trigo_buena',         wheat:  'trigo_buena',
   calabaza: 'calabaza_buena',   pumpkin:'calabaza_buena',
+  fresa: 'fresa_buena',         strawberry: 'fresa_buena',
   piedra: 'mineral_piedra',     stone:  'mineral_piedra',
   cobre: 'mineral_cobre',       copper: 'mineral_cobre',
   hierro: 'mineral_hierro',     iron:   'mineral_hierro',
