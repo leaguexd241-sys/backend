@@ -6041,6 +6041,75 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// RELOJ DEL MUNDO — ciclo día/noche
+//
+// El reloj vive AQUÍ, no en el cliente. El navegador solo pregunta la hora una
+// vez cada media hora y entremedias la extrapola con un cronómetro monótono
+// (performance.now), no con Date.now(): cambiar la hora del sistema operativo
+// no adelanta ni retrasa el ciclo, y tocar variables de JS solo desincroniza
+// el HUD de ese jugador hasta la siguiente sincronización.
+//
+// DURACIÓN: 6 h reales de día + 6 h reales de noche = ciclo de 12 h.
+// Ese ciclo se muestra como un día de 24 h en el reloj del HUD, o sea
+// 1 hora de juego = 30 minutos reales. Amanece a las 06:00 y anochece a las
+// 18:00 del reloj del juego.
+//
+// Para cambiar la duración solo se tocan estas dos constantes.
+const CICLO_DIA_MS   = 6 * 60 * 60 * 1000;
+const CICLO_NOCHE_MS = 6 * 60 * 60 * 1000;
+
+const CICLO_TOTAL_MS = CICLO_DIA_MS + CICLO_NOCHE_MS;
+
+// Origen fijo del ciclo. Es una fecha constante a propósito: si se usara la
+// hora de arranque del servidor, cada reinicio movería el amanecer y dos
+// instancias detrás de un balanceador irían desincronizadas.
+const CICLO_EPOCA_MS = Date.UTC(2024, 0, 1, 0, 0, 0);
+
+function estadoDelMundo(ahoraMs) {
+  let t = (ahoraMs - CICLO_EPOCA_MS) % CICLO_TOTAL_MS;
+  if (t < 0) t += CICLO_TOTAL_MS;
+
+  const esDia = t < CICLO_DIA_MS;
+  const msParaCambio = esDia ? (CICLO_DIA_MS - t) : (CICLO_TOTAL_MS - t);
+
+  // El día se reparte sobre 06:00→18:00 y la noche sobre 18:00→06:00. Se
+  // calcula por fase, no sobre el ciclo entero, para que siga cuadrando si
+  // algún día el día y la noche dejan de durar lo mismo.
+  let minutos;
+  if (esDia) {
+    minutos = 360 + (t / CICLO_DIA_MS) * 720;
+  } else {
+    minutos = (1080 + ((t - CICLO_DIA_MS) / CICLO_NOCHE_MS) * 720) % 1440;
+  }
+  minutos = Math.floor(minutos) % 1440;
+  const hora = Math.floor(minutos / 60);
+  const minuto = minutos % 60;
+
+  return {
+    ok: true,
+    ahora: ahoraMs,
+    epocaMs: CICLO_EPOCA_MS,
+    fase: esDia ? 'dia' : 'noche',
+    esDia,
+    hora,
+    minuto,
+    horaTexto: String(hora).padStart(2, '0') + ':' + String(minuto).padStart(2, '0'),
+    progresoCiclo: t / CICLO_TOTAL_MS,
+    msParaCambio,
+    cicloMs: CICLO_TOTAL_MS,
+    diaMs: CICLO_DIA_MS,
+    nocheMs: CICLO_NOCHE_MS
+  };
+}
+
+// Pública a propósito: es la misma hora para todo el mundo y no depende de la
+// sesión, así que el HUD puede pintarla antes incluso de que el jugador entre.
+app.get('/api/world/time', apiLimiter, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  return res.json(estadoDelMundo(Date.now()));
+});
+
 // CSRF token endpoint
 app.get('/api/auth/csrf-token', (req, res) => {
   // REUTILIZAR el token existente si la cookie ya tiene uno válido (64 hex).
