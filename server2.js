@@ -8903,7 +8903,9 @@ const DANO_MORDISCO_ANIMAL = 6;
 const REVIVIR_BASE_PLATA   = 30;
 const REVIVIR_TOPE_PLATA   = 480;
 const REVIVIR_VENTANA_MS   = 24 * 60 * 60 * 1000;
-const REVIVIR_VIDA         = 50;
+// Al revivir se vuelve con la vida LLENA. Estaba en 50 y el jugador
+// esperaba, con razón, volver entero después de pagar.
+const REVIVIR_VIDA         = 100;
 
 /**
  * Precio de revivir según cuántas veces hayas muerto en la ventana de 24 h.
