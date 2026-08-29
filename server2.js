@@ -9454,6 +9454,9 @@ async function climaDoc() {
 async function climaAvanzar(d) {
   if (!d.activo || d.modo !== 'auto') return d;
   const ahora = Date.now();
+  // Para avisar solo si de verdad cambia algo: si no, cada consulta soltaría
+  // un evento a todos los jugadores para decirles lo mismo.
+  const antes = climaHuella(d);
 
   // ¿Se acabó lo que había?
   if (d.hasta && ahora >= new Date(d.hasta).getTime()) {
@@ -9482,6 +9485,7 @@ async function climaAvanzar(d) {
     d.proximo = new Date(ahora + d.minutosSorteo * 60000);
     await d.save();
   }
+  if (climaHuella(d) !== antes) climaEmitir(d);
   return d;
 }
 
@@ -9503,6 +9507,33 @@ function climaPublico(d) {
     proximo: d.proximo ? new Date(d.proximo).toISOString() : null,
     ahora: Date.now()
   };
+}
+
+/**
+ * Avisa a TODOS los que estén jugando del tiempo que hace AHORA.
+ *
+ * EL FALLO QUE ARREGLA: el juego solo preguntaba el tiempo cada 3 minutos. Se
+ * cambiaba algo en climas.html, se guardaba, y los jugadores seguían con el
+ * tiempo viejo hasta que recargaban la página. Ahora el cambio sale empujado
+ * por el mismo socket que ya usa el juego y entra al momento; la consulta
+ * periódica se queda solo de red de seguridad para quien tenga el socket
+ * caído.
+ *
+ * Va a todo el mundo (io.emit, no io.to): el clima es del MUNDO, no de una
+ * sala ni de un canal.
+ */
+function climaEmitir(d) {
+  try {
+    if (io && io.emit) io.emit('worldWeather', climaPublico(d));
+  } catch (err) {
+    console.warn('🌦️  no se pudo avisar del clima:', err && err.message);
+  }
+}
+
+/** Lo que de verdad se ve, para saber si hace falta avisar. */
+function climaHuella(d) {
+  return [d.activo, d.modo, d.viento, d.lluvia, d.truenos,
+          d.vientoFuerza, d.lluviaFuerza].join('|');
 }
 
 // ── GET /api/world/weather ──────────────────────────────────────────────────
@@ -9576,6 +9607,8 @@ app.post('/api/admin/weather', adminAuth, strictLimiter, csrfProtection, async (
 
     console.log(`🌦️  Clima actualizado por ${d.actualizadoPor}: ` +
                 `${d.activo ? d.modo : 'apagado'} · viento=${d.viento} lluvia=${d.lluvia}`);
+    // Al momento, sin esperar a que nadie pregunte.
+    climaEmitir(d);
     const o = d.toObject(); delete o._id;
     return res.json({ ok: true, config: o, publico: climaPublico(d) });
   } catch (err) {
@@ -9604,6 +9637,7 @@ app.post('/api/admin/weather/test', adminAuth, strictLimiter, csrfProtection, as
     d.actualizadoPor = (req.user && req.user.address) || null;
     await d.save();
     console.log(`🌦️  Prueba de clima: ${que} durante ${minutos} min`);
+    climaEmitir(d);
     return res.json({ ok: true, publico: climaPublico(d) });
   } catch (err) {
     console.error('POST /api/admin/weather/test:', err);
