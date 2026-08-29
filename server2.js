@@ -563,6 +563,31 @@ const gamePlayerSchema = new mongoose.Schema({
   // Nivel de la MASCOTA. Sube con las batallas (ver computePetLevel/bump).
   // Se muestra junto al nombre del perro, propio y de los demás jugadores.
   petLevel: { type: Number, default: 1, min: 1 },
+
+  // ── MASCOTA: vida, modo de comportamiento y muerte ──────────────────────
+  // La vida va de 0 a 100 y es un PORCENTAJE: con ella entra a las batallas
+  // PvP/PvE (ver crearParticipante). A 0 la mascota muere y hay que revivirla
+  // con el elixir del alquimista.
+  petHealth: { type: Number, default: 100, min: 0, max: 100 },
+  // 'passive' → la mascota no pelea y los animales agresivos van a por el
+  // JUGADOR.  'attack' → la mascota pelea y los animales van a por ELLA.
+  // Lo decide el servidor a propósito: si lo escribiera el cliente, bastaría
+  // con ponerlo en 'attack' para que nada tocara nunca al personaje.
+  petMode: { type: String, enum: ['passive', 'attack'], default: 'passive' },
+  petDiedAt: { type: Date, default: null },
+  // Cuando recibio el ultimo mordisco. Sirve para el ritmo minimo entre
+  // golpes: sin persistirlo, el limite se perdia en cada peticion.
+  petLastHitAt: { type: Date, default: null },
+
+  // ── MUERTES DEL JUGADOR ─────────────────────────────────────────────────
+  // `isGhost` = el personaje está muerto y anda como fantasma hasta que pague
+  // el revivir. `deathCount` sube con cada muerte y encarece el precio;
+  // `deathWindowAt` marca cuándo empezó la ventana de 24 h tras la cual el
+  // contador vuelve a cero y el precio a 30 de plata.
+  isGhost: { type: Boolean, default: false },
+  deathCount: { type: Number, default: 0, min: 0 },
+  deathWindowAt: { type: Date, default: null },
+
   inventory: { type: Array, default: [] },
   chest: { type: Array, default: [] },
   address: { type: String, lowercase: true, default: null }
@@ -1345,6 +1370,9 @@ const UserCropSchema = new mongoose.Schema({
   growthStage: { type: Number, default: 1 },
   plantedAt: { type: Date, default: Date.now },
   growthDuration: { type: Number, required: true },
+  // Duracion ORIGINAL, antes de que ningun cuervo la retrasara. Sin ella no
+  // habria contra que medir el tope y los picotazos se acumularian sin fin.
+  growthDurationOriginal: { type: Number, default: null },
   currentGrowthTime: { type: Number, default: 0 },
   isWatered: { type: Boolean, default: false },
   isCompleted: { type: Boolean, default: false },
@@ -6089,7 +6117,7 @@ app.get('/api/health', async (req, res) => {
 //
 // Para cambiar la duración solo se tocan estas dos constantes.
 const CICLO_DIA_MS   = 6 * 60 * 60 * 1000;
-const CICLO_NOCHE_MS = 6 * 60 * 60 * 1000;
+const CICLO_NOCHE_MS = 3 * 60 * 60 * 1000;   // la noche dura la mitad que el dia
 
 const CICLO_TOTAL_MS = CICLO_DIA_MS + CICLO_NOCHE_MS;
 
@@ -8573,6 +8601,17 @@ app.post('/api/save/:playerName',
       //
       // Los dos se quitan del cuerpo ANTES de tocar la base de datos.
       delete update.petLevel;
+      // Mismo motivo que petLevel: estos los decide el servidor. `petMode`
+      // manda sobre a quién atacan los animales, `petHealth` sobre con cuánta
+      // vida entra la mascota a las batallas, y el trío de la muerte sobre lo
+      // que cuesta revivir. Todos se escriben solo por sus endpoints.
+      delete update.petHealth;
+      delete update.petMode;
+      delete update.petDiedAt;
+      delete update.isGhost;
+      delete update.deathCount;
+      delete update.deathWindowAt;
+      delete update.petLastHitAt;
       {
         const expParaNivel = (update.nivel_exp !== undefined)
           ? update.nivel_exp
@@ -8826,6 +8865,524 @@ app.post('/api/water/collect/refund',
   }
 );
 
+
+// =============================================================================
+// MASCOTA (VIDA Y MODO) Y MUERTE DEL JUGADOR
+// -----------------------------------------------------------------------------
+// QUÉ DECIDE EL SERVIDOR Y POR QUÉ
+//
+//   · petMode      — de él depende a quién atacan los animales. Si lo escribiera
+//                    el cliente, bastaría con ponerlo en 'attack' para que nada
+//                    tocara jamás al personaje.
+//   · petHealth    — con ella entra la mascota a las batallas PvP/PvE.
+//   · deathCount   — decide el precio de revivir. En el cliente, todo el mundo
+//                    reviviría siempre por 30 de plata.
+//
+// LA PLATA VIVE EN LA CADENA. Cobrar el revivir es bajar el número en Mongo y
+// apuntar la deuda con `marcarPendienteDeCadena`, exactamente igual que hace
+// /api/stats/consume. El liquidador agrupa y escribe. Inventarse un descuento
+// por otro lado dejaría la cadena desincronizada.
+// =============================================================================
+
+const PET_VIDA_MAX      = 100;
+// Cuánto cura cada poción del alquimista.
+const PET_POCIONES      = { pocion_mascota: 40, pocion_mascota_grande: 100 };
+const PET_ITEM_REVIVIR  = 'elixir_revivir';
+// Con cuánta vida vuelve la mascota tras el elixir: no vuelve al 100, revivir
+// no puede ser mejor que cuidarla.
+const PET_VIDA_AL_REVIVIR = 50;
+// Tope de daño por petición. Los animales son decoración del cliente, así que
+// el mordisco lo reporta él; lo que no puede es reportar 5.000 de golpe.
+const PET_DANO_MAX_POR_GOLPE = 12;
+// Un mordisco como mucho cada tanto, por mascota.
+const PET_DANO_INTERVALO_MS  = 700;
+
+// Lo que le quita al JUGADOR un mordisco (lo cobra /api/stats/consume).
+const DANO_MORDISCO_ANIMAL = 6;
+
+const REVIVIR_BASE_PLATA   = 30;
+const REVIVIR_TOPE_PLATA   = 480;
+const REVIVIR_VENTANA_MS   = 24 * 60 * 60 * 1000;
+const REVIVIR_VIDA         = 50;
+
+/**
+ * Precio de revivir según cuántas veces hayas muerto en la ventana de 24 h.
+ * 30 la primera, y el doble cada vez, con tope para que no se vuelva absurdo.
+ */
+function precioRevivir(muertes) {
+  const n = Math.max(0, Number(muertes) || 0);
+  return Math.min(REVIVIR_BASE_PLATA * Math.pow(2, n), REVIVIR_TOPE_PLATA);
+}
+
+/**
+ * Si ya pasaron 24 h desde la primera muerte de la racha, el contador vuelve a
+ * cero y el precio a 30. Devuelve true si ha cambiado algo.
+ *
+ * Es una ventana rodante desde la PRIMERA muerte, no un día de calendario: el
+ * jugador dijo "si ya se cumplieron las 24 horas", no "a medianoche".
+ */
+function normalizarVentanaMuertes(gp) {
+  const ahora = Date.now();
+  const ini = gp.deathWindowAt ? new Date(gp.deathWindowAt).getTime() : 0;
+  if (ini && (ahora - ini) < REVIVIR_VENTANA_MS) return false;
+  if (!ini && !gp.deathCount) return false;
+  gp.deathWindowAt = null;
+  gp.deathCount = 0;
+  return true;
+}
+
+/** El GamePlayer de quien hace la petición, o null si no cuadra la sesión. */
+async function jugadorDeLaSesion(req) {
+  const address = String((req.user && req.user.address) || '').toLowerCase();
+  if (!address) return null;
+  const auth = await PlayerAuth.findOne({ address }).lean().exec();
+  if (!auth || !auth.playerName) return null;
+  return GamePlayer.findOne({ playerName: auth.playerName }).exec();
+}
+
+/** Respuesta común: todo lo que el cliente necesita para pintar el estado. */
+function estadoVivo(gp) {
+  const salud = Math.max(0, Math.min(PET_VIDA_MAX, Number(gp.petHealth ?? PET_VIDA_MAX)));
+  return {
+    ok: true,
+    pet: {
+      health: salud,
+      maxHealth: PET_VIDA_MAX,
+      mode: gp.petMode === 'attack' ? 'attack' : 'passive',
+      alive: salud > 0
+    },
+    player: {
+      ghost: !!gp.isGhost,
+      deaths: Math.max(0, Number(gp.deathCount) || 0),
+      reviveCost: precioRevivir(gp.deathCount),
+      windowEndsAt: gp.deathWindowAt
+        ? new Date(new Date(gp.deathWindowAt).getTime() + REVIVIR_VENTANA_MS).toISOString()
+        : null
+    }
+  };
+}
+
+// ── GET /api/pet/state ──────────────────────────────────────────────────────
+// Estado de la mascota Y de la muerte del jugador en una sola llamada: el
+// cliente los necesita juntos y así no hay dos viajes en cada cambio de escena.
+app.get('/api/pet/state', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (normalizarVentanaMuertes(gp)) await gp.save();
+    return res.json(estadoVivo(gp));
+  } catch (err) {
+    console.error('GET /api/pet/state:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── POST /api/pet/mode ──────────────────────────────────────────────────────
+// body: { mode: 'passive' | 'attack' }
+app.post('/api/pet/mode', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const modo = String((req.body && req.body.mode) || '').toLowerCase();
+    if (modo !== 'passive' && modo !== 'attack') {
+      return res.status(400).json({ error: 'modo_invalido' });
+    }
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+
+    // Una mascota muerta no puede ponerse a pelear.
+    if (modo === 'attack' && (Number(gp.petHealth) || 0) <= 0) {
+      return res.status(409).json({ error: 'mascota_muerta', ...estadoVivo(gp) });
+    }
+    gp.petMode = modo;
+    await gp.save();
+    console.log(`🐕 ${gp.playerName}: mascota en modo ${modo}`);
+    return res.json(estadoVivo(gp));
+  } catch (err) {
+    console.error('POST /api/pet/mode:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── POST /api/pet/damage ────────────────────────────────────────────────────
+// body: { amount }   Un animal ha mordido a la mascota.
+app.post('/api/pet/damage', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+
+    const salud = Math.max(0, Math.min(PET_VIDA_MAX, Number(gp.petHealth ?? PET_VIDA_MAX)));
+    if (salud <= 0) return res.json(estadoVivo(gp));   // ya estaba muerta
+
+    // Ritmo mínimo entre mordiscos: sin esto, un cliente modificado podría
+    // mandar mil peticiones seguidas. Va en un campo del esquema a propósito:
+    // una propiedad suelta en el documento no se guarda, así que el límite se
+    // habría perdido entre peticiones y no habría limitado nada.
+    const ahora = Date.now();
+    const ultimo = gp.petLastHitAt ? new Date(gp.petLastHitAt).getTime() : 0;
+    if (ultimo && (ahora - ultimo) < PET_DANO_INTERVALO_MS) {
+      return res.json(estadoVivo(gp));
+    }
+    gp.petLastHitAt = new Date(ahora);
+
+    const dano = Math.max(1, Math.min(PET_DANO_MAX_POR_GOLPE,
+                                      Math.round(Number(req.body && req.body.amount) || 1)));
+    const nueva = Math.max(0, salud - dano);
+    gp.petHealth = nueva;
+    if (nueva === 0) {
+      gp.petDiedAt = new Date();
+      // Una mascota muerta no sigue en modo ataque: si no, al revivirla se
+      // pondría a pelear sola sin que el jugador lo haya pedido.
+      gp.petMode = 'passive';
+      console.log(`💀 ${gp.playerName}: la mascota ha muerto`);
+    }
+    await gp.save();
+    return res.json(estadoVivo(gp));
+  } catch (err) {
+    console.error('POST /api/pet/damage:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── POST /api/pet/heal ──────────────────────────────────────────────────────
+// body: { itemId }   Usa una poción del inventario para curar a la mascota.
+app.post('/api/pet/heal', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const itemId = String((req.body && req.body.itemId) || '');
+    const cura = PET_POCIONES[itemId];
+    if (!cura) return res.status(400).json({ error: 'item_invalido' });
+
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+
+    const salud = Math.max(0, Math.min(PET_VIDA_MAX, Number(gp.petHealth ?? PET_VIDA_MAX)));
+    if (salud <= 0) {
+      return res.status(409).json({ error: 'mascota_muerta', ...estadoVivo(gp) });
+    }
+    if (salud >= PET_VIDA_MAX) {
+      return res.status(409).json({ error: 'mascota_llena', ...estadoVivo(gp) });
+    }
+
+    // La poción se descuenta del inventario GUARDADO. Si el cliente todavía no
+    // ha guardado la compra, responde `inventario_desfasado` y él guarda y
+    // reintenta — mejor eso que curar sin gastar nada.
+    if (contarEnSlots(gp.inventory, itemId) + contarEnSlots(gp.chest, itemId) < 1) {
+      return res.status(409).json({ error: 'inventario_desfasado', itemId });
+    }
+    const r = descontarDeSlots(gp.chest, gp.inventory, itemId, 1);
+    if (r.descontadas < 1) {
+      return res.status(409).json({ error: 'inventario_desfasado', itemId });
+    }
+    gp.inventory = r.inventory;
+    gp.chest     = r.chest;
+    gp.markModified('inventory');
+    gp.markModified('chest');
+    gp.petHealth = Math.min(PET_VIDA_MAX, salud + cura);
+    await gp.save();
+    console.log(`🧪 ${gp.playerName}: ${itemId} → mascota ${salud}→${gp.petHealth}`);
+    return res.json(estadoVivo(gp));
+  } catch (err) {
+    console.error('POST /api/pet/heal:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── POST /api/pet/revive ────────────────────────────────────────────────────
+// Gasta un elixir del alquimista y devuelve la mascota a la vida.
+app.post('/api/pet/revive', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+
+    const salud = Math.max(0, Number(gp.petHealth) || 0);
+    if (salud > 0) {
+      return res.status(409).json({ error: 'mascota_viva', ...estadoVivo(gp) });
+    }
+    if (contarEnSlots(gp.inventory, PET_ITEM_REVIVIR) +
+        contarEnSlots(gp.chest, PET_ITEM_REVIVIR) < 1) {
+      return res.status(409).json({ error: 'falta_elixir', itemId: PET_ITEM_REVIVIR });
+    }
+    const r = descontarDeSlots(gp.chest, gp.inventory, PET_ITEM_REVIVIR, 1);
+    if (r.descontadas < 1) {
+      return res.status(409).json({ error: 'falta_elixir', itemId: PET_ITEM_REVIVIR });
+    }
+    gp.inventory = r.inventory;
+    gp.chest     = r.chest;
+    gp.markModified('inventory');
+    gp.markModified('chest');
+    gp.petHealth = PET_VIDA_AL_REVIVIR;
+    gp.petDiedAt = null;
+    gp.petMode   = 'passive';
+    await gp.save();
+    console.log(`✨ ${gp.playerName}: mascota revivida al ${PET_VIDA_AL_REVIVIR}%`);
+    return res.json(estadoVivo(gp));
+  } catch (err) {
+    console.error('POST /api/pet/revive:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── POST /api/player/death ──────────────────────────────────────────────────
+// El personaje se ha quedado sin vida: pasa a fantasma. El servidor comprueba
+// que de verdad está a 0 antes de creérselo — así nadie se declara muerto para
+// forzar nada raro.
+app.post('/api/player/death', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (gp.isGhost) return res.json(estadoVivo(gp));
+
+    const stats = await PlayerStats.findOne({ playerName: gp.playerName }).exec();
+    const vida = stats ? Math.max(0, Number(stats.vida) || 0) : 0;
+    if (vida > 0) {
+      return res.status(409).json({ error: 'sigue_vivo', vida, ...estadoVivo(gp) });
+    }
+
+    normalizarVentanaMuertes(gp);
+    if (!gp.deathWindowAt) gp.deathWindowAt = new Date();
+    gp.deathCount = Math.max(0, Number(gp.deathCount) || 0) + 1;
+    gp.isGhost = true;
+    await gp.save();
+    console.log(`👻 ${gp.playerName} ha muerto (${gp.deathCount} en 24 h) — ` +
+                `revivir cuesta ${precioRevivir(gp.deathCount - 1)} de plata`);
+    return res.json(estadoVivo(gp));
+  } catch (err) {
+    console.error('POST /api/player/death:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── POST /api/player/revive ─────────────────────────────────────────────────
+// Paga en plata y vuelve a la vida. El precio lo pone el servidor.
+app.post('/api/player/revive', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (!gp.isGhost) return res.status(409).json({ error: 'no_estas_muerto', ...estadoVivo(gp) });
+
+    normalizarVentanaMuertes(gp);
+    // El precio es el de las muertes ANTERIORES a esta: la primera muerte del
+    // día cuesta 30, no 60.
+    const precio = precioRevivir(Math.max(0, (Number(gp.deathCount) || 1) - 1));
+
+    const stats = await PlayerStats.findOne({ playerName: gp.playerName }).exec();
+    if (!stats) return res.status(409).json({ error: 'sin_stats' });
+
+    const plata = Math.max(0, Math.round(Number(stats.plata) || 0));
+    if (plata < precio) {
+      return res.status(409).json({ error: 'plata_insuficiente', precio, plata, ...estadoVivo(gp) });
+    }
+
+    // Cobro: mismo camino que /api/stats/consume. Se baja en Mongo, que es la
+    // fuente autoritativa del saldo, y se apunta la deuda con la cadena; el
+    // liquidador agrupa y escribe la factura.
+    stats.plata = clampStat('plata', plata - precio);
+    stats.vida  = clampStat('vida', REVIVIR_VIDA);
+    marcarPendienteDeCadena(stats, ['plata', 'vida']);
+    await stats.save();
+
+    gp.isGhost = false;
+    await gp.save();
+
+    console.log(`💖 ${gp.playerName} revive por ${precio} de plata ` +
+                `(le quedan ${stats.plata}) — vida al ${REVIVIR_VIDA}%`);
+    return res.json({
+      ...estadoVivo(gp),
+      paid: precio,
+      stats: buildStatsResponse(stats)
+    });
+  } catch (err) {
+    console.error('POST /api/player/revive:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+
+// ── POST /api/crops/crow ────────────────────────────────────────────────────
+// EL CUERVO HAMBRIENTO SE METE EN UNA PARCELA.
+//
+// Lo que pasa lo decide el SERVIDOR, no el navegador:
+//
+//   · cultivo LISTO para cosechar  → se lo come. El cultivo pasa a `isDead`,
+//     que es el mismo estado en el que queda una cosecha que se pudre por
+//     abandono: al recogerla da la recompensa mala en vez de la buena. Se ha
+//     preferido eso a borrarla del todo porque perder la parcela entera por un
+//     pájaro es demasiado castigo, y el estado ya existía en el juego.
+//     (Para que la destruya del todo, aquí bastaría con un deleteOne.)
+//
+//   · cultivo TODAVÍA CRECIENDO   → no se lo puede comer, pero lo pisotea y lo
+//     RETRASA: se le alarga la duración del crecimiento. Con tope, para que
+//     picotazo tras picotazo no acabe tardando un día.
+//
+// HASTA DÓNDE LLEGA LA VALIDACIÓN: el cuervo es un sprite del cliente, así que
+// es él quien avisa de que ha picoteado. El servidor comprueba de quién es la
+// parcela, en qué estado está, cuánto retrasa y cada cuánto se admite. Lo que
+// no puede evitar es que un cliente modificado NO avise nunca — pero eso solo
+// le ahorra molestias a quien lo haga, no le da nada a cambio.
+const CUERVO_RETRASO_PCT   = 0.12;        // cuánto retrasa un picotazo
+const CUERVO_RETRASO_TOPE  = 1.60;        // nunca más del 60% sobre lo original
+const CUERVO_INTERVALO_MS  = 45 * 1000;   // uno por jugador y rato
+const _cuervoUltimo = new Map();
+
+app.post('/api/crops/crow', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+
+    const ahora = Date.now();
+    const ultimo = _cuervoUltimo.get(gp.playerName) || 0;
+    if (ahora - ultimo < CUERVO_INTERVALO_MS) {
+      return res.json({ ok: true, resultado: 'demasiado_pronto' });
+    }
+
+    const plotId = String((req.body && req.body.plotId) || '').slice(0, 60);
+    if (!plotId) return res.status(400).json({ error: 'falta_plotId' });
+
+    const crop = await UserCrop.findOne({
+      userId: gp.playerName, plotId, isHarvested: false, isDead: false
+    }).exec();
+    if (!crop) return res.json({ ok: true, resultado: 'nada_que_picar' });
+
+    _cuervoUltimo.set(gp.playerName, ahora);
+
+    if (crop.isCompleted) {
+      crop.isDead = true;
+      await crop.save();
+      console.log(`🐦 Un cuervo se comió la cosecha de ${gp.playerName} en ${plotId}`);
+      return res.json({ ok: true, resultado: 'comida', plotId });
+    }
+
+    const original = Number(crop.growthDurationOriginal) || Number(crop.growthDuration) || 0;
+    if (!crop.growthDurationOriginal) crop.growthDurationOriginal = original;
+    const tope  = Math.round(original * CUERVO_RETRASO_TOPE);
+    const nueva = Math.min(tope, Math.round(crop.growthDuration * (1 + CUERVO_RETRASO_PCT)));
+    const retrasado = nueva > crop.growthDuration;
+    crop.growthDuration = nueva;
+    await crop.save();
+    console.log(`🐦 Un cuervo pisoteó el cultivo de ${gp.playerName} en ${plotId}` +
+                (retrasado ? ` (crece en ${nueva} en vez de ${original})` : ' (ya al tope)'));
+    return res.json({
+      ok: true, resultado: retrasado ? 'retrasada' : 'ya_al_tope',
+      plotId, growthDuration: nueva
+    });
+  } catch (err) {
+    console.error('POST /api/crops/crow:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+
+// =============================================================================
+// EL ALQUIMISTA
+// -----------------------------------------------------------------------------
+// Vende pociones para la mascota y el elixir para revivirla.
+//
+// POR QUÉ TIENE SU PROPIO ENDPOINT Y NO PASA POR LA TIENDA: la tienda hace la
+// compra desde el CLIENTE, con su propia cola de transacciones on-chain
+// (Additemblockchains). Reaprovecharla desde fuera obligaría a meter mano en su
+// estado interno. Aquí la compra entera —cobrar la plata, acuñar el ítem y
+// meterlo en el inventario— se hace en el servidor con los mismos helpers que
+// usan las misiones, que ya están probados.
+// =============================================================================
+
+const ALQUIMISTA_CATALOGO = {
+  pocion_mascota:        { plata: 45,  cura: 40,  nombre: 'Pet Potion' },
+  pocion_mascota_grande: { plata: 110, cura: 100, nombre: 'Great Pet Potion' },
+  elixir_revivir:        { plata: 260, revive: true, nombre: 'Revival Elixir' }
+};
+const ALQUIMISTA_MAX_POR_COMPRA = 5;
+
+// ── GET /api/alchemist/catalog ──────────────────────────────────────────────
+app.get('/api/alchemist/catalog', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const stats = await PlayerStats.findOne({ playerName: gp.playerName }).lean();
+    const items = Object.keys(ALQUIMISTA_CATALOGO).map(function (id) {
+      const c = ALQUIMISTA_CATALOGO[id];
+      return {
+        id, name: c.nombre, price: c.plata,
+        heals: c.cura || 0, revives: !!c.revive,
+        owned: contarEnSlots(gp.inventory, id) + contarEnSlots(gp.chest, id)
+      };
+    });
+    return res.json({
+      ok: true, items,
+      silver: stats ? Math.max(0, Math.round(Number(stats.plata) || 0)) : 0,
+      pet: estadoVivo(gp).pet
+    });
+  } catch (err) {
+    console.error('GET /api/alchemist/catalog:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── POST /api/alchemist/buy ─────────────────────────────────────────────────
+// body: { itemId, qty }
+app.post('/api/alchemist/buy', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const itemId = String((req.body && req.body.itemId) || '');
+    const cfg = ALQUIMISTA_CATALOGO[itemId];
+    if (!cfg) return res.status(400).json({ error: 'item_desconocido' });
+
+    const qty = Math.max(1, Math.min(ALQUIMISTA_MAX_POR_COMPRA,
+                                     Math.floor(Number(req.body && req.body.qty) || 1)));
+
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+
+    const stats = await PlayerStats.findOne({ playerName: gp.playerName }).exec();
+    if (!stats) return res.status(409).json({ error: 'sin_stats' });
+
+    // EL PRECIO LO PONE EL SERVIDOR. El cliente solo dice qué y cuántos.
+    const coste = cfg.plata * qty;
+    const plata = Math.max(0, Math.round(Number(stats.plata) || 0));
+    if (plata < coste) {
+      return res.status(409).json({ error: 'plata_insuficiente', precio: coste, plata });
+    }
+
+    // 1) Acuñar el ítem. Si esto falla NO se cobra: primero se entrega.
+    const address = String(gp.address || '').toLowerCase();
+    let acunado = null;
+    const tipo = itemTipoOnChain(itemId);
+    if (address && tipo) {
+      try { acunado = await mintGatherReward(address, tipo, qty); }
+      catch (e) { console.error('❌ alquimista: acuñado falló:', e.message); }
+      if (!acunado) {
+        return res.status(502).json({ error: 'acunado_fallido', itemId });
+      }
+    }
+
+    // 2) Meterlo en el inventario guardado.
+    const puesto = agregarASlots(gp.inventory, itemId, qty, {
+      invoiceId: acunado ? acunado.id : null,
+      manualId:  acunado ? acunado.manualId : null
+    });
+    if (puesto.metidas <= 0) {
+      return res.status(409).json({ error: 'inventario_lleno', itemId });
+    }
+    gp.inventory = puesto.inventory;
+    gp.markModified('inventory');
+    await gp.save();
+
+    // 3) Cobrar, por el mismo camino que el resto del juego.
+    const entregadas = puesto.metidas;
+    const cobro = cfg.plata * entregadas;
+    stats.plata = clampStat('plata', plata - cobro);
+    marcarPendienteDeCadena(stats, ['plata']);
+    await stats.save();
+
+    console.log(`⚗️  ${gp.playerName} compró ${entregadas}x ${itemId} por ${cobro} de plata`);
+    return res.json({
+      ok: true, itemId, qty: entregadas, paid: cobro,
+      silver: stats.plata,
+      partial: entregadas < qty ? qty - entregadas : 0,
+      stats: buildStatsResponse(stats)
+    });
+  } catch (err) {
+    console.error('POST /api/alchemist/buy:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
 // Misiones diarias
 // FIX: ':date?' (parámetro opcional al final) usa una sintaxis que solo
 // entiende el path-to-regexp viejo que trae Express 4 (0.1.x). En Express 5
@@ -8963,6 +9520,13 @@ const ITEM_TIPO_MAP = {
   trigo_buena:     'trigo_buena',     trigo_corta:     'trigo_corta',     trigo_mala:     'trigo_mala',
   calabaza_buena:  'calabaza_buena',  calabaza_corta:  'calabaza_corta',  calabaza_mala:  'calabaza_mala',
   fresa_buena:     'fresa_buena',     fresa_corta:     'fresa_corta',     fresa_mala:     'fresa_mala',
+
+  // Alquimista: pociones para la mascota y elixir para revivirla. Al estar
+  // aqui, sus tablas on-chain se aprovisionan solas como las de cualquier
+  // otro item del juego.
+  pocion_mascota:        'pocion_mascota',
+  pocion_mascota_grande: 'pocion_mascota_grande',
+  elixir_revivir:        'elixir_revivir',
 };
 
 function itemTipoOnChain(itemId) {
@@ -8973,6 +9537,9 @@ function itemTipoOnChain(itemId) {
 // para repartir la recompensa entre casillas del inventario guardado.
 const ITEM_MAX_STACK = {
   Semillax: 50, Semillax1: 50, Semillax2: 50, Semillax3: 50, Semillax4: 50,
+
+  // Pociones del alquimista: se apilan poco, son consumibles caros.
+  pocion_mascota: 20, pocion_mascota_grande: 10, elixir_revivir: 5,
   Regaderax: 1, Tijerasx: 1,
   mineral_piedra: 20, mineral_cobre: 20, mineral_hierro: 20, carbon: 20,
   palo: 20, tablon_de_madera: 20,
@@ -13962,6 +14529,14 @@ function costesDeAccion(reason, seedType, units) {
     return salida;
   }
 
+  // MORDISCO DE UN ANIMAL.
+  // El coste lo pone el SERVIDOR, igual que el de talar o minar: el cliente
+  // solo dice "me ha mordido algo", nunca cuánto duele. Si el daño llegara en
+  // el cuerpo de la petición, bastaría con mandar 0 para ser invulnerable.
+  if (reason === 'animal_bite') {
+    return { vida: DANO_MORDISCO_ANIMAL };
+  }
+
   return null;   // acción no reconocida
 }
 
@@ -15639,9 +16214,13 @@ async function construirJugadorDeSocket(socket) {
   let playerName = await resolveBattlePlayerName(socket);
   if (!playerName) playerName = '---';
 
-  let nivel = 1, petName = 'Pet';
+  // petHealth NO estaba declarado y el select() tampoco lo traia: la asignacion
+  // creaba un global suelto y el valor siempre acababa siendo el 100 por
+  // defecto, con lo que la vida de la mascota nunca habria llegado a la batalla.
+  let nivel = 1, petName = 'Pet', petHealth = 100;
   try {
-    const gp = await GamePlayer.findOne({ playerName }).select('nivel nivel_exp petName').lean();
+    const gp = await GamePlayer.findOne({ playerName })
+      .select('nivel nivel_exp petName petHealth').lean();
     if (gp) {
       // ANTI-TRAMPA: el nivel de combate se DERIVA de la experiencia, que está
       // respaldada por el contrato, en vez de leer `gp.nivel` — que hasta ahora
@@ -15649,10 +16228,21 @@ async function construirJugadorDeSocket(socket) {
       // nivel 150. Ver nivelPorExperiencia().
       nivel = Math.max(1, nivelPorExperiencia(gp.nivel_exp));
       petName = gp.petName && gp.petName !== '---' ? gp.petName : 'Pet';
+      petHealth = gp.petHealth == null ? 100 : gp.petHealth;
     }
   } catch (e) { /* valores por defecto */ }
 
   const stats = battleStatsForLevel(nivel);
+
+  // LA MASCOTA ENTRA CON LA VIDA QUE LE QUEDE.
+  // `maxHp` sigue siendo el del nivel (la barra mide lo mismo), pero la vida
+  // con la que ARRANCA el combate es el porcentaje que tenga la mascota en el
+  // mundo. Si la mordió un cocodrilo y va al 40%, entra al 40%. Si está muerta
+  // (0) entra con 1: no se puede empezar un combate ya perdido de salida, pero
+  // se nota muchísimo.
+  const saludPet = Math.max(0, Math.min(100, Number(petHealth) || 0));
+  const hpEntrada = Math.max(1, Math.round(stats.maxHp * saludPet / 100));
+
   return {
     socket,
     isBot: false,
@@ -15660,8 +16250,9 @@ async function construirJugadorDeSocket(socket) {
     petName,
     address: socket.authenticatedAddress || '',
     level: nivel,
+    petHealthPct: saludPet,
     maxHp: stats.maxHp,
-    hp: stats.maxHp,
+    hp: hpEntrada,
     attack: stats.attack
   };
 }
