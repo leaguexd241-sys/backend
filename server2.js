@@ -9219,7 +9219,7 @@ app.post('/api/player/revive', apiLimiter, authMiddleware, csrfProtection, async
 // parcela, en qué estado está, cuánto retrasa y cada cuánto se admite. Lo que
 // no puede evitar es que un cliente modificado NO avise nunca — pero eso solo
 // le ahorra molestias a quien lo haga, no le da nada a cambio.
-const CUERVO_RETRASO_PCT   = 0.12;        // cuánto retrasa un picotazo
+const CUERVO_RETRASO_PCT   = 0.25;        // cuánto retrasa un picotazo
 const CUERVO_RETRASO_TOPE  = 1.60;        // nunca más del 60% sobre lo original
 const CUERVO_INTERVALO_MS  = 45 * 1000;   // uno por jugador y rato
 const _cuervoUltimo = new Map();
@@ -9238,18 +9238,28 @@ app.post('/api/crops/crow', apiLimiter, authMiddleware, csrfProtection, async (r
     const plotId = String((req.body && req.body.plotId) || '').slice(0, 60);
     if (!plotId) return res.status(400).json({ error: 'falta_plotId' });
 
+    /* Se incluyen también las MUERTAS: una planta seca en la parcela es
+       comida para un cuervo igual que una buena, y el jugador se quejó de que
+       esas no desaparecían. Solo se excluyen las ya recogidas, que ya no
+       existen sobre el terreno. */
     const crop = await UserCrop.findOne({
-      userId: gp.playerName, plotId, isHarvested: false, isDead: false
+      userId: gp.playerName, plotId, isHarvested: false
     }).exec();
     if (!crop) return res.json({ ok: true, resultado: 'nada_que_picar' });
 
     _cuervoUltimo.set(gp.playerName, ahora);
 
-    if (crop.isCompleted) {
-      crop.isDead = true;
-      await crop.save();
-      console.log(`🐦 Un cuervo se comió la cosecha de ${gp.playerName} en ${plotId}`);
-      return res.json({ ok: true, resultado: 'comida', plotId });
+    if (crop.isCompleted || crop.isDead) {
+      /* SE LA COME DE VERDAD: la parcela queda VACÍA.
+
+         Antes solo se marcaba `isDead`, y eso deja la planta ahí, seca pero
+         visible; el jugador veía al cuervo picotear y la cosecha seguía en su
+         sitio. Ahora se borra el cultivo y el cliente limpia la parcela con
+         resetPlot(), igual que al recoger. */
+      await UserCrop.deleteOne({ _id: crop._id });
+      console.log(`🐦 Un cuervo se comió el cultivo de ${gp.playerName} en ${plotId}` +
+                  (crop.isDead ? ' (estaba seco)' : ' (estaba listo)'));
+      return res.json({ ok: true, resultado: 'comida', plotId, vaciada: true });
     }
 
     const original = Number(crop.growthDurationOriginal) || Number(crop.growthDuration) || 0;
@@ -9381,6 +9391,222 @@ app.post('/api/alchemist/buy', apiLimiter, authMiddleware, csrfProtection, async
     });
   } catch (err) {
     console.error('POST /api/alchemist/buy:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+
+// =============================================================================
+// CLIMA DEL MUNDO: VIENTO Y LLUVIA
+// -----------------------------------------------------------------------------
+// El clima es del MUNDO, no de cada navegador: si lo decidiera el cliente, dos
+// jugadores en la misma plaza verían cosas distintas. Se decide aquí, se guarda,
+// y todos lo leen — igual que la hora (/api/world/time).
+//
+// Se configura desde climas.html, que exige cartera de administrador.
+// =============================================================================
+
+const climaSchema = new mongoose.Schema({
+  _id: { type: String, default: 'config' },
+
+  // ── Interruptores ──────────────────────────────────────────────────────
+  activo:     { type: Boolean, default: true },   // clima sí/no
+  modo:       { type: String, enum: ['auto', 'manual'], default: 'auto' },
+
+  // ── Lo que se ve AHORA (lo que manda en modo manual) ───────────────────
+  viento:     { type: Boolean, default: false },
+  vientoFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
+  lluvia:     { type: Boolean, default: false },
+  lluviaFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
+  truenos:    { type: Boolean, default: true },
+
+  // ── Reglas del modo automático (en minutos y en tanto por uno) ─────────
+  probViento:   { type: Number, default: 0.25, min: 0, max: 1 },
+  probLluvia:   { type: Number, default: 0.15, min: 0, max: 1 },
+  minutosSorteo:{ type: Number, default: 12, min: 1, max: 240 },
+  duracionMin:  { type: Number, default: 2,  min: 1, max: 120 },
+  duracionMax:  { type: Number, default: 6,  min: 1, max: 240 },
+
+  // ── Estado interno del sorteo ──────────────────────────────────────────
+  hasta:      { type: Date, default: null },   // cuándo acaba lo de ahora
+  proximo:    { type: Date, default: null },   // cuándo se vuelve a sortear
+  actualizadoPor: { type: String, default: null },
+  updatedAt:  { type: Date, default: Date.now }
+}, { versionKey: false });
+
+const Clima = mongoose.model('Clima', climaSchema);
+
+/** La configuración, creándola con los valores por defecto la primera vez. */
+async function climaDoc() {
+  let d = await Clima.findById('config').exec();
+  if (!d) d = await Clima.create({ _id: 'config' });
+  return d;
+}
+
+/**
+ * Hace avanzar el sorteo del modo automático si toca.
+ *
+ * Se llama desde la propia consulta en vez de con un temporizador: así no hay
+ * un trabajo periódico corriendo para nada cuando no hay nadie jugando, y el
+ * resultado es el mismo porque lo único que importa es qué se ve cuando
+ * alguien mira.
+ */
+async function climaAvanzar(d) {
+  if (!d.activo || d.modo !== 'auto') return d;
+  const ahora = Date.now();
+
+  // ¿Se acabó lo que había?
+  if (d.hasta && ahora >= new Date(d.hasta).getTime()) {
+    d.viento = false;
+    d.lluvia = false;
+    d.hasta = null;
+  }
+
+  if (!d.proximo || ahora >= new Date(d.proximo).getTime()) {
+    // Solo se sortea si no hay nada en curso: si no, un sorteo cortaría la
+    // tormenta a la mitad.
+    if (!d.hasta) {
+      const dur = (d.duracionMin +
+                   Math.random() * Math.max(0, d.duracionMax - d.duracionMin)) * 60000;
+      const r = Math.random();
+      if (r < d.probLluvia) {
+        d.lluvia = true;
+        d.viento = Math.random() < 0.6;      // casi siempre llueve con viento
+        d.hasta = new Date(ahora + dur);
+      } else if (r < d.probLluvia + d.probViento) {
+        d.viento = true;
+        d.lluvia = false;
+        d.hasta = new Date(ahora + dur);
+      }
+    }
+    d.proximo = new Date(ahora + d.minutosSorteo * 60000);
+    await d.save();
+  }
+  return d;
+}
+
+/** Lo que se le manda al juego. */
+function climaPublico(d) {
+  const encendido = !!d.activo;
+  return {
+    ok: true,
+    activo: encendido,
+    modo: d.modo,
+    viento: encendido && !!d.viento,
+    vientoFuerza: d.vientoFuerza,
+    lluvia: encendido && !!d.lluvia,
+    lluviaFuerza: d.lluviaFuerza,
+    truenos: encendido && !!d.truenos,
+    // Cuándo acaba y cuándo se vuelve a mirar, para que el cliente no pregunte
+    // más de lo necesario.
+    hasta: d.hasta ? new Date(d.hasta).toISOString() : null,
+    proximo: d.proximo ? new Date(d.proximo).toISOString() : null,
+    ahora: Date.now()
+  };
+}
+
+// ── GET /api/world/weather ──────────────────────────────────────────────────
+// Público como /api/world/time: lo pide el juego en cada escena.
+app.get('/api/world/weather', apiLimiter, async (req, res) => {
+  try {
+    const d = await climaAvanzar(await climaDoc());
+    return res.json(climaPublico(d));
+  } catch (err) {
+    console.error('GET /api/world/weather:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── GET /api/admin/weather ──────────────────────────────────────────────────
+// La configuración completa, solo para el panel.
+app.get('/api/admin/weather', adminAuth, async (req, res) => {
+  try {
+    const d = await climaAvanzar(await climaDoc());
+    const o = d.toObject();
+    delete o._id;
+    return res.json({ ok: true, config: o, publico: climaPublico(d) });
+  } catch (err) {
+    console.error('GET /api/admin/weather:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── POST /api/admin/weather ─────────────────────────────────────────────────
+// Guarda la configuración. Solo se aceptan los campos conocidos y dentro de
+// rango: lo que llegue de más se ignora.
+const CLIMA_BOOL = ['activo', 'viento', 'lluvia', 'truenos'];
+const CLIMA_NUM = {
+  vientoFuerza:  [0.2, 2],
+  lluviaFuerza:  [0.2, 2],
+  probViento:    [0, 1],
+  probLluvia:    [0, 1],
+  minutosSorteo: [1, 240],
+  duracionMin:   [1, 120],
+  duracionMax:   [1, 240]
+};
+
+app.post('/api/admin/weather', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  try {
+    const d = await climaDoc();
+    const b = req.body || {};
+
+    for (const k of CLIMA_BOOL) {
+      if (typeof b[k] === 'boolean') d[k] = b[k];
+    }
+    for (const [k, [min, max]] of Object.entries(CLIMA_NUM)) {
+      if (b[k] === undefined || b[k] === null) continue;
+      const n = Number(b[k]);
+      if (!Number.isFinite(n)) continue;
+      d[k] = Math.min(max, Math.max(min, n));
+    }
+    if (b.modo === 'auto' || b.modo === 'manual') d.modo = b.modo;
+
+    // duracionMax nunca por debajo de duracionMin: si no, el sorteo daría
+    // duraciones negativas y la tormenta acabaría antes de empezar.
+    if (d.duracionMax < d.duracionMin) d.duracionMax = d.duracionMin;
+
+    /* En MANUAL el administrador manda: se borra el reloj del sorteo para que
+       lo que ha puesto no se lo lleve por delante el automático dos minutos
+       después. */
+    if (d.modo === 'manual') { d.hasta = null; d.proximo = null; }
+
+    d.actualizadoPor = (req.user && req.user.address) || null;
+    d.updatedAt = new Date();
+    await d.save();
+
+    console.log(`🌦️  Clima actualizado por ${d.actualizadoPor}: ` +
+                `${d.activo ? d.modo : 'apagado'} · viento=${d.viento} lluvia=${d.lluvia}`);
+    const o = d.toObject(); delete o._id;
+    return res.json({ ok: true, config: o, publico: climaPublico(d) });
+  } catch (err) {
+    console.error('POST /api/admin/weather:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── POST /api/admin/weather/test ────────────────────────────────────────────
+// Lanza algo AHORA sin tocar la configuración: para probarlo desde el panel.
+app.post('/api/admin/weather/test', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  try {
+    const d = await climaDoc();
+    const que = String((req.body && req.body.que) || '').toLowerCase();
+    const minutos = Math.min(60, Math.max(1, Number(req.body && req.body.minutos) || 3));
+
+    d.activo = true;
+    if (que === 'viento')      { d.viento = true;  d.lluvia = false; }
+    else if (que === 'lluvia') { d.lluvia = true;  d.viento = false; }
+    else if (que === 'tormenta') { d.lluvia = true; d.viento = true; d.truenos = true; }
+    else if (que === 'despejado') { d.lluvia = false; d.viento = false; }
+    else return res.status(400).json({ error: 'que_invalido' });
+
+    d.hasta = que === 'despejado' ? null : new Date(Date.now() + minutos * 60000);
+    d.proximo = new Date(Date.now() + minutos * 60000);
+    d.actualizadoPor = (req.user && req.user.address) || null;
+    await d.save();
+    console.log(`🌦️  Prueba de clima: ${que} durante ${minutos} min`);
+    return res.json({ ok: true, publico: climaPublico(d) });
+  } catch (err) {
+    console.error('POST /api/admin/weather/test:', err);
     return res.status(500).json({ error: 'internal_server_error' });
   }
 });
@@ -14629,7 +14855,23 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
       return res.json({ ok: true, spent: {}, stats: buildStatsResponse(doc) });
     }
 
-    // 2. ¿Alcanza para TODO el coste? Es todo o nada: media tala no existe.
+    /* 2. ¿Alcanza para TODO el coste? Es todo o nada: media tala no existe.
+
+       EXCEPCIÓN: EL DAÑO. Un mordisco no es una acción que el jugador elija,
+       es algo que le pasa, así que se cobra lo que haya: si te quedan 5 de vida
+       y el zorro pega 6, te quedas en 0, no te salvas.
+
+       EL BUG QUE ESTO ARREGLA — "mi vida llega al 5% y no baja de ahí aunque me
+       sigan mordiendo": con la regla de todo o nada, en cuanto la vida bajaba
+       del coste del mordisco el servidor devolvía 409 y NO descontaba nada. Los
+       últimos puntos eran ininvulnerables y el personaje no podía morir jamás. */
+    const esDano = (reason === 'animal_bite');
+    if (esDano) {
+      for (const stat of Object.keys(costs)) {
+        costs[stat] = Math.min(costs[stat], clampStat(stat, doc[stat]));
+      }
+    }
+
     const faltan = [];
     for (const [stat, coste] of Object.entries(costs)) {
       if (clampStat(stat, doc[stat]) < coste) faltan.push(stat);
