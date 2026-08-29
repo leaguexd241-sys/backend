@@ -9143,6 +9143,14 @@ app.post('/api/player/death', apiLimiter, authMiddleware, csrfProtection, async 
     gp.deathCount = Math.max(0, Number(gp.deathCount) || 0) + 1;
     gp.isGhost = true;
     await gp.save();
+
+    // Se para el reloj de la vida: un muerto no se cura solo esperando.
+    if (stats && !stats.vidaCongelada) {
+      stats.vidaCongelada = true;
+      try { await stats.save(); } catch (e) {
+        console.warn('⚠️  no se pudo congelar la vida:', e.message);
+      }
+    }
     console.log(`👻 ${gp.playerName} ha muerto (${gp.deathCount} en 24 h) — ` +
                 `revivir cuesta ${precioRevivir(gp.deathCount - 1)} de plata`);
     return res.json(estadoVivo(gp));
@@ -9178,6 +9186,12 @@ app.post('/api/player/revive', apiLimiter, authMiddleware, csrfProtection, async
     // liquidador agrupa y escribe la factura.
     stats.plata = clampStat('plata', plata - precio);
     stats.vida  = clampStat('vida', REVIVIR_VIDA);
+    stats.vidaCongelada = false;          // vuelve a correr el reloj de la vida
+    /* Y se pone el reloj a cero AHORA: si no, los tics que pasaron mientras
+       estaba muerto se cobrarían de golpe en la primera lectura y el que acaba
+       de revivir con el 100 % no lo notaría, pero el que reviva con menos vería
+       un salto raro. */
+    stats.lastVitalRegen = new Date();
     marcarPendienteDeCadena(stats, ['plata', 'vida']);
     await stats.save();
 
@@ -9419,17 +9433,57 @@ const climaSchema = new mongoose.Schema({
   lluvia:     { type: Boolean, default: false },
   lluviaFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
   truenos:    { type: Boolean, default: true },
+  nieve:      { type: Boolean, default: false },
+  nieveFuerza:{ type: Number, default: 1, min: 0.2, max: 2 },
 
-  // ── Reglas del modo automático (en minutos y en tanto por uno) ─────────
+  /* ESTACIÓN DEL AÑO. Cambia el color de todo el mundo: el otoño lo pone
+     ámbar, el invierno azulado y frío. 'auto' la saca del mes real. */
+  estacion:   { type: String,
+                enum: ['auto', 'primavera', 'verano', 'otono', 'invierno'],
+                default: 'auto' },
+
+  /* ── Reglas del modo automático (en minutos y en tanto por uno) ─────────
+
+     LOS TOPES SE HAN SOLTADO. Estaban en 120 y 240 minutos y el panel no
+     dejaba escribir más: si el administrador quería una tormenta de 20 min o
+     de 8 horas, no podía. Ahora el tope es un día entero, que es lo máximo
+     que tiene sentido para algo que se programa a mano. */
   probViento:   { type: Number, default: 0.25, min: 0, max: 1 },
   probLluvia:   { type: Number, default: 0.15, min: 0, max: 1 },
-  minutosSorteo:{ type: Number, default: 12, min: 1, max: 240 },
-  duracionMin:  { type: Number, default: 2,  min: 1, max: 120 },
-  duracionMax:  { type: Number, default: 6,  min: 1, max: 240 },
+  probNieve:    { type: Number, default: 0.05, min: 0, max: 1 },
+  minutosSorteo:{ type: Number, default: 12, min: 1, max: 1440 },
+  duracionMin:  { type: Number, default: 2,  min: 1, max: 1440 },
+  duracionMax:  { type: Number, default: 6,  min: 1, max: 1440 },
+
+  /* ── COLA DE CLIMAS PROGRAMADOS ─────────────────────────────────────────
+
+     El administrador apunta "lluvia 20 min", luego "tormenta 5 min", luego
+     "despejado 30 min" y se van poniendo uno detrás de otro. Cuando acaba lo
+     que hay puesto, entra el primero de la cola.
+
+     La cola manda sobre el sorteo automático: mientras haya algo apuntado, el
+     azar no pinta nada. Es lo que se espera de una programación. */
+  cola: {
+    type: [new mongoose.Schema({
+      que:          { type: String, enum: ['viento', 'lluvia', 'tormenta',
+                                           'nieve', 'despejado'], required: true },
+      minutos:      { type: Number, required: true, min: 1, max: 1440 },
+      vientoFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
+      lluviaFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
+      nieveFuerza:  { type: Number, default: 1, min: 0.2, max: 2 },
+      truenos:      { type: Boolean, default: true },
+      creadoPor:    { type: String, default: null },
+      creadoEn:     { type: Date, default: Date.now }
+    }, { _id: true, versionKey: false })],
+    default: []
+  },
 
   // ── Estado interno del sorteo ──────────────────────────────────────────
   hasta:      { type: Date, default: null },   // cuándo acaba lo de ahora
   proximo:    { type: Date, default: null },   // cuándo se vuelve a sortear
+  // Qué se está viendo ahora mismo y de dónde salió, para el panel.
+  actual:     { type: String, default: null },
+  actualDeCola: { type: Boolean, default: false },
   actualizadoPor: { type: String, default: null },
   updatedAt:  { type: Date, default: Date.now }
 }, { versionKey: false });
@@ -9444,6 +9498,36 @@ async function climaDoc() {
 }
 
 /**
+ * Pone en el mundo lo que dice una entrada (de la cola o del botón de probar).
+ *
+ * Un solo sitio para traducir "qué" a los interruptores: antes esta traducción
+ * estaba copiada en la ruta de probar, y añadir la nieve habría obligado a
+ * tocarla en dos lados.
+ */
+function climaAplicarEntrada(d, e, ahora) {
+  // `== null` y no `||`: con `||`, pasar 0 (la epoca) caeria en Date.now()
+  // y el llamante no tendria forma de fijar el reloj. Solo lo notan las
+  // pruebas, pero es la clase de trampa que luego cuesta encontrar.
+  ahora = (ahora == null) ? Date.now() : ahora;
+  d.activo = true;
+  d.viento  = (e.que === 'viento' || e.que === 'tormenta');
+  d.lluvia  = (e.que === 'lluvia' || e.que === 'tormenta');
+  d.nieve   = (e.que === 'nieve');
+  if (e.que === 'despejado') { d.viento = false; d.lluvia = false; d.nieve = false; }
+  if (e.que === 'tormenta') d.truenos = true;
+  else if (typeof e.truenos === 'boolean') d.truenos = e.truenos;
+  if (Number.isFinite(Number(e.vientoFuerza))) d.vientoFuerza = Number(e.vientoFuerza);
+  if (Number.isFinite(Number(e.lluviaFuerza))) d.lluviaFuerza = Number(e.lluviaFuerza);
+  if (Number.isFinite(Number(e.nieveFuerza)))  d.nieveFuerza  = Number(e.nieveFuerza);
+
+  const dur = Math.max(1, Math.min(1440, Number(e.minutos) || 5)) * 60000;
+  d.hasta   = new Date(ahora + dur);
+  d.proximo = new Date(ahora + dur);
+  d.actual  = e.que;
+  return d;
+}
+
+/**
  * Hace avanzar el sorteo del modo automático si toca.
  *
  * Se llama desde la propia consulta en vez de con un temporizador: así no hay
@@ -9452,17 +9536,44 @@ async function climaDoc() {
  * alguien mira.
  */
 async function climaAvanzar(d) {
-  if (!d.activo || d.modo !== 'auto') return d;
+  if (!d.activo) return d;
   const ahora = Date.now();
   // Para avisar solo si de verdad cambia algo: si no, cada consulta soltaría
   // un evento a todos los jugadores para decirles lo mismo.
   const antes = climaHuella(d);
 
   // ¿Se acabó lo que había?
-  if (d.hasta && ahora >= new Date(d.hasta).getTime()) {
+  const seAcabo = d.hasta && ahora >= new Date(d.hasta).getTime();
+  if (seAcabo) {
     d.viento = false;
     d.lluvia = false;
+    d.nieve = false;
     d.hasta = null;
+    d.actual = null;
+    d.actualDeCola = false;
+  }
+
+  /* LA COLA VA PRIMERO.
+
+     Si hay algo apuntado y no hay nada en curso, entra el siguiente. Va antes
+     del sorteo a propósito: una programación hecha a mano no debe pisarla el
+     azar, y funciona igual en automático que en manual — el administrador que
+     programa una lista quiere que se cumpla, no que dependa del modo. */
+  if (!d.hasta && Array.isArray(d.cola) && d.cola.length) {
+    const e = d.cola.shift();
+    climaAplicarEntrada(d, e.toObject ? e.toObject() : e, ahora);
+    d.actualDeCola = true;
+    await d.save();
+    if (climaHuella(d) !== antes) climaEmitir(d);
+    return d;
+  }
+
+  if (d.modo !== 'auto') {
+    if (seAcabo) {
+      await d.save();
+      if (climaHuella(d) !== antes) climaEmitir(d);
+    }
+    return d;
   }
 
   if (!d.proximo || ahora >= new Date(d.proximo).getTime()) {
@@ -9476,10 +9587,17 @@ async function climaAvanzar(d) {
         d.lluvia = true;
         d.viento = Math.random() < 0.6;      // casi siempre llueve con viento
         d.hasta = new Date(ahora + dur);
+        d.actual = d.viento ? 'tormenta' : 'lluvia';
       } else if (r < d.probLluvia + d.probViento) {
         d.viento = true;
         d.lluvia = false;
         d.hasta = new Date(ahora + dur);
+        d.actual = 'viento';
+      } else if (r < d.probLluvia + d.probViento + (d.probNieve || 0)) {
+        d.nieve = true;
+        d.viento = Math.random() < 0.4;      // la nieve con poco viento
+        d.hasta = new Date(ahora + dur);
+        d.actual = 'nieve';
       }
     }
     d.proximo = new Date(ahora + d.minutosSorteo * 60000);
@@ -9487,6 +9605,21 @@ async function climaAvanzar(d) {
   }
   if (climaHuella(d) !== antes) climaEmitir(d);
   return d;
+}
+
+/**
+ * Qué estación es.
+ *
+ * En 'auto' sale del mes real del servidor, para que el mundo acompañe al año
+ * de verdad sin que nadie tenga que tocarlo. El administrador puede clavarla.
+ */
+function estacionDe(d) {
+  if (d.estacion && d.estacion !== 'auto') return d.estacion;
+  const m = new Date().getMonth();               // 0 = enero
+  if (m <= 1 || m === 11) return 'invierno';
+  if (m <= 4) return 'primavera';
+  if (m <= 7) return 'verano';
+  return 'otono';
 }
 
 /** Lo que se le manda al juego. */
@@ -9501,6 +9634,12 @@ function climaPublico(d) {
     lluvia: encendido && !!d.lluvia,
     lluviaFuerza: d.lluviaFuerza,
     truenos: encendido && !!d.truenos,
+    nieve: encendido && !!d.nieve,
+    nieveFuerza: d.nieveFuerza,
+    estacion: estacionDe(d),
+    // Cuántos climas quedan apuntados: el juego no necesita la lista, solo
+    // saber que hay programación por delante.
+    enCola: (d.cola || []).length,
     // Cuándo acaba y cuándo se vuelve a mirar, para que el cliente no pregunte
     // más de lo necesario.
     hasta: d.hasta ? new Date(d.hasta).toISOString() : null,
@@ -9524,7 +9663,12 @@ function climaPublico(d) {
  */
 function climaEmitir(d) {
   try {
-    if (io && io.emit) io.emit('worldWeather', climaPublico(d));
+    // typeof y no `io` a secas: en las pruebas este trozo se ejecuta aislado,
+    // sin socket, y `io` a pelo lanzaria ReferenceError y ensuciaria la salida
+    // con un aviso por cada llamada.
+    if (typeof io !== 'undefined' && io && io.emit) {
+      io.emit('worldWeather', climaPublico(d));
+    }
   } catch (err) {
     console.warn('🌦️  no se pudo avisar del clima:', err && err.message);
   }
@@ -9532,8 +9676,9 @@ function climaEmitir(d) {
 
 /** Lo que de verdad se ve, para saber si hace falta avisar. */
 function climaHuella(d) {
-  return [d.activo, d.modo, d.viento, d.lluvia, d.truenos,
-          d.vientoFuerza, d.lluviaFuerza].join('|');
+  return [d.activo, d.modo, d.viento, d.lluvia, d.truenos, d.nieve,
+          d.vientoFuerza, d.lluviaFuerza, d.nieveFuerza,
+          d.estacion, (d.cola || []).length].join('|');
 }
 
 // ── GET /api/world/weather ──────────────────────────────────────────────────
@@ -9553,6 +9698,7 @@ app.get('/api/world/weather', apiLimiter, async (req, res) => {
 app.get('/api/admin/weather', adminAuth, async (req, res) => {
   try {
     const d = await climaAvanzar(await climaDoc());
+    // (la cola viaja dentro de `config`, ver más abajo)
     const o = d.toObject();
     delete o._id;
     return res.json({ ok: true, config: o, publico: climaPublico(d) });
@@ -9565,16 +9711,21 @@ app.get('/api/admin/weather', adminAuth, async (req, res) => {
 // ── POST /api/admin/weather ─────────────────────────────────────────────────
 // Guarda la configuración. Solo se aceptan los campos conocidos y dentro de
 // rango: lo que llegue de más se ignora.
-const CLIMA_BOOL = ['activo', 'viento', 'lluvia', 'truenos'];
+const CLIMA_BOOL = ['activo', 'viento', 'lluvia', 'truenos', 'nieve'];
 const CLIMA_NUM = {
   vientoFuerza:  [0.2, 2],
   lluviaFuerza:  [0.2, 2],
+  nieveFuerza:   [0.2, 2],
   probViento:    [0, 1],
   probLluvia:    [0, 1],
-  minutosSorteo: [1, 240],
-  duracionMin:   [1, 120],
-  duracionMax:   [1, 240]
+  probNieve:     [0, 1],
+  // Hasta un día entero: el panel ya no recorta lo que se escribe.
+  minutosSorteo: [1, 1440],
+  duracionMin:   [1, 1440],
+  duracionMax:   [1, 1440]
 };
+const CLIMA_ESTACIONES = ['auto', 'primavera', 'verano', 'otono', 'invierno'];
+const CLIMA_QUE = ['viento', 'lluvia', 'tormenta', 'nieve', 'despejado'];
 
 app.post('/api/admin/weather', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
   try {
@@ -9591,6 +9742,7 @@ app.post('/api/admin/weather', adminAuth, strictLimiter, csrfProtection, async (
       d[k] = Math.min(max, Math.max(min, n));
     }
     if (b.modo === 'auto' || b.modo === 'manual') d.modo = b.modo;
+    if (CLIMA_ESTACIONES.indexOf(b.estacion) >= 0) d.estacion = b.estacion;
 
     // duracionMax nunca por debajo de duracionMin: si no, el sorteo daría
     // duraciones negativas y la tormenta acabaría antes de empezar.
@@ -9617,23 +9769,122 @@ app.post('/api/admin/weather', adminAuth, strictLimiter, csrfProtection, async (
   }
 });
 
+/* ════════════════════ COLA DE CLIMAS PROGRAMADOS ═══════════════════════════
+
+   El administrador apunta "lluvia 20 min", luego "tormenta 5 min", y se van
+   poniendo uno detrás de otro conforme acaba lo anterior. Ver climaAvanzar:
+   la cola manda sobre el sorteo automático.                                  */
+
+// ── POST /api/admin/weather/queue ───────────────────────────────────────────
+// body: { que, minutos, vientoFuerza?, lluviaFuerza?, nieveFuerza?, truenos?,
+//         alPrincipio? }
+app.post('/api/admin/weather/queue', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const que = String(b.que || '').toLowerCase();
+    if (CLIMA_QUE.indexOf(que) < 0) return res.status(400).json({ error: 'que_invalido' });
+
+    const minutos = Math.floor(Number(b.minutos));
+    if (!Number.isFinite(minutos) || minutos < 1 || minutos > 1440) {
+      return res.status(400).json({ error: 'minutos_invalidos', min: 1, max: 1440 });
+    }
+
+    const d = await climaDoc();
+    if (!Array.isArray(d.cola)) d.cola = [];
+    // Un tope sano: la cola es una lista de trabajo, no un almacén.
+    if (d.cola.length >= 40) return res.status(409).json({ error: 'cola_llena', max: 40 });
+
+    const nl = (v, def) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.min(2, Math.max(0.2, n)) : def;
+    };
+    const entrada = {
+      que, minutos,
+      vientoFuerza: nl(b.vientoFuerza, d.vientoFuerza),
+      lluviaFuerza: nl(b.lluviaFuerza, d.lluviaFuerza),
+      nieveFuerza:  nl(b.nieveFuerza,  d.nieveFuerza),
+      truenos: typeof b.truenos === 'boolean' ? b.truenos : !!d.truenos,
+      creadoPor: (req.user && req.user.address) || null,
+      creadoEn: new Date()
+    };
+    if (b.alPrincipio) d.cola.unshift(entrada); else d.cola.push(entrada);
+
+    d.actualizadoPor = (req.user && req.user.address) || null;
+    await d.save();
+    console.log(`🌦️  En cola: ${que} ${minutos} min (${d.cola.length} esperando)`);
+
+    /* Si no hay nada puesto ahora mismo, que entre YA en vez de esperar a que
+       alguien consulte: el administrador acaba de programarlo y quiere verlo. */
+    const tras = await climaAvanzar(d);
+    climaEmitir(tras);
+    return res.json({ ok: true, cola: tras.cola, publico: climaPublico(tras) });
+  } catch (err) {
+    console.error('POST /api/admin/weather/queue:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── DELETE /api/admin/weather/queue/:id ─────────────────────────────────────
+// Quita una entrada. Con id = 'all' se vacía la cola entera.
+app.delete('/api/admin/weather/queue/:id', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  try {
+    const id = String(req.params.id || '');
+    const d = await climaDoc();
+    if (!Array.isArray(d.cola)) d.cola = [];
+
+    if (id === 'all') {
+      d.cola = [];
+    } else {
+      const antes = d.cola.length;
+      d.cola = d.cola.filter(e => String(e._id) !== id);
+      if (d.cola.length === antes) return res.status(404).json({ error: 'no_esta_en_la_cola' });
+    }
+    d.actualizadoPor = (req.user && req.user.address) || null;
+    await d.save();
+    climaEmitir(d);
+    return res.json({ ok: true, cola: d.cola, publico: climaPublico(d) });
+  } catch (err) {
+    console.error('DELETE /api/admin/weather/queue:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ── POST /api/admin/weather/queue/next ──────────────────────────────────────
+// Corta lo que hay puesto y salta al siguiente de la cola.
+app.post('/api/admin/weather/queue/next', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  try {
+    const d = await climaDoc();
+    d.hasta = null;                       // se da por acabado lo de ahora
+    const tras = await climaAvanzar(d);
+    climaEmitir(tras);
+    return res.json({ ok: true, cola: tras.cola, publico: climaPublico(tras) });
+  } catch (err) {
+    console.error('POST /api/admin/weather/queue/next:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
 // ── POST /api/admin/weather/test ────────────────────────────────────────────
 // Lanza algo AHORA sin tocar la configuración: para probarlo desde el panel.
 app.post('/api/admin/weather/test', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
   try {
     const d = await climaDoc();
     const que = String((req.body && req.body.que) || '').toLowerCase();
-    const minutos = Math.min(60, Math.max(1, Number(req.body && req.body.minutos) || 3));
+    // Hasta un día entero. Antes el tope eran 60 minutos y el panel mandaba
+    // siempre 4: no había forma de pedir "lluvia durante 20 minutos".
+    const minutos = Math.min(1440, Math.max(1, Number(req.body && req.body.minutos) || 3));
+    if (CLIMA_QUE.indexOf(que) < 0) return res.status(400).json({ error: 'que_invalido' });
 
-    d.activo = true;
-    if (que === 'viento')      { d.viento = true;  d.lluvia = false; }
-    else if (que === 'lluvia') { d.lluvia = true;  d.viento = false; }
-    else if (que === 'tormenta') { d.lluvia = true; d.viento = true; d.truenos = true; }
-    else if (que === 'despejado') { d.lluvia = false; d.viento = false; }
-    else return res.status(400).json({ error: 'que_invalido' });
-
-    d.hasta = que === 'despejado' ? null : new Date(Date.now() + minutos * 60000);
-    d.proximo = new Date(Date.now() + minutos * 60000);
+    climaAplicarEntrada(d, {
+      que: que, minutos: minutos,
+      vientoFuerza: req.body && req.body.vientoFuerza,
+      lluviaFuerza: req.body && req.body.lluviaFuerza,
+      nieveFuerza:  req.body && req.body.nieveFuerza,
+      truenos:      req.body && req.body.truenos
+    });
+    d.actualDeCola = false;
+    // "Despejado" no tiene sentido que caduque a un rato y vuelva lo anterior.
+    if (que === 'despejado') { d.hasta = null; d.proximo = null; }
     d.actualizadoPor = (req.user && req.user.address) || null;
     await d.save();
     console.log(`🌦️  Prueba de clima: ${que} durante ${minutos} min`);
@@ -13026,6 +13277,18 @@ const playerStatsSchema = new mongoose.Schema({
   vida:       { type: Number, default: 100, min: 0 },
   agua:       { type: Number, default: 100, min: 0 },
   comida:     { type: Number, default: 100, min: 0 },
+
+  /* VIDA CONGELADA MIENTRAS ESTÁS MUERTO.
+
+     Quién manda sobre estar muerto es GamePlayer.isGhost, pero la regeneración
+     pasiva trabaja sobre ESTE documento y no lee aquél. Antes que hacer una
+     lectura cruzada en cada tic —que es el camino caliente, se llama en casi
+     todas las rutas— se apunta aquí la misma decisión en el único momento en
+     que puede cambiar: al morir y al revivir.
+
+     Sin esto la vida del fantasma trepaba sola desde 0 mientras esperaba a
+     pagar el revivir. */
+  vidaCongelada: { type: Boolean, default: false },
   oro:        { type: Number, default: 0,      min: 0 },
   plata:      { type: Number, default: 0,      min: 0 },
   // Experiencia del personaje (GamePlayer.nivel_exp). Se lleva al contrato con
@@ -13182,6 +13445,17 @@ function applyGhostVitalRegen(doc, now = new Date()) {
   const ganancia = Math.min(tics, VITAL_REGEN_MAX_TICKS) * VITAL_REGEN_PER_TICK;
   let changed = false;
   for (const stat of VITAL_STATS) {
+    /* MUERTO NO SE CURA SOLO.
+
+       EL FALLO QUE ARREGLA: la regeneración pasiva subía las TRES barras sin
+       mirar si el jugador estaba muerto, así que un fantasma veía cómo su vida
+       trepaba desde 0 mientras esperaba a pagar el revivir. Además el propio
+       vigilante de muerte podía dejar de verla en 0 y sacarlo del estado
+       fantasma sin haber pagado.
+
+       Agua y comida sí siguen subiendo: el hambre y la sed no se paran porque
+       te hayan mordido, y no dan nada gratis. */
+    if (stat === 'vida' && doc.vidaCongelada) continue;
     const actual = clampStat(stat, doc[stat]);
     const nuevo  = clampStat(stat, actual + ganancia);
     if (nuevo !== doc[stat]) { doc[stat] = nuevo; changed = true; }
