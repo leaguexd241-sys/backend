@@ -3683,21 +3683,34 @@ class WaterCollectionController {
 
   startDailyResetTimer() {
     setInterval(async () => {
-      const now = new Date();
-      const currentHour = now.getHours();
+      /* CON try/catch, y no es cosmetico.
+
+         Este callback es `async` y no lo capturaba nadie: si Mongo estaba
+         reconectando en el momento del tic --y pasa-- el `await` rechazaba,
+         nadie recogia el rechazo y, en Node 15 o superior, una promesa
+         rechazada sin capturar TERMINA EL PROCESO. O sea que un hipo de la base
+         de datos a las 00:00 tiraba el servidor entero con todos los jugadores
+         dentro. Ver tambien el guardian de `unhandledRejection` al final del
+         archivo. */
+      try {
+        const now = new Date();
+        const currentHour = now.getHours();
       
-      if (currentHour === 0) {
-        await WaterCollection.updateMany(
-          {},
-          {
-            collectionCount: 0,
-            totalCollectionsToday: 0,
-            isDailyLimitReached: false,
-            dailyResetTime: now,
-            collectionCycle: 0
-          }
-        );
-        console.log('🔄 Reset diario de recolección de agua ejecutado');
+        if (currentHour === 0) {
+          await WaterCollection.updateMany(
+            {},
+            {
+              collectionCount: 0,
+              totalCollectionsToday: 0,
+              isDailyLimitReached: false,
+              dailyResetTime: now,
+              collectionCycle: 0
+            }
+          );
+          console.log('🔄 Reset diario de recolección de agua ejecutado');
+        }
+      } catch (e) {
+        console.error('❌ Reset diario de recoleccion de agua:', e && e.message);
       }
     }, 3600000);
   }
@@ -4580,8 +4593,27 @@ const cropController = new CropController(io);
 
 // Variables globales para Socket.IO
 let players = {};
-let chatHistory = [];
+/* HISTORIAL DE CHAT POR SALA, NO UNO PARA TODO EL SERVIDOR.
+   ────────────────────────────────────────────────────────────────────────────
+   FALLO QUE ESTO ARREGLA (fuga entre canales): `chatHistory` era UN solo array
+   de 50 mensajes compartido por el servidor entero. Como las salas llevan el
+   canal en el nombre ('game#c3', 'tienda#c7'), un jugador del canal 3 que pedía
+   el historial recibía los mensajes de los diez canales y de las dos salas.
+   Además, con varios canales hablando a la vez, 50 mensajes globales se
+   consumían en segundos y el historial de tu propia sala desaparecía enseguida.
+
+   Ahora hay un anillo de 50 POR SALA. Se guardan en un Map, y las salas que se
+   quedan sin nadie se borran en la purga periódica para que el Map no crezca
+   sin techo con canales que ya nadie usa. */
+const chatHistory = new Map();          // sala -> array de mensajes
 const MAX_HISTORY = 50;
+
+/** El anillo de mensajes de una sala, creándolo si hace falta. */
+function historialDe(room) {
+  let h = chatHistory.get(room);
+  if (!h) { h = []; chatHistory.set(room, h); }
+  return h;
+}
 const rooms = {
   'game': {},
   'tienda': {}
@@ -5247,8 +5279,18 @@ io.on("connection", (socket) => {
   });
 
   socket.on("playerMove", (data) => {
-    const room = socket.playerData.room;
-    if (!room || !rooms[room] || !rooms[room][socket.id]) return;
+    const room = socket.playerData && socket.playerData.room;
+    /* Igual que en el chat: si el socket se movió pero el servidor no le conoce
+       sala, es que hay que rehacer el join. Con un freno para no soltar un
+       aviso por cada paquete de movimiento (llegan varios por segundo). */
+    if (!room || !rooms[room] || !rooms[room][socket.id]) {
+      const ahora = Date.now();
+      if (ahora - (socket._avisoRejoin || 0) > 3000) {
+        socket._avisoRejoin = ahora;
+        socket.emit('rejoinRequired', { motivo: 'sin_sala' });
+      }
+      return;
+    }
     
     rooms[room][socket.id] = {
       ...rooms[room][socket.id],
@@ -5294,8 +5336,24 @@ io.on("connection", (socket) => {
 
   socket.on('chatMessage', (payload) => {
     try {
-      const room = socket.playerData.room;
-      if (!room) return;
+      const room = socket.playerData && socket.playerData.room;
+      /* FUERA DE LA SALA = SE LE DICE, NO SE TIRA EL MENSAJE EN SILENCIO.
+
+         FALLO QUE ESTO ARREGLA — "intento hablar, dice que no encuentra el
+         servidor y ya no se recupera": tras una reconexión el socket es NUEVO y
+         el servidor no le conoce ninguna sala hasta que el cliente vuelve a
+         hacer joinRoom. Si el cliente no lo hacía (porque la escena estaba
+         pausada, o porque `window.activeScene` estaba a null en ese momento),
+         el socket se quedaba conectado pero MUDO: los mensajes se descartaban
+         aquí sin decir nada y los demás jugadores no se veían.
+
+         Ahora se le contesta `rejoinRequired`; el cliente rehace el join y
+         vuelve a la sala solo. */
+      if (!room) {
+        socket.emit('rejoinRequired', { motivo: 'sin_sala' });
+        socket.emit('chatError', { msg: 'Reconnecting to the room… try again in a second.' });
+        return;
+      }
       
       const now = Date.now();
       if (now - (socket.chatLastSent || 0) < 1000) {
@@ -5329,8 +5387,9 @@ io.on("connection", (socket) => {
         room: room
       };
 
-      chatHistory.push(message);
-      if (chatHistory.length > MAX_HISTORY) chatHistory.shift();
+      const historial = historialDe(room);
+      historial.push(message);
+      if (historial.length > MAX_HISTORY) historial.shift();
 
       io.to(room).emit('chatMessage', message);
     } catch (e) {
@@ -5340,7 +5399,12 @@ io.on("connection", (socket) => {
 
   socket.on('requestHistory', () => {
     try {
-      socket.emit('chatHistory', chatHistory.slice(-MAX_HISTORY));
+      /* El historial es el de SU sala. Si todavía no ha entrado en ninguna
+         —pasa justo después de una reconexión— se le dice que rehaga el join
+         en vez de mandarle una lista vacía sin explicación. */
+      const room = socket.playerData && socket.playerData.room;
+      if (!room) { socket.emit('rejoinRequired', { motivo: 'sin_sala' }); return; }
+      socket.emit('chatHistory', historialDe(room).slice(-MAX_HISTORY));
     } catch (e) {
       console.error('Error enviando chatHistory:', e);
     }
@@ -9490,12 +9554,36 @@ const climaSchema = new mongoose.Schema({
 
 const Clima = mongoose.model('Clima', climaSchema);
 
+/* EL DOCUMENTO DEL CLIMA SE GUARDA EN MEMORIA.
+
+   /api/world/weather lo consulta CADA JUGADOR cada 45 segundos, y antes cada
+   una de esas consultas era una lectura a Mongo de un documento que solo
+   escribe este proceso. Con doscientos jugadores eso son cuatro lecturas por
+   segundo para leer siempre lo mismo. Como nadie más toca esta colección, el
+   documento vivo en memoria ES la verdad, y guardarlo se sigue haciendo con
+   d.save() como siempre. */
+let _climaCache = null;
+let _climaCacheAt = 0;
+/* CON CADUCIDAD, no para siempre. Si algún día esto corre en más de un proceso
+   (cluster, dos instancias detrás de un balanceador), una caché eterna sería
+   PEOR que el problema que arregla: el proceso que no recibió la escritura del
+   panel se quedaría sirviendo el clima viejo indefinidamente — justo el fallo
+   que se está corrigiendo. Con 5 s se evitan el 99 % de las lecturas y ninguna
+   instancia puede ir desfasada más de ese rato. */
+const CLIMA_CACHE_MS = 5000;
+
 /** La configuración, creándola con los valores por defecto la primera vez. */
 async function climaDoc() {
+  if (_climaCache && (Date.now() - _climaCacheAt) < CLIMA_CACHE_MS) return _climaCache;
   let d = await Clima.findById('config').exec();
   if (!d) d = await Clima.create({ _id: 'config' });
+  _climaCache = d;
+  _climaCacheAt = Date.now();
   return d;
 }
+
+/** Número de versión del clima: sube con cada cambio de verdad. */
+let climaRev = 1;
 
 /**
  * Pone en el mundo lo que dice una entrada (de la cola o del botón de probar).
@@ -9538,6 +9626,8 @@ function climaAplicarEntrada(d, e, ahora) {
 async function climaAvanzar(d) {
   if (!d.activo) return d;
   const ahora = Date.now();
+  // Si algo cambia hay que GUARDARLO, no solo anunciarlo. Ver más abajo.
+  let sucio = false;
   // Para avisar solo si de verdad cambia algo: si no, cada consulta soltaría
   // un evento a todos los jugadores para decirles lo mismo.
   const antes = climaHuella(d);
@@ -9551,6 +9641,7 @@ async function climaAvanzar(d) {
     d.hasta = null;
     d.actual = null;
     d.actualDeCola = false;
+    sucio = true;
   }
 
   /* LA COLA VA PRIMERO.
@@ -9564,19 +9655,20 @@ async function climaAvanzar(d) {
     climaAplicarEntrada(d, e.toObject ? e.toObject() : e, ahora);
     d.actualDeCola = true;
     await d.save();
-    if (climaHuella(d) !== antes) climaEmitir(d);
+    if (climaHuella(d) !== antes) { climaRev++; climaEmitir(d); }
     return d;
   }
 
   if (d.modo !== 'auto') {
     if (seAcabo) {
       await d.save();
-      if (climaHuella(d) !== antes) climaEmitir(d);
+      if (climaHuella(d) !== antes) { climaRev++; climaEmitir(d); }
     }
     return d;
   }
 
   if (!d.proximo || ahora >= new Date(d.proximo).getTime()) {
+    sucio = true;
     // Solo se sortea si no hay nada en curso: si no, un sorteo cortaría la
     // tormenta a la mitad.
     if (!d.hasta) {
@@ -9601,9 +9693,18 @@ async function climaAvanzar(d) {
       }
     }
     d.proximo = new Date(ahora + d.minutosSorteo * 60000);
-    await d.save();
   }
-  if (climaHuella(d) !== antes) climaEmitir(d);
+  /* SE GUARDA SI HA CAMBIADO ALGO, PASE POR DONDE PASE.
+
+     FALLO QUE ESTO ARREGLA (tormenta de avisos + base de datos que no avanza):
+     el `d.save()` estaba DENTRO del `if` del sorteo. Si lo que había puesto se
+     acababa pero todavía no tocaba sortear, se limpiaba el documento EN
+     MEMORIA, se avisaba a todos los jugadores… y no se guardaba. En la
+     siguiente consulta el documento se leía otra vez de Mongo con el `hasta`
+     viejo ya vencido, se volvía a limpiar y se volvía a avisar a todo el mundo.
+     Un aviso a todos los jugadores POR CADA CONSULTA, para siempre. */
+  if (sucio) await d.save();
+  if (climaHuella(d) !== antes) { climaRev++; climaEmitir(d); }
   return d;
 }
 
@@ -9644,6 +9745,11 @@ function climaPublico(d) {
     // más de lo necesario.
     hasta: d.hasta ? new Date(d.hasta).toISOString() : null,
     proximo: d.proximo ? new Date(d.proximo).toISOString() : null,
+    /* NÚMERO DE VERSIÓN. Sirve para una cosa muy concreta: distinguir "el
+       servidor dice que no hace nada" de "me están sirviendo una respuesta
+       vieja". Si el panel guarda un cambio y el juego sigue viendo el mismo
+       `rev`, lo que hay en medio es una caché, no un fallo del clima. */
+    rev: climaRev,
     ahora: Date.now()
   };
 }
@@ -9685,6 +9791,18 @@ function climaHuella(d) {
 // Público como /api/world/time: lo pide el juego en cada escena.
 app.get('/api/world/weather', apiLimiter, async (req, res) => {
   try {
+    /* NADIE PUEDE GUARDARSE ESTA RESPUESTA.
+
+       FALLO QUE ESTO ARREGLA — "guardo un clima manual en climas.html, la
+       página dice que se aplicó y en el juego no pasa nada": esta ruta
+       respondía un 200 normal y corriente, sin cabeceras de caché. Cualquier
+       intermediario (Cloudflare delante de api.grasslandforest.com, un proxy,
+       el propio navegador) puede guardarse una respuesta así y seguir
+       sirviéndola durante minutos. El cliente ya pedía `cache: 'no-store'`,
+       pero eso solo manda sobre SU caché, no sobre la del intermediario: quien
+       tiene que decirlo es el servidor. `/api/world/time` ya lo hacía. */
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.set('Pragma', 'no-cache');
     const d = await climaAvanzar(await climaDoc());
     return res.json(climaPublico(d));
   } catch (err) {
@@ -9756,6 +9874,7 @@ app.post('/api/admin/weather', adminAuth, strictLimiter, csrfProtection, async (
     d.actualizadoPor = (req.user && req.user.address) || null;
     d.updatedAt = new Date();
     await d.save();
+    climaRev++;
 
     console.log(`🌦️  Clima actualizado por ${d.actualizadoPor}: ` +
                 `${d.activo ? d.modo : 'apagado'} · viento=${d.viento} lluvia=${d.lluvia}`);
@@ -9887,6 +10006,7 @@ app.post('/api/admin/weather/test', adminAuth, strictLimiter, csrfProtection, as
     if (que === 'despejado') { d.hasta = null; d.proximo = null; }
     d.actualizadoPor = (req.user && req.user.address) || null;
     await d.save();
+    climaRev++;
     console.log(`🌦️  Prueba de clima: ${que} durante ${minutos} min`);
     climaEmitir(d);
     return res.json({ ok: true, publico: climaPublico(d) });
@@ -15805,6 +15925,19 @@ function purgarMapasEnMemoria() {
   // ── Enfriamientos (valor = marca de tiempo) ───────────────────────────────
   stats._gatherLastByPlayer = purgarMapaDeTiempos(_gatherLastByPlayer, ahora, PURGA_EDAD_MS);
   stats._verifierCooldown   = purgarMapaDeTiempos(_verifierCooldown,   ahora, PURGA_EDAD_MS);
+  // Se quedó fuera del barrido original y crece igual que los otros: una
+  // entrada por jugador que espante un cuervo, para siempre.
+  stats._cuervoUltimo       = purgarMapaDeTiempos(_cuervoUltimo,       ahora, PURGA_EDAD_MS);
+
+  // ── Historial de chat de salas que ya no tiene nadie ──────────────────────
+  // El historial es por sala y las salas llevan canal; una partida larga puede
+  // dejar historiales de canales por los que ya no pasa nadie.
+  n = 0;
+  for (const [sala] of chatHistory) {
+    const viva = rooms[sala] && Object.keys(rooms[sala]).length > 0;
+    if (!viva) { chatHistory.delete(sala); n++; }
+  }
+  stats.chatHistory = n;
 
   // ── Caché de administradores ({ value, at }) ──────────────────────────────
   // Caduca a los ACCESS_CACHE_MS (30 s); pasado un minuto ya no sirve a nadie.
@@ -17132,6 +17265,61 @@ server.listen(PORT, HOST, () => {
 });
 
 // --- GRACEFUL SHUTDOWN ---
+/* ════════════════════════════════════════════════════════════════════════════
+   QUE UN FALLO SUELTO NO TIRE EL SERVIDOR ENTERO
+   ────────────────────────────────────────────────────────────────────────────
+   FALLO QUE ESTO ARREGLA (y explica desconexiones "sin motivo"):
+
+   No había ningún manejador de `unhandledRejection`. Desde Node 15 el
+   comportamiento por defecto ante una promesa rechazada que nadie captura es
+   MATAR EL PROCESO. Y este archivo está lleno de trabajo asíncrono de fondo
+   —tareas periódicas, llamadas a la cadena, escrituras a Mongo— donde un fallo
+   pasajero (la base de datos reconectando, el RPC devolviendo un 502) es normal
+   y esperable. Cualquiera de ellos, en el sitio equivocado, tumbaba el servidor
+   con todos los jugadores dentro: se les caía el chat, dejaban de verse entre
+   ellos, y al volver el proceso el socket reconectaba pero fuera de la sala.
+
+   El criterio es el estándar para un servidor de larga vida:
+
+     · `unhandledRejection` → se APUNTA y se sigue. Un fallo de red asíncrono no
+       deja el proceso en mal estado; tirarlo hace mucho más daño que el fallo.
+     · `uncaughtException` → se apunta y se cierra ORDENADAMENTE. Ahí sí puede
+       haber quedado estado a medias, así que lo correcto es salir y dejar que
+       el supervisor levante un proceso limpio — pero cerrando antes el socket y
+       Mongo, para que los clientes se enteren y reconecten.
+   ═══════════════════════════════════════════════════════════════════════════ */
+let _cerrando = false;
+
+function cerrarOrdenadamente(motivo, codigo) {
+  if (_cerrando) return;
+  _cerrando = true;
+  console.log(`🛑 Cerrando servidor (${motivo})...`);
+  // Un tope: si algo se queda colgado, no se puede dejar el proceso zombi.
+  const rendicion = setTimeout(() => process.exit(codigo), 8000);
+  if (typeof rendicion.unref === 'function') rendicion.unref();
+  try { if (typeof io !== 'undefined' && io) io.close(); } catch (e) {}
+  server.close(async () => {
+    try {
+      await mongoose.connection.close(false);
+      console.log('✅ Conexión MongoDB cerrada');
+    } catch (e) {
+      console.error('❌ Error cerrando MongoDB:', e && e.message);
+      codigo = codigo || 1;
+    }
+    process.exit(codigo);
+  });
+}
+
+process.on('unhandledRejection', (razon) => {
+  console.error('⚠️  Promesa rechazada sin capturar — el servidor SIGUE en pie:',
+                (razon && razon.stack) || razon);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('💥 Excepción sin capturar:', (err && err.stack) || err);
+  cerrarOrdenadamente('uncaughtException', 1);
+});
+
 process.on('SIGTERM', () => {
   console.log('🛑 Recibido SIGTERM, cerrando servidor...');
   server.close(async () => {
