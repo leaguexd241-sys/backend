@@ -9500,6 +9500,14 @@ const climaSchema = new mongoose.Schema({
   nieve:      { type: Boolean, default: false },
   nieveFuerza:{ type: Number, default: 1, min: 0.2, max: 2 },
 
+  /* SOLEADO. Entran rayos de sol por la esquina de arriba a la izquierda —de
+     donde viene la luz en todo el arte del juego, y de donde caen las sombras.
+     No es "lo contrario de llover": despejado es que no pasa nada, y esto es
+     que hace un día bueno y se nota. Por eso es su propio interruptor y no un
+     hueco entre los demás. */
+  soleado:    { type: Boolean, default: false },
+  soleadoFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
+
   /* ESTACIÓN DEL AÑO. Cambia el color de todo el mundo: el otoño lo pone
      ámbar, el invierno azulado y frío. 'auto' la saca del mes real. */
   estacion:   { type: String,
@@ -9530,11 +9538,13 @@ const climaSchema = new mongoose.Schema({
   cola: {
     type: [new mongoose.Schema({
       que:          { type: String, enum: ['viento', 'lluvia', 'tormenta',
-                                           'nieve', 'despejado'], required: true },
+                                           'nieve', 'soleado', 'despejado'],
+                      required: true },
       minutos:      { type: Number, required: true, min: 1, max: 1440 },
       vientoFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
       lluviaFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
       nieveFuerza:  { type: Number, default: 1, min: 0.2, max: 2 },
+      soleadoFuerza:{ type: Number, default: 1, min: 0.2, max: 2 },
       truenos:      { type: Boolean, default: true },
       creadoPor:    { type: String, default: null },
       creadoEn:     { type: Date, default: Date.now }
@@ -9601,7 +9611,12 @@ function climaAplicarEntrada(d, e, ahora) {
   d.viento  = (e.que === 'viento' || e.que === 'tormenta');
   d.lluvia  = (e.que === 'lluvia' || e.que === 'tormenta');
   d.nieve   = (e.que === 'nieve');
+  /* El sol y el agua no conviven: si entra sol, se va todo lo demás. Un día
+     soleado con lluvia cayendo se lee como un fallo, no como un chubasco. */
+  d.soleado = (e.que === 'soleado');
+  if (d.soleado) { d.viento = false; d.lluvia = false; d.nieve = false; }
   if (e.que === 'despejado') { d.viento = false; d.lluvia = false; d.nieve = false; }
+  if (Number.isFinite(Number(e.soleadoFuerza))) d.soleadoFuerza = Number(e.soleadoFuerza);
   if (e.que === 'tormenta') d.truenos = true;
   else if (typeof e.truenos === 'boolean') d.truenos = e.truenos;
   if (Number.isFinite(Number(e.vientoFuerza))) d.vientoFuerza = Number(e.vientoFuerza);
@@ -9638,6 +9653,7 @@ async function climaAvanzar(d) {
     d.viento = false;
     d.lluvia = false;
     d.nieve = false;
+    d.soleado = false;
     d.hasta = null;
     d.actual = null;
     d.actualDeCola = false;
@@ -9737,6 +9753,8 @@ function climaPublico(d) {
     truenos: encendido && !!d.truenos,
     nieve: encendido && !!d.nieve,
     nieveFuerza: d.nieveFuerza,
+    soleado: encendido && !!d.soleado,
+    soleadoFuerza: d.soleadoFuerza,
     estacion: estacionDe(d),
     // Cuántos climas quedan apuntados: el juego no necesita la lista, solo
     // saber que hay programación por delante.
@@ -9782,8 +9800,8 @@ function climaEmitir(d) {
 
 /** Lo que de verdad se ve, para saber si hace falta avisar. */
 function climaHuella(d) {
-  return [d.activo, d.modo, d.viento, d.lluvia, d.truenos, d.nieve,
-          d.vientoFuerza, d.lluviaFuerza, d.nieveFuerza,
+  return [d.activo, d.modo, d.viento, d.lluvia, d.truenos, d.nieve, d.soleado,
+          d.vientoFuerza, d.lluviaFuerza, d.nieveFuerza, d.soleadoFuerza,
           d.estacion, (d.cola || []).length].join('|');
 }
 
@@ -9829,11 +9847,12 @@ app.get('/api/admin/weather', adminAuth, async (req, res) => {
 // ── POST /api/admin/weather ─────────────────────────────────────────────────
 // Guarda la configuración. Solo se aceptan los campos conocidos y dentro de
 // rango: lo que llegue de más se ignora.
-const CLIMA_BOOL = ['activo', 'viento', 'lluvia', 'truenos', 'nieve'];
+const CLIMA_BOOL = ['activo', 'viento', 'lluvia', 'truenos', 'nieve', 'soleado'];
 const CLIMA_NUM = {
   vientoFuerza:  [0.2, 2],
   lluviaFuerza:  [0.2, 2],
   nieveFuerza:   [0.2, 2],
+  soleadoFuerza: [0.2, 2],
   probViento:    [0, 1],
   probLluvia:    [0, 1],
   probNieve:     [0, 1],
@@ -9843,7 +9862,7 @@ const CLIMA_NUM = {
   duracionMax:   [1, 1440]
 };
 const CLIMA_ESTACIONES = ['auto', 'primavera', 'verano', 'otono', 'invierno'];
-const CLIMA_QUE = ['viento', 'lluvia', 'tormenta', 'nieve', 'despejado'];
+const CLIMA_QUE = ['viento', 'lluvia', 'tormenta', 'nieve', 'soleado', 'despejado'];
 
 app.post('/api/admin/weather', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
   try {
@@ -9922,6 +9941,7 @@ app.post('/api/admin/weather/queue', adminAuth, strictLimiter, csrfProtection, a
       vientoFuerza: nl(b.vientoFuerza, d.vientoFuerza),
       lluviaFuerza: nl(b.lluviaFuerza, d.lluviaFuerza),
       nieveFuerza:  nl(b.nieveFuerza,  d.nieveFuerza),
+      soleadoFuerza: nl(b.soleadoFuerza, d.soleadoFuerza),
       truenos: typeof b.truenos === 'boolean' ? b.truenos : !!d.truenos,
       creadoPor: (req.user && req.user.address) || null,
       creadoEn: new Date()
@@ -9999,6 +10019,7 @@ app.post('/api/admin/weather/test', adminAuth, strictLimiter, csrfProtection, as
       vientoFuerza: req.body && req.body.vientoFuerza,
       lluviaFuerza: req.body && req.body.lluviaFuerza,
       nieveFuerza:  req.body && req.body.nieveFuerza,
+      soleadoFuerza: req.body && req.body.soleadoFuerza,
       truenos:      req.body && req.body.truenos
     });
     d.actualDeCola = false;
