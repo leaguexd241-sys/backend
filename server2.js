@@ -10329,24 +10329,51 @@ function agregarASlots(inventory, itemId, cantidad, { invoiceId = null, manualId
     restante  -= meter;
   }
 
-  // 2) Abrir stacks nuevos en los números de casilla que estén libres.
-  const ocupadas = new Set(lista.filter(s => s && s.objeto).map(s => Number(s.id)));
+  /* 2) Abrir stacks nuevos en los números de casilla que estén libres.
+
+     QUÉ CUENTA COMO OCUPADA — Y EL FALLO QUE ARREGLA.
+
+     "Mi inventario tiene como 3 espacios, ¿por qué dice que la bolsa está
+     llena?". Una casilla se daba por ocupada con solo tener `objeto` puesto,
+     sin mirar la CANTIDAD. Una entrada con `objeto` y `cantidad: 0` es una
+     casilla vacía: el juego la pinta vacía y el jugador ve hueco, pero aquí
+     bloqueaba el número de casilla y la recompensa se perdía con un
+     'inventory_full' que no era verdad.
+
+     Esas entradas basura salen de cualquier camino que deje el contador a cero
+     sin borrar la entrada — y el cliente también escribe el inventario, así que
+     no basta con arreglar quien lo vacía aquí.
+
+     Ahora: ocupada = tiene objeto Y cantidad > 0. Y al abrir un stack nuevo, si
+     ya existe una entrada basura con ese número, se REESCRIBE en vez de añadir
+     otra; si no, se acumularían dos entradas con el mismo id y el juego pintaría
+     una casilla encima de la otra. */
+  const util = (x) => !!(x && x.objeto && (parseInt(x.cantidad, 10) || 0) > 0);
+  const ocupadas = new Set(lista.filter(util).map(x => Number(x.id)));
+
   for (let i = 0; i < INV_SLOTS && restante > 0; i++) {
     if (ocupadas.has(i)) continue;
     const meter = Math.min(maxStack, restante);
-    lista.push({
+    const nueva = {
       id: i,
       IDX: invoiceId,
       Manualid: manualId,
       objeto: itemId,
       cantidad: meter,
       tipo: 'inventario'
-    });
+    };
+    const basura = lista.findIndex(x => x && Number(x.id) === i && !util(x));
+    if (basura >= 0) lista[basura] = nueva; else lista.push(nueva);
     ocupadas.add(i);
     restante -= meter;
   }
 
-  return { metidas: cantidad - restante, inventory: lista };
+  /* Y de paso se barre lo que quede vacío: mantenerlo no sirve para nada y es
+     lo que ha ido llenando la bolsa de fantasmas. Las entradas SIN `objeto` se
+     respetan, que son las casillas normales que el cliente guarda vacías. */
+  const limpia = lista.filter(x => !x || !x.objeto || util(x));
+
+  return { metidas: cantidad - restante, inventory: limpia };
 }
 
 app.post('/api/missions/daily/complete',
