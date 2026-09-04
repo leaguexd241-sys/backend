@@ -2697,11 +2697,31 @@ class RelayManager {
       }
     }
 
-    // Leer la factura on-chain (getInvoice revierte si no existe → se captura).
+    /* Leer la factura on-chain (getInvoice revierte si no existe → se captura).
+     *
+     * PERO NO TODO LO QUE FALLA AQUÍ ES "no existe". Este catch se tragaba
+     * TAMBIÉN las caídas del nodo, y ese era un fallo caro:
+     *
+     *   El nodo de LitVM se cae y vuelve cada pocos minutos (está documentado
+     *   arriba, en esErrorTransitorioRPC). Cuando se caía justo en esta
+     *   lectura, el error de red se convertía aquí en un
+     *   "ownership_check_failed: invoice N not found on-chain" — un mensaje que
+     *   ya NO parece transitorio. Y como conReintentoRPC() solo reintenta lo
+     *   que parece transitorio, dejaba de reintentar: la comprobación
+     *   anti-trampa se saldaba con "esa factura no existe" y la acción del
+     *   jugador se perdía. En el juego eso se veía como "❌ Error borrando
+     *   invoice 1764" al craftear o al llenar el balde en la fuente, con la
+     *   factura perfectamente viva en la cadena.
+     *
+     * Se distingue: si el nodo no contestó, se relanza el error ORIGINAL para
+     * que el reintento lo reconozca y vuelva a intentarlo. Solo cuando la
+     * lectura llegó de verdad al contrato y este revirtió se puede afirmar que
+     * la factura no está. */
     let inv;
     try {
       inv = await contract.getInvoice(invoiceId);
     } catch (e) {
+      if (RelayManager.esErrorTransitorioRPC(e)) throw e;
       throw new Error(`ownership_check_failed: invoice ${invoiceId} not found on-chain`);
     }
     if (!inv || !inv.active) {
