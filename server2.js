@@ -16106,6 +16106,11 @@ function battlePublicPlayer(p) {
     hp: p.hp,
     maxHp: p.maxHp,
     isBot: !!p.isBot,
+    /* QUÉ BICHO ES. Lo usa el cliente para dibujarlo (ver ESPECIES en
+       BattleScene.js). Las mascotas de los jugadores son siempre perros; los
+       bots, cada uno lo suyo. Sin esto, en pantalla salían dos perros
+       idénticos y no se distinguía cuál era el tuyo. */
+    species: p.species || 'perro',
     // Estados activos (veneno, escudo de espinas, aturdido…), para que la UI
     // los muestre siempre junto a la barra de vida.
     status: estadosPublicos(p)
@@ -16117,15 +16122,76 @@ function battlePublicPlayer(p) {
 // ---------------------------------------------------------------------------
 // ronda va de 1 a 5 y cada una es más dura que la anterior: sube de nivel,
 // vida, ataque y también la "inteligencia" con la que elige su jugada.
-const BATTLE_BOT_NAMES = ['Rooty', 'Thorn', 'Boulder', 'Blaze', 'Warden'];
+/* ═══════════════════════════════════════════════════════════════════════
+   LOS CINCO RIVALES DEL DÍA
+   ───────────────────────────────────────────────────────────────────────
+   Antes los cinco eran EL MISMO PERRO con otro nombre. El jugador lo dijo
+   tal cual: "enemigos bots, haz que no solo sean los perros". Ahora cada
+   ronda es un bicho distinto, y el bicho lo dibuja el cliente con los
+   sprites de animales que el juego ya tiene en el mapa (ver ESPECIES en
+   BattleScene.js) — no hace falta ni un archivo nuevo.
 
-function crearBotDeRonda(ronda, nivelJugador) {
+   El orden va de menos a más amenazante, que es lo que se espera de cinco
+   rondas: conejo, jabalí, cuervo, zorro y cocodrilo de jefe.
+   ═══════════════════════════════════════════════════════════════════════ */
+const BATTLE_BOTS = [
+  { species: 'conejo',    petName: 'Nibbles', playerName: 'Wild Rabbit' },
+  { species: 'cerdo',     petName: 'Tusk',    playerName: 'Wild Boar' },
+  { species: 'cuervo',    petName: 'Shade',   playerName: 'Old Crow' },
+  { species: 'zorro',     petName: 'Rusty',   playerName: 'Red Fox' },
+  { species: 'cocodrilo', petName: 'Gnash',   playerName: 'Swamp Croc' }
+];
+/* Rivales sueltos para el PvP contra bot fuera de las diarias, y por si algún
+   día hay más de cinco rondas. */
+const BATTLE_BOTS_EXTRA = [
+  { species: 'vibora', petName: 'Fang',   playerName: 'Viper' },
+  { species: 'topo',   petName: 'Digger', playerName: 'Mole' },
+  { species: 'zorra',  petName: 'Ember',  playerName: 'Vixen' },
+  { species: 'vaca',   petName: 'Bruno',  playerName: 'Angry Bull' }
+];
+// Se deja el nombre viejo por si algo externo lo mira.
+const BATTLE_BOT_NAMES = BATTLE_BOTS.map(b => b.petName);
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CUÁNTO SUBE EL RIVAL EN CADA RONDA
+   ───────────────────────────────────────────────────────────────────────
+   EL DESEQUILIBRIO QUE ESTO ARREGLA — "que las batallas sean justas":
+
+   El bot subía TRES veces a la vez. En la ronda 5 tenía el nivel del jugador
+   +4 (o sea, +48 de vida y +8 de ataque por la curva), y ENCIMA se le
+   multiplicaba la vida por 1,48 y el ataque por 1,40. Total: contra un
+   jugador de nivel 10 (200 hp / 30 atq), la ronda 5 salía con 355 hp y 53 de
+   ataque. Un 78 % más de vida y un 77 % más de pegada. Eso no es una batalla
+   difícil, es una batalla imposible: el jugador no llega a bajarle la vida
+   antes de que el bot le pegue el doble de veces.
+
+   Y hay más: el jugador entra con la vida QUE LE QUEDE a su mascota en el
+   mapa (si un cocodrilo la mordió, entra al 40 %), mientras el bot entra
+   siempre al 100 %.
+
+   Ahora sube UNA sola vez, y poco: +6 % de vida y +5 % de ataque por ronda,
+   sobre el nivel del jugador SIN sumarle rondas. En la ronda 5 el bot tiene
+   un 24 % más de vida y un 20 % más de pegada — se nota que es más duro y se
+   puede ganar. La otra palanca para que las rondas altas cuesten es la
+   ASTUCIA: el bot juega mejor sus cartas, que es dificultad de verdad y no
+   un muro de números.
+   ═══════════════════════════════════════════════════════════════════════ */
+const BOT_VIDA_POR_RONDA   = 0.06;
+const BOT_ATAQUE_POR_RONDA = 0.05;
+
+function crearBotDeRonda(ronda, nivelJugador, opciones) {
   const r = Math.max(1, Math.min(BATTLE_DAILY_MAX, Number(ronda) || 1));
-  const nivel = Math.max(1, (Number(nivelJugador) || 1) + (r - 1));
+  /* El nivel del bot es el DEL JUGADOR, sin sumarle la ronda: lo que sube por
+     ronda es el porcentaje de abajo, y sumar las dos cosas era justo el
+     problema. */
+  const nivel = Math.max(1, Number(nivelJugador) || 1);
   const base = battleStatsForLevel(nivel);
 
-  const maxHp = Math.round(base.maxHp * (1 + 0.12 * (r - 1)));
-  const attack = Math.round(base.attack * (1 + 0.10 * (r - 1)));
+  const maxHp  = Math.round(base.maxHp  * (1 + BOT_VIDA_POR_RONDA   * (r - 1)));
+  const attack = Math.round(base.attack * (1 + BOT_ATAQUE_POR_RONDA * (r - 1)));
+
+  const ficha = (opciones && opciones.ficha) || BATTLE_BOTS[r - 1] ||
+                BATTLE_BOTS_EXTRA[(r - 1) % BATTLE_BOTS_EXTRA.length];
 
   return {
     socket: null,
@@ -16133,8 +16199,9 @@ function crearBotDeRonda(ronda, nivelJugador) {
     ronda: r,
     // 0.2 en la ronda 1 → 0.6 en la 5: probabilidad de leer la jugada del rival
     astucia: 0.2 + 0.1 * (r - 1),
-    playerName: `BOT · Round ${r}`,
-    petName: BATTLE_BOT_NAMES[r - 1] || `Bot ${r}`,
+    playerName: `${ficha.playerName} · Round ${r}`,
+    petName: ficha.petName,
+    species: ficha.species,
     address: '',
     level: nivel,
     maxHp,
@@ -17106,6 +17173,26 @@ async function iniciarBatallaBot(socket) {
 
   const ronda = estado.nextRound;
   const bot = crearBotDeRonda(ronda, jugador.level);
+
+  /* ═══════════════════════════════════════════════════════════════════
+     EL RIVAL LLEGA COMO LLEGUES TÚ
+     ───────────────────────────────────────────────────────────────────
+     LA INJUSTICIA QUE ESTO ARREGLA: la mascota entra al combate con la
+     vida que le quede en el mapa —si la mordió un cocodrilo, al 40 %—
+     mientras que el bot entraba SIEMPRE al 100 %. Sumado a que el bot ya
+     pegaba y aguantaba más por la ronda, una batalla diaria con la
+     mascota tocada estaba perdida antes de repartir cartas.
+
+     Ahora el bot llega en la misma proporción, con un suelo del 75 %: es
+     un animal salvaje, no está recién curado, pero tampoco medio muerto.
+     Así seguir cuidando a la mascota SIGUE importando —a media vida el
+     combate es mucho más corto y un mal turno te tumba— pero deja de ser
+     una derrota automática.
+     ═══════════════════════════════════════════════════════════════════ */
+  const fraccionJugador = Math.max(0, Math.min(1,
+    (Number(jugador.petHealthPct) || 100) / 100));
+  const fraccionBot = Math.max(0.75, fraccionJugador);
+  bot.hp = Math.max(1, Math.round(bot.maxHp * fraccionBot));
 
   const match = {
     id: `b_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
