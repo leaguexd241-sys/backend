@@ -6443,15 +6443,29 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
       });
     }
 
+    // El timestamp del token lo genera el NAVEGADOR, así que no sirve como
+    // control de frescura: si el reloj del usuario va atrasado o adelantado
+    // (desfases de varios minutos son habituales en Windows), este check
+    // rechazaba logins perfectamente válidos con "token_expired" justo
+    // después de firmar, y el usuario no tenía forma de arreglarlo desde la
+    // web. La frescura REAL ya la garantiza el nonce con el reloj del
+    // SERVIDOR: es de un solo uso, lo fechamos nosotros en nonceTimestamp y
+    // unas líneas más arriba se rechaza si tiene más de 10 minutos. Aquí
+    // sólo validamos que el timestamp sea un valor plausible en SEGUNDOS
+    // (descarta milisegundos o basura), tolerando el desfase del cliente.
     const now = Math.floor(Date.now() / 1000);
-    const MAX_AGE = 60 * 5; // 5 minutos
+    const MAX_CLOCK_SKEW = parseInt(process.env.AUTH_MAX_CLOCK_SKEW || '86400', 10); // 24 h
     
-    if (Math.abs(now - ts) > MAX_AGE) {
-      console.log(`⏰ Token expirado (timestamp: ${ts}, ahora: ${now})`);
+    if (!Number.isFinite(ts) || ts <= 0 || Math.abs(now - ts) > MAX_CLOCK_SKEW) {
+      console.log(`⏰ Timestamp del token fuera de rango (timestamp: ${ts}, ahora: ${now}, desfase: ${now - ts}s)`);
       return res.status(401).json({ 
-        error: 'token_expired',
-        message: 'Token expirado'
+        error: 'invalid_token_timestamp',
+        message: 'Timestamp del token inválido'
       });
+    }
+    
+    if (Math.abs(now - ts) > 60 * 5) {
+      console.log(`⚠️  Reloj del cliente desfasado ${now - ts}s respecto al servidor (login permitido: la frescura la controla el nonce)`);
     }
 
     if (!validateSignedMessage(message, token)) {
