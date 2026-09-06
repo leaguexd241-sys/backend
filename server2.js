@@ -16169,26 +16169,134 @@ const BATTLE_BOT_NAMES = BATTLE_BOTS.map(b => b.petName);
    mapa (si un cocodrilo la mordió, entra al 40 %), mientras el bot entra
    siempre al 100 %.
 
-   Ahora sube UNA sola vez, y poco: +6 % de vida y +5 % de ataque por ronda,
-   sobre el nivel del jugador SIN sumarle rondas. En la ronda 5 el bot tiene
-   un 24 % más de vida y un 20 % más de pegada — se nota que es más duro y se
-   puede ganar. La otra palanca para que las rondas altas cuesten es la
-   ASTUCIA: el bot juega mejor sus cartas, que es dificultad de verdad y no
-   un muro de números.
+   Ahora sube UNA sola vez y poco, y lo que sube de verdad de una ronda a otra
+   es EL NIVEL DEL BICHO (ver más abajo). La otra palanca para que las rondas
+   altas cuesten es la ASTUCIA: el bot juega mejor sus cartas, que es
+   dificultad de verdad y no un muro de números.
    ═══════════════════════════════════════════════════════════════════════ */
-const BOT_VIDA_POR_RONDA   = 0.06;
-const BOT_ATAQUE_POR_RONDA = 0.05;
+
+/* ═══════════════════════════════════════════════════════════════════════
+   EL NIVEL DEL RIVAL, RONDA A RONDA
+   ───────────────────────────────────────────────────────────────────────
+   LO QUE ESTO ARREGLA: los cinco animales del día salían TODOS con el
+   mismo nivel, el del jugador. En pantalla se leía "Lv.10" en las dos
+   tarjetas las cinco veces, así que las cinco batallas parecían la misma y
+   subir de nivel no se notaba por ningún lado — el rival subía contigo,
+   clavado, para siempre.
+
+   Ahora hay una cuesta: la primera es un animal MÁS FLOJO que tu mascota
+   (uno o dos niveles por debajo) y la última es el jefe, uno o dos por
+   encima. Por el medio se gradúa. Cada tramo tiene dos valores posibles y
+   se echa a suertes, así que dos días seguidos no son idénticos.
+
+   Y de vez en cuando —una de cada siete— sale un bicho IGUALADO: mismo
+   nivel que tu mascota, pero con un poco más de fuerza. Es la sorpresa que
+   pidió el jugador: te lo esperas flojo por ser la ronda 1 y resulta que
+   pega igual que tú.
+
+   POR QUÉ LOS PORCENTAJES BAJAN DE 6/5 A 3/2,5: porque ahora el nivel
+   vuelve a moverse, y las dos cosas se multiplican. Con los números viejos,
+   la ronda 5 contra un jugador de nivel 10 (200 hp / 30 atq) salía con
+   278 hp y 41 de ataque —un 39 % y un 37 % por encima— y por ese camino se
+   volvía otra vez al muro que se quitó. Con éstos sale 251/37, que es un
+   26 % y un 25 %: se nota que es el jefe y se puede ganar. La dificultad la
+   pone el NIVEL, que además se VE en la tarjeta, y no un multiplicador
+   invisible.
+
+   La cuesta completa contra un jugador de nivel 10 (200 hp / 30 atq):
+
+       ronda 1   nivel −2   176 hp / 26 atq   ← tú pegas más
+       ronda 2   nivel −1   194 hp / 29 atq   ← parejo
+       ronda 3   nivel  0   212 hp / 32 atq
+       ronda 4   nivel +1   231 hp / 34 atq
+       ronda 5   nivel +2   251 hp / 37 atq   ← el jefe
+   ═══════════════════════════════════════════════════════════════════════ */
+const BOT_VIDA_POR_RONDA   = 0.030;
+const BOT_ATAQUE_POR_RONDA = 0.025;
+
+/* Cuántos niveles por encima o por debajo de la mascota, en cada ronda. Se
+   elige uno de los dos al azar. */
+const BOT_NIVEL_POR_RONDA = [
+  [-2, -1],   // ronda 1: claramente más flojo
+  [-2,  0],   // ronda 2
+  [-1, +1],   // ronda 3: de tú a tú
+  [ 0, +1],   // ronda 4
+  [+1, +2]    // ronda 5: el jefe
+];
+
+/* La sorpresa: mismo nivel que la mascota pero pegando un poco más. */
+const BOT_PROB_IGUALADO  = 1 / 7;
+const BOT_BONUS_IGUALADO = 1.08;
+
+/* Cuando la mascota es de nivel 1 o 2, un rival "dos niveles por debajo" no
+   cabe: el nivel mínimo es 1. Para que la primera batalla de un jugador nuevo
+   siga siendo la fácil, los niveles que no caben se descuentan de las
+   estadísticas. */
+const BOT_DESCUENTO_POR_NIVEL_QUE_NO_CABE = 0.06;
+const BOT_DESCUENTO_MAXIMO = 0.25;
+
+/* EL TECHO: cuánto puede pasarse el rival por encima de tu mascota, como
+   mucho, en cada ronda.
+
+   Hace falta porque `battleStatsForLevel` es 80 + 12·nivel de vida y
+   10 + 2·nivel de ataque: con esa base fija tan gorda, DOS NIVELES valen
+   muchísimo más abajo que arriba. Contra una mascota de nivel 1 (92 hp /
+   12 atq), el jefe de la ronda 5 con +2 niveles salía con un 41 % más de vida
+   y un 50 % más de pegada; contra una de nivel 20, el mismo +2 son un 21 % y
+   un 18 %. O sea que la última batalla del día era brutal justo para quien
+   acaba de empezar y llevadera para el veterano — al revés de lo que tiene
+   que ser.
+
+   Con el techo, la cuesta es la misma para todos: el jefe nunca pasa de un
+   32 % por encima de ti, tengas el nivel que tengas. De nivel 10 para arriba
+   ni siquiera llega a rozarlo (sale en el 25 %), así que esto solo actúa
+   donde hacía falta.
+
+   El de la ronda 1 no es 1.00 a propósito: tiene que dejar sitio al rival
+   IGUALADO, que por definición pega un poquito más que tú. */
+const BOT_TOPE_SOBRE_LA_MASCOTA = [1.08, 1.14, 1.20, 1.26, 1.32];
 
 function crearBotDeRonda(ronda, nivelJugador, opciones) {
   const r = Math.max(1, Math.min(BATTLE_DAILY_MAX, Number(ronda) || 1));
-  /* El nivel del bot es el DEL JUGADOR, sin sumarle la ronda: lo que sube por
-     ronda es el porcentaje de abajo, y sumar las dos cosas era justo el
-     problema. */
-  const nivel = Math.max(1, Number(nivelJugador) || 1);
-  const base = battleStatsForLevel(nivel);
+  const nivelMascota = Math.max(1, Number(nivelJugador) || 1);
+  const azar = (opciones && typeof opciones.azar === 'function') ? opciones.azar : Math.random;
 
-  const maxHp  = Math.round(base.maxHp  * (1 + BOT_VIDA_POR_RONDA   * (r - 1)));
-  const attack = Math.round(base.attack * (1 + BOT_ATAQUE_POR_RONDA * (r - 1)));
+  // ── El nivel del rival ──────────────────────────────────────────────────
+  const igualado = azar() < BOT_PROB_IGUALADO;
+  const tramo = BOT_NIVEL_POR_RONDA[r - 1] || [0, 0];
+  const desvio = igualado ? 0 : tramo[azar() < 0.5 ? 0 : 1];
+
+  const nivelDeseado = nivelMascota + desvio;
+  const nivel = Math.max(1, nivelDeseado);
+
+  /* Si el suelo del nivel 1 se ha comido parte del descuento, se devuelve por
+     el lado de las estadísticas. Sin esto, la ronda 1 de un jugador de nivel 1
+     salía con el rival EXACTAMENTE igual de fuerte que él, que es justo lo
+     contrario de lo que tiene que ser la primera batalla del día. */
+  const nivelesQueNoCaben = nivel - nivelDeseado;
+  const descuento = nivelesQueNoCaben > 0
+    ? Math.max(1 - BOT_DESCUENTO_MAXIMO,
+               1 - BOT_DESCUENTO_POR_NIVEL_QUE_NO_CABE * nivelesQueNoCaben)
+    : 1;
+
+  // ── Sus estadísticas ────────────────────────────────────────────────────
+  const base = battleStatsForLevel(nivel);
+  const extra = igualado ? BOT_BONUS_IGUALADO : 1;
+
+  const mascota = battleStatsForLevel(nivelMascota);
+  const tope = BOT_TOPE_SOBRE_LA_MASCOTA[r - 1] || 1.32;
+
+  /* El techo se redondea HACIA ABAJO y el valor natural hacia el más cercano.
+     Si se redondearan los dos igual, el tope se pasaría por el redondeo: a
+     nivel 1 el ataque tope es 12 × 1,32 = 15,84, que redondeado son 16 — un
+     33,3 %, por encima del 32 % que dice esta tabla. Poca cosa en números
+     absolutos, pero un techo que se puede pasar no es un techo. */
+  const maxHp = Math.max(1, Math.min(
+    Math.round(base.maxHp * (1 + BOT_VIDA_POR_RONDA * (r - 1)) * extra * descuento),
+    Math.floor(mascota.maxHp * tope)));
+  const attack = Math.max(1, Math.min(
+    Math.round(base.attack * (1 + BOT_ATAQUE_POR_RONDA * (r - 1)) * extra * descuento),
+    Math.floor(mascota.attack * tope)));
 
   const ficha = (opciones && opciones.ficha) || BATTLE_BOTS[r - 1] ||
                 BATTLE_BOTS_EXTRA[(r - 1) % BATTLE_BOTS_EXTRA.length];
@@ -16197,6 +16305,7 @@ function crearBotDeRonda(ronda, nivelJugador, opciones) {
     socket: null,
     isBot: true,
     ronda: r,
+    igualado,
     // 0.2 en la ronda 1 → 0.6 en la 5: probabilidad de leer la jugada del rival
     astucia: 0.2 + 0.1 * (r - 1),
     playerName: `${ficha.playerName} · Round ${r}`,
@@ -16815,12 +16924,50 @@ async function saveBattleResult(match, winnerKey, reason) {
   }
 }
 
+/**
+ * Espera a una promesa, pero no para siempre.
+ *
+ * POR QUÉ HACE FALTA — "el juego se atasca en las batallas":
+ *
+ * `endBattle` marca la partida como terminada y apaga el reloj del turno
+ * ANTES de esperar a la base de datos. A partir de ese punto no hay más
+ * turnos, y lo único que puede sacar al jugador de la pantalla de combate es
+ * el `battle:end` que se emite DESPUÉS de esa espera.
+ *
+ * `saveBattleResult` captura sus propios errores, así que no puede fallar —
+ * pero sí puede TARDAR: si Mongo no responde, una consulta se queda esperando
+ * y esa espera no tiene fin. Y mientras tanto: no llega el `battle:end`, no se
+ * borra la entrada de `socketMatch` (o sea que el siguiente intento de pelear
+ * responde 'already_in_battle') y la partida se queda en memoria para siempre.
+ * Un tropiezo de la base de datos deja al jugador encerrado y sin poder volver
+ * a entrar hasta que se reinicie el servidor.
+ *
+ * Con el plazo, lo peor que pasa es que se pierdan los puntos de esa partida
+ * —que ya se registran en el log de errores— pero el jugador sale de la
+ * batalla y puede seguir jugando.
+ */
+function conPlazo(promesa, ms, valorSiTarda) {
+  let reloj;
+  return Promise.race([
+    Promise.resolve(promesa).catch((e) => {
+      console.error('❌ Fallo esperando a la base de datos en la batalla:', e);
+      return valorSiTarda;
+    }),
+    new Promise((res) => { reloj = setTimeout(() => {
+      console.error(`⏱️  La base de datos no contestó en ${ms} ms; se cierra la batalla igual.`);
+      res(valorSiTarda);
+    }, ms); })
+  ]).then((v) => { clearTimeout(reloj); return v; });
+}
+
+const BATTLE_PLAZO_BD_MS = 6000;
+
 async function endBattle(match, winnerKey, reason) {
   if (!match || match.ended) return;
   match.ended = true;
   clearBattleTurnTimer(match);
 
-  await saveBattleResult(match, winnerKey, reason);
+  await conPlazo(saveBattleResult(match, winnerKey, reason), BATTLE_PLAZO_BD_MS, null);
 
   // Contador de batallas diarias contra bot (solo si esta era una de ellas).
   // El contador vive ENTERO en el backend: se incrementa aquí y el valor
@@ -16828,11 +16975,17 @@ async function endBattle(match, winnerKey, reason) {
   let dailyInfo = null;
   if (match.esBot && match.a && match.a.playerName && match.a.playerName !== '---') {
     try {
-      const doc = await BattleDaily.findOneAndUpdate(
+      /* Con plazo, por lo mismo de arriba. Si no llega a tiempo, `doc` es null
+         y el cliente recibe `daily: null`: enseña el resultado sin la línea de
+         "Daily battles: x/5" en vez de no enseñar nada. El contador de verdad
+         lo vuelve a pedir el mundo con `battle:dailyStatus` al volver al mapa,
+         así que el jugador no se queda sin saber cuántas le quedan. */
+      const doc = await conPlazo(BattleDaily.findOneAndUpdate(
         { playerName: match.a.playerName, day: battleTodayKey() },
         { $inc: { done: 1, wins: winnerKey === 'a' ? 1 : 0 } },
         { upsert: true, new: true, setDefaultsOnInsert: true }
-      );
+      ), BATTLE_PLAZO_BD_MS, null);
+      if (!doc) throw new Error('la base de datos no contestó a tiempo');
       const done = doc.done;
       dailyInfo = {
         done,
@@ -16847,7 +17000,15 @@ async function endBattle(match, winnerKey, reason) {
     }
   }
 
+  /* CADA JUGADOR EN SU PROPIO try.
+     Si el aviso a uno reventara —un socket a medio cerrar, un error al
+     serializar— antes se llevaba por delante todo lo que venía detrás: el
+     OTRO jugador no recibía su `battle:end` (se quedaba mirando el combate sin
+     salida), no se borraban las entradas de `socketMatch` (los dos con
+     'already_in_battle' a partir de ahí) y la partida se quedaba en memoria.
+     Un fallo al enviar un mensaje no puede costar eso. */
   ['a', 'b'].forEach(key => {
+   try {
     const p = match[key];
     if (!p || !p.socket) return;   // el bot no tiene socket
     const gano = winnerKey === key;
@@ -16871,6 +17032,12 @@ async function endBattle(match, winnerKey, reason) {
       try { p.socket.emit('battle:daily', dailyInfo); } catch (_) {}
     }
     socketMatch.delete(p.socket.id);
+   } catch (e) {
+    console.error(`❌ No se pudo avisar del final al jugador ${key}:`, e);
+    // El candado se suelta IGUAL: es lo que impide volver a pelear.
+    const p = match[key];
+    if (p && p.socket) { try { socketMatch.delete(p.socket.id); } catch (_) {} }
+   }
   });
 
   battleMatches.delete(match.id);
@@ -16893,7 +17060,11 @@ function startBattleTurn(match) {
         p.socket.emit('battle:status', { turn: match.turn, notes: notasEstado });
       }
     });
-    endBattle(match, ganador, 'poison');
+    /* `.catch` obligatorio: esta llamada NO se espera (la función de arriba no
+       es async en este punto), así que sin él un fallo aquí sería una promesa
+       rechazada sin dueño. */
+    Promise.resolve(endBattle(match, ganador, 'poison'))
+      .catch((e) => console.error('❌ endBattle (veneno):', e));
     return;
   }
 
@@ -17054,13 +17225,38 @@ async function construirJugadorDeSocket(socket) {
   let nivel = 1, petName = 'Pet', petHealth = 100;
   try {
     const gp = await GamePlayer.findOne({ playerName })
-      .select('nivel nivel_exp petName petHealth').lean();
+      .select('nivel nivel_exp petName petHealth petLevel').lean();
     if (gp) {
       // ANTI-TRAMPA: el nivel de combate se DERIVA de la experiencia, que está
       // respaldada por el contrato, en vez de leer `gp.nivel` — que hasta ahora
       // lo escribía el cliente y bastaba para entrar a PvP con estadísticas de
       // nivel 150. Ver nivelPorExperiencia().
-      nivel = Math.max(1, nivelPorExperiencia(gp.nivel_exp));
+      const nivelPersonaje = Math.max(1, nivelPorExperiencia(gp.nivel_exp));
+
+      /* ═══════════════════════════════════════════════════════════════════
+         EL NIVEL DE LA MASCOTA CUENTA
+         ───────────────────────────────────────────────────────────────────
+         LO QUE ESTO ARREGLA: el combate usaba SOLO el nivel del personaje
+         (el de la experiencia). El nivel de la MASCOTA —el que sale junto a
+         su nombre en el HUD y en la tarjeta de la batalla, el que sube al
+         pelear— no entraba en la cuenta por ningún lado: era un adorno. Se
+         podían encadenar veinte victorias, ver "Lv.9" bajo el perro y seguir
+         peleando exactamente con la misma fuerza que el primer día.
+
+         Ahora se toma EL MAYOR de los dos. Con eso:
+           · Nadie pierde fuerza respecto a antes (el del personaje sigue
+             valiendo si es el más alto).
+           · Entrenar a la mascota peleando SÍ la hace más fuerte, que es de
+             lo que se trata.
+           · Y sigue sin poder tocarlo el cliente: `petLevel` lo calcula el
+             servidor en `saveBattleResult` a partir de las victorias y las
+             batallas guardadas (`computePetLevel`), igual que el otro sale
+             de la experiencia respaldada por el contrato. La puerta que se
+             cerró con `nivelPorExperiencia` sigue cerrada.
+         ═══════════════════════════════════════════════════════════════════ */
+      const nivelMascota = Math.max(1, Math.min(50, Number(gp.petLevel) || 1));
+      nivel = Math.max(nivelPersonaje, nivelMascota);
+
       petName = gp.petName && gp.petName !== '---' ? gp.petName : 'Pet';
       petHealth = gp.petHealth == null ? 100 : gp.petHealth;
     }
