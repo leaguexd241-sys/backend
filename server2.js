@@ -410,7 +410,7 @@ const relayerNonceManager = new RelayerNonceManager();
 const SECURITY_CONFIG = {
   MAX_MESSAGE_LENGTH: 200,
   MAX_TRANSACTIONS_PER_HOUR: 50,
-  MAX_FAILED_ATTEMPTS: 5,
+  MAX_FAILED_ATTEMPTS: 25,   // era 5: un usuario normal lo alcanzaba solo
   BLOCK_DURATION_MINUTES: 60,
   AUTO_BLOCK_SUSPICIOUS: true,
   BLACKLISTED_SUBNETS: process.env.NODE_ENV === 'production' ? [
@@ -427,12 +427,19 @@ const SECURITY_CONFIG = {
   // cinco "rutas sospechosas" en segundos y el sistema BLOQUEABA la IP del
   // propio administrador.
   SAFE_OWN_PATHS: [
-    '/api/admin/',        // panel de jugadores y editor de misiones
-    '/api/auth/',
-    '/api/relay/',
-    '/api/stats/',
-    '/api/security/',
-    '/api/access'
+    // FIX (usuarios reales bloqueados): esta lista era una enumeración a mano
+    // y se dejó fuera '/api/wallet/'. Como la detección usa `includes()`, el
+    // patrón '/config' marcaba /api/wallet/config —que el SDK pide en CADA
+    // carga de la página de login— como "escaneo". Cinco recargas en cinco
+    // minutos y la IP del jugador quedaba baneada 60 minutos: a partir de ahí
+    // TODO respondía 403 "Acceso denegado" (health, csrf-token, auth/me...).
+    // Ahora es un prefijo único: nuestra API entera nunca es un escaneo. El
+    // recorrido de directorios ('..') se sigue mirando SIEMPRE, aparte.
+    '/api/',
+    '/socket.io/',
+    '/pingxxx',
+    '/health',
+    '/favicon.ico'
   ],
   SUSPICIOUS_PATHS: [
     '/..', '/../', '/../../',
@@ -1974,6 +1981,13 @@ class SecurityController {
     const path = req.path;
     const userAgent = req.headers['user-agent'] || '';
 
+    // Puertas que nunca se cierran. Si alguna vez se bloquea a alguien por
+    // error, al menos el cliente arranca y puede decir POR QUÉ, en vez de dar
+    // un 403 mudo en todo. Ninguna de estas expone datos ni cambia estado.
+    if (SecurityController.PUERTAS_ABIERTAS.has(path)) {
+      return next();
+    }
+
     if (!ip || ip === 'undefined' || ip === '::1' || ip === '::ffff:127.0.0.1') {
       return next();
     }
@@ -1989,7 +2003,13 @@ class SecurityController {
       const ses = req.cookies && req.cookies.session;
       if (ses) {
         const dec = jwt.verify(ses, JWT_SECRET, { algorithms: ['HS256'] });
-        if (dec && dec.address && await isAdminAddressCached(dec.address)) {
+        // Antes solo se libraba el admin. Ahora se libra CUALQUIER sesión
+        // firmada válida: un jugador que ya ha iniciado sesión no puede quedar
+        // fuera por el detector de escáneres. Para colarse aquí hay que tener
+        // un JWT emitido por este servidor, que no se falsifica.
+        if (dec && dec.address) {
+          if (await isAdminAddressCached(dec.address)) return next();
+          req.__sesionValida = true;
           return next();
         }
       }
@@ -2064,7 +2084,11 @@ class SecurityController {
         reason: 'User agent de scanner detectado'
       });
       
-      await this.trackFailedAttempt(ip, 'suspicious_user_agent');
+      // NO se llama a trackFailedAttempt: contaba para el bloqueo automático,
+      // así que cualquier monitor de salud con 'curl'/'wget' en su user-agent
+      // se auto-baneaba a los 5 pings, y en un proxy compartido se llevaba por
+      // delante a los jugadores que salían por esa misma IP. Queda anotado en
+      // IPActivity/SecurityIncident, pero no bloquea por sí solo.
     }
     
     await this.logIPActivity(req, false);
@@ -2289,6 +2313,16 @@ class SecurityController {
     };
   }
 }
+
+SecurityController.PUERTAS_ABIERTAS = new Set([
+  '/api/health',
+  '/pingxxx',
+  '/api/auth/csrf-token',
+  '/api/auth/me',
+  '/api/auth/logout',
+  '/api/auth/refresh',
+  '/api/wallet/config'
+]);
 
 const securityController = new SecurityController();
 
@@ -5950,16 +5984,49 @@ mongoose.connect(MONGO, {
   .then(async () => {
     console.log('✅ MongoDB connected');
     
-    // Limpieza inicial
+    // ── LIMPIEZA DE ARRANQUE ────────────────────────────────────────────
+    // La lista de IPs bloqueadas se VACÍA entera en cada arranque. Los bloqueos
+    // que había venían del fallo de /api/wallet/config (ver SAFE_OWN_PATHS), o
+    // sea usuarios reales, no atacantes. Se empieza de cero y a partir de aquí
+    // solo entra en la lista quien de verdad escanee.
+    // Poner SECURITY_WIPE_BLOCKS=0 en el entorno para conservarla.
     try {
-      await BlockedIP.deleteMany({
-        isPermanent: false,
-        blockedUntil: { $lt: new Date() }
-      });
-      
+      const vaciar = process.env.SECURITY_WIPE_BLOCKS !== '0';
+
+      if (vaciar) {
+        const borradas = await BlockedIP.deleteMany({});
+        console.log(`🧹 Lista de IPs bloqueadas VACIADA: ${borradas.deletedCount} registros borrados`);
+
+        const incid = await SecurityIncident.deleteMany({});
+        console.log(`🧹 Incidentes de seguridad borrados: ${incid.deletedCount}`);
+
+        // Los contadores de amenaza también se ponen a cero: si no, la próxima
+        // ruta rara vuelve a disparar el bloqueo desde un marcador alto.
+        const act = await IPActivity.updateMany({}, {
+          $set: {
+            threatScore: 0,
+            failedRequests: 0,
+            failedLastMinute: 0,
+            suspiciousCount: 0,
+            suspiciousPaths: [],
+            failedAttempts: []
+          }
+        });
+        console.log(`🧹 Contadores de amenaza reiniciados en ${act.modifiedCount} IPs`);
+
+        // Y la memoria del proceso, que es la que corta de verdad en caliente.
+        securityController.blockedIPs.clear();
+        securityController.suspiciousIPs.clear();
+        securityController.failedAttempts.clear();
+      } else {
+        await BlockedIP.deleteMany({ isPermanent: false, blockedUntil: { $lt: new Date() } });
+        console.log('ℹ️  SECURITY_WIPE_BLOCKS=0: solo se limpiaron los bloqueos ya caducados');
+      }
+
       // Limpiar tokens expirados
       await RefreshToken.deleteMany({ expiresAt: { $lt: new Date() } });
-      
+
+      await securityController.loadBlockedIPs();
       console.log('✅ Sistema de seguridad inicializado');
     } catch (e) {
       console.log('Error limpiando datos iniciales:', e);
