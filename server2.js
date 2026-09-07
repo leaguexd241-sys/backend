@@ -4747,6 +4747,52 @@ function salaBase(sala) {
   return String(sala || '').split('#')[0];
 }
 
+/**
+ * Quita de una sala a los que ya no tienen socket vivo, y avisa a los demás.
+ *
+ * FALLO QUE ESTO ARREGLA — "veo a un amigo plantado que no se mueve nunca":
+ * cuando alguien se reconecta, su socket NUEVO entra en la sala enseguida,
+ * pero el VIEJO sigue en `rooms` hasta que Socket.IO se da cuenta de que ya no
+ * responde (hasta 60 s de pingTimeout). Durante ese rato el `currentPlayers`
+ * que se manda a los demás lleva un doble suyo, quieto, que nadie borra. Si el
+ * corte fue en el móvil o al suspender el portátil, esto pasa continuamente.
+ *
+ * Se compara contra los sockets realmente conectados, que es la única fuente
+ * de verdad, en vez de fiarse de marcas de tiempo.
+ */
+function purgarFantasmas(room) {
+  const sala = rooms[room];
+  if (!sala) return 0;
+  let vivos;
+  try { vivos = io.of('/').sockets; } catch (_) { return 0; }
+  let n = 0;
+  for (const id of Object.keys(sala)) {
+    if (!vivos.has(id)) {
+      delete sala[id];
+      n++;
+      io.to(room).emit('playerLeft', { id, reason: 'ghost' });
+    }
+  }
+  if (n) io.to(room).emit('playerCount', Object.keys(sala).length);
+  return n;
+}
+
+/** Barrido periódico de todas las salas + borrado de las que quedan vacías. */
+function barrerSalas() {
+  let fantasmas = 0;
+  for (const room of Object.keys(rooms)) {
+    fantasmas += purgarFantasmas(room);
+    // Las salas base ('game', 'tienda') se conservan; las de canal se borran
+    // al vaciarse para que el objeto no crezca sin techo.
+    if (room.includes('#') && Object.keys(rooms[room]).length === 0) {
+      delete rooms[room];
+    }
+  }
+  if (fantasmas) console.log('🧹 Barrido de salas: ' + fantasmas + ' fantasmas fuera');
+}
+const _barridoSalas = setInterval(barrerSalas, 30000);
+if (typeof _barridoSalas.unref === 'function') _barridoSalas.unref();
+
 /** playerNames conectados AHORA en un canal. Lo usa la clasificación. */
 function jugadoresDelCanal(canal) {
   const nombres = new Set();
@@ -4947,8 +4993,30 @@ io.on("connection", (socket) => {
     canal: null
   };
 
-  // ── ASIGNACIÓN DE CANAL (una sola vez por conexión) ──────────────────────
-  socket.playerData.canal = primerCanalLibre() || CANALES_TOTAL;
+  // ── ASIGNACIÓN DE CANAL ───────────────────────────────────────────────────
+  //
+  // EL CANAL SE CONSERVA AL RECONECTAR.
+  //
+  // FALLO QUE ESTO ARREGLA — "vuelvo y ya no veo a mis amigos": el canal se
+  // asignaba con primerCanalLibre() en CADA conexión, y una reconexión es una
+  // conexión nueva. Si mientras tanto el canal 1 se había llenado (o lo
+  // parecía, por sockets zombis del propio jugador), al volver te metían en el
+  // 2 sin decir nada: mismo mapa, mismo chat, pero un mundo paralelo donde no
+  // está nadie de tu grupo.
+  //
+  // Ahora el cliente manda en el saludo el canal que ya tenía y se le devuelve
+  // ESE si queda sitio. No es un agujero: el jugador ya podía elegir canal a
+  // mano con 'canalCambiar', así que pedir el suyo no le da ningún poder nuevo.
+  const canalPedido = Number(socket.handshake && socket.handshake.auth && socket.handshake.auth.canal);
+  let canalElegido = null;
+  if (Number.isInteger(canalPedido) && canalPedido >= 1 && canalPedido <= CANALES_TOTAL) {
+    const cuenta = ocupacionCanales();
+    if (cuenta[canalPedido] < CANAL_CUPO) {
+      canalElegido = canalPedido;
+      console.log('🎫 ' + socket.id + ' recupera su canal ' + canalPedido);
+    }
+  }
+  socket.playerData.canal = canalElegido || primerCanalLibre() || CANALES_TOTAL;
   socket.emit('canalAsignado', {
     canal: socket.playerData.canal,
     total: CANALES_TOTAL,
@@ -5263,9 +5331,27 @@ io.on("connection", (socket) => {
       }
     }
 
-    if (socket.playerData.room === room && socket.playerData.lastScene === lastScene) {
-      return;
-    }
+    /* UN JOIN SIEMPRE SE CONTESTA. NUNCA SE VUELVE EN SILENCIO.
+
+       FALLO GORDO QUE ESTO ARREGLA — "mis amigos me ven moverme, yo a ellos
+       no": aquí había un `return` seco cuando la sala y la escena coincidían
+       con lo que el servidor ya tenía apuntado. El problema es CUÁNDO se
+       vuelve a pedir un join: justo después de una reconexión, o cuando el
+       servidor manda `rejoinRequired`. Y el cliente, antes de pedirlo, BORRA
+       todos los jugadores que tenía en pantalla esperando que el servidor le
+       mande la lista otra vez (`currentPlayers`).
+
+       Con el `return`, esa lista no llegaba nunca. Resultado: el mapa se te
+       quedaba vacío PARA SIEMPRE —y el chat sin historial— mientras tú seguías
+       en la sala del servidor, así que los demás sí te veían moverte. Justo el
+       síntoma que se veía.
+
+       Ahora no hay atajo: se rehace `socket.join`, se conserva la posición que
+       ya tenías (para no teletransportarte al 0,0 a ojos de los demás) y se
+       reenvía la foto de la sala. Lo único que se calla es el aviso de "jugador
+       nuevo" a los demás, porque nuevo no eres. */
+    const yaEstaba = !!(rooms[room] && rooms[room][socket.id]);
+    const mismoSitio = socket.playerData.room === room && socket.playerData.lastScene === lastScene;
 
     if (socket.playerData.room && socket.playerData.room !== room) {
       if (rooms[socket.playerData.room]) {
@@ -5293,18 +5379,22 @@ io.on("connection", (socket) => {
       rooms[room] = {};
     }
     
+    // Lo que ya hubiera de este jugador en la sala: al rehacer el join tras
+    // una reconexión hay que conservar DÓNDE estaba, no plantarlo en el 0,0.
+    const previo = (rooms[room] && rooms[room][socket.id]) || null;
+
     rooms[room][socket.id] = {
       id: socket.id,
-      x: 0,
-      y: 0,
+      x: previo ? previo.x : 0,
+      y: previo ? previo.y : 0,
       username: username || '---',
       // Identidad REAL del socket (no la que diga el cliente): la usa el
       // submenú de jugador (perfil / verificador / reporte) para saber a quién
       // se está señalando sin que nadie pueda suplantar a otro.
       address:    socket.authenticatedAddress || null,
       playerName: socket.authenticatedPlayer  || null,
-      direction: 'right',
-      directionx: 'stop_right',
+      direction:  previo ? previo.direction  : 'right',
+      directionx: previo ? previo.directionx : 'stop_right',
       // Nivel del personaje y de la mascota ya desde el JOIN.
       // Antes solo viajaban dentro de playerMove, así que un jugador que
       // entraba y se quedaba QUIETO nunca emitía nada y los demás lo veían sin
@@ -5321,14 +5411,27 @@ io.on("connection", (socket) => {
       lastUpdate: Date.now()
     };
 
+    // socket.join es idempotente, pero hay que rehacerlo SIEMPRE: tras una
+    // reconexión el socket es otro y no pertenece a ninguna sala del adaptador
+    // aunque `rooms` diga que sí.
     socket.join(room);
-    console.log(`✅ ${socket.id} unido a ${room} como ${username}`);
-    
+
+    // Antes de mandar la foto de la sala, fuera los que ya no tienen socket:
+    // si no, el que acaba de entrar se encuentra con dobles de los que se
+    // reconectaron hace un momento, clavados y para siempre.
+    purgarFantasmas(room);
+
+    console.log('✅ ' + socket.id + (mismoSitio ? ' re-entra en ' : ' unido a ') + room + ' como ' + username);
+
     const otherPlayers = Object.values(rooms[room]).filter(p => p.id !== socket.id);
     socket.emit("currentPlayers", otherPlayers);
-    
-    socket.to(room).emit("newPlayer", rooms[room][socket.id]);
-    
+
+    // "Jugador nuevo" solo si de verdad lo es. Al re-sincronizar no se molesta
+    // a los demás: ya lo tienen pintado y volverían a crearlo desde cero.
+    if (!yaEstaba) {
+      socket.to(room).emit("newPlayer", rooms[room][socket.id]);
+    }
+
     io.to(room).emit("playerCount", Object.keys(rooms[room]).length);
   });
 
@@ -5383,7 +5486,16 @@ io.on("connection", (socket) => {
   socket.on('chatTyping', (data) => {
     try {
       const room = socket.playerData && socket.playerData.room;
-      if (!room) return;
+      // Sin sala tampoco aquí se calla: escribir es lo primero que hace quien
+      // acaba de volver, así que es un buen momento para pedirle el rejoin.
+      if (!room) {
+        const ahora = Date.now();
+        if (ahora - (socket._avisoRejoin || 0) > 3000) {
+          socket._avisoRejoin = ahora;
+          socket.emit('rejoinRequired', { motivo: 'sin_sala' });
+        }
+        return;
+      }
       socket.to(room).emit('chatTyping', { ...data, id: socket.id });
     } catch (_) {}
   });
@@ -5481,7 +5593,13 @@ io.on("connection", (socket) => {
       io.to(room).emit("playerLeft", { id: socket.id, reason: 'disconnected' });
       io.to(room).emit("playerCount", Object.keys(rooms[room]).length);
       
-      console.log(`❌ ${socket.id} desconectado de la sala: ${room}`);
+      // Sala de canal vacía: fuera del mapa de salas. Si no, cada canal por el
+      // que haya pasado alguien deja un objeto vacío que ya nadie borra.
+      if (room.includes('#') && Object.keys(rooms[room]).length === 0) {
+        delete rooms[room];
+      }
+
+      console.log('❌ ' + socket.id + ' desconectado de la sala: ' + room);
     }
   });
 
