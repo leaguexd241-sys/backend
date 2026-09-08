@@ -558,6 +558,11 @@ const gamePlayerSchema = new mongoose.Schema({
      demas jugadores. */
   nameColor: { type: String, default: null },
 
+  /* COLOR DEL NOMBRE DE LA MASCOTA. Igual que `nameColor` pero para el cartel
+     del perro, y aparte porque son dos decisiones distintas del jugador.
+     `null` = el blanco de siempre. Solo '#rrggbb'. */
+  petNameColor: { type: String, default: null },
+
   lenguaje: { type: Number, default: 1 },
   nivel: { type: Number, default: 0 },
   nivel_exp: { type: Number, default: 0 },
@@ -5351,12 +5356,16 @@ io.on("connection", (socket) => {
        cache en caliente cuando el jugador lo cambia. */
     if (socket._nameColor === undefined) {
       socket._nameColor = null;
+      socket._petNameColor = null;
       try {
         if (socket.authenticatedPlayer) {
           const gpColor = await GamePlayer.findOne({ playerName: socket.authenticatedPlayer })
-            .select('nameColor').lean();
+            .select('nameColor petNameColor').lean();
           if (gpColor && /^#[0-9a-fA-F]{6}$/.test(String(gpColor.nameColor || ''))) {
             socket._nameColor = String(gpColor.nameColor).toLowerCase();
+          }
+          if (gpColor && /^#[0-9a-fA-F]{6}$/.test(String(gpColor.petNameColor || ''))) {
+            socket._petNameColor = String(gpColor.petNameColor).toLowerCase();
           }
         }
       } catch (e) { /* sin color: se ve el blanco de siempre */ }
@@ -5442,6 +5451,7 @@ io.on("connection", (socket) => {
       // Color elegido para el nombre. Va en la foto de la sala para que quien
       // entra vea a los demas ya con su color, sin esperar a que se muevan.
       nameColor: socket._nameColor || null,
+      petNameColor: socket._petNameColor || null,
       lastUpdate: Date.now()
     };
 
@@ -5493,8 +5503,9 @@ io.on("connection", (socket) => {
       id:         socket.id,
       address:    socket.authenticatedAddress || rooms[room][socket.id].address || null,
       playerName: socket.authenticatedPlayer  || rooms[room][socket.id].playerName || null,
-      // Mismo motivo que address/playerName: el color lo pone el servidor.
-      nameColor:  socket._nameColor || null,
+      // Mismo motivo que address/playerName: los colores los pone el servidor.
+      nameColor:    socket._nameColor || null,
+      petNameColor: socket._petNameColor || null,
       lastUpdate: Date.now()
     };
 
@@ -5705,47 +5716,15 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ── EDITAR UN MENSAJE, UNA SOLA VEZ ───────────────────────────────────────
-  //
-  // "Una sola vez" es la regla que se pidio y ademas es la que hace que esto no
-  // se pueda usar para enganar: con ediciones ilimitadas, cualquiera puede
-  // escribir algo, esperar a que lo lean y dejar otra cosa puesta. Con una
-  // sola, y marcado como "(edited)", el mensaje sigue siendo comprobable.
-  //
-  // El plazo de dos minutos va en la misma direccion: una edicion es para
-  // arreglar una errata recien cometida, no para reescribir la conversacion de
-  // hace un rato.
-  const EDICION_PLAZO_MS = 2 * 60 * 1000;
+  /* EL CHAT GENERAL NO SE EDITA.
 
-  socket.on('chatEdit', (data) => {
-    try {
-      const room = socket.playerData && socket.playerData.room;
-      if (!room) { socket.emit('rejoinRequired', { motivo: 'sin_sala' }); return; }
+     Aquí había un `chatEdit`. Se ha quitado a petición del jugador, y la razón
+     es buena: un mensaje público que cambia después de que lo haya leído medio
+     canal no es de fiar — se puede decir una cosa, esperar a que la lean, y
+     dejar otra puesta. En una conversación privada eso no pasa, así que editar
+     vive ahora solo allí (`friends:dm:edit`).
 
-      const encontrado = mensajeDeLaSala(socket, data && data.mid);
-      const msg = encontrado.msg;
-      if (!msg) return socket.emit('chatEditError', { motivo: 'no_existe' });
-
-      const quien = socket.authenticatedPlayer || socket.id;
-      if (msg._dueno !== quien) return socket.emit('chatEditError', { motivo: 'no_es_tuyo' });
-      if (msg.editado)          return socket.emit('chatEditError', { motivo: 'ya_editado' });
-      if (Date.now() - new Date(msg.ts).getTime() > EDICION_PLAZO_MS) {
-        return socket.emit('chatEditError', { motivo: 'fuera_de_plazo' });
-      }
-
-      const crudo = String((data && data.text) || '').trim();
-      const recortado = [...crudo].slice(0, 300).join('');
-      const texto = escapeHtml(recortado);
-      if (!texto) return socket.emit('chatEditError', { motivo: 'vacio' });
-      if (texto === msg.text) return;
-
-      msg.text = texto;
-      msg.editado = true;
-      io.to(encontrado.room).emit('chatEdited', { mid: msg.mid, text: msg.text, editado: true });
-    } catch (e) {
-      console.error('chatEdit error:', e);
-    }
-  });
+     Las REACCIONES sí se quedan: no cambian lo que alguien dijo. */
 
   // ── COLOR DEL NOMBRE ──────────────────────────────────────────────────────
   //
@@ -8933,11 +8912,12 @@ app.post('/api/save/:playerName',
          cabeza y en el chat). Un texto arbitrario ahi es una inyeccion de
          estilo en el navegador de otro. Cualquier cosa que no sea un color
          hexadecimal de seis digitos se descarta y el campo no se toca. */
-      if ('nameColor' in update) {
-        const c = String(update.nameColor == null ? '' : update.nameColor).trim();
-        if (!c) update.nameColor = null;
-        else if (/^#[0-9a-fA-F]{6}$/.test(c)) update.nameColor = c.toLowerCase();
-        else delete update.nameColor;
+      for (const campoColor of ['nameColor', 'petNameColor']) {
+        if (!(campoColor in update)) continue;
+        const c = String(update[campoColor] == null ? '' : update[campoColor]).trim();
+        if (!c) update[campoColor] = null;
+        else if (/^#[0-9a-fA-F]{6}$/.test(c)) update[campoColor] = c.toLowerCase();
+        else delete update[campoColor];
       }
 
       // ── REGLA DE NOMBRE ÚNICO (personaje y mascota) ─────────────────────
@@ -18043,6 +18023,14 @@ const amistadSchema = new mongoose.Schema({
   amigos:     [{ _id: false, playerName: String, desde:  { type: Date, default: Date.now } }],
   entrantes:  [{ _id: false, playerName: String, cuando: { type: Date, default: Date.now } }],
   salientes:  [{ _id: false, playerName: String, cuando: { type: Date, default: Date.now } }],
+
+  /* EL LIMPIADOR AUTOMÁTICO DE LOS PRIVADOS, en horas: 0 = apagado, 24, 72
+     (tres días) o 168 (una semana). Es una preferencia de ESTE jugador y solo
+     manda sobre lo que él ve: si tú pones 24 horas y tu amigo no pone nada, tú
+     dejas de ver los viejos y él los conserva. Es lo que significa "mi
+     limpiador" — y borrar los del otro no sería asunto tuyo. */
+  limpiezaDM: { type: Number, default: 0, enum: [0, 24, 72, 168] },
+
   updatedAt:  { type: Date, default: Date.now }
 }, { collection: 'player_friends', versionKey: false });
 
@@ -18057,7 +18045,30 @@ const mensajePrivadoSchema = new mongoose.Schema({
   deNombre: { type: String, default: '---' },
   texto:    { type: String, default: '' },
   ts:       { type: Date, default: Date.now },
-  leido:    { type: Boolean, default: false }
+  leido:    { type: Boolean, default: false },
+
+  /* Editado una sola vez, y marcado. Ver el manejador `friends:dm:edit`. */
+  editado:  { type: Boolean, default: false },
+
+  /* Reacciones al privado: [{emoji, quienes:[playerName]}]. Aquí SÍ se guardan
+     —al revés que en el chat general, que vive en un anillo de 50 en memoria—
+     porque un privado se conserva y su reacción tiene que seguir ahí mañana. */
+  reacciones: {
+    type: [new mongoose.Schema({
+      emoji:   { type: String, required: true },
+      quienes: { type: [String], default: [] }
+    }, { _id: false, versionKey: false })],
+    default: []
+  },
+
+  /* QUIÉN LO HA VACIADO DE SU LADO.
+
+     Un privado es de DOS. Si "vaciar chat" borrara el documento, le estarías
+     quitando a la otra persona algo que también es suyo — y sería un regalo
+     para quien quiera decir algo y hacerlo desaparecer del historial ajeno.
+     Así que se apunta quién lo ha ocultado y se filtra al leer. Cuando lo han
+     ocultado los dos, ya no le sirve a nadie y se borra de verdad. */
+  ocultoPara: { type: [String], default: [] }
 }, { collection: 'player_dms', versionKey: false });
 
 // Las dos consultas que se hacen de verdad: "mi bandeja" y "mi conversación
@@ -18065,6 +18076,11 @@ const mensajePrivadoSchema = new mongoose.Schema({
 // panel sería un recorrido completo de la colección.
 mensajePrivadoSchema.index({ para: 1, leido: 1, ts: -1 });
 mensajePrivadoSchema.index({ de: 1, para: 1, ts: -1 });
+/* La BANDEJA consulta `$or: [{de: yo}, {para: yo}]` ordenado por fecha, y se
+   ejecuta cada vez que se abre el apartado de mensajes. La rama `de` la cubre
+   el índice de arriba (empieza por `de`); la rama `para` no tenía ninguno que
+   sirviera para ordenar, porque el otro lleva `leido` en medio. */
+mensajePrivadoSchema.index({ para: 1, ts: -1 });
 
 const MensajePrivado = mongoose.model('MensajePrivado', mensajePrivadoSchema);
 
@@ -18104,18 +18120,26 @@ async function fichasDe(nombres) {
   const unicos = [...new Set((nombres || []).filter(Boolean))];
   if (!unicos.length) return new Map();
   const docs = await GamePlayer.find({ playerName: { $in: unicos } })
-    .select('playerName Username nivel nameColor').lean();
+    .select('playerName Username nivel nameColor petNameColor address').lean();
   const mapa = new Map();
   docs.forEach(d => mapa.set(d.playerName, {
     playerName: d.playerName,
+    /* La DIRECCIÓN va en la ficha porque es la segunda llave con la que se
+       busca la presencia (ver `enLaFoto`). No sale hacia el cliente: los
+       manejadores solo mandan playerName, username, nivel y colores. */
+    address:    d.address || null,
     username:   d.Username && d.Username !== '---' ? d.Username : d.playerName,
     nivel:      Number(d.nivel) || 0,
-    nameColor:  d.nameColor || null
+    nameColor:  d.nameColor || null,
+    petNameColor: d.petNameColor || null
   }));
   // Un jugador que aún no tiene GamePlayer (recién registrado) no puede
   // desaparecer de la lista de su amigo: se le pone una ficha mínima.
   unicos.forEach(n => {
-    if (!mapa.has(n)) mapa.set(n, { playerName: n, username: n, nivel: 0, nameColor: null });
+    if (!mapa.has(n)) {
+      mapa.set(n, { playerName: n, address: null, username: n, nivel: 0,
+                    nameColor: null, petNameColor: null });
+    }
   });
   return mapa;
 }
@@ -18136,7 +18160,13 @@ function socketsDeJugador(playerName) {
   return salida;
 }
 
-/** ¿Está jugando ahora mismo? Y si lo está, ¿en qué canal? */
+/**
+ * ¿Está jugando ahora mismo? Y si lo está, ¿en qué canal?
+ *
+ * Para UNA consulta suelta. Cuando hay que preguntarlo por una lista entera
+ * —los amigos, la bandeja, una búsqueda— se usa `fotoDePresencia` + `enLaFoto`,
+ * que recorren los sockets una sola vez.
+ */
 function presenciaDe(playerName) {
   const ss = socketsDeJugador(playerName);
   if (!ss.length) return { online: false, canal: null };
@@ -18161,12 +18191,46 @@ function fotoDePresencia() {
   const mapa = new Map();
   try {
     for (const [, s] of io.of('/').sockets) {
-      if (!s.authenticatedPlayer) continue;
-      if (mapa.has(s.authenticatedPlayer)) continue;
-      mapa.set(s.authenticatedPlayer, (s.playerData && s.playerData.canal) || null);
+      const canal = (s.playerData && s.playerData.canal) || null;
+
+      /* TODAS LAS CLAVES CON LAS QUE ESE SOCKET PUEDE ESTAR APUNTADO.
+
+         `resolveBattlePlayerName` tiene tres fuentes y una de respaldo (la
+         propia dirección), así que la misma cuenta puede haberse guardado en
+         una amistad con una clave y resolverse hoy con otra. Indexando por
+         todas, un desajuste deja de poder contestar "offline" de alguien que
+         está jugando — que es lo que pasaba. */
+      const claves = [
+        s.authenticatedPlayer,
+        s.authenticatedAddress,
+        (s.playerData && s.playerData.room && rooms[s.playerData.room] &&
+         rooms[s.playerData.room][s.id] && rooms[s.playerData.room][s.id].playerName) || null
+      ];
+      for (const clave of claves) {
+        if (!clave) continue;
+        const k = String(clave).toLowerCase();
+        if (!mapa.has(k)) mapa.set(k, canal);
+      }
     }
   } catch (_) {}
   return mapa;
+}
+
+/**
+ * ¿Está conectado este jugador, mire por donde se le mire?
+ *
+ * Se prueban su nombre de cuenta y su dirección: si CUALQUIERA de los dos
+ * aparece en la foto, está jugando. Ver el comentario de `fotoDePresencia`
+ * sobre por qué las claves pueden no coincidir.
+ */
+function enLaFoto(foto, ficha) {
+  if (!foto || !ficha) return { online: false, canal: null };
+  const candidatas = [ficha.playerName, ficha.address].filter(Boolean);
+  for (const c of candidatas) {
+    const k = String(c).toLowerCase();
+    if (foto.has(k)) return { online: true, canal: foto.get(k) };
+  }
+  return { online: false, canal: null };
 }
 
 /** Manda un evento a TODAS las pestañas de una cuenta. */
@@ -18189,16 +18253,25 @@ async function estadoAmistades(playerName) {
   // Una sola vuelta a los sockets para toda la lista (ver fotoDePresencia).
   const foto = fotoDePresencia();
   const conPresencia = (e) => {
-    const f = fichas.get(e.playerName) || { playerName: e.playerName, username: e.playerName, nivel: 0, nameColor: null };
-    const online = foto.has(e.playerName);
-    return { ...f, online, canal: online ? foto.get(e.playerName) : null,
+    const f = fichas.get(e.playerName) ||
+              { playerName: e.playerName, address: null, username: e.playerName,
+                nivel: 0, nameColor: null, petNameColor: null };
+    const p = enLaFoto(foto, f);
+    // La dirección se queda AQUÍ: identifica la cartera y no es asunto de los
+    // demás jugadores.
+    const { address, ...publica } = f;
+    return { ...publica, online: p.online, canal: p.canal,
              desde: e.desde || e.cuando || null };
   };
 
-  const noLeidos = await MensajePrivado.countDocuments({ para: playerName, leido: false }).exec();
+  const noLeidos = await MensajePrivado.countDocuments({
+    para: playerName, leido: false, ocultoPara: { $ne: playerName }
+  }).exec();
 
   return {
     ok: true,
+    // El ajuste del limpiador de privados, para que el panel lo pinte marcado.
+    limpiezaDM: d.limpiezaDM || 0,
     yo: fichas.get(playerName) || { playerName, username: playerName, nivel: 0, nameColor: null },
     amigos:    d.amigos.map(conPresencia).sort((a, b) => (b.online - a.online) || a.username.localeCompare(b.username)),
     entrantes: d.entrantes.map(conPresencia),
@@ -18396,21 +18469,21 @@ io.on('connection', (socket) => {
       const docs = await GamePlayer.find({
         Username: { $regex: '^' + esc, $options: 'i' },
         playerName: { $ne: yo }
-      }).select('playerName Username nivel nameColor').limit(20).lean();
+      }).select('playerName Username nivel nameColor address').limit(20).lean();
 
       const d = await amistadDoc(yo);
       const foto = fotoDePresencia();     // una vuelta para los 20 resultados
       const jugadores = docs
         .filter(x => x.Username && x.Username !== '---')
         .map(x => {
-          const online = foto.has(x.playerName);
+          const p = enLaFoto(foto, x);
           return {
             playerName: x.playerName,
             username:   x.Username,
             nivel:      Number(x.nivel) || 0,
             nameColor:  x.nameColor || null,
-            online:     online,
-            canal:      online ? foto.get(x.playerName) : null,
+            online:     p.online,
+            canal:      p.canal,
             esAmigo:    enLista(d.amigos, x.playerName),
             pendiente:  enLista(d.salientes, x.playerName),
             tePidio:    enLista(d.entrantes, x.playerName)
@@ -18640,7 +18713,8 @@ io.on('connection', (socket) => {
       const paquete = {
         id: String(doc._id), de: yo, para: otro,
         deNombre: doc.deNombre, texto: doc.texto,
-        ts: doc.ts.toISOString(), leido: false
+        ts: doc.ts.toISOString(), leido: false,
+        editado: false, reacciones: []
       };
 
       // A él (todas sus pestañas) y a mí (para que el mensaje salga también en
@@ -18673,8 +18747,15 @@ io.on('connection', (socket) => {
       const yo = await cuentaDelSocket(socket);
       if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
 
-      const msgs = await MensajePrivado.find({ $or: [{ de: yo }, { para: yo }] })
-        .sort({ ts: -1 }).limit(400).lean();
+      /* SOLO LO QUE ESTE JUGADOR PUEDE VER: ni lo que él vació, ni lo que ha
+         caducado según SU limpiador. El del otro no manda sobre lo que yo veo. */
+      const miFicha = await amistadDoc(yo);
+      const desde = miFicha.limpiezaDM > 0
+        ? new Date(Date.now() - miFicha.limpiezaDM * 3600 * 1000) : null;
+      const filtro = { $or: [{ de: yo }, { para: yo }], ocultoPara: { $ne: yo } };
+      if (desde) filtro.ts = { $gte: desde };
+
+      const msgs = await MensajePrivado.find(filtro).sort({ ts: -1 }).limit(400).lean();
 
       const conv = new Map();
       msgs.forEach(m => {
@@ -18688,14 +18769,224 @@ io.on('connection', (socket) => {
       const fichas = await fichasDe([...conv.keys()]);
       const foto = fotoDePresencia();     // una vuelta para toda la bandeja
       const lista = [...conv.values()].map(c => {
-        const f = fichas.get(c.playerName) || { username: c.playerName, nivel: 0, nameColor: null };
+        const f = fichas.get(c.playerName) ||
+                  { username: c.playerName, nivel: 0, nameColor: null, address: null };
         return { ...c, ts: new Date(c.ts).toISOString(), username: f.username,
-                 nivel: f.nivel, nameColor: f.nameColor, online: foto.has(c.playerName) };
+                 nivel: f.nivel, nameColor: f.nameColor,
+                 online: enLaFoto(foto, f).online };
       }).sort((a, b) => new Date(b.ts) - new Date(a.ts));
 
       socket.emit('friends:inbox', { ok: true, conversaciones: lista });
     } catch (e) {
       console.error('friends:inbox', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+
+  // ── LOS PRIVADOS: REACCIONES, EDITAR, VACIAR Y LIMPIEZA AUTOMÁTICA ────────
+  //
+  // Aquí SÍ se puede editar, al revés que en el chat general. La diferencia no
+  // es un capricho: un mensaje público que cambia después de que lo hayan leído
+  // no es de fiar y se presta a engañar a todo un canal; en una conversación de
+  // dos, arreglar una errata no engaña a nadie y se marca como "(edited)".
+
+  /** Las mismas seis reacciones que el chat general. Una sola lista, un solo criterio. */
+  function reaccionValida(e) { return REACCIONES_VALIDAS.indexOf(String(e || '')) >= 0; }
+
+  /** ¿Este privado es de esta conversación y puede verlo quien pregunta? */
+  function mioOSuyo(m, yo) { return m && (m.de === yo || m.para === yo); }
+
+  /**
+   * Busca un privado por su id, sin reventar si el id es basura.
+   *
+   * `findById` con algo que no es un ObjectId lanza CastError. Como el id viene
+   * del cliente, un cliente manipulado podría llenar el registro de errores
+   * mandando cualquier cosa. Se comprueba la forma antes de preguntar.
+   */
+  async function privadoPorId(id) {
+    const s = String(id || '');
+    if (!/^[0-9a-fA-F]{24}$/.test(s)) return null;
+    return MensajePrivado.findById(s).exec();
+  }
+
+  socket.on('friends:dm:react', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      if (frenado(socket, 'dmreact', 250)) return;
+
+      const emoji = String((data && data.emoji) || '');
+      if (!reaccionValida(emoji)) return;
+
+      const m = await privadoPorId(data && data.id);
+      if (!m || !mioOSuyo(m, yo)) return;
+
+      m.reacciones = m.reacciones || [];
+      let grupo = m.reacciones.find(r => r.emoji === emoji);
+      if (grupo && grupo.quienes.indexOf(yo) >= 0) {
+        // El segundo toque la quita, igual que en el chat general.
+        grupo.quienes = grupo.quienes.filter(q => q !== yo);
+        if (!grupo.quienes.length) m.reacciones = m.reacciones.filter(r => r.emoji !== emoji);
+      } else {
+        if (!grupo) {
+          if (m.reacciones.length >= 6) return;
+          grupo = { emoji, quienes: [] };
+          m.reacciones.push(grupo);
+        }
+        grupo.quienes.push(yo);
+      }
+      m.markModified('reacciones');
+      await m.save();
+
+      const paquete = { id: String(m._id), reacciones: m.reacciones.map(r => ({
+        emoji: r.emoji, quienes: r.quienes.slice()
+      })) };
+      avisarAJugador(m.de,   'friends:dm:reaccion', paquete);
+      avisarAJugador(m.para, 'friends:dm:reaccion', paquete);
+    } catch (e) {
+      console.error('friends:dm:react', e);
+    }
+  });
+
+  /**
+   * Editar un privado. Solo el mío, solo una vez, solo dentro del plazo.
+   *
+   * "Una sola vez" es lo que impide usar esto para engañar: se puede corregir
+   * una errata recién cometida, no reescribir lo que el otro ya leyó y
+   * contestó. Y queda marcado.
+   */
+  const DM_EDICION_PLAZO_MS = 5 * 60 * 1000;
+
+  socket.on('friends:dm:edit', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      if (frenado(socket, 'dmedit', 400)) return;
+
+      const m = await privadoPorId(data && data.id);
+      if (!m)            return socket.emit('friends:dm:editError', { motivo: 'no_existe' });
+      if (m.de !== yo)   return socket.emit('friends:dm:editError', { motivo: 'no_es_tuyo' });
+      if (m.editado)     return socket.emit('friends:dm:editError', { motivo: 'ya_editado' });
+      if (Date.now() - new Date(m.ts).getTime() > DM_EDICION_PLAZO_MS) {
+        return socket.emit('friends:dm:editError', { motivo: 'fuera_de_plazo' });
+      }
+
+      const crudo = String((data && data.texto) || '').trim();
+      const recortado = [...crudo].slice(0, DM_LARGO_MAX).join('');
+      const texto = escapeHtml(recortado);
+      if (!texto) return socket.emit('friends:dm:editError', { motivo: 'vacio' });
+      if (texto === m.texto) return;
+
+      m.texto = texto;
+      m.editado = true;
+      await m.save();
+
+      const paquete = { id: String(m._id), texto: m.texto, editado: true };
+      avisarAJugador(m.de,   'friends:dm:editado', paquete);
+      avisarAJugador(m.para, 'friends:dm:editado', paquete);
+    } catch (e) {
+      console.error('friends:dm:edit', e);
+      socket.emit('friends:dm:editError', { motivo: 'error' });
+    }
+  });
+
+  /**
+   * VACIAR UNA CONVERSACIÓN.
+   *
+   * Se vacía SOLO PARA QUIEN LO PIDE. Un mensaje privado es de dos, y borrar de
+   * un lado la copia del otro sería quitarle algo que también es suyo — y un
+   * regalo para quien quiera decir algo y hacerlo desaparecer del historial
+   * ajeno. Por eso hay `ocultoPara` en vez de un borrado a secas.
+   *
+   * Cuando los DOS lo han ocultado, el documento ya no le sirve a nadie y ahí
+   * sí se borra de verdad: es lo único que impide que la colección crezca para
+   * siempre con conversaciones que nadie va a volver a abrir.
+   */
+  socket.on('friends:dm:clear', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      if (frenado(socket, 'dmclear', 800)) return;
+
+      const otro = String((data && data.con) || '').trim();
+      if (!otro || otro === yo) return;
+
+      const filtro = { $or: [{ de: yo, para: otro }, { de: otro, para: yo }] };
+      await MensajePrivado.updateMany(filtro, { $addToSet: { ocultoPara: yo } }).exec();
+      // Los que ya están ocultos para los dos no le sirven a nadie.
+      await MensajePrivado.deleteMany({
+        $and: [filtro, { ocultoPara: { $all: [yo, otro] } }]
+      }).exec();
+
+      socket.emit('friends:dm:cleared', { con: otro });
+      avisarAJugador(yo, 'friends:unread', {
+        noLeidos: await MensajePrivado.countDocuments({
+          para: yo, leido: false, ocultoPara: { $ne: yo }
+        }).exec()
+      });
+    } catch (e) {
+      console.error('friends:dm:clear', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  /**
+   * EL LIMPIADOR AUTOMÁTICO: 24 horas, 3 días, 1 semana, o apagado.
+   *
+   * Es una preferencia TUYA y vale para todos tus privados. No borra los del
+   * otro: al leer se filtra por tu ventana, y el documento se borra de verdad
+   * cuando ha caducado para los dos (ver `podarPrivados`). Así, si tú pones 24
+   * horas y tu amigo no pone nada, tú dejas de verlos y él los conserva —
+   * que es lo que significa "mi limpiador".
+   */
+  const LIMPIEZA_VALIDA = [0, 24, 72, 168];
+
+  socket.on('friends:dm:limpieza', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+
+      const horas = Number(data && data.horas);
+      if (LIMPIEZA_VALIDA.indexOf(horas) < 0) {
+        return socket.emit('friends:error', { motivo: 'limpieza_invalida' });
+      }
+      const d = await amistadDoc(yo);
+      d.limpiezaDM = horas;
+      d.updatedAt = new Date();
+      await d.save();
+      socket.emit('friends:dm:limpieza', { ok: true, horas });
+    } catch (e) {
+      console.error('friends:dm:limpieza', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  // ── COLOR DEL NOMBRE DE LA MASCOTA ───────────────────────────────────────
+  //
+  // Exactamente lo mismo que `player:nameColor` pero para el cartel del perro.
+  // Va aparte y no como un campo más de aquel porque son dos decisiones
+  // distintas del jugador y se cambian por separado.
+  socket.on('player:petNameColor', async (data) => {
+    try {
+      const yo = socket.authenticatedPlayer || await resolveBattlePlayerName(socket);
+      if (!yo || yo === '---') return socket.emit('friends:error', { motivo: 'sin_sesion' });
+
+      const bruto = String((data && data.color) || '').trim();
+      const color = bruto ? (/^#[0-9a-fA-F]{6}$/.test(bruto) ? bruto.toLowerCase() : null) : null;
+      if (bruto && !color) return socket.emit('friends:error', { motivo: 'color_invalido' });
+
+      await GamePlayer.updateOne({ playerName: yo }, { $set: { petNameColor: color } }).exec();
+      socket._petNameColor = color;
+
+      const room = socket.playerData && socket.playerData.room;
+      if (room && rooms[room] && rooms[room][socket.id]) {
+        rooms[room][socket.id].petNameColor = color;
+        io.to(room).emit('playerPetNameColor', { id: socket.id, petNameColor: color });
+      }
+      socket.emit('player:petNameColor', { ok: true, color: color });
+    } catch (e) {
+      console.error('player:petNameColor error:', e);
       socket.emit('friends:error', { motivo: 'error' });
     }
   });
@@ -18708,11 +18999,40 @@ io.on('connection', (socket) => {
       const otro = String((data && data.con) || '').trim();
       if (!otro) return;
 
-      const msgs = await MensajePrivado.find({
-        $or: [{ de: yo, para: otro }, { de: otro, para: yo }]
-      }).sort({ ts: 1 }).limit(DM_GUARDADOS_MAX).lean();
+      const miFicha = await amistadDoc(yo);
+      const desde = miFicha.limpiezaDM > 0
+        ? new Date(Date.now() - miFicha.limpiezaDM * 3600 * 1000) : null;
+      const filtro = {
+        $or: [{ de: yo, para: otro }, { de: otro, para: yo }],
+        ocultoPara: { $ne: yo }
+      };
+      if (desde) filtro.ts = { $gte: desde };
 
-      await MensajePrivado.updateMany({ de: otro, para: yo, leido: false }, { $set: { leido: true } }).exec();
+      const msgs = await MensajePrivado.find(filtro)
+        .sort({ ts: 1 }).limit(DM_GUARDADOS_MAX).lean();
+
+      await MensajePrivado.updateMany(
+        { de: otro, para: yo, leido: false }, { $set: { leido: true } }).exec();
+
+      /* PODA DE VERDAD. Un mensaje solo se borra cuando ya NO LE SIRVE A
+         NADIE: o lo han ocultado los dos, o ha caducado para los dos según sus
+         limpiadores. Filtrar al leer es lo que ve el jugador; esto es lo que
+         impide que la colección crezca para siempre. */
+      try {
+        const suFicha = await amistadDoc(otro);
+        const caducados = [];
+        if (miFicha.limpiezaDM > 0 && suFicha.limpiezaDM > 0) {
+          const masLargo = Math.max(miFicha.limpiezaDM, suFicha.limpiezaDM);
+          caducados.push({ ts: { $lt: new Date(Date.now() - masLargo * 3600 * 1000) } });
+        }
+        const condiciones = [{ ocultoPara: { $all: [yo, otro] } }].concat(caducados);
+        await MensajePrivado.deleteMany({
+          $and: [
+            { $or: [{ de: yo, para: otro }, { de: otro, para: yo }] },
+            { $or: condiciones }
+          ]
+        }).exec();
+      } catch (e) { /* la poda nunca puede impedir leer la conversación */ }
 
       const fichas = await fichasDe([otro, yo]);
       socket.emit('friends:dm:history', {
@@ -18721,12 +19041,16 @@ io.on('connection', (socket) => {
         ficha: fichas.get(otro),
         mensajes: msgs.map(m => ({
           id: String(m._id), de: m.de, para: m.para, deNombre: m.deNombre,
-          texto: m.texto, ts: new Date(m.ts).toISOString(), leido: !!m.leido
+          texto: m.texto, ts: new Date(m.ts).toISOString(), leido: !!m.leido,
+          editado: !!m.editado,
+          reacciones: (m.reacciones || []).map(r => ({ emoji: r.emoji, quienes: (r.quienes || []).slice() }))
         }))
       });
 
       // El contador del botón baja al momento en todas sus pestañas.
-      const noLeidos = await MensajePrivado.countDocuments({ para: yo, leido: false }).exec();
+      const noLeidos = await MensajePrivado.countDocuments({
+        para: yo, leido: false, ocultoPara: { $ne: yo }
+      }).exec();
       avisarAJugador(yo, 'friends:unread', { noLeidos });
     } catch (e) {
       console.error('friends:dm:history', e);
