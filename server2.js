@@ -548,6 +548,16 @@ const gamePlayerSchema = new mongoose.Schema({
   // Nombre de la mascota. Igual que Username: nace en '---' y solo puede
   // fijarse UNA vez (regla aplicada en /api/save).
   petName: { type: String, default: '---' },
+
+  /* COLOR DEL NOMBRE DEL PERSONAJE.
+     Lo elige el jugador desde el dashboard y lo ven TODOS: se pinta sobre su
+     cabeza en el mapa y en la tienda, y delante de sus mensajes en el chat.
+     `null` = el blanco de siempre.
+     Solo se admite '#rrggbb' — se valida en /api/save y en el socket
+     'player:nameColor', porque este valor acaba dentro de la pantalla de los
+     demas jugadores. */
+  nameColor: { type: String, default: null },
+
   lenguaje: { type: Number, default: 1 },
   nivel: { type: Number, default: 0 },
   nivel_exp: { type: Number, default: 0 },
@@ -5331,6 +5341,27 @@ io.on("connection", (socket) => {
       }
     }
 
+    /* EL COLOR DEL NOMBRE SE LEE UNA VEZ POR SESION Y SE GUARDA EN EL SOCKET.
+
+       Tiene que salir del servidor y no del mensaje del cliente: es lo unico
+       que impide que alguien se pinte el nombre —o el de otro— del color que le
+       apetezca en la pantalla de los demas. Se cachea porque hace falta en cada
+       mensaje de chat, y una consulta a Mongo por mensaje no tiene sentido para
+       un dato que casi nunca cambia. El evento 'player:nameColor' actualiza la
+       cache en caliente cuando el jugador lo cambia. */
+    if (socket._nameColor === undefined) {
+      socket._nameColor = null;
+      try {
+        if (socket.authenticatedPlayer) {
+          const gpColor = await GamePlayer.findOne({ playerName: socket.authenticatedPlayer })
+            .select('nameColor').lean();
+          if (gpColor && /^#[0-9a-fA-F]{6}$/.test(String(gpColor.nameColor || ''))) {
+            socket._nameColor = String(gpColor.nameColor).toLowerCase();
+          }
+        }
+      } catch (e) { /* sin color: se ve el blanco de siempre */ }
+    }
+
     /* UN JOIN SIEMPRE SE CONTESTA. NUNCA SE VUELVE EN SILENCIO.
 
        FALLO GORDO QUE ESTO ARREGLA — "mis amigos me ven moverme, yo a ellos
@@ -5408,6 +5439,9 @@ io.on("connection", (socket) => {
       // Se valida aquí porque el cliente lo usa para COMPONER UNA RUTA de
       // sprites: sin filtro, un "../.." se saldría de la carpeta Soulbound.
       soulbound: NOMBRE_SOULBOUND_VALIDO.test(String(soulbound || '')) ? String(soulbound) : null,
+      // Color elegido para el nombre. Va en la foto de la sala para que quien
+      // entra vea a los demas ya con su color, sin esperar a que se muevan.
+      nameColor: socket._nameColor || null,
       lastUpdate: Date.now()
     };
 
@@ -5459,6 +5493,8 @@ io.on("connection", (socket) => {
       id:         socket.id,
       address:    socket.authenticatedAddress || rooms[room][socket.id].address || null,
       playerName: socket.authenticatedPlayer  || rooms[room][socket.id].playerName || null,
+      // Mismo motivo que address/playerName: el color lo pone el servidor.
+      nameColor:  socket._nameColor || null,
       lastUpdate: Date.now()
     };
 
@@ -5545,21 +5581,200 @@ io.on("connection", (socket) => {
       const text = escapeHtml(recortado);
       if (!text) return;
 
+      /* COMANDOS DEL CHAT.
+
+         `/add_friend "Fulano"` no es un mensaje: es una accion. Se ejecuta y NO
+         se reparte por la sala — si se repartiera, todo el canal veria a quien
+         le estas mandando una solicitud, que no es asunto suyo.
+
+         Se interpreta AQUI, en el servidor, aunque el cliente ya lo intercepte
+         antes de enviarlo. Los dos sitios hacen falta por motivos distintos: en
+         el cliente para que la respuesta sea inmediata, y aqui para que un
+         cliente viejo —o una pestaña que no se haya recargado— no acabe
+         escribiendo el comando en el chat de todo el mundo. */
+      const comando = /^\/add_?friend\s+(.+)$/i.exec(crudo);
+      if (comando) {
+        const pedido = comando[1].trim().replace(/^["'“”]+|["'“”]+$/g, '');
+        socket.emit('chatCommand', { que: 'add_friend', nombre: pedido });
+        return;
+      }
+
+      /* IDENTIFICADOR DE MENSAJE.
+
+         Hace falta para dos cosas nuevas: reaccionar a un mensaje y editarlo.
+         Sin un identificador propio no hay forma de senalar CUAL — el indice en
+         la lista no vale, porque el anillo de 50 va desplazandose y el mensaje
+         numero 3 de uno es el 4 de otro. */
+      const mid = 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
       const message = {
         id: socket.id,
+        mid,
         playerName,
+        // El color que el jugador eligio para su nombre. Sale del servidor y no
+        // del mensaje: si viniera en el cuerpo, cualquiera podria pintarse el
+        // nombre del color que quisiera en el chat de los demas.
+        nameColor: socket._nameColor || null,
         text,
         ts: new Date().toISOString(),
-        room: room
+        room: room,
+        editado: false,
+        reacciones: []
       };
 
       const historial = historialDe(room);
+      /* LA LLAVE DEL DUENO NO VIAJA. Es lo que decide quien puede editar o
+         quitar su reaccion, y va por CUENTA y no por id de socket: si fuera por
+         socket, una reconexion te dejaria sin poder editar tu propio mensaje de
+         hace diez segundos. Se define sin enumerar para que un JSON.stringify
+         del historial no la saque nunca por error. */
+      Object.defineProperty(message, '_dueno', {
+        value: socket.authenticatedPlayer || socket.id,
+        enumerable: false, writable: false
+      });
       historial.push(message);
       if (historial.length > MAX_HISTORY) historial.shift();
 
       io.to(room).emit('chatMessage', message);
     } catch (e) {
       console.error('chatMessage error:', e);
+    }
+  });
+
+  /** Busca un mensaje dentro del historial de la sala en la que esta el socket. */
+  function mensajeDeLaSala(sock, mid) {
+    const room = sock.playerData && sock.playerData.room;
+    if (!room || !mid) return { room: null, msg: null };
+    const msg = historialDe(room).find(m => m && m.mid === mid) || null;
+    return { room, msg };
+  }
+
+  // ── REACCIONES ────────────────────────────────────────────────────────────
+  //
+  // Viven en el anillo de 50 mensajes de la sala y en ningun sitio mas: no se
+  // guardan en la base de datos. Es lo coherente con el chat, que tampoco se
+  // guarda — una reaccion a un mensaje que ya no existe no tendria donde
+  // pintarse.
+  //
+  // La lista de emojis esta CERRADA a proposito. Con emoji libre, el campo se
+  // convierte en un segundo chat sin freno de longitud ni antispam, pegado
+  // debajo de cada mensaje.
+  const REACCIONES_VALIDAS = ['\u{1F44D}', '❤️', '\u{1F602}', '\u{1F62E}', '\u{1F622}', '\u{1F525}'];
+  const REACCIONES_POR_MENSAJE = 6;
+
+  socket.on('chatReact', (data) => {
+    try {
+      const room = socket.playerData && socket.playerData.room;
+      if (!room) { socket.emit('rejoinRequired', { motivo: 'sin_sala' }); return; }
+
+      const ahora = Date.now();
+      if (ahora - (socket._ultimaReaccion || 0) < 250) return;
+      socket._ultimaReaccion = ahora;
+
+      const emoji = String((data && data.emoji) || '');
+      if (REACCIONES_VALIDAS.indexOf(emoji) === -1) return;
+
+      const encontrado = mensajeDeLaSala(socket, data && data.mid);
+      const msg = encontrado.msg;
+      if (!msg) return;
+
+      const quien  = socket.authenticatedPlayer || socket.id;
+      const nombre = escapeHtml(socket.playerData.username || '---');
+
+      msg.reacciones = msg.reacciones || [];
+      let grupo = msg.reacciones.find(r => r.emoji === emoji);
+
+      if (grupo && grupo.quienes.some(q => q.k === quien)) {
+        // Ya habia reaccionado con este: el segundo toque la QUITA.
+        grupo.quienes = grupo.quienes.filter(q => q.k !== quien);
+        if (!grupo.quienes.length) {
+          msg.reacciones = msg.reacciones.filter(r => r.emoji !== emoji);
+        }
+      } else {
+        if (!grupo) {
+          if (msg.reacciones.length >= REACCIONES_POR_MENSAJE) return;
+          grupo = { emoji: emoji, quienes: [] };
+          msg.reacciones.push(grupo);
+        }
+        grupo.quienes.push({ k: quien, n: nombre });
+      }
+
+      io.to(encontrado.room).emit('chatReaction', { mid: msg.mid, reacciones: msg.reacciones });
+    } catch (e) {
+      console.error('chatReact error:', e);
+    }
+  });
+
+  // ── EDITAR UN MENSAJE, UNA SOLA VEZ ───────────────────────────────────────
+  //
+  // "Una sola vez" es la regla que se pidio y ademas es la que hace que esto no
+  // se pueda usar para enganar: con ediciones ilimitadas, cualquiera puede
+  // escribir algo, esperar a que lo lean y dejar otra cosa puesta. Con una
+  // sola, y marcado como "(edited)", el mensaje sigue siendo comprobable.
+  //
+  // El plazo de dos minutos va en la misma direccion: una edicion es para
+  // arreglar una errata recien cometida, no para reescribir la conversacion de
+  // hace un rato.
+  const EDICION_PLAZO_MS = 2 * 60 * 1000;
+
+  socket.on('chatEdit', (data) => {
+    try {
+      const room = socket.playerData && socket.playerData.room;
+      if (!room) { socket.emit('rejoinRequired', { motivo: 'sin_sala' }); return; }
+
+      const encontrado = mensajeDeLaSala(socket, data && data.mid);
+      const msg = encontrado.msg;
+      if (!msg) return socket.emit('chatEditError', { motivo: 'no_existe' });
+
+      const quien = socket.authenticatedPlayer || socket.id;
+      if (msg._dueno !== quien) return socket.emit('chatEditError', { motivo: 'no_es_tuyo' });
+      if (msg.editado)          return socket.emit('chatEditError', { motivo: 'ya_editado' });
+      if (Date.now() - new Date(msg.ts).getTime() > EDICION_PLAZO_MS) {
+        return socket.emit('chatEditError', { motivo: 'fuera_de_plazo' });
+      }
+
+      const crudo = String((data && data.text) || '').trim();
+      const recortado = [...crudo].slice(0, 300).join('');
+      const texto = escapeHtml(recortado);
+      if (!texto) return socket.emit('chatEditError', { motivo: 'vacio' });
+      if (texto === msg.text) return;
+
+      msg.text = texto;
+      msg.editado = true;
+      io.to(encontrado.room).emit('chatEdited', { mid: msg.mid, text: msg.text, editado: true });
+    } catch (e) {
+      console.error('chatEdit error:', e);
+    }
+  });
+
+  // ── COLOR DEL NOMBRE ──────────────────────────────────────────────────────
+  //
+  // Se guarda en GamePlayer.nameColor y se propaga al momento a la sala, para
+  // que el cambio se vea sin recargar. Se valida aqui —#rrggbb y nada mas—
+  // porque este valor acaba pintado en el nombre de un jugador dentro de la
+  // pantalla de TODOS los demas.
+  socket.on('player:nameColor', async (data) => {
+    try {
+      const yo = socket.authenticatedPlayer || await resolveBattlePlayerName(socket);
+      if (!yo || yo === '---') return socket.emit('friends:error', { motivo: 'sin_sesion' });
+
+      const bruto = String((data && data.color) || '').trim();
+      // Cadena vacia = volver al blanco de siempre.
+      const color = bruto ? (/^#[0-9a-fA-F]{6}$/.test(bruto) ? bruto.toLowerCase() : null) : null;
+      if (bruto && !color) return socket.emit('friends:error', { motivo: 'color_invalido' });
+
+      await GamePlayer.updateOne({ playerName: yo }, { $set: { nameColor: color } }).exec();
+      socket._nameColor = color;
+
+      const room = socket.playerData && socket.playerData.room;
+      if (room && rooms[room] && rooms[room][socket.id]) {
+        rooms[room][socket.id].nameColor = color;
+        io.to(room).emit('playerNameColor', { id: socket.id, nameColor: color });
+      }
+      socket.emit('player:nameColor', { ok: true, color: color });
+    } catch (e) {
+      console.error('player:nameColor error:', e);
+      socket.emit('friends:error', { motivo: 'error' });
     }
   });
 
@@ -8711,6 +8926,20 @@ app.post('/api/save/:playerName',
       // El cliente no debe poder escribir esta marca a mano.
       delete update.marketWriteAt;
 
+      /* COLOR DEL NOMBRE: '#rrggbb' o nada.
+         Llega por Object.assign como cualquier otro campo del cuerpo, asi que
+         sin esto se guardaria tal cual lo mandara el cliente — y este valor se
+         pinta luego DENTRO DE LA PANTALLA DE LOS DEMAS jugadores (sobre su
+         cabeza y en el chat). Un texto arbitrario ahi es una inyeccion de
+         estilo en el navegador de otro. Cualquier cosa que no sea un color
+         hexadecimal de seis digitos se descarta y el campo no se toca. */
+      if ('nameColor' in update) {
+        const c = String(update.nameColor == null ? '' : update.nameColor).trim();
+        if (!c) update.nameColor = null;
+        else if (/^#[0-9a-fA-F]{6}$/.test(c)) update.nameColor = c.toLowerCase();
+        else delete update.nameColor;
+      }
+
       // ── REGLA DE NOMBRE ÚNICO (personaje y mascota) ─────────────────────
       // Ambos nombres nacen como '---'. El jugador puede fijar cada uno UNA
       // sola vez: cuando el valor guardado ya NO es '---', cualquier intento
@@ -9727,6 +9956,19 @@ const climaSchema = new mongoose.Schema({
   soleado:    { type: Boolean, default: false },
   soleadoFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
 
+  /* NUBLADO. Es el hermano tranquilo del despejado: no cae nada del cielo, no
+     hay cortina ni relampagos, y el mundo se ve igual de nitido. Lo unico que
+     cambia es que pasan SOMBRAS DE NUBES por el suelo.
+
+     Por que es su propio interruptor y no un hueco entre los demas: "despejado"
+     significa que no pasa nada, y esto si pasa. Y no puede colgar del soleado
+     porque son opuestos — con sol no hay nubes que proyecten sombra.
+
+     `nubladoFuerza` es cuanto tapan: 0.2 son cuatro nubes altas que apenas se
+     notan, 2 es un cielo cubierto con sombras marcadas cruzando el campo. */
+  nublado:    { type: Boolean, default: false },
+  nubladoFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
+
   /* ESTACIÓN DEL AÑO. Cambia el color de todo el mundo: el otoño lo pone
      ámbar, el invierno azulado y frío. 'auto' la saca del mes real. */
   estacion:   { type: String,
@@ -9757,13 +9999,15 @@ const climaSchema = new mongoose.Schema({
   cola: {
     type: [new mongoose.Schema({
       que:          { type: String, enum: ['viento', 'lluvia', 'tormenta',
-                                           'nieve', 'soleado', 'despejado'],
+                                           'nieve', 'soleado', 'nublado',
+                                           'despejado'],
                       required: true },
       minutos:      { type: Number, required: true, min: 1, max: 1440 },
       vientoFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
       lluviaFuerza: { type: Number, default: 1, min: 0.2, max: 2 },
       nieveFuerza:  { type: Number, default: 1, min: 0.2, max: 2 },
       soleadoFuerza:{ type: Number, default: 1, min: 0.2, max: 2 },
+      nubladoFuerza:{ type: Number, default: 1, min: 0.2, max: 2 },
       truenos:      { type: Boolean, default: true },
       creadoPor:    { type: String, default: null },
       creadoEn:     { type: Date, default: Date.now }
@@ -9833,9 +10077,15 @@ function climaAplicarEntrada(d, e, ahora) {
   /* El sol y el agua no conviven: si entra sol, se va todo lo demás. Un día
      soleado con lluvia cayendo se lee como un fallo, no como un chubasco. */
   d.soleado = (e.que === 'soleado');
-  if (d.soleado) { d.viento = false; d.lluvia = false; d.nieve = false; }
-  if (e.que === 'despejado') { d.viento = false; d.lluvia = false; d.nieve = false; }
+  /* NUBLADO Y SOLEADO SON EXCLUYENTES. Con el sol entrando por la esquina no
+     puede haber a la vez un cielo cubierto tapandolo: se leeria como un fallo
+     de dibujo, no como un dia raro. */
+  d.nublado = (e.que === 'nublado');
+  if (d.soleado) { d.viento = false; d.lluvia = false; d.nieve = false; d.nublado = false; }
+  if (d.nublado) { d.lluvia = false; d.nieve = false; d.soleado = false; }
+  if (e.que === 'despejado') { d.viento = false; d.lluvia = false; d.nieve = false; d.nublado = false; }
   if (Number.isFinite(Number(e.soleadoFuerza))) d.soleadoFuerza = Number(e.soleadoFuerza);
+  if (Number.isFinite(Number(e.nubladoFuerza))) d.nubladoFuerza = Number(e.nubladoFuerza);
   if (e.que === 'tormenta') d.truenos = true;
   else if (typeof e.truenos === 'boolean') d.truenos = e.truenos;
   if (Number.isFinite(Number(e.vientoFuerza))) d.vientoFuerza = Number(e.vientoFuerza);
@@ -9873,6 +10123,7 @@ async function climaAvanzar(d) {
     d.lluvia = false;
     d.nieve = false;
     d.soleado = false;
+    d.nublado = false;
     d.hasta = null;
     d.actual = null;
     d.actualDeCola = false;
@@ -9974,6 +10225,8 @@ function climaPublico(d) {
     nieveFuerza: d.nieveFuerza,
     soleado: encendido && !!d.soleado,
     soleadoFuerza: d.soleadoFuerza,
+    nublado: encendido && !!d.nublado,
+    nubladoFuerza: d.nubladoFuerza,
     estacion: estacionDe(d),
     // Cuántos climas quedan apuntados: el juego no necesita la lista, solo
     // saber que hay programación por delante.
@@ -10020,7 +10273,9 @@ function climaEmitir(d) {
 /** Lo que de verdad se ve, para saber si hace falta avisar. */
 function climaHuella(d) {
   return [d.activo, d.modo, d.viento, d.lluvia, d.truenos, d.nieve, d.soleado,
+          d.nublado,
           d.vientoFuerza, d.lluviaFuerza, d.nieveFuerza, d.soleadoFuerza,
+          d.nubladoFuerza,
           d.estacion, (d.cola || []).length].join('|');
 }
 
@@ -10066,12 +10321,13 @@ app.get('/api/admin/weather', adminAuth, async (req, res) => {
 // ── POST /api/admin/weather ─────────────────────────────────────────────────
 // Guarda la configuración. Solo se aceptan los campos conocidos y dentro de
 // rango: lo que llegue de más se ignora.
-const CLIMA_BOOL = ['activo', 'viento', 'lluvia', 'truenos', 'nieve', 'soleado'];
+const CLIMA_BOOL = ['activo', 'viento', 'lluvia', 'truenos', 'nieve', 'soleado', 'nublado'];
 const CLIMA_NUM = {
   vientoFuerza:  [0.2, 2],
   lluviaFuerza:  [0.2, 2],
   nieveFuerza:   [0.2, 2],
   soleadoFuerza: [0.2, 2],
+  nubladoFuerza: [0.2, 2],
   probViento:    [0, 1],
   probLluvia:    [0, 1],
   probNieve:     [0, 1],
@@ -10081,7 +10337,7 @@ const CLIMA_NUM = {
   duracionMax:   [1, 1440]
 };
 const CLIMA_ESTACIONES = ['auto', 'primavera', 'verano', 'otono', 'invierno'];
-const CLIMA_QUE = ['viento', 'lluvia', 'tormenta', 'nieve', 'soleado', 'despejado'];
+const CLIMA_QUE = ['viento', 'lluvia', 'tormenta', 'nieve', 'soleado', 'nublado', 'despejado'];
 
 app.post('/api/admin/weather', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
   try {
@@ -10161,6 +10417,7 @@ app.post('/api/admin/weather/queue', adminAuth, strictLimiter, csrfProtection, a
       lluviaFuerza: nl(b.lluviaFuerza, d.lluviaFuerza),
       nieveFuerza:  nl(b.nieveFuerza,  d.nieveFuerza),
       soleadoFuerza: nl(b.soleadoFuerza, d.soleadoFuerza),
+      nubladoFuerza: nl(b.nubladoFuerza, d.nubladoFuerza),
       truenos: typeof b.truenos === 'boolean' ? b.truenos : !!d.truenos,
       creadoPor: (req.user && req.user.address) || null,
       creadoEn: new Date()
@@ -10239,6 +10496,7 @@ app.post('/api/admin/weather/test', adminAuth, strictLimiter, csrfProtection, as
       lluviaFuerza: req.body && req.body.lluviaFuerza,
       nieveFuerza:  req.body && req.body.nieveFuerza,
       soleadoFuerza: req.body && req.body.soleadoFuerza,
+      nubladoFuerza: req.body && req.body.nubladoFuerza,
       truenos:      req.body && req.body.truenos
     });
     d.actualDeCola = false;
@@ -17724,6 +17982,760 @@ io.on('connection', (socket) => {
 });
 
 console.log('✅ Battle routes cargados: GET /api/battle/leaderboard + sockets battle:*');
+
+
+// =============================================================================
+// AMISTADES, SOLICITUDES Y MENSAJES PRIVADOS
+// =============================================================================
+//
+// QUÉ RESUELVE
+// -----------------------------------------------------------------------------
+// El juego separa a la gente en 10 canales (ver el bloque de CANALES). Eso está
+// bien para el mundo —cincuenta personas por copia del mapa— pero es terrible
+// para los amigos: si tu amigo está en el canal 4 y tú en el 1, hoy no existe
+// para ti. No puedes escribirle, no sabes si está jugando, y si os separáis no
+// hay forma de volver a encontraros.
+//
+// Aquí las amistades son de la CUENTA, no del canal. Un mensaje privado se
+// entrega al amigo esté en el canal que esté, y si no está conectado se guarda
+// y le espera: lo ve al entrar, aunque hayan pasado días.
+//
+// DOS NOMBRES, Y NO SON INTERCAMBIABLES
+// -----------------------------------------------------------------------------
+//   · `playerName`  identifica la CUENTA. No cambia nunca. Es la clave con la
+//                   que se guardan amistades y mensajes.
+//   · `Username`    es el nombre VISIBLE del personaje. Es único entre jugadores
+//                   (lo comprueba /api/save) y es el que la gente ve y escribe.
+//
+// El jugador busca y agrega por Username, porque es lo único que conoce. Todo
+// lo demás —lo que se guarda, lo que se compara, a quién se entrega un mensaje—
+// va por playerName. Mezclarlos sería el fallo clásico: un jugador se cambia el
+// nombre visible y pierde a todos sus amigos.
+//
+// POR QUÉ SOCKETS Y NO RUTAS HTTP
+// -----------------------------------------------------------------------------
+// Una solicitud de amistad y un mensaje privado tienen que LLEGAR, no esperar a
+// que el otro pregunte. El socket ya está abierto, ya está autenticado (ver el
+// io.use del JWT) y ya sobrevive a los cambios de escena, así que es el sitio
+// natural. Y de paso no hay que duplicar CSRF ni token en cada llamada.
+//
+// LA IDENTIDAD LA PONE EL SERVIDOR, SIEMPRE
+// -----------------------------------------------------------------------------
+// Ningún manejador de aquí se cree el nombre que venga en el mensaje: quién
+// eres sale de `resolveBattlePlayerName(socket)`, que lo saca del JWT de la
+// cookie. Si no, cualquiera podría aceptar amistades ajenas o mandar mensajes
+// privados firmando con el nombre de otro.
+// =============================================================================
+
+const AMISTADES_MAX      = 100;   // amigos por jugador
+const SOLICITUDES_MAX    = 60;    // solicitudes pendientes (entrantes o salientes)
+const DM_GUARDADOS_MAX   = 200;   // mensajes guardados por conversación
+const DM_LARGO_MAX       = 300;   // caracteres por mensaje privado
+const DM_ESPERA_MS       = 900;   // freno antispam entre mensajes privados
+const ACCION_ESPERA_MS   = 400;   // freno entre acciones (agregar, aceptar…)
+
+const amistadSchema = new mongoose.Schema({
+  playerName: { type: String, required: true, unique: true, index: true },
+  // Cada entrada es solo el playerName del otro y desde cuándo. El nombre
+  // visible NO se copia aquí a propósito: se lee de GamePlayer al pintar la
+  // lista, así que si alguien fija su nombre después, sus amigos lo ven bien
+  // sin tener que migrar nada.
+  amigos:     [{ _id: false, playerName: String, desde:  { type: Date, default: Date.now } }],
+  entrantes:  [{ _id: false, playerName: String, cuando: { type: Date, default: Date.now } }],
+  salientes:  [{ _id: false, playerName: String, cuando: { type: Date, default: Date.now } }],
+  updatedAt:  { type: Date, default: Date.now }
+}, { collection: 'player_friends', versionKey: false });
+
+const Amistad = mongoose.model('Amistad', amistadSchema);
+
+const mensajePrivadoSchema = new mongoose.Schema({
+  de:       { type: String, required: true, index: true },
+  para:     { type: String, required: true, index: true },
+  // El nombre visible del remitente EN EL MOMENTO DE ENVIARLO. Se copia porque
+  // un mensaje es un hecho pasado: tiene que poder leerse tal cual se envió
+  // aunque la cuenta del remitente ya no exista.
+  deNombre: { type: String, default: '---' },
+  texto:    { type: String, default: '' },
+  ts:       { type: Date, default: Date.now },
+  leido:    { type: Boolean, default: false }
+}, { collection: 'player_dms', versionKey: false });
+
+// Las dos consultas que se hacen de verdad: "mi bandeja" y "mi conversación
+// con fulano". Sin estos índices, con unos miles de mensajes cada apertura del
+// panel sería un recorrido completo de la colección.
+mensajePrivadoSchema.index({ para: 1, leido: 1, ts: -1 });
+mensajePrivadoSchema.index({ de: 1, para: 1, ts: -1 });
+
+const MensajePrivado = mongoose.model('MensajePrivado', mensajePrivadoSchema);
+
+/** La ficha de amistades de un jugador, creándola la primera vez. */
+async function amistadDoc(playerName) {
+  let d = await Amistad.findOne({ playerName }).exec();
+  if (!d) {
+    // upsert y no create: dos pestañas del mismo jugador abriendo el panel a la
+    // vez chocarían contra el índice único y una de las dos reventaría.
+    await Amistad.updateOne(
+      { playerName },
+      { $setOnInsert: { playerName, amigos: [], entrantes: [], salientes: [] } },
+      { upsert: true }
+    ).exec();
+    d = await Amistad.findOne({ playerName }).exec();
+  }
+  return d;
+}
+
+/** ¿Está `otro` en la lista `lista`? (comparación por playerName) */
+function enLista(lista, otro) {
+  return (lista || []).some(e => e && e.playerName === otro);
+}
+
+/** Quita a `otro` de una lista de subdocumentos, en el sitio. */
+function quitarDeLista(lista, otro) {
+  for (let i = lista.length - 1; i >= 0; i--) {
+    if (lista[i] && lista[i].playerName === otro) lista.splice(i, 1);
+  }
+}
+
+/**
+ * Ficha pública de un jugador: lo que se enseña en la lista de amigos.
+ * Se piden varios de golpe porque el panel siempre pinta una lista entera.
+ */
+async function fichasDe(nombres) {
+  const unicos = [...new Set((nombres || []).filter(Boolean))];
+  if (!unicos.length) return new Map();
+  const docs = await GamePlayer.find({ playerName: { $in: unicos } })
+    .select('playerName Username nivel nameColor').lean();
+  const mapa = new Map();
+  docs.forEach(d => mapa.set(d.playerName, {
+    playerName: d.playerName,
+    username:   d.Username && d.Username !== '---' ? d.Username : d.playerName,
+    nivel:      Number(d.nivel) || 0,
+    nameColor:  d.nameColor || null
+  }));
+  // Un jugador que aún no tiene GamePlayer (recién registrado) no puede
+  // desaparecer de la lista de su amigo: se le pone una ficha mínima.
+  unicos.forEach(n => {
+    if (!mapa.has(n)) mapa.set(n, { playerName: n, username: n, nivel: 0, nameColor: null });
+  });
+  return mapa;
+}
+
+/**
+ * Sockets conectados de una cuenta. Son varios cuando el jugador tiene dos
+ * pestañas abiertas, o cuando acaba de reconectar y el viejo todavía no ha
+ * expirado — a todos hay que avisarles.
+ */
+function socketsDeJugador(playerName) {
+  const salida = [];
+  if (!playerName) return salida;
+  try {
+    for (const [, s] of io.of('/').sockets) {
+      if (s.authenticatedPlayer && s.authenticatedPlayer === playerName) salida.push(s);
+    }
+  } catch (_) {}
+  return salida;
+}
+
+/** ¿Está jugando ahora mismo? Y si lo está, ¿en qué canal? */
+function presenciaDe(playerName) {
+  const ss = socketsDeJugador(playerName);
+  if (!ss.length) return { online: false, canal: null };
+  const canal = ss[0].playerData ? ss[0].playerData.canal : null;
+  return { online: true, canal: canal || null };
+}
+
+/**
+ * UNA FOTO DE QUIÉN ESTÁ CONECTADO: playerName -> canal.
+ *
+ * POR QUÉ EXISTE: `presenciaDe` se recorre TODOS los sockets, y el panel de
+ * amistades la necesita para cada amigo y para cada solicitud. Con 500
+ * jugadores y una lista de 100 amigos eso son cincuenta mil vueltas por cada
+ * apertura del panel — y el panel se refresca solo cada vez que alguien entra,
+ * sale, pide amistad o la acepta.
+ *
+ * Con la foto se recorre UNA vez y luego se consulta un Map. No se cachea entre
+ * llamadas a propósito: la presencia cambia cada segundo y una foto vieja sería
+ * peor que el coste que ahorra.
+ */
+function fotoDePresencia() {
+  const mapa = new Map();
+  try {
+    for (const [, s] of io.of('/').sockets) {
+      if (!s.authenticatedPlayer) continue;
+      if (mapa.has(s.authenticatedPlayer)) continue;
+      mapa.set(s.authenticatedPlayer, (s.playerData && s.playerData.canal) || null);
+    }
+  } catch (_) {}
+  return mapa;
+}
+
+/** Manda un evento a TODAS las pestañas de una cuenta. */
+function avisarAJugador(playerName, evento, datos) {
+  socketsDeJugador(playerName).forEach(s => {
+    try { s.emit(evento, datos); } catch (_) {}
+  });
+}
+
+/** El estado completo que pinta el panel de amistades. */
+async function estadoAmistades(playerName) {
+  const d = await amistadDoc(playerName);
+  const nombres = []
+    .concat(d.amigos.map(a => a.playerName))
+    .concat(d.entrantes.map(a => a.playerName))
+    .concat(d.salientes.map(a => a.playerName))
+    .concat([playerName]);
+  const fichas = await fichasDe(nombres);
+
+  // Una sola vuelta a los sockets para toda la lista (ver fotoDePresencia).
+  const foto = fotoDePresencia();
+  const conPresencia = (e) => {
+    const f = fichas.get(e.playerName) || { playerName: e.playerName, username: e.playerName, nivel: 0, nameColor: null };
+    const online = foto.has(e.playerName);
+    return { ...f, online, canal: online ? foto.get(e.playerName) : null,
+             desde: e.desde || e.cuando || null };
+  };
+
+  const noLeidos = await MensajePrivado.countDocuments({ para: playerName, leido: false }).exec();
+
+  return {
+    ok: true,
+    yo: fichas.get(playerName) || { playerName, username: playerName, nivel: 0, nameColor: null },
+    amigos:    d.amigos.map(conPresencia).sort((a, b) => (b.online - a.online) || a.username.localeCompare(b.username)),
+    entrantes: d.entrantes.map(conPresencia),
+    salientes: d.salientes.map(conPresencia),
+    noLeidos
+  };
+}
+
+/** Refresca el panel de las dos partes tras un cambio. */
+async function refrescarAmbos(a, b) {
+  for (const n of [a, b]) {
+    if (!n) continue;
+    if (!socketsDeJugador(n).length) continue;   // no está: no hay a quién avisar
+    try { avisarAJugador(n, 'friends:state', await estadoAmistades(n)); }
+    catch (e) { console.warn('⚠️ friends:state', n, e && e.message); }
+  }
+}
+
+/**
+ * De lo que escribe el jugador a una cuenta.
+ *
+ * Acepta el nombre VISIBLE (que es lo que la gente conoce) y también el
+ * playerName, por si el panel manda uno que ya tenía. La búsqueda por nombre
+ * visible NO distingue mayúsculas: para quien lo lee, "Kuro" y "kuro" son el
+ * mismo jugador, y obligar a acertar las mayúsculas sería una trampa tonta.
+ */
+async function buscarCuentaPorNombre(texto) {
+  const bruto = String(texto || '').trim();
+  if (!bruto || bruto === '---') return null;
+  // Se limita a lo que /api/save admite como nombre: letras y dígitos, 15
+  // caracteres. Así un texto con comodines de expresión regular no llega nunca
+  // a la consulta.
+  let limpio;
+  try { limpio = bruto.normalize('NFC').replace(/[^\p{L}\p{Nd}]/gu, '').slice(0, 15); }
+  catch (e) { limpio = bruto.replace(/[^A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü]/g, '').slice(0, 15); }
+  if (!limpio) return null;
+
+  const esc = limpio.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let gp = await GamePlayer.findOne({ Username: { $regex: '^' + esc + '$', $options: 'i' } })
+    .select('playerName Username nivel nameColor').lean();
+  if (!gp) {
+    gp = await GamePlayer.findOne({ playerName: bruto })
+      .select('playerName Username nivel nameColor').lean();
+  }
+  if (!gp || !gp.playerName) return null;
+  return {
+    playerName: gp.playerName,
+    username:   gp.Username && gp.Username !== '---' ? gp.Username : gp.playerName,
+    nivel:      Number(gp.nivel) || 0,
+    nameColor:  gp.nameColor || null
+  };
+}
+
+/** Freno antispam por socket, uno por familia de acción. */
+function frenado(socket, clave, ms) {
+  const ahora = Date.now();
+  socket._frenoAmistades = socket._frenoAmistades || {};
+  if (ahora - (socket._frenoAmistades[clave] || 0) < ms) return true;
+  socket._frenoAmistades[clave] = ahora;
+  return false;
+}
+
+/**
+ * Quién es este socket, en clave de cuenta.
+ *
+ * Devuelve null para un socket anónimo: sin sesión no hay amistades que valgan.
+ * `resolveBattlePlayerName` cachea el resultado en el propio socket, así que
+ * esto es una consulta a la base de datos por sesión, no por mensaje.
+ */
+async function cuentaDelSocket(socket) {
+  const n = await resolveBattlePlayerName(socket);
+  if (!n || n === '---') return null;
+  return n;
+}
+
+io.on('connection', (socket) => {
+
+  /* La cuenta se resuelve NADA MÁS CONECTAR, sin esperar a que el jugador abra
+     el panel. Es lo que hace que la presencia funcione: para saber si tu amigo
+     está jugando hay que poder mirar en los sockets y ver su nombre, y hasta
+     ahora `authenticatedPlayer` solo se rellenaba dentro de joinRoom — o sea,
+     tarde, y solo si llegaba a entrar en una sala. */
+  cuentaDelSocket(socket).then((yo) => {
+    if (!yo) return;
+    // Avisar a sus amigos de que acaba de entrar, y darle a él la lista.
+    Amistad.findOne({ playerName: yo }).select('amigos').lean()
+      .then(d => {
+        const p = presenciaDe(yo);
+        (d && d.amigos ? d.amigos : []).forEach(a => {
+          avisarAJugador(a.playerName, 'friends:presence',
+                         { playerName: yo, online: true, canal: p.canal });
+        });
+      })
+      .catch(() => {});
+  }).catch(() => {});
+
+  socket.on('disconnect', () => {
+    const yo = socket.authenticatedPlayer;
+    if (!yo) return;
+    /* Se comprueba si le queda ALGUNA pestaña abierta antes de dar a nadie por
+       desconectado. Sin esto, cerrar una de dos pestañas —o una reconexión, que
+       es exactamente eso— le apagaría el punto verde a alguien que sigue
+       jugando. El propio socket ya está fuera del mapa cuando esto corre. */
+    setTimeout(() => {
+      if (socketsDeJugador(yo).length) return;
+      Amistad.findOne({ playerName: yo }).select('amigos').lean()
+        .then(d => {
+          (d && d.amigos ? d.amigos : []).forEach(a => {
+            avisarAJugador(a.playerName, 'friends:presence',
+                           { playerName: yo, online: false, canal: null });
+          });
+        })
+        .catch(() => {});
+    }, 1500);
+  });
+
+  /** El estado completo: amigos, solicitudes y cuántos mensajes sin leer. */
+  socket.on('friends:state', async () => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      socket.emit('friends:state', await estadoAmistades(yo));
+    } catch (e) {
+      console.error('friends:state', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  /**
+   * Quién está conectado EN MI CANAL, con su nivel.
+   *
+   * Sale de `rooms`, que es lo que el servidor ya usa para el mapa y la tienda,
+   * así que la lista es exactamente la gente con la que te puedes cruzar. Se
+   * juntan las dos salas del canal (mapa y tienda) porque para el jugador es el
+   * mismo sitio: su amigo no deja de estar ahí por haber entrado en la tienda.
+   */
+  socket.on('friends:online', async () => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+
+      const canal = (socket.playerData && socket.playerData.canal) || 1;
+      const vistos = new Map();          // playerName -> {sala}
+      for (const [, s] of io.of('/').sockets) {
+        if (!s.authenticatedPlayer) continue;
+        const c = s.playerData && s.playerData.canal;
+        if (c !== canal) continue;
+        if (s.authenticatedPlayer === yo) continue;
+        const sala = s.playerData && s.playerData.room ? salaBase(s.playerData.room) : null;
+        if (!vistos.has(s.authenticatedPlayer)) vistos.set(s.authenticatedPlayer, sala);
+      }
+
+      const nombres = [...vistos.keys()];
+      const fichas  = await fichasDe(nombres);
+      const d       = await amistadDoc(yo);
+
+      const jugadores = nombres.map(n => {
+        const f = fichas.get(n);
+        return {
+          ...f,
+          zona: vistos.get(n) === 'tienda' ? 'shop' : 'world',
+          esAmigo:    enLista(d.amigos, n),
+          pendiente:  enLista(d.salientes, n),
+          tePidio:    enLista(d.entrantes, n)
+        };
+      }).sort((a, b) => b.nivel - a.nivel || a.username.localeCompare(b.username));
+
+      socket.emit('friends:online', { ok: true, canal, jugadores });
+    } catch (e) {
+      console.error('friends:online', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  /**
+   * Buscar jugadores por nombre visible.
+   *
+   * Busca en TODO el juego, no solo en tu canal: si tu amigo está en el canal 7
+   * lo normal es que quieras agregarlo precisamente por eso. La consulta es por
+   * prefijo y con tope de 20, que es lo que cabe en el panel.
+   */
+  socket.on('friends:search', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      if (frenado(socket, 'buscar', 250)) return;
+
+      const bruto = String((data && data.q) || '').trim();
+      let limpio;
+      try { limpio = bruto.normalize('NFC').replace(/[^\p{L}\p{Nd}]/gu, '').slice(0, 15); }
+      catch (e) { limpio = bruto.replace(/[^A-Za-z0-9ÁÉÍÓÚáéíóúÑñÜü]/g, '').slice(0, 15); }
+      if (limpio.length < 2) return socket.emit('friends:search', { ok: true, q: bruto, jugadores: [] });
+
+      const esc = limpio.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const docs = await GamePlayer.find({
+        Username: { $regex: '^' + esc, $options: 'i' },
+        playerName: { $ne: yo }
+      }).select('playerName Username nivel nameColor').limit(20).lean();
+
+      const d = await amistadDoc(yo);
+      const foto = fotoDePresencia();     // una vuelta para los 20 resultados
+      const jugadores = docs
+        .filter(x => x.Username && x.Username !== '---')
+        .map(x => {
+          const online = foto.has(x.playerName);
+          return {
+            playerName: x.playerName,
+            username:   x.Username,
+            nivel:      Number(x.nivel) || 0,
+            nameColor:  x.nameColor || null,
+            online:     online,
+            canal:      online ? foto.get(x.playerName) : null,
+            esAmigo:    enLista(d.amigos, x.playerName),
+            pendiente:  enLista(d.salientes, x.playerName),
+            tePidio:    enLista(d.entrantes, x.playerName)
+          };
+        });
+
+      socket.emit('friends:search', { ok: true, q: bruto, jugadores });
+    } catch (e) {
+      console.error('friends:search', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  /** Mandar solicitud. Acepta nombre visible (lo normal) o playerName. */
+  socket.on('friends:request', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      if (frenado(socket, 'accion', ACCION_ESPERA_MS)) {
+        return socket.emit('friends:error', { motivo: 'demasiado_rapido' });
+      }
+
+      const ficha = await buscarCuentaPorNombre((data && (data.nombre || data.playerName)) || '');
+      if (!ficha) return socket.emit('friends:error', { motivo: 'no_existe', nombre: (data && data.nombre) || '' });
+      const otro = ficha.playerName;
+      if (otro === yo) return socket.emit('friends:error', { motivo: 'eres_tu' });
+
+      const mio  = await amistadDoc(yo);
+      const suyo = await amistadDoc(otro);
+
+      if (enLista(mio.amigos, otro)) {
+        return socket.emit('friends:error', { motivo: 'ya_amigos', nombre: ficha.username });
+      }
+      if (mio.amigos.length >= AMISTADES_MAX) {
+        return socket.emit('friends:error', { motivo: 'lista_llena' });
+      }
+      if (suyo.amigos.length >= AMISTADES_MAX) {
+        return socket.emit('friends:error', { motivo: 'su_lista_llena', nombre: ficha.username });
+      }
+
+      /* SI ÉL YA TE HABÍA PEDIDO A TI, ESTO ES UN "SÍ".
+         Pedir amistad a quien ya te la pidió es aceptarla: dejar las dos
+         solicitudes cruzadas colgando sería absurdo y el jugador no entendería
+         por qué sigue sin ser su amigo. */
+      if (enLista(mio.entrantes, otro)) {
+        quitarDeLista(mio.entrantes, otro);
+        quitarDeLista(suyo.salientes, yo);
+        mio.amigos.push({ playerName: otro, desde: new Date() });
+        suyo.amigos.push({ playerName: yo,  desde: new Date() });
+        mio.updatedAt = suyo.updatedAt = new Date();
+        await mio.save(); await suyo.save();
+        avisarAJugador(otro, 'friends:accepted', { por: (await fichasDe([yo])).get(yo) });
+        await refrescarAmbos(yo, otro);
+        return socket.emit('friends:ok', { que: 'aceptada', nombre: ficha.username });
+      }
+
+      if (enLista(mio.salientes, otro)) {
+        return socket.emit('friends:error', { motivo: 'ya_pedida', nombre: ficha.username });
+      }
+      if (mio.salientes.length >= SOLICITUDES_MAX) {
+        return socket.emit('friends:error', { motivo: 'demasiadas_pendientes' });
+      }
+      if (suyo.entrantes.length >= SOLICITUDES_MAX) {
+        return socket.emit('friends:error', { motivo: 'su_bandeja_llena', nombre: ficha.username });
+      }
+
+      const ahora = new Date();
+      mio.salientes.push({ playerName: otro, cuando: ahora });
+      suyo.entrantes.push({ playerName: yo,  cuando: ahora });
+      mio.updatedAt = suyo.updatedAt = ahora;
+      await mio.save(); await suyo.save();
+
+      avisarAJugador(otro, 'friends:request:new', { de: (await fichasDe([yo])).get(yo) });
+      await refrescarAmbos(yo, otro);
+      socket.emit('friends:ok', { que: 'enviada', nombre: ficha.username });
+    } catch (e) {
+      console.error('friends:request', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  /** Aceptar una solicitud recibida. */
+  socket.on('friends:accept', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      if (frenado(socket, 'accion', ACCION_ESPERA_MS)) return;
+
+      const otro = String((data && data.playerName) || '').trim();
+      if (!otro || otro === yo) return;
+
+      const mio  = await amistadDoc(yo);
+      if (!enLista(mio.entrantes, otro)) {
+        return socket.emit('friends:error', { motivo: 'sin_solicitud' });
+      }
+      if (mio.amigos.length >= AMISTADES_MAX) {
+        return socket.emit('friends:error', { motivo: 'lista_llena' });
+      }
+      const suyo = await amistadDoc(otro);
+
+      quitarDeLista(mio.entrantes, otro);
+      quitarDeLista(suyo.salientes, yo);
+      // El `enLista` de antes de empujar cubre el caso de dos pestañas
+      // aceptando la misma solicitud a la vez: sin él quedaría duplicado.
+      if (!enLista(mio.amigos, otro))  mio.amigos.push({ playerName: otro, desde: new Date() });
+      if (!enLista(suyo.amigos, yo))   suyo.amigos.push({ playerName: yo,  desde: new Date() });
+      mio.updatedAt = suyo.updatedAt = new Date();
+      await mio.save(); await suyo.save();
+
+      avisarAJugador(otro, 'friends:accepted', { por: (await fichasDe([yo])).get(yo) });
+      await refrescarAmbos(yo, otro);
+      socket.emit('friends:ok', { que: 'aceptada' });
+    } catch (e) {
+      console.error('friends:accept', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  /** Rechazar una solicitud recibida (o cancelar una que mandé yo). */
+  socket.on('friends:reject', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      if (frenado(socket, 'accion', ACCION_ESPERA_MS)) return;
+
+      const otro = String((data && data.playerName) || '').trim();
+      if (!otro || otro === yo) return;
+
+      const mio  = await amistadDoc(yo);
+      const suyo = await amistadDoc(otro);
+      quitarDeLista(mio.entrantes,  otro);
+      quitarDeLista(mio.salientes,  otro);
+      quitarDeLista(suyo.entrantes, yo);
+      quitarDeLista(suyo.salientes, yo);
+      mio.updatedAt = suyo.updatedAt = new Date();
+      await mio.save(); await suyo.save();
+
+      await refrescarAmbos(yo, otro);
+      socket.emit('friends:ok', { que: 'rechazada' });
+    } catch (e) {
+      console.error('friends:reject', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  /** Dejar de ser amigos. Se quita de los DOS lados: la amistad es mutua. */
+  socket.on('friends:remove', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      if (frenado(socket, 'accion', ACCION_ESPERA_MS)) return;
+
+      const otro = String((data && data.playerName) || '').trim();
+      if (!otro || otro === yo) return;
+
+      const mio  = await amistadDoc(yo);
+      const suyo = await amistadDoc(otro);
+      quitarDeLista(mio.amigos,  otro);
+      quitarDeLista(suyo.amigos, yo);
+      mio.updatedAt = suyo.updatedAt = new Date();
+      await mio.save(); await suyo.save();
+
+      avisarAJugador(otro, 'friends:removed', { playerName: yo });
+      await refrescarAmbos(yo, otro);
+      socket.emit('friends:ok', { que: 'eliminada' });
+    } catch (e) {
+      console.error('friends:remove', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  // ── MENSAJES PRIVADOS ─────────────────────────────────────────────────────
+  //
+  // Se guardan SIEMPRE, esté el otro conectado o no, y además se le empujan si
+  // lo está. Guardar primero y avisar después es a propósito: si el proceso se
+  // cae entre las dos cosas, el mensaje existe y se ve al abrir el panel. Al
+  // revés se habría perdido.
+
+  /** Enviar un privado. Solo entre amigos. */
+  socket.on('friends:dm', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      if (frenado(socket, 'dm', DM_ESPERA_MS)) {
+        return socket.emit('friends:error', { motivo: 'demasiado_rapido' });
+      }
+
+      const otro = String((data && data.para) || '').trim();
+      if (!otro || otro === yo) return;
+
+      const mio = await amistadDoc(yo);
+      /* HACE FALTA UNA RELACIÓN: amistad, o una solicitud pendiente en
+         cualquiera de los dos sentidos.
+
+         POR QUÉ NO SOLO AMIGOS: te llega una solicitud de alguien y lo primero
+         que quieres es preguntarle quién es. Obligar a aceptarla antes de poder
+         escribir es pedirle al jugador que se fíe antes de preguntar.
+
+         POR QUÉ NO CUALQUIERA: esta es la única puerta de entrada a la bandeja
+         de otro jugador, y lo que entra se GUARDA. Dejarla abierta sería un
+         canal de spam persistente. Con la regla de arriba, para escribirle a un
+         desconocido hay que mandarle antes una solicitud —y solo se puede
+         mandar UNA—; si la rechaza, la relación desaparece y con ella el
+         permiso. */
+      const hayRelacion = enLista(mio.amigos, otro) ||
+                          enLista(mio.entrantes, otro) ||
+                          enLista(mio.salientes, otro);
+      if (!hayRelacion) {
+        return socket.emit('friends:error', { motivo: 'no_es_amigo' });
+      }
+
+      const crudo = String((data && data.texto) || '').trim();
+      // Recorte por PUNTOS DE CÓDIGO, no por unidades UTF-16: si no, un mensaje
+      // justo en el límite se parte por la mitad de un emoji (mismo cuidado que
+      // en el chat general).
+      const recortado = [...crudo].slice(0, DM_LARGO_MAX).join('');
+      const texto = escapeHtml(recortado);
+      if (!texto) return;
+
+      const fichas = await fichasDe([yo]);
+      const doc = await MensajePrivado.create({
+        de: yo, para: otro,
+        deNombre: (fichas.get(yo) || {}).username || yo,
+        texto, ts: new Date(), leido: false
+      });
+
+      const paquete = {
+        id: String(doc._id), de: yo, para: otro,
+        deNombre: doc.deNombre, texto: doc.texto,
+        ts: doc.ts.toISOString(), leido: false
+      };
+
+      // A él (todas sus pestañas) y a mí (para que el mensaje salga también en
+      // la otra pestaña que tenga abierta, no solo en la que lo escribió).
+      avisarAJugador(otro, 'friends:dm', paquete);
+      avisarAJugador(yo,   'friends:dm:sent', paquete);
+
+      // Se poda la conversación para que no crezca sin fin. Se cuenta por
+      // pareja y en los dos sentidos: una conversación es una sola cosa.
+      const total = await MensajePrivado.countDocuments({
+        $or: [{ de: yo, para: otro }, { de: otro, para: yo }]
+      }).exec();
+      if (total > DM_GUARDADOS_MAX) {
+        const sobran = await MensajePrivado.find({
+          $or: [{ de: yo, para: otro }, { de: otro, para: yo }]
+        }).sort({ ts: 1 }).limit(total - DM_GUARDADOS_MAX).select('_id').lean();
+        if (sobran.length) {
+          await MensajePrivado.deleteMany({ _id: { $in: sobran.map(x => x._id) } }).exec();
+        }
+      }
+    } catch (e) {
+      console.error('friends:dm', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  /** La bandeja: una línea por conversación, con lo último y los no leídos. */
+  socket.on('friends:inbox', async () => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+
+      const msgs = await MensajePrivado.find({ $or: [{ de: yo }, { para: yo }] })
+        .sort({ ts: -1 }).limit(400).lean();
+
+      const conv = new Map();
+      msgs.forEach(m => {
+        const otro = (m.de === yo) ? m.para : m.de;
+        if (!conv.has(otro)) {
+          conv.set(otro, { playerName: otro, ultimo: m.texto, ts: m.ts, mio: m.de === yo, noLeidos: 0 });
+        }
+        if (m.para === yo && !m.leido) conv.get(otro).noLeidos++;
+      });
+
+      const fichas = await fichasDe([...conv.keys()]);
+      const foto = fotoDePresencia();     // una vuelta para toda la bandeja
+      const lista = [...conv.values()].map(c => {
+        const f = fichas.get(c.playerName) || { username: c.playerName, nivel: 0, nameColor: null };
+        return { ...c, ts: new Date(c.ts).toISOString(), username: f.username,
+                 nivel: f.nivel, nameColor: f.nameColor, online: foto.has(c.playerName) };
+      }).sort((a, b) => new Date(b.ts) - new Date(a.ts));
+
+      socket.emit('friends:inbox', { ok: true, conversaciones: lista });
+    } catch (e) {
+      console.error('friends:inbox', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  /** Una conversación entera. Al abrirla se marca como leída. */
+  socket.on('friends:dm:history', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      const otro = String((data && data.con) || '').trim();
+      if (!otro) return;
+
+      const msgs = await MensajePrivado.find({
+        $or: [{ de: yo, para: otro }, { de: otro, para: yo }]
+      }).sort({ ts: 1 }).limit(DM_GUARDADOS_MAX).lean();
+
+      await MensajePrivado.updateMany({ de: otro, para: yo, leido: false }, { $set: { leido: true } }).exec();
+
+      const fichas = await fichasDe([otro, yo]);
+      socket.emit('friends:dm:history', {
+        ok: true,
+        con: otro,
+        ficha: fichas.get(otro),
+        mensajes: msgs.map(m => ({
+          id: String(m._id), de: m.de, para: m.para, deNombre: m.deNombre,
+          texto: m.texto, ts: new Date(m.ts).toISOString(), leido: !!m.leido
+        }))
+      });
+
+      // El contador del botón baja al momento en todas sus pestañas.
+      const noLeidos = await MensajePrivado.countDocuments({ para: yo, leido: false }).exec();
+      avisarAJugador(yo, 'friends:unread', { noLeidos });
+    } catch (e) {
+      console.error('friends:dm:history', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+});
+
+console.log('✅ Amistades cargadas: sockets friends:* (solicitudes, presencia y privados)');
 
 
 // --- MANEJO DE ERRORES ---
