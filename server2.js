@@ -4947,6 +4947,21 @@ function checkAndTrackPlantSpam(userId, seedType) {
   return { bloqueado: false };
 }
 
+/* LAS REACCIONES QUE SE ADMITEN, EN UN SOLO SITIO.
+
+   Estaban declaradas DENTRO del `io.on('connection')` del chat, y el manejador
+   de reacciones de los privados vive en OTRO `io.on('connection')` — o sea,
+   otro ámbito. Allí la constante no existía: cada reacción a un privado lanzaba
+   un ReferenceError que se tragaba el try/catch del manejador. Ni error, ni
+   respuesta, ni nada: el jugador pulsaba y no pasaba absolutamente nada.
+
+   Aquí arriba la ven los dos, y de paso queda garantizado que el chat general y
+   los privados admiten exactamente los mismos seis. La lista está CERRADA a
+   propósito: con emoji libre, el campo se convierte en un segundo chat sin
+   freno de longitud ni antispam pegado debajo de cada mensaje. */
+const REACCIONES_VALIDAS = ['\u{1F44D}', '\u2764\uFE0F', '\u{1F602}',
+                            '\u{1F62E}', '\u{1F622}', '\u{1F525}'];
+
 // Socket.IO handlers COMPLETOS
 // Nombre de personaje Soulbound admitido. Se declara AQUÍ, antes del primer
 // manejador de sockets, porque lo usan las dos partes: el joinRoom (más abajo)
@@ -5670,7 +5685,6 @@ io.on("connection", (socket) => {
   // La lista de emojis esta CERRADA a proposito. Con emoji libre, el campo se
   // convierte en un segundo chat sin freno de longitud ni antispam, pegado
   // debajo de cada mensaje.
-  const REACCIONES_VALIDAS = ['\u{1F44D}', '❤️', '\u{1F602}', '\u{1F62E}', '\u{1F622}', '\u{1F525}'];
   const REACCIONES_POR_MENSAJE = 6;
 
   socket.on('chatReact', (data) => {
@@ -18429,9 +18443,20 @@ io.on('connection', (socket) => {
       const d       = await amistadDoc(yo);
 
       const jugadores = nombres.map(n => {
-        const f = fichas.get(n);
+        const f = fichas.get(n) ||
+                  { playerName: n, username: n, nivel: 0, nameColor: null, address: null };
+        /* La DIRECCIÓN se queda aquí: entró en la ficha para poder buscar la
+           presencia por varias llaves (ver `enLaFoto`), no para viajar al
+           cliente. Identifica la cartera y no es asunto de los demás. */
+        const { address, ...publica } = f;
         return {
-          ...f,
+          ...publica,
+          /* ESTÁN CONECTADOS POR DEFINICIÓN: esta lista sale de recorrer los
+             sockets vivos del canal. Sin esta línea el cliente leía
+             `j.online === undefined` y pintaba "Offline" a todo el mundo —
+             en la pestaña que se llama, precisamente, "Online". */
+          online: true,
+          canal:  canal,
           zona: vistos.get(n) === 'tienda' ? 'shop' : 'world',
           esAmigo:    enLista(d.amigos, n),
           pendiente:  enLista(d.salientes, n),
@@ -18476,6 +18501,8 @@ io.on('connection', (socket) => {
       const jugadores = docs
         .filter(x => x.Username && x.Username !== '---')
         .map(x => {
+          // `x` lleva `address` porque hace falta para `enLaFoto`; NO se copia
+          // al objeto que sale hacia el cliente.
           const p = enLaFoto(foto, x);
           return {
             playerName: x.playerName,
