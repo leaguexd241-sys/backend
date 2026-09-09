@@ -7778,9 +7778,18 @@ function gatherNodeTypeFromKey(key) {
 // ItemDefinitions en el cliente. Las maderas llevan ESPACIOS ("madera pinos"),
 // no guion bajo; aquí estaban con guion bajo, así que el modo servidor habría
 // acuñado a una tabla distinta de la que usa el inventario del jugador.
+// LO QUE SUELTA CADA NODO. Desde 2026-09-08 las vetas de cobre y hierro dan
+// PIEDRA EN BRUTO, no el lingote: el lingote sale del horno (1 piedra + 1
+// carbón). Si esto no se cambiara, el modo servidor acuñaría lingotes al picar
+// —saltándose el horno— y además dejaría a mineral_cobre/mineral_hierro dentro
+// de GATHER_TIPOS, que es la lista de tablas que el CLIENTE tiene prohibido
+// acuñar: con GATHER_ENFORCE activo el horno no podría entregar el lingote.
 const GATHER_REWARD_TIPO = {
   pinos: 'madera pinos', arbolx: 'madera seca', arbustos: 'madera con hojas',
-  piedra: 'mineral_piedra', cobre: 'mineral_cobre', hierro: 'mineral_hierro', carbon: 'carbon'
+  piedra: 'mineral_piedra',
+  cobre:  'mineral_piedra_cobre',
+  hierro: 'mineral_piedra_hierro',
+  carbon: 'carbon'
 };
 // Conjunto de tipos que SOLO el servidor puede acuñar (recolección).
 const GATHER_TIPOS = new Set(Object.values(GATHER_REWARD_TIPO));
@@ -10629,6 +10638,15 @@ const ITEM_TIPO_MAP = {
   mineral_piedra: 'mineral_piedra', mineral_cobre: 'mineral_cobre',
   mineral_hierro: 'mineral_hierro', carbon: 'carbon',
 
+  // PIEDRA EN BRUTO (2026-09-08). Lo que suelta la mina; los lingotes de
+  // arriba salen ahora del horno. SIN ESTAS TRES LÍNEAS NO SE PUEDEN ACUÑAR:
+  // ensureItemTipoOnChain solo da de alta las tablas que están en esta lista
+  // blanca, y una tabla sin dar de alta hace que createInvoice revierta con
+  // TipoNotConfigured. Son tablas DISTINTAS de las de los lingotes.
+  mineral_piedra_cobre:  'mineral_piedra_cobre',
+  mineral_piedra_hierro: 'mineral_piedra_hierro',
+  mineral_carbon:        'mineral_carbon',
+
   palo: 'palo', tablon_de_madera: 'tablon_de_madera',
   madera_pinos: 'madera pinos', madera_con_hojas: 'madera con hojas',
   madera_seca: 'madera seca',
@@ -10667,6 +10685,7 @@ const ITEM_MAX_STACK = {
   pocion_mascota: 20, pocion_mascota_grande: 10, elixir_revivir: 5,
   Regaderax: 1, Tijerasx: 1,
   mineral_piedra: 20, mineral_cobre: 20, mineral_hierro: 20, carbon: 20,
+  mineral_piedra_cobre: 20, mineral_piedra_hierro: 20, mineral_carbon: 20,
   palo: 20, tablon_de_madera: 20,
   madera_pinos: 50, madera_con_hojas: 50, madera_seca: 50,
   balde_vacio: 5, balde_con_agua: 5,
@@ -10851,6 +10870,10 @@ const MISSION_ITEM_ALIASES = {
   hierro: 'mineral_hierro',     iron:   'mineral_hierro',
   carbon: 'carbon',             coal:   'carbon',
   madera: 'madera_pinos',       wood:   'madera_pinos',
+  // Piedra en bruto (lo que se pica desde que hay horno).
+  piedra_cobre:  'mineral_piedra_cobre',  copper_ore: 'mineral_piedra_cobre',
+  piedra_hierro: 'mineral_piedra_hierro', iron_ore:   'mineral_piedra_hierro',
+  piedra_carbon: 'mineral_carbon',        coal_ore:   'mineral_carbon',
 };
 
 function resolveMissionItemId(itemId) {
