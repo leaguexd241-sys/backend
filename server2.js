@@ -6018,23 +6018,68 @@ app.use((req, res, next) => {
   next();
 });
 
+/* TRUST PROXY — ESTO TUMBO EL API ENTERO.
+ *
+ * QUE PASABA: todas las rutas, sin excepción, contestaban
+ * `426 {"error":"https_required"}`. Y como ese rechazo ocurría ANTES del
+ * middleware de CORS, la respuesta salía sin `Access-Control-Allow-Origin` y
+ * el navegador lo contaba como un problema de CORS. No lo era: el servidor
+ * creía que la petición había llegado por HTTP.
+ *
+ * POR QUE: `requireSecureTransport` mira `req.secure`, que Express deduce de
+ * `X-Forwarded-Proto` PERO SOLO SI CONFIA EN QUIEN LA MANDA. Aquí la
+ * confianza estaba puesta en `['loopback']` — 127.0.0.1 — y en Railway (o
+ * Render, o cualquier PaaS) la petición no llega de loopback, llega del borde
+ * de la plataforma, cuya IP no es fija ni se puede escribir en un .env.
+ * Resultado: `req.secure` siempre false, 426 para todo el mundo.
+ *
+ * LA CIFRA CORRECTA ES 1, NO `true`. `trust proxy: true` se cree el
+ * `X-Forwarded-For` entero, y ahí cualquiera puede añadir IPs inventadas: eso
+ * enganaria al cortafuegos de IP y a los limitadores de peticiones, que
+ * identifican al cliente por `req.ip`. Con `1` se confia SOLO en el ultimo
+ * salto — el borde de la plataforma, que reescribe esas cabeceras — y
+ * `req.ip` sigue siendo el del cliente de verdad.
+ *
+ * `TRUSTED_PROXY_IP` sigue mandando si esta puesta, para quien tenga un nginx
+ * propio con IP fija; y `TRUST_PROXY_HOPS` permite decir "dos saltos" si algun
+ * dia hay un Cloudflare delante del PaaS. */
 if (NODE_ENV === 'production') {
-  // En producción: confiar en loopback (127.0.0.1) y el IP de tu proxy/load balancer real.
-  // Cambia el IP del proxy real en TRUSTED_PROXY_IP en .env si usas nginx/cloudflare.
   const trustedProxy = process.env.TRUSTED_PROXY_IP;
-  app.set('trust proxy', trustedProxy ? ['loopback', trustedProxy] : ['loopback']);
+  const saltos = parseInt(process.env.TRUST_PROXY_HOPS, 10);
+  if (trustedProxy) {
+    app.set('trust proxy', ['loopback', trustedProxy]);
+  } else {
+    app.set('trust proxy', Number.isFinite(saltos) && saltos > 0 ? saltos : 1);
+  }
+  console.log('⚙️  trust proxy =', app.get('trust proxy'));
 } else {
   // En desarrollo: solo loopback
   app.set('trust proxy', ['loopback']);
 }
 
+/* Se DECLARA aqui pero se ENGANCHA despues del CORS (mas abajo).
+ *
+ * Estaba enganchado justo aqui, delante de todo. Cuando decia que no, la
+ * respuesta salia sin cabeceras CORS y el navegador la traducia a "No
+ * 'Access-Control-Allow-Origin' header is present": un mensaje que manda a
+ * buscar el fallo en la lista de origenes permitidos, que estaba perfecta.
+ * Dos horas de CORS por un problema de HTTPS.
+ *
+ * Rechazando DESPUES del CORS, la respuesta lleva sus cabeceras y el navegador
+ * ensena el 426 y su `https_required`, que es la verdad y se arregla sola. */
 function requireSecureTransport(req, res, next) {
   // req.secure respects Express trust-proxy. A raw forwarded header does not.
   // Do not build a redirect using an untrusted Host header.
-  if (NODE_ENV === 'production' && !req.secure) return res.status(426).json({ error: 'https_required' });
+  if (NODE_ENV === 'production' && !req.secure) {
+    console.warn('⚠️  426 https_required — ' + req.method + ' ' + req.path +
+                 ' | proto=' + req.protocol +
+                 ' | x-forwarded-proto=' + (req.headers['x-forwarded-proto'] || '-') +
+                 ' | trust proxy=' + app.get('trust proxy'));
+    return res.status(426).json({ error: 'https_required' });
+  }
   return next();
 }
-app.use(requireSecureTransport);
+
 app.use('/api/auth', (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Pragma', 'no-cache');
@@ -6061,6 +6106,13 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+
+/* Y AQUI SI: el HTTPS obligatorio, DESPUES del CORS.
+   Asi un rechazo se ve como lo que es (426 https_required) en vez de
+   disfrazarse de problema de CORS. La proteccion es la misma: sigue sin dejar
+   pasar una peticion que no venga por HTTPS. */
+app.use(requireSecureTransport);
+
 // FIX: '*' como string ya no es válido en Express 5 / path-to-regexp 8+ (tira
 // "PathError: Missing parameter name at index 1: *" y el servidor no arranca).
 // Con una RegExp real (/.*/), evitamos el parser de rutas de string y funciona
