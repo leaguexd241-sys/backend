@@ -13,7 +13,6 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { body, param, validationResult } = require('express-validator');
 const useragent = require('express-useragent');
-const requestIp = require('request-ip');
 const geoip = require('geoip-lite');
 const fs = require('fs');
 const path = require('path');
@@ -476,6 +475,18 @@ const SECURITY_CONFIG = {
 
 // --- Configuración de Orígenes ---
 const allowedOrigins = FRONTEND_ORIGINS_RAW.split(',').map(s => s.trim()).filter(Boolean);
+// Compare parsed origins, never substrings such as "localhost.attacker.test".
+function isAllowedBrowserOrigin(origin) {
+  if (!origin) return true; // CLI/native clients still need normal authentication.
+  if (typeof origin !== 'string' || origin.length > 2048) return false;
+  try {
+    const parsed = new URL(origin);
+    if (parsed.origin !== origin || parsed.username || parsed.password) return false;
+    if (!['https:', 'http:'].includes(parsed.protocol)) return false;
+    if (allowedOrigins.includes(origin)) return true;
+    return NODE_ENV === 'development' && ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname);
+  } catch (_) { return false; }
+}
 console.log('🌐 Orígenes configurados:', allowedOrigins);
 
 // --- Esquemas Mongoose ---
@@ -1128,6 +1139,14 @@ const activitySchema = new mongoose.Schema({
   playerName: { type: String, required: true, unique: true, index: true },
   registeredAt: { type: Date, default: Date.now },
   loginCount: { type: Number, default: 0 },
+  /* TIEMPO JUGADO ACUMULADO, en milisegundos.
+     No existia ninguna medida de cuanto juega cada uno: habia `loginCount`
+     (cuantas veces entra) y `lastLogin` (cuando fue la ultima), que no es
+     lo mismo. Esto lo suma `anotarTiempoJugado()` cada vez que un socket
+     se va, y tambien cada cinco minutos para que una caida del servidor no
+     se lleve la sesion entera por delante.
+     Lleva indice porque la clasificacion del panel ordena por el. */
+  tiempoJugadoMs: { type: Number, default: 0, index: true },
   lastLogin: { type: Date },
   ip: { type: String },
   geo: {
@@ -4625,13 +4644,12 @@ const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
+  // CORS alone does not protect a WebSocket upgrade.
+  allowRequest: (req, callback) => callback(null, isAllowedBrowserOrigin(req.headers.origin)),
+  maxHttpBufferSize: 128 * 1024,
   cors: {
     origin: function(origin, callback) {
-      // Permitir todos los orígenes en desarrollo
-      if (NODE_ENV === 'development' || !origin) {
-        return callback(null, true);
-      }
-      if (allowedOrigins.indexOf(origin) !== -1) {
+      if (isAllowedBrowserOrigin(origin)) {
         return callback(null, true);
       }
       console.warn('❌ CORS bloqueado para origen:', origin);
@@ -4791,6 +4809,45 @@ function purgarFantasmas(room) {
   if (n) io.to(room).emit('playerCount', Object.keys(sala).length);
   return n;
 }
+
+/**
+ * Suma al jugador el rato que lleva conectado y reinicia su reloj.
+ *
+ * Se llama al desconectar y cada cinco minutos. Lo segundo no es adorno:
+ * sin ello, un servidor que se cae o un jugador que deja la pestana abierta
+ * ocho horas no anotan NADA, porque la suma solo ocurria al final.
+ *
+ * `$inc` y no leer-sumar-escribir: dos sockets de la misma cuenta (dos
+ * pestanas) sumarian sobre el mismo valor leido y uno de los dos se
+ * perderia. Con `$inc` lo resuelve la base de datos.
+ *
+ * No crea el documento si no existe (`upsert: false`): quien no ha pasado
+ * por el registro no deberia aparecer en la clasificacion.
+ */
+function anotarTiempoJugado(socket) {
+  try {
+    if (!socket || !socket._jugandoDesde) return;
+    const quien = socket.authenticatedPlayer;
+    const ahora = Date.now();
+    const rato = ahora - socket._jugandoDesde;
+    socket._jugandoDesde = ahora;
+    // Menos de un segundo no se anota, y mas de 24 h es un reloj roto.
+    if (!quien || rato < 1000 || rato > 86400000) return;
+    UserActivity.updateOne(
+      { playerName: quien },
+      { $inc: { tiempoJugadoMs: rato } },
+      { upsert: false }
+    ).catch(() => {});
+  } catch (_) {}
+}
+
+/* Volcado periodico: cada cinco minutos, todos los que esten jugando. */
+const _volcadoTiempo = setInterval(() => {
+  try {
+    for (const s of io.of('/').sockets.values()) anotarTiempoJugado(s);
+  } catch (_) {}
+}, 300000);
+if (typeof _volcadoTiempo.unref === 'function') _volcadoTiempo.unref();
 
 /** Barrido periódico de todas las salas + borrado de las que quedan vacías. */
 function barrerSalas() {
@@ -5348,6 +5405,14 @@ io.on("connection", (socket) => {
 
     console.log(`🔵 joinRoom: ${socket.id} -> ${room}, último escena: ${lastScene}`);
 
+    /* EL RELOJ DEL TIEMPO JUGADO ARRANCA AQUI.
+       En el `connection` todavia no se sabe quien es: la identidad se
+       resuelve unas lineas mas abajo. Al entrar en una sala ya esta, y
+       entrar en una sala es exactamente el momento en que se empieza a
+       jugar. Si el socket rehace el join no se reinicia: solo se pone la
+       marca si no la habia. */
+    if (!socket._jugandoDesde) socket._jugandoDesde = Date.now();
+
     // FIX: Si el socket tiene dirección autenticada, verificar que el username
     // corresponde a un jugador real vinculado a esa dirección.
     if (socket.authenticatedAddress && !socket.authenticatedPlayer) {
@@ -5434,9 +5499,44 @@ io.on("connection", (socket) => {
       rooms[room] = {};
     }
     
+    /* UN JUGADOR, UN AVATAR EN LA SALA.
+     *
+     * FALLO QUE ESTO ARREGLA — "aparece un clon mío": `purgarFantasmas()`
+     * solo echa a los que YA NO ESTÁN en el adaptador de Socket.IO. Pero
+     * cuando un cliente se reconecta, su socket VIEJO sigue contando como
+     * conectado hasta que vence el pingTimeout — hasta 60 segundos. Durante
+     * ese rato la sala tiene DOS entradas de la misma cuenta, y el
+     * `currentPlayers` que se manda las lleva las dos: el jugador se ve a sí
+     * mismo plantado al lado, y los demás también le ven doble.
+     *
+     * La identidad buena es la AUTENTICADA (`socket.authenticatedAddress`),
+     * no el `socket.id`, que cambia en cada conexión. Así que al entrar se
+     * echa cualquier otra entrada de la misma cuenta, sin esperar al
+     * pingTimeout.
+     *
+     * Y se hereda su posición: reconectarse no debería devolverte al 0,0. */
+    let duplicado = null;
+    const miCuenta = String(socket.authenticatedAddress ||
+                            socket.authenticatedPlayer || '').toLowerCase();
+    if (miCuenta && rooms[room]) {
+      for (const otroId of Object.keys(rooms[room])) {
+        if (otroId === socket.id) continue;
+        const otro = rooms[room][otroId];
+        const suCuenta = String((otro && (otro.address || otro.playerName)) || '').toLowerCase();
+        if (suCuenta && suCuenta === miCuenta) {
+          duplicado = duplicado || otro;
+          delete rooms[room][otroId];
+          io.to(room).emit('playerLeft', { id: otroId, reason: 'duplicado' });
+          console.log('[sala] ' + otroId + ' fuera de ' + room +
+                      ': era un doble de ' + socket.id + ' (' + miCuenta + ')');
+        }
+      }
+    }
+
     // Lo que ya hubiera de este jugador en la sala: al rehacer el join tras
     // una reconexión hay que conservar DÓNDE estaba, no plantarlo en el 0,0.
-    const previo = (rooms[room] && rooms[room][socket.id]) || null;
+    // Si el socket es nuevo, vale la entrada del doble que se acaba de echar.
+    const previo = (rooms[room] && rooms[room][socket.id]) || duplicado || null;
 
     rooms[room][socket.id] = {
       id: socket.id,
@@ -5792,6 +5892,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
+    // Lo primero: anotar el rato jugado antes de perder el socket.
+    anotarTiempoJugado(socket);
+
     const room = socket.playerData.room;
     
     if (room && rooms[room]) {
@@ -5925,41 +6028,23 @@ if (NODE_ENV === 'production') {
   app.set('trust proxy', ['loopback']);
 }
 
-if (NODE_ENV === 'production') {
-  app.use((req, res, next) => {
-    if (req.headers['x-forwarded-proto'] !== 'https' && !req.secure) {
-      return res.redirect('https://' + req.headers.host + req.url);
-    }
-    next();
-  });
+function requireSecureTransport(req, res, next) {
+  // req.secure respects Express trust-proxy. A raw forwarded header does not.
+  // Do not build a redirect using an untrusted Host header.
+  if (NODE_ENV === 'production' && !req.secure) return res.status(426).json({ error: 'https_required' });
+  return next();
 }
+app.use(requireSecureTransport);
+app.use('/api/auth', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+  next();
+});
 
 // CORS dinámico CORREGIDO
 const corsOptions = {
   origin: function(origin, callback) {
-    if (!origin) {
-      return callback(null, true);
-    }
-    
-    if (NODE_ENV === 'development') {
-      const allowedLocalOrigins = [
-        'http://localhost:3000',
-        'http://localhost:5501',
-        'http://127.0.0.1:3000',
-        'http://127.0.0.1:5501',
-        'http://localhost:8080',
-        'http://127.0.0.1:8080',
-        'http://localhost:3001',
-        'http://127.0.0.1:3001'
-      ];
-      
-      if (allowedLocalOrigins.includes(origin) || origin.includes('localhost') || origin.includes('127.0.0.1')) {
-        console.log(`✅ CORS permitido en desarrollo para: ${origin}`);
-        return callback(null, true);
-      }
-    }
-    
-    if (allowedOrigins.includes(origin)) {
+    if (isAllowedBrowserOrigin(origin)) {
       return callback(null, true);
     }
     
@@ -5995,7 +6080,8 @@ app.use((req, res, next) => {
 
 // User Agent y IP middleware
 app.use(useragent.express());
-app.use(requestIp.mw());
+// Use Express's configured trusted proxies, not arbitrary client IP headers.
+app.use((req, res, next) => { req.clientIp = req.ip; next(); });
 
 // Middleware de análisis de seguridad
 app.use(async (req, res, next) => {
@@ -6093,11 +6179,6 @@ function setCookieOptions(maxAgeSeconds, csrf = false) {
     if (COOKIE_DOMAIN) {
       opts.domain = COOKIE_DOMAIN;
     }
-  } else {
-    // Solo en desarrollo LOCAL real usamos 127.0.0.1 explícito.
-    opts.domain = '127.0.0.1';
-    opts.secure = false;
-    opts.sameSite = 'Lax';
   }
 
   return opts;
@@ -6152,12 +6233,6 @@ function csrfProtection(req, res, next) {
   if (!verifyCSRFToken(req)) {
     console.warn('❌ CSRF attempt from IP:', req.clientIp || req.ip, 'Path:', req.path, 'Method:', req.method);
     
-    // En desarrollo, permitir continuar pero con advertencia
-    if (NODE_ENV === 'development') {
-      console.warn('⚠️  CSRF bypassed in development mode for debugging');
-      return next();
-    }
-    
     return res.status(403).json({ 
       error: 'csrf_token_invalid',
       message: 'Token CSRF inválido o faltante',
@@ -6206,9 +6281,7 @@ function authMiddleware(req, res, next) {
   // navegador / SameSite / third-party); si viene pero sin "session=", algo la
   // está limpiando antes; si viene con "session=" pero igual falla más abajo,
   // ya es un problema de verificación del JWT, no de transporte de la cookie.
-  console.log('🍪 [authMiddleware] Cookie header crudo:', req.headers.cookie || '(vacío — el navegador no mandó ninguna cookie)');
-  console.log('🍪 [authMiddleware] req.cookies parseadas:', req.cookies);
-  console.log('🍪 [authMiddleware] Origin:', req.headers.origin || '(sin Origin)', '| Referer:', req.headers.referer || '(sin Referer)');
+  // Session and refresh cookies are credentials; never write them to logs.
   
   try {
     // PRIMERO buscar en cookies
@@ -6738,7 +6811,7 @@ app.get('/api/auth/nonce', nonceLimiter, async (req, res) => {
       }
     );
     
-    console.log(`✅ Nonce generado para ${address.substring(0, 10)}...: ${nonce.substring(0, 20)}...`);
+    console.log('✅ Nonce de autenticación generado');
     console.log(`📊 Nonce guardado en DB: ${result.nonce ? 'SÍ' : 'NO'}`);
     
     return res.json({ 
@@ -6764,7 +6837,6 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
     const { address, signature, token, message } = req.body || {};
     
     console.log(`🔐 Intentando login para: ${address ? address.substring(0, 10) + '...' : 'dirección no proporcionada'}`);
-    console.log('🍪 [login] Origin:', req.headers.origin || '(sin Origin)', '| Cookie header entrante:', req.headers.cookie || '(vacío)');
     console.log('📦 Body recibido:', { 
       hasAddress: !!address, 
       hasSignature: !!signature, 
@@ -6800,9 +6872,7 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
 
     // DEBUG: Mostrar estado actual del nonce
     console.log(`🔍 Estado del nonce para ${lcAddress.substring(0, 10)}...:`);
-    console.log(`   - Nonce en DB: ${player.nonce ? player.nonce.substring(0, 20) + '...' : 'NULL'}`);
     console.log(`   - nonceTimestamp: ${player.nonceTimestamp}`);
-    console.log(`   - Token recibido: ${token.substring(0, 20)}...`);
 
     if (!player.nonce) {
       console.log(`❌ Nonce no encontrado para ${lcAddress.substring(0, 10)}...`);
@@ -6828,7 +6898,7 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
     const ts = parseInt(tsStr, 10);
     
     if (!nonceFromToken || !ts || isNaN(ts)) {
-      console.log(`❌ Formato de token inválido: ${token}`);
+      console.log('❌ Formato de token inválido');
       return res.status(400).json({ 
         error: 'invalid_token_format',
         message: 'Formato de token inválido'
@@ -6838,8 +6908,6 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
     // CORREGIDO: Comparación segura de nonce
     if (nonceFromToken !== player.nonce) {
       console.log(`❌ Nonce no coincide:`);
-      console.log(`   - Nonce esperado: ${player.nonce ? player.nonce.substring(0, 20) + '...' : 'NULL'}`);
-      console.log(`   - Nonce recibido: ${nonceFromToken.substring(0, 20) + '...'}`);
       
       const newAttempts = (player.loginAttempts || 0) + 1;
       let updateData = { loginAttempts: newAttempts };
@@ -8367,39 +8435,72 @@ app.get('/api/relay/transaction/:id',
 
 
 
+// Transaction logs are UI history, never proof that a blockchain operation succeeded.
+async function transactionLogOwner(req) {
+  const address = req.user && req.user.address;
+  if (typeof address !== 'string' || !/^0x[\da-f]{40}$/i.test(address)) return null;
+  const player = await PlayerAuth.findOne({ address: address.toLowerCase() }).select('playerName').lean().exec();
+  if (!player || typeof player.playerName !== 'string' || !player.playerName) return null;
+  return { playerName: player.playerName, address: address.toLowerCase() };
+}
+
+function validateTransactionLog(input, owner) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  if (typeof input.id !== 'string' || !/^[a-zA-Z0-9:_-]{1,160}$/.test(input.id)) return null;
+  if (!['interaction', 'items'].includes(input.category)) return null;
+  if (input.playerName !== undefined && input.playerName !== owner.playerName) return null;
+  if (input.address !== undefined && (typeof input.address !== 'string' || input.address.toLowerCase() !== owner.address)) return null;
+  if (input.name !== undefined && (typeof input.name !== 'string' || input.name.length > 200)) return null;
+  if (input.quantity !== undefined && (!Number.isSafeInteger(input.quantity) || input.quantity < 0)) return null;
+  if (input.hash && (typeof input.hash !== 'string' || !/^0x[\da-f]{64}$/i.test(input.hash))) return null;
+  if (input.status !== undefined && !['pending', 'confirmed', 'reverted'].includes(input.status)) return null;
+  if (input.hiddenData !== undefined && (!input.hiddenData || typeof input.hiddenData !== 'object' || Array.isArray(input.hiddenData))) return null;
+  if (JSON.stringify(input.hiddenData || {}).length > 16384) return null;
+  return { id: input.id, ...owner, category: input.category, name: input.name || '', quantity: input.quantity ?? 1,
+    hash: input.hash || '', status: input.status || 'pending', hiddenData: input.hiddenData || {}, timestamp: new Date() };
+}
+
 // GET /api/transactions?playerName=xxx
-app.get('/api/transactions', authMiddleware, async (req, res) => {
+app.get('/api/transactions', apiLimiter, authMiddleware, async (req, res) => {
   try {
-    const { playerName } = req.query;
-    if (!playerName) return res.status(400).json({ error: 'playerName required' });
-    const txs = await TransactionLog.find({ playerName }).lean();
-    // Group by category
+    const owner = await transactionLogOwner(req);
+    if (!owner || (req.query.playerName !== undefined && req.query.playerName !== owner.playerName)) return res.status(403).json({ error: 'not_authorized_for_player' });
+    // Include legacy rows by verified player name; never read another player's history.
+    const txs = await TransactionLog.find({ playerName: owner.playerName }).sort({ createdAt: -1 }).limit(200).lean();
     const grouped = { interaction: [], items: [] };
-    txs.forEach(tx => grouped[tx.category].push(tx));
+    txs.reverse().forEach(tx => { if (Object.prototype.hasOwnProperty.call(grouped, tx.category)) grouped[tx.category].push(tx); });
+    res.set('Cache-Control', 'no-store');
     res.json(grouped);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Unable to load transaction history' });
   }
 });
 
 // POST /api/transactions
-app.post('/api/transactions', authMiddleware, async (req, res) => {
+app.post('/api/transactions', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
   try {
-    const tx = new TransactionLog(req.body);
+    const owner = await transactionLogOwner(req);
+    if (!owner) return res.status(403).json({ error: 'not_authorized_for_player' });
+    const data = validateTransactionLog(req.body, owner);
+    if (!data) return res.status(400).json({ error: 'invalid_transaction_log' });
+    const tx = new TransactionLog(data);
     await tx.save();
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err && err.code === 11000 ? 409 : 500).json({ error: 'Unable to save transaction history' });
   }
 });
 
 // DELETE /api/transactions/:id
-app.delete('/api/transactions/:id', authMiddleware, async (req, res) => {
+app.delete('/api/transactions/:id', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
   try {
-    await TransactionLog.deleteOne({ id: req.params.id });
+    const owner = await transactionLogOwner(req);
+    if (!owner) return res.status(403).json({ error: 'not_authorized_for_player' });
+    if (!/^[a-zA-Z0-9:_-]{1,160}$/.test(req.params.id)) return res.status(400).json({ error: 'invalid_transaction_id' });
+    await TransactionLog.deleteOne({ id: req.params.id, playerName: owner.playerName });
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Unable to delete transaction history' });
   }
 });
 
@@ -8411,8 +8512,12 @@ app.get('/api/relay/transactions/history',
   async (req, res) => {
     try {
       const playerAddress = req.user.address.toLowerCase();
-      const { page = 1, limit = 20 } = req.query;
-      const skip = (parseInt(page) - 1) * parseInt(limit);
+      const page = Number(req.query.page ?? 1);
+      const limit = Number(req.query.limit ?? 20);
+      if (!Number.isSafeInteger(page) || page < 1 || page > 10000 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        return res.status(400).json({ error: 'invalid_pagination' });
+      }
+      const skip = (page - 1) * limit;
       
       const [transactions, total] = await Promise.all([
         RelayedTransaction.find({ playerAddress })
@@ -8571,10 +8676,10 @@ const adminAuth = async (req, res, next) => {
     if (sessionToken) {
       const decoded = jwt.verify(sessionToken, JWT_SECRET, { algorithms: ['HS256'] });
       const addr = String(decoded.address || '').toLowerCase();
-      if (addr && await isAdminAddress(addr)) {
+      if (decoded.type === 'access' && addr && await isAdminAddress(addr)) {
         req.admin = { address: addr, via: 'wallet', role: 'admin' };
         req.user  = req.user || { address: addr };
-        return next();
+        return csrfProtection(req, res, next);
       }
       // Sesión válida pero de alguien que no es admin: se dice claramente.
       if (addr) {
@@ -11931,6 +12036,58 @@ app.delete('/api/admin/players/:playerName', adminAuth, strictLimiter, async (re
 
 // ── GET /api/admin/overview ────────────────────────────────────────────────
 // Números de cabecera del panel.
+/**
+ * LOS QUE MAS HAN JUGADO.
+ *
+ *   GET /api/admin/top-jugadores?n=20
+ *
+ * Devuelve los `n` jugadores con mas tiempo acumulado, de mas a menos. El
+ * numero lo pone quien pregunta, con tope de 500 para que nadie se pida la
+ * tabla entera de una vez.
+ *
+ * Solo salen los que tienen tiempo > 0: los que se registraron y nunca
+ * llegaron a jugar no dicen nada en una clasificacion de tiempo jugado, y
+ * ademas solo tendrian tiempo quienes hayan jugado DESDE que existe el
+ * campo (no hay forma de inventarse el pasado).
+ */
+app.get('/api/admin/top-jugadores', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const n = Math.min(500, Math.max(1, parseInt(req.query.n, 10) || 20));
+    const docs = await UserActivity
+      .find({ tiempoJugadoMs: { $gt: 0 } })
+      .sort({ tiempoJugadoMs: -1 })
+      .limit(n)
+      .select('playerName tiempoJugadoMs loginCount lastLogin registeredAt')
+      .lean();
+
+    const jugando = new Set();
+    try {
+      for (const s of io.of('/').sockets.values()) {
+        if (s.authenticatedPlayer) jugando.add(s.authenticatedPlayer);
+      }
+    } catch (_) {}
+
+    res.json({
+      ok: true,
+      pedidos: n,
+      total: docs.length,
+      jugadores: docs.map((d, i) => ({
+        puesto: i + 1,
+        playerName: d.playerName,
+        ms: d.tiempoJugadoMs || 0,
+        horas: Math.round((d.tiempoJugadoMs || 0) / 36000) / 100,
+        loginCount: d.loginCount || 0,
+        lastLogin: d.lastLogin || null,
+        registeredAt: d.registeredAt || null,
+        conectado: jugando.has(d.playerName)
+      }))
+    });
+  } catch (e) {
+    console.error('top-jugadores:', e);
+    res.status(500).json({ ok: false, error: 'No se pudo leer la clasificacion' });
+  }
+});
+
 app.get('/api/admin/overview', adminAuth, apiLimiter, async (req, res) => {
   try {
     const hace24h = new Date(Date.now() - 24 * 3600 * 1000);
@@ -16387,6 +16544,40 @@ app.get('/api/battle/leaderboard', apiLimiter, authMiddleware, async (req, res) 
 const battleQueue = [];              // sockets esperando rival
 const battleMatches = new Map();     // matchId → estado del combate
 const socketMatch = new Map();       // socket.id → matchId
+const battleAdmissions = new Map(); // cuenta → solicitud/combate activo
+
+// Reservar ANTES del primer await impide dos combates desde un doble clic o
+// dos pestañas. El ticket también invalida cargas terminadas después de salir.
+function reserveBattleAdmission(socket, mode) {
+  const account = String(socket.authenticatedAddress || '').toLowerCase();
+  if (!account || socket.connected === false || socketMatch.has(socket.id) ||
+      socket._battleTicket || battleAdmissions.has(account)) return null;
+  const ticket = { account, mode, socket, createdAt: Date.now(), player: null };
+  socket._battleTicket = ticket;
+  battleAdmissions.set(account, ticket);
+  return ticket;
+}
+
+function isBattleAdmissionCurrent(socket, ticket) {
+  return !!ticket && socket.connected !== false && socket._battleTicket === ticket &&
+    battleAdmissions.get(ticket.account) === ticket && !socketMatch.has(socket.id);
+}
+
+function releaseBattleAdmission(socket, ticket = socket && socket._battleTicket) {
+  if (!socket || !ticket) return;
+  if (battleAdmissions.get(ticket.account) === ticket) battleAdmissions.delete(ticket.account);
+  if (socket._battleTicket === ticket) socket._battleTicket = null;
+}
+
+function removeBattleQueueSocket(socket) {
+  for (let i = battleQueue.length - 1; i >= 0; i--) {
+    if (battleQueue[i].id === socket.id) battleQueue.splice(i, 1);
+  }
+}
+
+function battleLevelsCompatible(a, b) {
+  return Math.abs(a.level - b.level) <= Math.max(2, Math.ceil(Math.min(a.level, b.level) * 0.20));
+}
 
 const BATTLE_TURN_MS = 20000;        // tiempo máximo para elegir acción
 const BATTLE_MAX_TURNS = 30;         // corte de seguridad
@@ -16475,10 +16666,15 @@ function purgarMapasEnMemoria() {
     const nacido = Number(String(id).split('_')[1]);
     const viejo  = Number.isFinite(nacido) && (ahora - nacido) > topeCombate;
     if (match && match.ended === true) {
-      if (match.turnTimer) { try { clearTimeout(match.turnTimer); } catch (e) {} }
+      clearBattleTurnTimer(match);
+      for (const p of [match.a, match.b]) if (p && p.socket) releaseBattleAdmission(p.socket, p.battleTicket);
       battleMatches.delete(id); n++;
     } else if (viejo) {
-      if (match && match.turnTimer) { try { clearTimeout(match.turnTimer); } catch (e) {} }
+      if (match) {
+        match.ended = true;
+        clearBattleTurnTimer(match);
+        for (const p of [match.a, match.b]) if (p && p.socket) releaseBattleAdmission(p.socket, p.battleTicket);
+      }
       battleMatches.delete(id); n++;
     }
   }
@@ -17002,6 +17198,8 @@ function cartaPublica(id, jugador) {
   if (c.self)       out.self       = c.self;
   if (c.lifesteal)  out.lifesteal  = c.lifesteal;
   if (c.energyNext) out.energyNext = c.energyNext;
+  if (c.cleanse)    out.cleanse    = true;
+  if (c.dispel)     out.dispel     = true;
   if (jugador && typeof jugador.attack === 'number') {
     out.dmg = c.dmg ? Math.round(jugador.attack * c.dmg) : 0;
     out.shield = c.shield ? Math.round(jugador.attack * c.shield) : 0;
@@ -17050,8 +17248,9 @@ function tickEstados(p) {
     notas.push(`💚 ${p.petName} regenerates ${cura}`);
   }
 
-  // Se descuenta un turno a todos los estados activos.
-  for (const k of Object.keys(p.estados)) {
+  // Veneno y regeneración consumen su turno aquí. Los estados de combate
+  // caducan DESPUÉS de resolver: stun/focus de duración 1 deben poder usarse.
+  for (const k of ['poison', 'regen']) {
     if (p.estados[k] > 0) p.estados[k]--;
     if (p.estados[k] <= 0) delete p.estados[k];
   }
@@ -17144,8 +17343,8 @@ function validarJugada(mano, indices, jugador) {
   const tope = jugador ? energiaDelTurno(jugador) : BATTLE_ENERGY_PER_TURN;
 
   (Array.isArray(indices) ? indices : []).forEach(i => {
-    const idx = parseInt(i, 10);
-    if (isNaN(idx) || idx < 0 || idx >= mano.length || usados.has(idx)) return;
+    const idx = i;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= mano.length || usados.has(idx)) return;
     const carta = BATTLE_CARDS[mano[idx]];
     if (!carta) return;
     if (energia + carta.cost > tope) return; // no cabe
@@ -17186,30 +17385,68 @@ function elegirCartasBot(bot, mano) {
     return v;
   };
 
-  const orden = [...mano.keys()].sort((i, j) => valor(BATTLE_CARDS[mano[j]]) - valor(BATTLE_CARDS[mano[i]]));
-
   const tope = energiaDelTurno(bot);
-  const elegidas = [];
-  let energia = 0;
-  orden.forEach(i => {
-    const c = BATTLE_CARDS[mano[i]];
-    if (energia + c.cost <= tope) {
-      elegidas.push(i);
-      energia += c.cost;
+  let elegidas = [], mejor = -Infinity;
+  // Sólo 32 subconjuntos con una mano de 5: comparar combinaciones evita
+  // malgastar energía por elegir primero una carta cara. No lee la mano ni
+  // la elección del rival; decide al repartir, antes del envío del humano.
+  for (let mask = 0; mask < (1 << mano.length); mask++) {
+    const indices = [], cartas = [];
+    let energia = 0, puntos = 0;
+    for (let i = 0; i < mano.length; i++) if (mask & (1 << i)) {
+      const c = BATTLE_CARDS[mano[i]];
+      indices.push(i); cartas.push(c);
+      energia += c.cost; puntos += valor(c);
     }
-  });
-  bot.energiaBanco = Math.min(BATTLE_MAX_ENERGY_BANK, tope - energia);
+    if (energia > tope) continue;
+    const combos = combosActivos(cartas.map(c => c.id));
+    for (const c of combos) {
+      puntos += ((c.dmgMult || 1) - 1) * cartas.reduce((s, x) => s + x.dmg, 0);
+      puntos += ((c.shieldMult || 1) - 1) * cartas.reduce((s, x) => s + x.shield, 0);
+      puntos += (c.poisonBoost || 0) * 0.18 + (c.lifestealBonus || 0) * 0.8;
+    }
+    // No valorar una curación que la vida máxima impediría recibir.
+    const cura = cartas.reduce((s, c) => s + c.heal, 0);
+    puntos -= Math.max(0, cura - (bot.maxHp - bot.hp) / bot.attack) * (vidaBaja ? 3 : 1);
+    puntos += Math.min(BATTLE_MAX_ENERGY_BANK, tope - energia) * 0.12;
+    if (puntos > mejor) { mejor = puntos; elegidas = indices; }
+  }
+  elegidas.sort((i, j) => BATTLE_CARDS[mano[j]].dmg - BATTLE_CARDS[mano[i]].dmg);
+  // Elegir no gasta ni modifica energía: validarJugada lo hace exactamente
+  // una vez al resolver, igual que para el jugador humano.
   return elegidas;
 }
 
 // Resuelve el turno con las cartas de ambos lados, ya con estados y combos.
 // Devuelve { dmgToA, dmgToB, curaA, curaB, escudoA, escudoB, texto, combos… }
 function resolverCartas(a, b, cartasA, cartasB) {
-  const azar = (v) => Math.max(0, Math.round(v * (0.9 + Math.random() * 0.2)));
+  // El daño base coincide con la carta. El azar está en el reparto, no en
+  // perder un combate porque la misma jugada pega distinto según el asiento.
+  const valor = (v) => Math.max(0, Math.round(v));
   iniciarEstados(a); iniciarEstados(b);
 
+  // Resolver simultáneamente, sin que calcular A cambie los modificadores
+  // de B. Limpieza/disipación ganan a los estados aplicados este mismo turno.
+  const limpiaA = cartasA.some(c => c.cleanse), limpiaB = cartasB.some(c => c.cleanse);
+  const disipaA = cartasA.some(c => c.dispel), disipaB = cartasB.some(c => c.dispel);
+  const preparar = (p, cartas, limpia, disipado) => {
+    const estados = { ...p.estados };
+    if (limpia) BATTLE_ESTADOS_MALOS.forEach(e => { delete estados[e]; });
+    if (disipado) BATTLE_ESTADOS_BUENOS.forEach(e => { delete estados[e]; });
+    // Armadura/espinas protegen ya, junto al escudo. Focus y las
+    // penalizaciones del rival se reservan para la próxima mano.
+    if (!disipado) for (const c of cartas) {
+      if (c.self === 'armor' || c.self === 'thorns') {
+        estados[c.self] = Math.max(estados[c.self] || 0, BATTLE_STATUS_TURNS[c.self]);
+      }
+    }
+    return estados;
+  };
+  const estadosA = preparar(a, cartasA, limpiaA, disipaB);
+  const estadosB = preparar(b, cartasB, limpiaB, disipaA);
+
   // Suma de una mano, aplicando sus propios modificadores.
-  const sumar = (jugador, rival, cartas) => {
+  const sumar = (jugador, estados, cartas) => {
     const combos = combosActivos(cartas.map(c => c.id));
     const dmgMult    = combos.reduce((m, c) => m * (c.dmgMult    || 1), 1);
     const shieldMult = combos.reduce((m, c) => m * (c.shieldMult || 1), 1);
@@ -17217,62 +17454,71 @@ function resolverCartas(a, b, cartasA, cartasB) {
     const venenoExtra= combos.reduce((s, c) => s + (c.poisonBoost   || 0), 0);
 
     // 'focus' venía de un turno anterior: potencia el ataque de ESTE turno.
-    const focusMult = tieneEstado(jugador, 'focus') ? 1.5 : 1;
+    let focusDisponible = estados.focus > 0;
     // 'weak' lo puso el rival: pega menos.
-    const weakMult  = tieneEstado(jugador, 'weak') ? 0.65 : 1;
+    const weakMult  = estados.weak > 0 ? 0.65 : 1;
 
     let dmg = 0, shield = 0, heal = 0, lifesteal = 0, energyNext = 0;
     for (const c of cartas) {
-      dmg    += azar(jugador.attack * c.dmg);
-      shield += azar(jugador.attack * c.shield);
-      heal   += azar(jugador.attack * c.heal);
+      const focusMult = c.dmg > 0 && focusDisponible ? 1.5 : 1;
+      if (c.dmg > 0) focusDisponible = false;
+      dmg    += valor(jugador.attack * c.dmg) * focusMult;
+      shield += valor(jugador.attack * c.shield);
+      heal   += valor(jugador.attack * c.heal);
       if (c.lifesteal)  lifesteal = Math.max(lifesteal, c.lifesteal + lifeBonus);
       if (c.energyNext) energyNext += c.energyNext;
-      // Estados que la carta pone AL RIVAL o A UNO MISMO (para el turno que viene)
-      if (c.applies) aplicarEstado(rival, c.applies, c.applies === 'poison' ? venenoExtra : 0);
-      if (c.self)    aplicarEstado(jugador, c.self);
-
-      // ── ROMPER ESTADOS ─────────────────────────────────────────────────
-      // `cleanse` te quita TUS estados malos; `dispel` le quita al rival los
-      // suyos buenos. Es lo que faltaba para poder responder a un veneno o a
-      // alguien atrincherado. Se resuelven en el momento de jugar la carta.
-      if (c.cleanse && jugador.estados) {
-        BATTLE_ESTADOS_MALOS.forEach(e => { jugador.estados[e] = 0; });
-      }
-      if (c.dispel && rival.estados) {
-        BATTLE_ESTADOS_BUENOS.forEach(e => { rival.estados[e] = 0; });
-      }
     }
 
-    dmg    = Math.round(dmg * dmgMult * focusMult * weakMult);
+    dmg    = Math.round(dmg * dmgMult * weakMult);
 
     // 'expose' del rival: los escudos que levanta valen la mitad.
-    shield = Math.round(shield * shieldMult * (tieneEstado(jugador, 'expose') ? 0.5 : 1));
+    shield = Math.round(shield * shieldMult * (estados.expose > 0 ? 0.5 : 1));
 
-    return { dmg, shield, heal, lifesteal, energyNext, combos };
+    return { dmg, shield, heal, lifesteal, energyNext, combos, venenoExtra };
   };
 
-  const A = sumar(a, b, cartasA);
-  const B = sumar(b, a, cartasB);
+  const A = sumar(a, estadosA, cartasA);
+  const B = sumar(b, estadosB, cartasB);
 
   // ARMADURA: reduce a la mitad el daño que se recibe y dura varios turnos,
   // al contrario que el escudo, que se gasta en el turno. `expose` la anula:
   // ésa es la forma de romper a alguien que se atrinchera.
-  const reduccionPorArmadura = (defensor) =>
-    (tieneEstado(defensor, 'armor') && !tieneEstado(defensor, 'expose')) ? 0.5 : 1;
+  const reduccionPorArmadura = (estados) =>
+    (estados.armor > 0 && !(estados.expose > 0)) ? 0.5 : 1;
 
   // El escudo del rival absorbe daño de ESTE turno; la armadura recorta lo que
   // se cuela después.
-  const dmgToB = Math.round(Math.max(0, A.dmg - B.shield) * reduccionPorArmadura(b));
-  const dmgToA = Math.round(Math.max(0, B.dmg - A.shield) * reduccionPorArmadura(a));
+  const dmgToB = Math.round(Math.max(0, A.dmg - B.shield) * reduccionPorArmadura(estadosB));
+  const dmgToA = Math.round(Math.max(0, B.dmg - A.shield) * reduccionPorArmadura(estadosA));
 
   // Robo de vida sobre el daño REALMENTE hecho
   const roboA = A.lifesteal ? Math.round(dmgToB * A.lifesteal) : 0;
   const roboB = B.lifesteal ? Math.round(dmgToA * B.lifesteal) : 0;
 
   // Espinas: devuelve el 25% del daño recibido, saltándose el escudo del que pega
-  const espinasA = tieneEstado(a, 'thorns') ? Math.round(dmgToA * 0.25) : 0;
-  const espinasB = tieneEstado(b, 'thorns') ? Math.round(dmgToB * 0.25) : 0;
+  const espinasA = estadosA.thorns > 0 ? Math.round(dmgToA * 0.25) : 0;
+  const espinasB = estadosB.thorns > 0 ? Math.round(dmgToB * 0.25) : 0;
+
+  // Consumir estados usados este turno antes de añadir los del próximo.
+  const avanzar = (p, estados) => {
+    p.estados = {};
+    for (const [id, turnos] of Object.entries(estados)) {
+      const restantes = turnos - (id === 'poison' || id === 'regen' ? 0 : 1);
+      if (restantes > 0) p.estados[id] = restantes;
+    }
+  };
+  avanzar(a, estadosA); avanzar(b, estadosB);
+  const siguientes = (p, rival, cartas, resumen, disipado, rivalLimpia) => {
+    for (const c of cartas) {
+      if (c.applies && !rivalLimpia) aplicarEstado(rival, c.applies,
+        c.applies === 'poison' ? resumen.venenoExtra : 0);
+      if (c.self && !disipado && c.self !== 'armor' && c.self !== 'thorns') {
+        aplicarEstado(p, c.self);
+      }
+    }
+  };
+  siguientes(a, b, cartasA, A, disipaB, limpiaB);
+  siguientes(b, a, cartasB, B, disipaA, limpiaA);
 
   // Energía guardada para el turno siguiente
   a.energiaExtra = A.energyNext;
@@ -17313,6 +17559,23 @@ function clearBattleTurnTimer(match) {
     clearTimeout(match.turnTimer);
     match.turnTimer = null;
   }
+}
+
+// Una sola referencia cubre introducción, selección y pausa entre turnos.
+// Cerrar la batalla cancela cualquiera de las tres y no deja callbacks vivos.
+function scheduleBattleTurn(match, delay) {
+  clearBattleTurnTimer(match);
+  if (!match || match.ended) return;
+  match.phase = 'waiting';
+  match.turnTimer = setTimeout(() => {
+    match.turnTimer = null;
+    if (!match.ended && battleMatches.get(match.id) === match) startBattleTurn(match);
+  }, delay);
+}
+
+function emitBattle(socket, event, payload) {
+  try { if (socket && socket.connected !== false) socket.emit(event, payload); }
+  catch (e) { console.warn('No se pudo enviar ' + event + ':', e.message); }
 }
 
 async function saveBattleResult(match, winnerKey, reason) {
@@ -17425,6 +17688,7 @@ const BATTLE_PLAZO_BD_MS = 6000;
 async function endBattle(match, winnerKey, reason) {
   if (!match || match.ended) return;
   match.ended = true;
+  match.phase = 'ended';
   clearBattleTurnTimer(match);
 
   await conPlazo(saveBattleResult(match, winnerKey, reason), BATTLE_PLAZO_BD_MS, null);
@@ -17441,7 +17705,7 @@ async function endBattle(match, winnerKey, reason) {
          lo vuelve a pedir el mundo con `battle:dailyStatus` al volver al mapa,
          así que el jugador no se queda sin saber cuántas le quedan. */
       const doc = await conPlazo(BattleDaily.findOneAndUpdate(
-        { playerName: match.a.playerName, day: battleTodayKey() },
+        { playerName: match.a.playerName, day: match.dailyDay || battleTodayKey() },
         { $inc: { done: 1, wins: winnerKey === 'a' ? 1 : 0 } },
         { upsert: true, new: true, setDefaultsOnInsert: true }
       ), BATTLE_PLAZO_BD_MS, null);
@@ -17474,6 +17738,7 @@ async function endBattle(match, winnerKey, reason) {
     const gano = winnerKey === key;
     p.socket.emit('battle:end', {
       matchId: match.id,
+      turn: match.turn,
       result: winnerKey ? (gano ? 'win' : 'lose') : 'draw',
       reason: reason || 'ko',
       // Contra bot se da 1 punto por victoria (máximo 5 batallas al día);
@@ -17491,20 +17756,27 @@ async function endBattle(match, winnerKey, reason) {
     if (dailyInfo && key === 'a') {
       try { p.socket.emit('battle:daily', dailyInfo); } catch (_) {}
     }
-    socketMatch.delete(p.socket.id);
+    if (socketMatch.get(p.socket.id) === match.id) socketMatch.delete(p.socket.id);
    } catch (e) {
     console.error(`❌ No se pudo avisar del final al jugador ${key}:`, e);
     // El candado se suelta IGUAL: es lo que impide volver a pelear.
     const p = match[key];
-    if (p && p.socket) { try { socketMatch.delete(p.socket.id); } catch (_) {} }
+    if (p && p.socket && socketMatch.get(p.socket.id) === match.id) {
+      try { socketMatch.delete(p.socket.id); } catch (_) {}
+    }
    }
   });
 
+  for (const p of [match.a, match.b]) {
+    if (p && p.socket) releaseBattleAdmission(p.socket, p.battleTicket);
+  }
   battleMatches.delete(match.id);
 }
 
 function startBattleTurn(match) {
+  if (!match || match.ended || battleMatches.get(match.id) !== match) return;
   clearBattleTurnTimer(match);
+  match.phase = 'choosing';
   match.actions = { a: null, b: null };
   match.turn += 1;
 
@@ -17517,7 +17789,7 @@ function startBattleTurn(match) {
     ['a', 'b'].forEach(k => {
       const p = match[k];
       if (p && p.socket && notasEstado.length) {
-        p.socket.emit('battle:status', { turn: match.turn, notes: notasEstado });
+        emitBattle(p.socket, 'battle:status', { matchId: match.id, turn: match.turn, notes: notasEstado });
       }
     });
     /* `.catch` obligatorio: esta llamada NO se espera (la función de arriba no
@@ -17535,13 +17807,17 @@ function startBattleTurn(match) {
     b: repartirMano(match.b && match.b.level)
   };
 
+  match.deadlineAt = Date.now() + BATTLE_TURN_MS;
+
   ['a', 'b'].forEach(key => {
     const p = match[key];
     if (p && p.socket) {
-      p.socket.emit('battle:turnStart', {
+      emitBattle(p.socket, 'battle:turnStart', {
         matchId: match.id,
         turn: match.turn,
         msToChoose: BATTLE_TURN_MS,
+        deadlineAt: match.deadlineAt,
+        serverNow: Date.now(),
         // Energía REAL de este turno: base + banco + extra − aturdimiento.
         energy: energiaDelTurno(p),
         energyBase: BATTLE_ENERGY_PER_TURN,
@@ -17567,15 +17843,16 @@ function startBattleTurn(match) {
 
   // Si alguien no juega a tiempo, pasa turno sin gastar energía
   match.turnTimer = setTimeout(() => {
-    if (match.ended) return;
+    if (match.ended || match.phase !== 'choosing') return;
     if (!match.actions.a) match.actions.a = [];
     if (!match.actions.b) match.actions.b = [];
-    resolveBattleTurn(match);
-  }, BATTLE_TURN_MS + 1000);
+    Promise.resolve(resolveBattleTurn(match)).catch(e => console.error('Battle timeout:', e));
+  }, BATTLE_TURN_MS);
 }
 
 async function resolveBattleTurn(match) {
-  if (match.ended) return;
+  if (!match || match.ended || match.phase !== 'choosing') return;
+  match.phase = 'resolving';
   clearBattleTurnTimer(match);
 
   // Se pasa el jugador para que el tope de energía sea el REAL de este turno
@@ -17595,7 +17872,7 @@ async function resolveBattleTurn(match) {
     const mia = key === 'a' ? jugadaA : jugadaB;
     const suya = key === 'a' ? jugadaB : jugadaA;
     const rivalP = match[key === 'a' ? 'b' : 'a'];
-    p.socket.emit('battle:turn', {
+    emitBattle(p.socket, 'battle:turn', {
       matchId: match.id,
       turn: match.turn,
       yourCards: mia.cartas.map(c => cartaPublica(c.id, p)),
@@ -17623,12 +17900,17 @@ async function resolveBattleTurn(match) {
     let ganador = null;
     if (muertoA && !muertoB) ganador = 'b';
     else if (muertoB && !muertoA) ganador = 'a';
-    else if (!muertoA && !muertoB) ganador = match.a.hp === match.b.hp ? null : (match.a.hp > match.b.hp ? 'a' : 'b');
+    else if (!muertoA && !muertoB) {
+      // Al alcanzar el límite gana quien conserva más porcentaje de vida,
+      // sin favorecer por defecto a la mascota con mayor vida máxima.
+      const ventaja = match.a.hp * match.b.maxHp - match.b.hp * match.a.maxHp;
+      ganador = ventaja === 0 ? null : (ventaja > 0 ? 'a' : 'b');
+    }
     await endBattle(match, ganador, muertoA || muertoB ? 'ko' : 'timeout');
     return;
   }
 
-  setTimeout(() => startBattleTurn(match), 1200);
+  scheduleBattleTurn(match, 1200);
 }
 
 /**
@@ -17753,6 +18035,7 @@ async function estadoBatallasDiarias(playerName) {
   const doc = await BattleDaily.findOne({ playerName, day }).lean();
   const done = doc ? doc.done : 0;
   return {
+    day,
     done,
     max: BATTLE_DAILY_MAX,
     remaining: Math.max(0, BATTLE_DAILY_MAX - done),
@@ -17762,16 +18045,30 @@ async function estadoBatallasDiarias(playerName) {
 }
 
 async function tryBattleMatchmaking() {
+  // Las fichas se cargan antes de entrar en la cola. Emparejar no contiene
+  // awaits: nadie puede ocupar los mismos sockets mientras se consulta Mongo.
+  for (let i = battleQueue.length - 1; i >= 0; i--) {
+    const s = battleQueue[i];
+    if (!isBattleAdmissionCurrent(s, s._battleTicket)) battleQueue.splice(i, 1);
+  }
   while (battleQueue.length >= 2) {
-    const sa = battleQueue.shift();
-    const sb = battleQueue.shift();
-    if (!sa || !sa.connected) { if (sb && sb.connected) battleQueue.unshift(sb); continue; }
-    if (!sb || !sb.connected) { battleQueue.unshift(sa); continue; }
-
-    const [a, b] = await Promise.all([
-      construirJugadorDeSocket(sa),
-      construirJugadorDeSocket(sb)
-    ]);
+    let ia = -1, ib = -1;
+    for (let i = 0; i < battleQueue.length - 1 && ia < 0; i++) {
+      const a = battleQueue[i]._battleTicket.player;
+      let distancia = Infinity;
+      for (let j = i + 1; j < battleQueue.length; j++) {
+        const b = battleQueue[j]._battleTicket.player;
+        const d = Math.abs(a.level - b.level);
+        if (a.playerName !== b.playerName && battleLevelsCompatible(a, b) && d < distancia) {
+          ia = i; ib = j; distancia = d;
+        }
+      }
+    }
+    if (ia < 0) return; // seguir esperando a un rival de nivel comparable
+    const sb = battleQueue.splice(ib, 1)[0];
+    const sa = battleQueue.splice(ia, 1)[0];
+    const a = sa._battleTicket.player, b = sb._battleTicket.player;
+    a.battleTicket = sa._battleTicket; b.battleTicket = sb._battleTicket;
 
     // NUNCA emparejar a alguien consigo mismo. Pasa con dos pestañas abiertas
     // (o al reconectar dejando el socket viejo en la cola): la partida salía
@@ -17781,6 +18078,7 @@ async function tryBattleMatchmaking() {
       console.log(`↩️  Cola: ${a.playerName} estaba dos veces; se descarta el socket viejo`);
       // Se conserva el más reciente (sb) y se descarta el anterior.
       try { sa.emit('battle:error', { error: 'duplicate_session' }); } catch (_) {}
+      releaseBattleAdmission(sa);
       battleQueue.unshift(sb);
       continue;
     }
@@ -17798,7 +18096,7 @@ async function tryBattleMatchmaking() {
 
     ['a', 'b'].forEach(key => {
       const p = match[key];
-      p.socket.emit('battle:matched', {
+      emitBattle(p.socket, 'battle:matched', {
         matchId: match.id,
         // Se marca explícitamente el modo: así el cliente puede rechazar una
         // partida que no sea la que pidió.
@@ -17809,21 +18107,33 @@ async function tryBattleMatchmaking() {
     });
 
     console.log(`⚔️ Batalla ${match.id}: ${a.playerName} vs ${b.playerName}`);
-    setTimeout(() => startBattleTurn(match), 2500);
+    scheduleBattleTurn(match, 2500);
   }
 }
 
 // ---------------------------------------------------------------------------
 // BATALLA DIARIA CONTRA BOT (5 al día, cada una más difícil)
 // ---------------------------------------------------------------------------
-async function iniciarBatallaBot(socket) {
-  const jugador = await construirJugadorDeSocket(socket);
+async function iniciarBatallaBot(socket, ticket) {
+  const jugador = await conPlazo(construirJugadorDeSocket(socket), BATTLE_PLAZO_BD_MS, null);
+  if (!isBattleAdmissionCurrent(socket, ticket)) return;
+  if (!jugador) {
+    releaseBattleAdmission(socket, ticket);
+    return emitBattle(socket, 'battle:error', { error: 'bot_failed' });
+  }
   if (!jugador.playerName || jugador.playerName === '---') {
+    releaseBattleAdmission(socket, ticket);
     return socket.emit('battle:error', { error: 'not_authenticated' });
   }
 
-  const estado = await estadoBatallasDiarias(jugador.playerName);
+  const estado = await conPlazo(estadoBatallasDiarias(jugador.playerName), BATTLE_PLAZO_BD_MS, null);
+  if (!isBattleAdmissionCurrent(socket, ticket)) return;
+  if (!estado) {
+    releaseBattleAdmission(socket, ticket);
+    return emitBattle(socket, 'battle:error', { error: 'bot_failed' });
+  }
   if (estado.remaining <= 0) {
+    releaseBattleAdmission(socket, ticket);
     return socket.emit('battle:error', { error: 'daily_limit', daily: estado });
   }
 
@@ -17845,16 +18155,18 @@ async function iniciarBatallaBot(socket) {
      combate es mucho más corto y un mal turno te tumba— pero deja de ser
      una derrota automática.
      ═══════════════════════════════════════════════════════════════════ */
+  const saludJugador = Number(jugador.petHealthPct);
   const fraccionJugador = Math.max(0, Math.min(1,
-    (Number(jugador.petHealthPct) || 100) / 100));
+    (Number.isFinite(saludJugador) ? saludJugador : 100) / 100));
   const fraccionBot = Math.max(0.75, fraccionJugador);
   bot.hp = Math.max(1, Math.round(bot.maxHp * fraccionBot));
 
+  jugador.battleTicket = ticket;
   const match = {
     id: `b_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     a: jugador, b: bot,
     turn: 0, ended: false,
-    esBot: true, ronda,
+    esBot: true, ronda, dailyDay: estado.day,
     actions: { a: null, b: null },
     ultimaAccionJugador: null,
     turnTimer: null
@@ -17863,7 +18175,7 @@ async function iniciarBatallaBot(socket) {
   battleMatches.set(match.id, match);
   socketMatch.set(socket.id, match.id);
 
-  socket.emit('battle:matched', {
+  emitBattle(socket, 'battle:matched', {
     matchId: match.id,
     mode: 'bot',
     round: ronda,
@@ -17873,7 +18185,7 @@ async function iniciarBatallaBot(socket) {
   });
 
   console.log(`🤖 Batalla diaria ${match.id}: ${jugador.playerName} vs ${bot.petName} (ronda ${ronda})`);
-  setTimeout(() => startBattleTurn(match), 2000);
+  scheduleBattleTurn(match, 2000);
 }
 
 io.on('connection', (socket) => {
@@ -17890,43 +18202,60 @@ io.on('connection', (socket) => {
   });
 
   socket.on('battle:bot', async () => {
+    let ticket = null;
     try {
       if (!socket.authenticatedAddress) {
         return socket.emit('battle:error', { error: 'not_authenticated' });
       }
-      if (socketMatch.has(socket.id)) {
+      ticket = reserveBattleAdmission(socket, 'bot');
+      if (!ticket) {
         return socket.emit('battle:error', { error: 'already_in_battle' });
       }
-      await iniciarBatallaBot(socket);
+      await iniciarBatallaBot(socket, ticket);
     } catch (e) {
+      releaseBattleAdmission(socket, ticket);
       console.error('❌ battle:bot', e);
       socket.emit('battle:error', { error: 'bot_failed' });
     }
   });
 
   socket.on('battle:queue', async () => {
+    let ticket = null;
     try {
       // Solo jugadores autenticados (la tabla es por playerName)
       if (!socket.authenticatedAddress) {
         return socket.emit('battle:error', { error: 'not_authenticated' });
       }
-      if (socketMatch.has(socket.id)) {
+      if (socket._battleTicket && socket._battleTicket.mode === 'pvp' &&
+          !socketMatch.has(socket.id)) return;
+      ticket = reserveBattleAdmission(socket, 'pvp');
+      if (!ticket) {
         return socket.emit('battle:error', { error: 'already_in_battle' });
       }
-      if (battleQueue.some(s => s.id === socket.id)) return;
-
+      const player = await conPlazo(construirJugadorDeSocket(socket), BATTLE_PLAZO_BD_MS, null);
+      if (!isBattleAdmissionCurrent(socket, ticket)) return;
+      if (!player || !player.playerName || player.playerName === '---') {
+        releaseBattleAdmission(socket, ticket);
+        return emitBattle(socket, 'battle:error', { error: 'queue_failed' });
+      }
+      ticket.player = player;
       battleQueue.push(socket);
-      socket.emit('battle:queued', { position: battleQueue.length });
+      emitBattle(socket, 'battle:queued', {
+        position: battleQueue.length, level: player.level,
+        maxLevelGap: Math.max(2, Math.ceil(player.level * 0.20))
+      });
       await tryBattleMatchmaking();
     } catch (e) {
+      removeBattleQueueSocket(socket);
+      releaseBattleAdmission(socket, ticket);
       console.error('❌ battle:queue', e);
       socket.emit('battle:error', { error: 'queue_failed' });
     }
   });
 
   socket.on('battle:leaveQueue', () => {
-    const i = battleQueue.findIndex(s => s.id === socket.id);
-    if (i >= 0) battleQueue.splice(i, 1);
+    removeBattleQueueSocket(socket);
+    if (!socketMatch.has(socket.id)) releaseBattleAdmission(socket);
     socket.emit('battle:leftQueue', {});
   });
 
@@ -17935,7 +18264,10 @@ io.on('connection', (socket) => {
       const matchId = socketMatch.get(socket.id);
       if (!matchId) return;
       const match = battleMatches.get(matchId);
-      if (!match || match.ended) return;
+      if (!match || match.ended || match.phase !== 'choosing') return;
+      if (data && data.matchId != null && data.matchId !== match.id) return;
+      if (data && data.turn != null && data.turn !== match.turn) return;
+      if (Date.now() > match.deadlineAt) return;
 
       const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
       if (match.actions[key]) return; // ya jugó en este turno
@@ -17948,9 +18280,11 @@ io.on('connection', (socket) => {
 
       // Avisar al rival de que ya eligió (sin decir qué)
       const rival = match[key === 'a' ? 'b' : 'a'];
-      if (rival && rival.socket) rival.socket.emit('battle:rivalReady', { turn: match.turn });
+      if (rival && rival.socket) emitBattle(rival.socket, 'battle:rivalReady', { matchId: match.id, turn: match.turn });
 
-      if (match.actions.a && match.actions.b) resolveBattleTurn(match);
+      if (match.actions.a && match.actions.b) {
+        Promise.resolve(resolveBattleTurn(match)).catch(e => console.error('Battle action:', e));
+      }
     } catch (e) {
       console.error('❌ battle:action', e);
     }
@@ -17966,8 +18300,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', async () => {
-    const i = battleQueue.findIndex(s => s.id === socket.id);
-    if (i >= 0) battleQueue.splice(i, 1);
+    removeBattleQueueSocket(socket);
 
     const matchId = socketMatch.get(socket.id);
     // El candado se suelta SIEMPRE. Antes se hacía `return` cuando el combate
@@ -17975,9 +18308,10 @@ io.on('connection', (socket) => {
     // quedaba puesta: a partir de ahí, cualquier intento de empezar otra
     // batalla respondía 'already_in_battle' y el jugador no podía entrar más.
     socketMatch.delete(socket.id);
-    if (!matchId) return;
+    if (!matchId) { releaseBattleAdmission(socket); return; }
     const match = battleMatches.get(matchId);
-    if (!match || match.ended) return;
+    if (!match) { releaseBattleAdmission(socket); return; }
+    if (match.ended) return;
     const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
     await endBattle(match, key === 'a' ? 'b' : 'a', 'forfeit');
   });
@@ -17987,12 +18321,15 @@ io.on('connection', (socket) => {
   // jugador se quedaba con 'already_in_battle' hasta recargar la página.
   socket.on('battle:leave', async () => {
     const matchId = socketMatch.get(socket.id);
-    socketMatch.delete(socket.id);
-    const i = battleQueue.findIndex(s => s.id === socket.id);
-    if (i >= 0) battleQueue.splice(i, 1);
-    if (!matchId) return;
+    removeBattleQueueSocket(socket);
+    if (!matchId) { releaseBattleAdmission(socket); return; }
     const match = battleMatches.get(matchId);
-    if (!match || match.ended) return;
+    if (!match) {
+      socketMatch.delete(socket.id);
+      releaseBattleAdmission(socket);
+      return;
+    }
+    if (match.ended) return;
     const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
     await endBattle(match, key === 'a' ? 'b' : 'a', 'forfeit');
   });
@@ -19229,32 +19566,5 @@ process.on('uncaughtException', (err) => {
   cerrarOrdenadamente('uncaughtException', 1);
 });
 
-process.on('SIGTERM', () => {
-  console.log('🛑 Recibido SIGTERM, cerrando servidor...');
-  server.close(async () => {
-    console.log('✅ Server closed (SIGTERM). Closing MongoDB connection...');
-    try {
-      await mongoose.connection.close(false);
-      console.log('✅ Conexión MongoDB cerrada');
-      process.exit(0);
-    } catch (e) {
-      console.error('❌ Error cerrando MongoDB:', e);
-      process.exit(1);
-    }
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('🛑 Recibido SIGINT, cerrando servidor...');
-  server.close(async () => {
-    console.log('✅ Server closed (SIGINT). Closing MongoDB connection...');
-    try {
-      await mongoose.connection.close(false);
-      console.log('✅ Conexión MongoDB cerrada');
-      process.exit(0);
-    } catch (e) {
-      console.error('❌ Error cerrando MongoDB:', e);
-      process.exit(1);
-    }
-  });
-});
+process.on('SIGTERM', () => cerrarOrdenadamente('SIGTERM', 0));
+process.on('SIGINT', () => cerrarOrdenadamente('SIGINT', 0));
