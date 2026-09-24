@@ -6754,6 +6754,19 @@ app.post('/api/relay/call-view',
 );
 
 // API pública de solo lectura: misma respuesta en ambas URLs, sin cookies/JWT.
+function tutorialTimeInEcuador(value) {
+  if (value === null || value === undefined) return null;
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Guayaquil', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+    timeZoneName: 'longOffset'
+  }).formatToParts(date).map(part => [part.type, part.value]));
+  const offset = parts.timeZoneName.replace('GMT', '') || '+00:00';
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}${offset}`;
+}
+
 function publicTutorialRecord(player) {
   const date = player.tutorialCompletedAt ? new Date(player.tutorialCompletedAt) : null;
   const timestamp = date && Number.isFinite(date.getTime()) ? Math.floor(date.getTime() / 1000) : null;
@@ -6763,7 +6776,11 @@ function publicTutorialRecord(player) {
     address: player.address || null,
     action: 'tutorial_completed',
     timestamp,
-    tutorialCompletedAt: timestamp
+    tutorialCompletedAt: timestamp,
+    tutorialCompletedAtISO: timestamp !== null ? date.toISOString() : null,
+    tutorialCompletedAtEcuador: tutorialTimeInEcuador(date),
+    timeZone: 'America/Guayaquil',
+    timeStatus: timestamp !== null ? 'recorded' : 'not_recorded'
   };
 }
 
@@ -6787,11 +6804,22 @@ async function publicTutorialSummary(req, res) {
       GamePlayer.findOne({ ...filter, tutorialCompletedAt: { $ne: null } })
         .select('tutorialCompletedAt -_id').sort({ tutorialCompletedAt: -1 }).lean()
     ]);
+    const now = new Date();
+    const latestRecord = latest ? publicTutorialRecord(latest) : null;
     return res.json({
       success: true,
+      // Hora de esta respuesta; no sustituye la fecha histórica del tutorial.
+      serverTime: {
+        timestamp: Math.floor(now.getTime() / 1000),
+        iso: now.toISOString(),
+        ecuador: tutorialTimeInEcuador(now),
+        timeZone: 'America/Guayaquil'
+      },
       summary: {
         totalCompleted,
-        lastTutorialCompletedAt: latest ? publicTutorialRecord(latest).timestamp : null,
+        lastTutorialCompletedAt: latestRecord ? latestRecord.timestamp : null,
+        lastTutorialCompletedAtISO: latestRecord ? latestRecord.tutorialCompletedAtISO : null,
+        lastTutorialCompletedAtEcuador: latestRecord ? latestRecord.tutorialCompletedAtEcuador : null,
         records: records.map(publicTutorialRecord)
       },
       pagination: {
