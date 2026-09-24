@@ -590,9 +590,10 @@ const gamePlayerSchema = new mongoose.Schema({
   agricultura: { type: Number, default: 0 },
   agricultura_exp: { type: Number, default: 0 },
   misiones: { type: Number, default: 0 },
-  // Tutorial de bienvenida: 0 = el jugador aún no lo ha hecho, 1 = ya lo hizo.
-  // Los jugadores nuevos nacen en 0 y ven el tutorial la primera vez que entran.
+  // Tutorial: 0..7, 20 y 21 = en curso; 22 = final actual; 8..19 = final antiguo.
   tutorial: { type: Number, default: 0 },
+  // Primera finalización observada por el servidor. Históricos sin fecha: null.
+  tutorialCompletedAt: { type: Date, default: null },
   // Nivel de la MASCOTA. Sube con las batallas (ver computePetLevel/bump).
   // Se muestra junto al nombre del perro, propio y de los demás jugadores.
   petLevel: { type: Number, default: 1, min: 1 },
@@ -626,7 +627,52 @@ const gamePlayerSchema = new mongoose.Schema({
   address: { type: String, lowercase: true, default: null }
 }, { timestamps: true, versionKey: false });
 
+gamePlayerSchema.index({ tutorial: 1, tutorialCompletedAt: -1, playerName: 1 });
 const GamePlayer = mongoose.model('GamePlayer', gamePlayerSchema);
+
+function isTutorialCompleted(value) {
+  const step = Number(value);
+  return Number.isInteger(step) && ((step >= 8 && step < 20) || step >= 22);
+}
+
+// Mantiene el primer instante aunque dos escenas guarden simultáneamente.
+// Estado y fecha se escriben juntos, conservando casting/validación de Mongoose.
+async function saveGamePlayerWithTutorial(playerName, fields) {
+  const update = { ...fields };
+  const rawStep = update.tutorial;
+  delete update.tutorial;
+  delete update.tutorialCompletedAt;
+  delete update.playerName;
+  const step = (typeof rawStep === 'number' || (typeof rawStep === 'string' && rawStep.trim()))
+    ? Number(rawStep) : NaN;
+  const hasStep = Number.isInteger(step) && step >= 0 && step <= 22;
+  if (!hasStep) {
+    return GamePlayer.findOneAndUpdate({ playerName }, { $set: update },
+      { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true });
+  }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const previous = await GamePlayer.findOne({ playerName })
+      .select('tutorial tutorialCompletedAt').lean();
+    const filter = {
+      playerName,
+      tutorial: previous?.tutorial ?? null,
+      tutorialCompletedAt: previous?.tutorialCompletedAt ?? null
+    };
+    const changes = { $set: { ...update }, $max: { tutorial: step } };
+    if (isTutorialCompleted(step) && !isTutorialCompleted(previous?.tutorial) && !previous?.tutorialCompletedAt) {
+      changes.$set.tutorialCompletedAt = new Date();
+    }
+    try {
+      const saved = await GamePlayer.findOneAndUpdate(filter, changes,
+        { upsert: !previous, new: true, setDefaultsOnInsert: true, runValidators: true });
+      if (saved) return saved;
+    } catch (error) {
+      // Otra petición puede haber creado la misma cuenta entre lectura y escritura.
+      if (previous || error.code !== 11000) throw error;
+    }
+  }
+  throw new Error('tutorial_save_conflict');
+}
 
 // Admin config
 const adminSchema = new mongoose.Schema({
@@ -2014,6 +2060,10 @@ class SecurityController {
     const ip = req.clientIp || req.ip;
     const path = req.path;
     const userAgent = req.headers['user-agent'] || '';
+
+    // Lectura pública limitada por su propio rate limiter; no requiere sesión
+    // ni registra a los integradores como escáneres del juego.
+    if (isPublicTutorialRead(req)) return next();
 
     // Puertas que nunca se cierran. Si alguna vez se bloquea a alguien por
     // error, al menos el cliente arranca y puede decir POR QUÉ, en vez de dar
@@ -6105,7 +6155,25 @@ const corsOptions = {
   optionsSuccessStatus: 204
 };
 
-app.use(cors(corsOptions));
+const publicTutorialCorsOptions = {
+  origin: '*', credentials: false, methods: ['GET', 'HEAD', 'OPTIONS'],
+  allowedHeaders: ['Accept', 'Content-Type'],
+  exposedHeaders: ['RateLimit-Limit', 'RateLimit-Remaining', 'RateLimit-Reset', 'Retry-After'],
+  maxAge: 86400, optionsSuccessStatus: 204
+};
+
+function isPublicTutorialRead(req) {
+  const path = req.path.toLowerCase().replace(/\/$/, '');
+  return ['GET', 'HEAD', 'OPTIONS'].includes(req.method) &&
+    (path === '/api/public/summary' || path === '/api/public/tutorial-completions');
+}
+
+app.use((req, res, next) => {
+  if (isPublicTutorialRead(req)) res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  next();
+});
+app.use(cors((req, callback) => callback(null,
+  isPublicTutorialRead(req) ? publicTutorialCorsOptions : corsOptions)));
 
 /* Y AQUI SI: el HTTPS obligatorio, DESPUES del CORS.
    Asi un rechazo se ve como lo que es (426 https_required) en vez de
@@ -6121,7 +6189,7 @@ app.options(/.*/, cors(corsOptions));
 
 // Middleware para debug de cookies en desarrollo
 app.use((req, res, next) => {
-  if (NODE_ENV === 'development') {
+  if (NODE_ENV === 'development' && !isPublicTutorialRead(req)) {
     res.header('Access-Control-Allow-Credentials', 'true');
     res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-CSRF-Token, X-Requested-With, Accept');
@@ -6168,6 +6236,7 @@ const loginLimiter = createCustomRateLimiter(15 * 60 * 1000, NODE_ENV === 'devel
 const apiLimiter = createCustomRateLimiter(60 * 1000, NODE_ENV === 'development' ? 500 : 200, 'too_many_requests', true);
 const strictLimiter = createCustomRateLimiter(15 * 60 * 1000, NODE_ENV === 'development' ? 500 : 200, 'Demasiadas peticiones. Por favor espera.', true);
 const relayLimiter = createCustomRateLimiter(60 * 1000, NODE_ENV === 'development' ? 50 : 20, 'too_many_relay_requests', true);
+const publicTutorialLimiter = createCustomRateLimiter(60 * 1000, 60, 'too_many_public_requests');
 
 const transactionLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
@@ -6683,6 +6752,62 @@ app.post('/api/relay/call-view',
     }
   }
 );
+
+// API pública de solo lectura: misma respuesta en ambas URLs, sin cookies/JWT.
+function publicTutorialRecord(player) {
+  const date = player.tutorialCompletedAt ? new Date(player.tutorialCompletedAt) : null;
+  const timestamp = date && Number.isFinite(date.getTime()) ? Math.floor(date.getTime() / 1000) : null;
+  return {
+    playerName: player.playerName,
+    username: player.Username && player.Username !== '---' ? player.Username : null,
+    address: player.address || null,
+    action: 'tutorial_completed',
+    timestamp,
+    tutorialCompletedAt: timestamp
+  };
+}
+
+async function publicTutorialSummary(req, res) {
+  res.setHeader('Cache-Control', 'no-store');
+  const { address, limit = '50', page = '1' } = req.query;
+  // No convertir objetos/arrays en strings: evita operadores e inputs ambiguos.
+  if ((address !== undefined && (typeof address !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(address))) ||
+      typeof limit !== 'string' || !/^[1-9]\d{0,2}$/.test(limit) || Number(limit) > 100 ||
+      typeof page !== 'string' || !/^[1-9]\d{0,4}$/.test(page) || Number(page) > 10000) {
+    return res.status(400).json({ error: 'invalid_query', message: 'address: 0x + 40 hex; limit: 1..100; page: 1..10000' });
+  }
+  const filter = { $or: [{ tutorial: { $gte: 8, $lt: 20 } }, { tutorial: { $gte: 22 } }] };
+  if (address !== undefined) filter.address = address.toLowerCase();
+  try {
+    const [totalCompleted, records, latest] = await Promise.all([
+      GamePlayer.countDocuments(filter),
+      GamePlayer.find(filter).select('playerName Username address tutorialCompletedAt -_id')
+        .sort({ tutorialCompletedAt: -1, playerName: 1 })
+        .skip((Number(page) - 1) * Number(limit)).limit(Number(limit)).lean(),
+      GamePlayer.findOne({ ...filter, tutorialCompletedAt: { $ne: null } })
+        .select('tutorialCompletedAt -_id').sort({ tutorialCompletedAt: -1 }).lean()
+    ]);
+    return res.json({
+      success: true,
+      summary: {
+        totalCompleted,
+        lastTutorialCompletedAt: latest ? publicTutorialRecord(latest).timestamp : null,
+        records: records.map(publicTutorialRecord)
+      },
+      pagination: {
+        page: Number(page), limit: Number(limit),
+        totalPages: Math.ceil(totalCompleted / Number(limit)),
+        hasMore: Number(page) * Number(limit) < totalCompleted
+      }
+    });
+  } catch (error) {
+    console.error('GET public tutorial summary:', error.message);
+    return res.status(503).json({ error: 'tutorial_summary_unavailable' });
+  }
+}
+
+app.get('/api/public/summary', publicTutorialLimiter, publicTutorialSummary);
+app.get('/api/public/tutorial-completions', publicTutorialLimiter, publicTutorialSummary);
 
 // Health endpoint — sin datos sensibles internos
 app.get('/api/health', async (req, res) => {
@@ -9335,11 +9460,7 @@ app.post('/api/save/:playerName',
         console.warn('⚠️  No se pudo aplicar la regla de progreso monótono:', monoErr.message);
       }
 
-      await GamePlayer.findOneAndUpdate(
-        { playerName },
-        { $set: update },
-        { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
-      );
+      await saveGamePlayerWithTutorial(playerName, update);
 
       if (missionsData && typeof missionsData === 'object') {
         await MissionsPlayer.findOneAndUpdate(
