@@ -597,6 +597,13 @@ const gamePlayerSchema = new mongoose.Schema({
   // Nivel de la MASCOTA. Sube con las batallas (ver computePetLevel/bump).
   // Se muestra junto al nombre del perro, propio y de los demás jugadores.
   petLevel: { type: Number, default: 1, min: 1 },
+  // Contadores de TODA LA VIDA de la mascota (los de BattleScore son de la
+  // temporada y se reinician cada 15 días). De ellos sale el nivel ganado
+  // peleando: ver nivelMascotaEfectivo() y sembrarContadoresMascota(). Sin
+  // valor por defecto A PROPÓSITO: "no existe" quiere decir "aún no se ha
+  // sembrado con lo jugado en temporadas anteriores".
+  petWins: { type: Number, min: 0 },
+  petBattles: { type: Number, min: 0 },
 
   // ── MASCOTA: vida, modo de comportamiento y muerte ──────────────────────
   // La vida va de 0 a 100 y es un PORCENTAJE: con ella entra a las batallas
@@ -9426,6 +9433,8 @@ app.post('/api/save/:playerName',
       //
       // Los dos se quitan del cuerpo ANTES de tocar la base de datos.
       delete update.petLevel;
+      delete update.petWins;
+      delete update.petBattles;
       // Mismo motivo que petLevel: estos los decide el servidor. `petMode`
       // manda sobre a quién atacan los animales, `petHealth` sobre con cuánta
       // vida entra la mascota a las batallas, y el trío de la muerte sobre lo
@@ -9579,8 +9588,22 @@ app.get('/api/load/:playerName',
 
       let p = await GamePlayer.findOne({ playerName }).lean().exec();
       if (!p) {
-        p = await GamePlayer.create({ playerName, address });
+        // `.toObject()`: un documento de Mongoose metido en Object.assign de
+        // abajo copiaba sus tripas ($__, _doc…) en vez de los campos, y la
+        // primera carga de un jugador nuevo llegaba sin petLevel ni nada.
+        p = (await GamePlayer.create({ playerName, address })).toObject();
       }
+
+      // EL NIVEL DE LA MASCOTA, el mismo que usa la arena (ver
+      // nivelMascotaEfectivo). Si sale más alto que el guardado —porque el
+      // personaje ha subido de nivel— se guarda (`$max`: nunca baja).
+      try {
+        const nivelPet = nivelMascotaEfectivo(p);
+        if (nivelPet > (Number(p.petLevel) || 1)) {
+          await GamePlayer.updateOne({ playerName }, { $max: { petLevel: nivelPet } });
+        }
+        p.petLevel = nivelPet;
+      } catch (e) { /* se queda el guardado */ }
 
       let a = await Admin.findById('config').lean().exec();
       if (!a) {
@@ -16463,25 +16486,18 @@ app.get('/api/stats/:playerName/chain', authMiddleware, async (req, res) => {
 console.log('✅ Stats routes cargados: GET/POST /api/stats/:playerName (sync, update, chain)');
 
 // ============================================================================
-// SISTEMA DE BATALLAS P2P DE MASCOTAS (matchmaking + turnos + clasificación)
+// SISTEMA DE BATALLAS DE MASCOTAS (arena en tiempo real + clasificación)
 // ============================================================================
 //
-// Todo el estado vive en el servidor: el cliente solo dibuja lo que se le
-// manda y envía la acción del turno. Ni puntos ni temporada se guardan en el
-// navegador.
+// Todo el estado vive en el servidor: el cliente dibuja lo que se le manda,
+// predice el movimiento de SU perro y envía sus disparos. Ni puntos ni
+// temporada se guardan en el navegador.
 //
-//  Flujo:
-//    1. socket.emit('battle:queue')            → entra a la cola
-//    2. cuando hay 2 en cola → 'battle:matched' a ambos (datos del rival)
-//    3. cada turno: socket.emit('battle:action', { action })
-//       cuando LOS DOS han elegido, el servidor resuelve y emite 'battle:turn'
-//    4. al llegar a 0 de vida → 'battle:end' + puntos guardados en Mongo
-//
-//  Acciones y resolución (piedra-papel-tijera con daño):
-//    attack  (equilibrado)  gana a  charge   → daño normal
-//    strong  (cargado)      gana a  attack   → daño alto, pero si el rival
-//                                              defiende, se falla
-//    defend  (defensa)      gana a  strong   → bloquea y contraataca flojo
+//  Flujo (ver "BATALLAS DE ARENA EN TIEMPO REAL", más abajo):
+//    1. brawl:cola / brawl:bot / brawl:practica      → se busca o crea partida
+//    2. brawl:inicio                                 → arena, luchadores, reglas
+//    3. 20 veces por segundo: brawl:mover (cliente) y brawl:snap (servidor)
+//    4. el último en pie gana → brawl:fin + puntos guardados en Mongo
 //
 // ---------------------------------------------------------------------------
 // MODELOS
@@ -16507,6 +16523,30 @@ function computePetLevel(wins, battles) {
   const losses = Math.max(0, b - w);
   const puntos = w * 2 + losses;              // victorias valen doble
   return Math.max(1, Math.min(50, 1 + Math.floor(puntos / 5)));
+}
+
+/**
+ * EL NIVEL DE LA MASCOTA. UNO SOLO PARA TODO EL JUEGO.
+ *
+ * EL FALLO QUE ESTO ARREGLA — "el nivel de la mascota sale en la batalla pero
+ * en el mapa, la tienda, las Lands y la mina sale sin actualizar":
+ *
+ * la batalla usaba el MAYOR entre el nivel del personaje (de su experiencia)
+ * y el ganado peleando, y el mapa enseñaba solo el ganado peleando. El mismo
+ * perro salía "Lv.7" en la arena y "Lv.2" en todos los demás sitios. Y el
+ * ganado peleando se calculaba con las victorias de la TEMPORADA, que se
+ * reinicia cada 15 días, así que encima podía bajar.
+ *
+ * Ahora hay una sola regla y la usan las dos cosas (/api/load y la arena):
+ * el mayor entre el nivel del personaje, el que tenía guardado (nunca baja) y
+ * el que sale de sus victorias de TODA LA VIDA (petWins / petBattles).
+ */
+function nivelMascotaEfectivo(gp) {
+  if (!gp) return 1;
+  const personaje = Math.max(1, nivelPorExperiencia(gp.nivel_exp));
+  const guardado = Math.max(1, Number(gp.petLevel) || 1);
+  const entrenado = gp.petBattles == null ? 1 : computePetLevel(gp.petWins, gp.petBattles);
+  return Math.min(MAX_LEVEL_PERSONAJE, Math.max(personaje, guardado, entrenado));
 }
 
 const battleScoreSchema = new mongoose.Schema({
@@ -16740,10 +16780,42 @@ app.get('/api/battle/leaderboard', apiLimiter, authMiddleware, async (req, res) 
 });
 
 // ---------------------------------------------------------------------------
-// MATCHMAKING + COMBATE POR TURNOS (socket.io)
+// BATALLAS DE ARENA EN TIEMPO REAL (estilo brawl)                (2026-10-02)
+// ---------------------------------------------------------------------------
+// Antes las batallas eran por CARTAS y turnos. Ahora cada jugador ES su perro
+// en una arena de casillas: se mueve, dispara, se esconde en la hierba alta,
+// rompe cajas para coger huesos de poder y aguanta mientras la niebla cierra
+// el campo. Gana el último en pie.
+//
+// Lo que se conserva de antes, tal cual: las temporadas y la clasificación,
+// las 5 batallas diarias con su escalera de rivales (crearBotDeRonda), los
+// candados que impiden estar en dos combates a la vez, los plazos de la base
+// de datos y la purga de memoria.
+//
+// La simulación entera (choques, balas, arbustos, niebla, bots) vive en el
+// MOTOR, que es el archivo gf-brawl-motor.js del juego copiado aquí dentro
+// entre las marcas <<BRAWL-MOTOR-INICIO>> / <<BRAWL-MOTOR-FIN>>. El cliente usa
+// ese mismo archivo para mover a su perro sin esperar a la red, así que los
+// dos lados chocan con las mismas paredes. NO SE EDITA AQUÍ: se edita
+// gf-brawl-motor.js y se copia con `node tools/brawl-a-servidor.js`.
+//
+//  Cliente → servidor
+//    brawl:cola        entrar a buscar partida contra otros jugadores
+//    brawl:salirCola   dejar de buscar
+//    brawl:bot         una de las 5 batallas diarias
+//    brawl:practica    partida de práctica contra 3 bots (sin puntos)
+//    brawl:mover       { s, x, y, c, a }  dónde está mi perro (20 por segundo)
+//    brawl:disparo     { a, sup, s }       disparo hacia el ángulo a
+//    brawl:rendirse    caigo, pero me quedo mirando
+//    brawl:salir       me voy (cuenta como rendirse si seguía vivo)
+//
+//  Servidor → cliente: brawl:enCola, brawl:sala, brawl:inicio, brawl:ya,
+//    brawl:snap, brawl:balas, brawl:golpe, brawl:caja, brawl:objeto,
+//    brawl:recoger, brawl:ko, brawl:fin, brawl:error, brawl:fueraCola
+//    (y battle:daily, que es el contador de las diarias que pinta el mapa)
 // ---------------------------------------------------------------------------
 const battleQueue = [];              // sockets esperando rival
-const battleMatches = new Map();     // matchId → estado del combate
+const battleMatches = new Map();     // matchId → partida (host + motor)
 const socketMatch = new Map();       // socket.id → matchId
 const battleAdmissions = new Map(); // cuenta → solicitud/combate activo
 
@@ -16779,9 +16851,6 @@ function removeBattleQueueSocket(socket) {
 function battleLevelsCompatible(a, b) {
   return Math.abs(a.level - b.level) <= Math.max(2, Math.ceil(Math.min(a.level, b.level) * 0.20));
 }
-
-const BATTLE_TURN_MS = 20000;        // tiempo máximo para elegir acción
-const BATTLE_MAX_TURNS = 30;         // corte de seguridad
 
 // =============================================================================
 // PURGA DE LOS MAPAS EN MEMORIA                                 (2026-08-11)
@@ -16857,24 +16926,18 @@ function purgarMapasEnMemoria() {
   stats._adminAddrCache = n;
 
   // ── Combates huérfanos ────────────────────────────────────────────────────
-  // Un combate dura como mucho BATTLE_MAX_TURNS × BATTLE_TURN_MS (10 min). Si
-  // los dos jugadores se caen a la vez, nadie llega a borrarlo y se queda
-  // colgado con su temporizador. Se da un margen del triple antes de tocarlo.
-  const topeCombate = BATTLE_MAX_TURNS * BATTLE_TURN_MS * 3;
+  // Una batalla de arena dura como mucho la cuenta atrás más el tope de
+  // partida (unos 3 minutos). Si algo la deja colgada —el motor no llegó a
+  // cerrarla, o el cierre se atascó—, se tira pasado el triple de eso y se
+  // suelta a sus jugadores para que puedan volver a pelear.
+  const topeCombate = (GFBrawlMotor.REGLAS.CUENTA_MS + GFBrawlMotor.REGLAS.DURACION_MAX_MS) * 3;
   n = 0;
   for (const [id, match] of battleMatches) {
-    // El id lleva dentro la marca de creación: 'm_<ms>_xxxx' | 'b_<ms>_xxxx'
-    const nacido = Number(String(id).split('_')[1]);
-    const viejo  = Number.isFinite(nacido) && (ahora - nacido) > topeCombate;
-    if (match && match.ended === true) {
-      clearBattleTurnTimer(match);
-      for (const p of [match.a, match.b]) if (p && p.socket) releaseBattleAdmission(p.socket, p.battleTicket);
-      battleMatches.delete(id); n++;
-    } else if (viejo) {
+    const viejo = !!match && (ahora - (match.creada || 0)) > topeCombate;
+    if (!match || match.ended === true || viejo) {
       if (match) {
         match.ended = true;
-        clearBattleTurnTimer(match);
-        for (const p of [match.a, match.b]) if (p && p.socket) releaseBattleAdmission(p.socket, p.battleTicket);
+        brawlSoltarJugadores(match);
       }
       battleMatches.delete(id); n++;
     }
@@ -16951,27 +17014,6 @@ function nivelPorExperiencia(exp) {
 function shortAddress(addr) {
   if (!addr || typeof addr !== 'string' || addr.length < 10) return '';
   return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
-}
-
-function battlePublicPlayer(p) {
-  return {
-    playerName: p.playerName,
-    petName: p.petName,
-    address: p.address,
-    addressShort: shortAddress(p.address),
-    level: p.level,
-    hp: p.hp,
-    maxHp: p.maxHp,
-    isBot: !!p.isBot,
-    /* QUÉ BICHO ES. Lo usa el cliente para dibujarlo (ver ESPECIES en
-       BattleScene.js). Las mascotas de los jugadores son siempre perros; los
-       bots, cada uno lo suyo. Sin esto, en pantalla salían dos perros
-       idénticos y no se distinguía cuál era el tuyo. */
-    species: p.species || 'perro',
-    // Estados activos (veneno, escudo de espinas, aturdido…), para que la UI
-    // los muestre siempre junto a la barra de vida.
-    status: estadosPublicos(p)
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -17176,676 +17218,9 @@ function crearBotDeRonda(ronda, nivelJugador, opciones) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// CARTAS (estilo Axie: mano + energía por turno)
-// ---------------------------------------------------------------------------
-// Cada turno se reparte una mano y una reserva de energía. Se juegan las
-// cartas que quepan en esa energía y AMBOS jugadores resuelven a la vez:
-// el daño de cada uno se reduce con el escudo que el rival haya puesto ESE
-// mismo turno, así que hay decisión real (atacar fuerte vs. cubrirse).
-const BATTLE_ENERGY_PER_TURN = 3;
-const BATTLE_HAND_SIZE = 5;          // antes 4: una carta más para decidir
-const BATTLE_MAX_ENERGY_BANK = 2;    // energía sin gastar que se guarda al turno siguiente
-
-// ── EFECTOS DE ESTADO ──────────────────────────────────────────────────────
-// Duran varios turnos y se resuelven al inicio de cada uno. Son lo que da
-// profundidad: ya no todo se decide en el intercambio de un solo turno.
-//   poison  → daño al inicio del turno, ignora el escudo
-//   stun    → el rival pierde 1 de energía el turno siguiente
-//   weak    → el rival pega un 35% menos el turno siguiente
-//   regen   → cura al inicio del turno
-//   thorns  → devuelve parte del daño recibido ese turno
-//   focus   → tu siguiente carta de ataque pega un 50% más
-// ── ESTADOS Y SU DURACIÓN EN TURNOS ─────────────────────────────────────────
-// `armor` y `expose` son nuevos (2026-08-12):
-//   • armor  (3 turnos) — reduce a la MITAD el daño recibido. Es la "armadura
-//     de varios turnos": a diferencia del escudo, que se gasta de un golpe y
-//     hay que rehacerlo cada turno, ésta aguanta y premia invertir un turno en
-//     defenderse.
-//   • expose (2 turnos) — anula el efecto de armor y reduce a la mitad los
-//     escudos que se levanten. Es la RESPUESTA al juego defensivo: antes, si
-//     el rival se atrincheraba a base de escudo, no había forma de romperlo.
-const BATTLE_STATUS_TURNS = {
-  poison: 3, stun: 1, weak: 2, regen: 3, thorns: 2, focus: 1,
-  armor: 3, expose: 2
-};
-
-// Qué estados son BUENOS para quien los lleva y cuáles son malos. Lo usan las
-// cartas de limpieza (te quitas los malos) y de disipación (le quitas los
-// buenos al rival).
-const BATTLE_ESTADOS_BUENOS = ['regen', 'thorns', 'focus', 'armor'];
-const BATTLE_ESTADOS_MALOS  = ['poison', 'stun', 'weak', 'expose'];
-
-const BATTLE_CARDS = {
-  // ── COMUNES (coste 1) ────────────────────────────────────────────────────
-  zarpazo:    { id: 'zarpazo',   name: 'Claw',        emoji: '🐾', cost: 1, dmg: 1.00, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'common',
-                desc: 'A fast swipe. Cheap, reliable damage every turn.' },
-  guardia:    { id: 'guardia',   name: 'Guard',       emoji: '🛡️', cost: 1, dmg: 0.00, shield: 1.25, heal: 0.00, type: 'defense', rarity: 'common',
-                desc: 'Raises a shield that soaks the rival’s hit this turn.' },
-  colazo:     { id: 'colazo',    name: 'Tail Whip',   emoji: '🌀', cost: 1, dmg: 0.65, shield: 0.45, heal: 0.00, type: 'hybrid', rarity: 'common',
-                desc: 'Cheap poke that also chips in a little shield.' },
-  arania:     { id: 'arania',    name: 'Scratch',     emoji: '✳️', cost: 1, dmg: 0.80, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'common',
-                applies: 'weak',
-                desc: 'Light cut that leaves the rival weakened next turn.' },
-  gruñido:    { id: 'gruñido',   name: 'Growl',       emoji: '😾', cost: 1, dmg: 0.00, shield: 0.60, heal: 0.00, type: 'defense', rarity: 'common',
-                applies: 'weak',
-                desc: 'A menacing growl: small shield and the rival hits softer.' },
-  olfatear:   { id: 'olfatear',  name: 'Sniff Out',   emoji: '👃', cost: 1, dmg: 0.00, shield: 0.00, heal: 0.00, type: 'buff', rarity: 'common',
-                self: 'focus',
-                desc: 'Finds the weak spot: your next attack hits 50% harder.' },
-
-  // ── RARAS (coste 2) ──────────────────────────────────────────────────────
-  mordisco:   { id: 'mordisco',  name: 'Bite',        emoji: '🦷', cost: 2, dmg: 1.85, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
-                desc: 'Sinks its fangs in for strong single-target damage.' },
-  aullido:    { id: 'aullido',   name: 'Howl',        emoji: '🌙', cost: 2, dmg: 0.70, shield: 0.85, heal: 0.00, type: 'hybrid', rarity: 'rare',
-                desc: 'Strikes and shields at once. Solid all-rounder.' },
-  lamer:      { id: 'lamer',     name: 'Lick Wounds', emoji: '💚', cost: 2, dmg: 0.00, shield: 0.00, heal: 0.95, type: 'heal', rarity: 'rare',
-                desc: 'Licks its wounds and recovers a chunk of HP.' },
-  colmillo:   { id: 'colmillo',  name: 'Venom Fang',  emoji: '🟢', cost: 2, dmg: 0.90, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
-                applies: 'poison',
-                desc: 'Poisons the rival: damage every turn that ignores shields.' },
-  sacudida:   { id: 'sacudida',  name: 'Head Slam',   emoji: '💫', cost: 2, dmg: 1.20, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
-                applies: 'stun',
-                desc: 'Dazes the rival: they get 1 less energy next turn.' },
-  espinas:    { id: 'espinas',   name: 'Bristle',     emoji: '🦔', cost: 2, dmg: 0.00, shield: 1.10, heal: 0.00, type: 'defense', rarity: 'rare',
-                self: 'thorns',
-                desc: 'Shield plus thorns: returns part of the damage you take.' },
-  siesta:     { id: 'siesta',    name: 'Cat Nap',     emoji: '😴', cost: 2, dmg: 0.00, shield: 0.40, heal: 0.35, type: 'heal', rarity: 'rare',
-                self: 'regen',
-                desc: 'Rests up: small shield and healing over the next turns.' },
-  robavida:   { id: 'robavida',  name: 'Leech Bite',  emoji: '🩸', cost: 2, dmg: 1.15, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
-                lifesteal: 0.5,
-                desc: 'Heals you for half of the damage it deals.' },
-
-  // ── ÉPICAS (coste 3) ─────────────────────────────────────────────────────
-  embestida:  { id: 'embestida', name: 'Charge',      emoji: '💥', cost: 3, dmg: 2.90, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
-                desc: 'A full-power body slam. Huge damage, all your energy.' },
-  furia:      { id: 'furia',     name: 'Frenzy',      emoji: '🔥', cost: 3, dmg: 2.20, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
-                applies: 'weak', self: 'focus',
-                desc: 'Wild assault: weakens the rival and sharpens your next hit.' },
-  muralla:    { id: 'muralla',   name: 'Bulwark',     emoji: '🧱', cost: 3, dmg: 0.00, shield: 2.60, heal: 0.30, type: 'defense', rarity: 'epic',
-                self: 'thorns',
-                desc: 'A wall of fur: huge shield, some healing and thorns.' },
-  colmillos:  { id: 'colmillos', name: 'Savage Maul', emoji: '🦴', cost: 3, dmg: 1.90, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
-                applies: 'poison', lifesteal: 0.35,
-                desc: 'Poisons and drains: damage over time plus life steal.' },
-  segundoaire:{ id: 'segundoaire', name: 'Second Wind', emoji: '🌬️', cost: 3, dmg: 0.00, shield: 0.70, heal: 1.60, type: 'heal', rarity: 'epic',
-                self: 'regen',
-                desc: 'Big heal, a shield and regeneration. The comeback card.' },
-  aluvion:    { id: 'aluvion',   name: 'Barrage',     emoji: '⚡', cost: 3, dmg: 1.60, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
-                applies: 'stun', energyNext: 1,
-                desc: 'Stuns the rival and leaves you 1 extra energy next turn.' },
-
-  // ── AMPLIACIÓN (2026-08-11) ──────────────────────────────────────────────
-  // Ocho cartas nuevas para que la mano dé más juego. Se han construido SOLO
-  // con mecánicas que el motor de batalla ya resuelve (dmg / shield / heal /
-  // applies / self / lifesteal / energyNext), así que no hacen falta cambios ni
-  // en el resolutor ni en el cliente: BattleScene pinta la carta con el emoji,
-  // el nombre y la descripción que manda el servidor.
-  //
-  // Lo que aportan de verdad, más allá de "más cartas":
-  //   • Veneno barato (Spit) — antes envenenar costaba 2 de energía sí o sí,
-  //     así que abrir con veneno era imposible. Ahora hay una apertura real.
-  //   • Defensas que preparan ataque (Sidestep, Roar) — defenderse dejaba de
-  //     construir nada. Ahora aguantar un turno también avanza tu plan.
-  //   • Rematadores (Executioner, Tempest) — dan una vía para cerrar partidas
-  //     largas contra alguien que se atrinchera a base de escudos.
-  // Los valores siguen la misma escala que las cartas de arriba: ~1 punto de
-  // valor por energía en comunes, ~1.85 en raras y ~2.9 en épicas.
-
-  // Comunes nuevas (coste 1)
-  escupir:    { id: 'escupir',   name: 'Spit',        emoji: '💧', cost: 1, dmg: 0.55, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'common',
-                applies: 'poison',
-                desc: 'A cheap glob of venom. Weak hit, but the poison ticks.' },
-  esquivar:   { id: 'esquivar',  name: 'Sidestep',    emoji: '💨', cost: 1, dmg: 0.00, shield: 0.75, heal: 0.00, type: 'defense', rarity: 'common',
-                self: 'focus',
-                desc: 'Slips aside: small shield and your next attack hits harder.' },
-
-  // Raras nuevas (coste 2)
-  zarpazo2:   { id: 'zarpazo2',  name: 'Double Slash',emoji: '⚔️', cost: 2, dmg: 1.45, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
-                self: 'focus',
-                desc: 'Two quick cuts that set up an even bigger next hit.' },
-  rugido:     { id: 'rugido',    name: 'Roar',        emoji: '🗣️', cost: 2, dmg: 0.00, shield: 0.90, heal: 0.00, type: 'defense', rarity: 'rare',
-                applies: 'stun',
-                desc: 'A deafening roar: you brace up and the rival loses energy.' },
-  lengua:     { id: 'lengua',    name: 'Lash',        emoji: '👅', cost: 2, dmg: 1.00, shield: 0.00, heal: 0.50, type: 'hybrid', rarity: 'rare',
-                applies: 'weak',
-                desc: 'Strikes, feeds and leaves the rival hitting softer.' },
-
-  // Épicas nuevas (coste 3)
-  tormenta:   { id: 'tormenta',  name: 'Tempest',     emoji: '🌪️', cost: 3, dmg: 2.40, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
-                applies: 'weak', energyNext: 1,
-                desc: 'A storm of blows that weakens the rival and keeps you going.' },
-  verdugo:    { id: 'verdugo',   name: 'Executioner', emoji: '🪓', cost: 3, dmg: 2.50, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
-                lifesteal: 0.50,
-                desc: 'Brutal finisher that drains half the damage back as HP.' },
-  renacer:    { id: 'renacer',   name: 'Rebirth',     emoji: '🌱', cost: 3, dmg: 0.00, shield: 1.20, heal: 1.40, type: 'heal', rarity: 'epic',
-                self: 'regen', energyNext: 1,
-                desc: 'Comes back swinging: shield, big heal, regen and extra energy.' },
-
-  // ── ARMADURA Y ROTURA DE ESTADOS (2026-08-12) ────────────────────────────
-  // Cierran los dos huecos que quedaban: no había defensa que durase más de un
-  // turno, y no había forma de quitarse un veneno ni de romper a alguien
-  // atrincherado. Ahora cada estrategia tiene su respuesta.
-  caparazon:  { id: 'caparazon', name: 'Carapace',    emoji: '🐢', cost: 2, dmg: 0.00, shield: 0.60, heal: 0.00, type: 'defense', rarity: 'rare',
-                self: 'armor',
-                desc: 'Hardens its hide: halves the damage you take for 3 turns.' },
-  sacudirse:  { id: 'sacudirse', name: 'Shake It Off',emoji: '🌀', cost: 1, dmg: 0.00, shield: 0.35, heal: 0.25, type: 'defense', rarity: 'common',
-                cleanse: true,
-                desc: 'Shrugs off poison, weakness and every bad effect on you.' },
-  quebrar:    { id: 'quebrar',   name: 'Shatter',     emoji: '🔨', cost: 2, dmg: 1.05, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
-                applies: 'expose',
-                desc: 'Cracks the rival open: their armor and shields are halved.' },
-  disipar:    { id: 'disipar',   name: 'Dispel',      emoji: '✨', cost: 2, dmg: 0.70, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'rare',
-                dispel: true,
-                desc: 'Strips every buff the rival has built up.' },
-  bastion:    { id: 'bastion',   name: 'Bastion',     emoji: '🏯', cost: 3, dmg: 0.00, shield: 1.40, heal: 0.60, type: 'defense', rarity: 'epic',
-                self: 'armor', cleanse: true,
-                desc: 'Cleanses you, shields you and armors you for 3 turns.' },
-  demoledor:  { id: 'demoledor', name: 'Wrecker',     emoji: '💣', cost: 3, dmg: 2.10, shield: 0.00, heal: 0.00, type: 'attack', rarity: 'epic',
-                applies: 'expose', dispel: true,
-                desc: 'Smashes through: strips the rival buffs and exposes them.' }
-};
-const BATTLE_CARD_IDS = Object.keys(BATTLE_CARDS);
-
-// ── COMBOS ─────────────────────────────────────────────────────────────────
-// Jugar ciertas combinaciones EN EL MISMO TURNO da una bonificación. Es lo que
-// premia planear la mano en vez de tirar siempre la carta más cara.
-const BATTLE_COMBOS = [
-  { id: 'cazador',  name: 'Hunter',      emoji: '🎯', need: ['olfatear', 'mordisco'],  dmgMult: 1.35,
-    desc: 'Sniff Out + Bite: the killing blow lands 35% harder.' },
-  { id: 'fortaleza',name: 'Fortress',    emoji: '🏰', need: ['guardia', 'espinas'],    shieldMult: 1.40,
-    desc: 'Guard + Bristle: shields stack 40% stronger.' },
-  { id: 'ponzoña',  name: 'Plague',      emoji: '☠️', need: ['colmillo', 'colazo'],    poisonBoost: 2,
-    desc: 'Venom Fang + Tail Whip: the poison lasts 2 extra turns.' },
-  { id: 'vampiro',  name: 'Bloodthirst', emoji: '🧛', need: ['robavida', 'zarpazo'],   lifestealBonus: 0.35,
-    desc: 'Leech Bite + Claw: steals a lot more life.' },
-  { id: 'berserk',  name: 'Berserk',     emoji: '😤', need: ['gruñido', 'zarpazo', 'colazo'], dmgMult: 1.5,
-    desc: 'Growl + Claw + Tail Whip: three cheap cards become a storm.' },
-
-  // ── COMBOS NUEVOS (2026-08-11) ───────────────────────────────────────────
-  // Cada uno premia una forma DISTINTA de jugar la mano, para que no haya una
-  // única línea buena:
-  { id: 'plaga',    name: 'Outbreak',    emoji: '🦠', need: ['escupir', 'colmillo'],   poisonBoost: 3,
-    desc: 'Spit + Venom Fang: the poison digs in for 3 extra turns.' },
-  { id: 'danza',    name: 'War Dance',   emoji: '🩰', need: ['esquivar', 'zarpazo2'],  dmgMult: 1.45,
-    desc: 'Sidestep + Double Slash: dodge, then cut 45% deeper.' },
-  { id: 'titan',    name: 'Titan',       emoji: '🗿', need: ['rugido', 'muralla'],     shieldMult: 1.55,
-    desc: 'Roar + Bulwark: an unbreakable wall of fur.' },
-  { id: 'sanguijuela', name: 'Bloodfeast', emoji: '🧟', need: ['verdugo', 'robavida'], lifestealBonus: 0.40,
-    desc: 'Executioner + Leech Bite: nearly every point of damage comes back as HP.' },
-  { id: 'ciclon',   name: 'Cyclone',     emoji: '🌀', need: ['tormenta', 'aluvion'],   dmgMult: 1.30,
-    desc: 'Tempest + Barrage: the rival never gets a turn to breathe.' }
-];
-
-/** Combos completos dentro de las cartas jugadas este turno. */
-function combosActivos(idsJugados) {
-  const set = new Set(idsJugados);
-  return BATTLE_COMBOS.filter(c => c.need.every(n => set.has(n)));
-}
-
-// Datos de la carta para el cliente. Si se pasa un jugador, se incluyen los
-// valores REALES (daño/escudo/cura) calculados con su ataque, para mostrarlos
-// en la carta como en Axie ("Deal 24", "Shield 15"…).
-function cartaPublica(id, jugador) {
-  const c = BATTLE_CARDS[id];
-  if (!c) return null;
-  const out = {
-    id: c.id, name: c.name, emoji: c.emoji, cost: c.cost,
-    type: c.type, rarity: c.rarity, desc: c.desc
-  };
-  // Efectos, para que el cliente los pinte como etiquetas en la carta.
-  if (c.applies)    out.applies    = c.applies;
-  if (c.self)       out.self       = c.self;
-  if (c.lifesteal)  out.lifesteal  = c.lifesteal;
-  if (c.energyNext) out.energyNext = c.energyNext;
-  if (c.cleanse)    out.cleanse    = true;
-  if (c.dispel)     out.dispel     = true;
-  if (jugador && typeof jugador.attack === 'number') {
-    out.dmg = c.dmg ? Math.round(jugador.attack * c.dmg) : 0;
-    out.shield = c.shield ? Math.round(jugador.attack * c.shield) : 0;
-    out.heal = c.heal ? Math.round(jugador.attack * c.heal) : 0;
-  }
-  return out;
-}
-
-// ── ESTADOS: aplicar, avanzar y consultar ──────────────────────────────────
-function iniciarEstados(p) {
-  if (!p.estados) p.estados = {};   // { poison: turnosRestantes, ... }
-  if (typeof p.energiaExtra !== 'number') p.energiaExtra = 0;
-  if (typeof p.energiaBanco  !== 'number') p.energiaBanco = 0;
-}
-
-function aplicarEstado(p, estado, turnosExtra = 0) {
-  if (!estado || !BATTLE_STATUS_TURNS[estado]) return;
-  iniciarEstados(p);
-  const dur = BATTLE_STATUS_TURNS[estado] + turnosExtra;
-  // Se refresca la duración (no se acumula sin límite).
-  p.estados[estado] = Math.max(p.estados[estado] || 0, dur);
-}
-
-function tieneEstado(p, estado) {
-  return !!(p.estados && p.estados[estado] > 0);
-}
-
-/**
- * Resuelve los estados al INICIO del turno: veneno y regeneración.
- * Devuelve el texto de lo que pasó, para el registro de la batalla.
- */
-function tickEstados(p) {
-  iniciarEstados(p);
-  const notas = [];
-
-  if (p.estados.poison > 0) {
-    // El veneno ignora el escudo a propósito: es la vía para castigar a quien
-    // se limita a cubrirse todos los turnos.
-    const dano = Math.max(1, Math.round(p.maxHp * 0.05));
-    p.hp = Math.max(0, p.hp - dano);
-    notas.push(`🟢 ${p.petName} takes ${dano} poison`);
-  }
-  if (p.estados.regen > 0) {
-    const cura = Math.max(1, Math.round(p.maxHp * 0.06));
-    p.hp = Math.min(p.maxHp, p.hp + cura);
-    notas.push(`💚 ${p.petName} regenerates ${cura}`);
-  }
-
-  // Veneno y regeneración consumen su turno aquí. Los estados de combate
-  // caducan DESPUÉS de resolver: stun/focus de duración 1 deben poder usarse.
-  for (const k of ['poison', 'regen']) {
-    if (p.estados[k] > 0) p.estados[k]--;
-    if (p.estados[k] <= 0) delete p.estados[k];
-  }
-  return notas;
-}
-
-/** Energía de la que dispone este turno (base + banco + extra − aturdimiento). */
-function energiaDelTurno(p) {
-  iniciarEstados(p);
-  let e = BATTLE_ENERGY_PER_TURN + (p.energiaBanco || 0) + (p.energiaExtra || 0);
-  if (tieneEstado(p, 'stun')) e -= 1;
-  return Math.max(1, e);   // nunca se queda sin poder jugar nada
-}
-
-/** Lista de estados activos para el cliente. */
-function estadosPublicos(p) {
-  if (!p.estados) return [];
-  return Object.entries(p.estados)
-    .filter(([, t]) => t > 0)
-    .map(([id, turnos]) => ({ id, turnos }));
-}
-
-/**
- * Reparte una mano PONDERADA POR EL NIVEL DE LA MASCOTA.
- *
- * Antes se sorteaba plano sobre BATTLE_CARD_IDS: una mascota de nivel 1 sacaba
- * épicas con la misma probabilidad que una de nivel 50, así que subir de nivel
- * no se notaba en la baraja y las mejores cartas salían igual de a menudo
- * desde el primer combate.
- *
- * Ahora cada rareza tiene un peso que se mueve con el nivel: las comunes van
- * perdiendo sitio y las raras y épicas lo van ganando. Los pesos son relativos,
- * así que siempre puede salir de todo — una mascota de nivel 1 puede tener
- * suerte y una de nivel 50 sigue viendo comunes. Lo que cambia es la
- * frecuencia, que es lo que hace que subir de nivel se note.
- *
- *   nivel 1   → común 70 %, rara 25 %, épica  5 %
- *   nivel 25  → común 45 %, rara 35 %, épica 20 %
- *   nivel 50+ → común 25 %, rara 40 %, épica 35 %
- */
-function pesosPorNivel(nivel) {
-  // 0 en el nivel 1, 1 a partir del 50.
-  const t = Math.max(0, Math.min(1, ((Number(nivel) || 1) - 1) / 49));
-  return {
-    common: 70 - 45 * t,
-    rare:   25 + 15 * t,
-    epic:    5 + 30 * t
-  };
-}
-
-function cartaAleatoriaPorNivel(nivel) {
-  const pesos = pesosPorNivel(nivel);
-
-  // Se sortea primero la RAREZA y después una carta de esa rareza. Así el
-  // reparto no depende de cuántas cartas haya de cada tipo: añadir cartas
-  // nuevas no desequilibra las probabilidades.
-  const total = pesos.common + pesos.rare + pesos.epic;
-  let r = Math.random() * total;
-  let rareza = 'common';
-  if ((r -= pesos.common) >= 0) rareza = ((r - pesos.rare) >= 0) ? 'epic' : 'rare';
-
-  const candidatas = BATTLE_CARD_IDS.filter(id => BATTLE_CARDS[id].rarity === rareza);
-  const lista = candidatas.length ? candidatas : BATTLE_CARD_IDS;
-  return lista[Math.floor(Math.random() * lista.length)];
-}
-
-function repartirMano(nivel = 1) {
-  const mano = [];
-  // Siempre al menos una carta de 1 de energía, para que nunca haya una mano
-  // imposible de jugar.
-  mano.push(Math.random() < 0.5 ? 'zarpazo' : 'colazo');
-  while (mano.length < BATTLE_HAND_SIZE) {
-    mano.push(cartaAleatoriaPorNivel(nivel));
-  }
-  // Mezclar
-  for (let i = mano.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [mano[i], mano[j]] = [mano[j], mano[i]];
-  }
-  return mano;
-}
-
-// Valida la jugada del cliente: índices reales de su mano y energía suficiente.
-// El tope de energía ya NO es fijo: depende del banco, del aturdimiento y de
-// las cartas que dan energía extra (energiaDelTurno).
-function validarJugada(mano, indices, jugador) {
-  const usados = new Set();
-  const cartas = [];
-  let energia = 0;
-  const tope = jugador ? energiaDelTurno(jugador) : BATTLE_ENERGY_PER_TURN;
-
-  (Array.isArray(indices) ? indices : []).forEach(i => {
-    const idx = i;
-    if (!Number.isInteger(idx) || idx < 0 || idx >= mano.length || usados.has(idx)) return;
-    const carta = BATTLE_CARDS[mano[idx]];
-    if (!carta) return;
-    if (energia + carta.cost > tope) return; // no cabe
-    usados.add(idx);
-    energia += carta.cost;
-    cartas.push(carta);
-  });
-
-  // La energía que no se gasta se guarda para el turno siguiente (con tope).
-  // Así "pasar" tiene sentido táctico en vez de ser siempre malo.
-  if (jugador) {
-    jugador.energiaBanco = Math.min(BATTLE_MAX_ENERGY_BANK, tope - energia);
-  }
-
-  return { cartas, indices: [...usados], energia, tope };
-}
-
-// El bot juega: gasta toda la energía que pueda, priorizando curarse si está
-// bajo de vida y atacando fuerte cuanto más difícil es la ronda.
-// Ahora también valora los estados y busca combos.
-function elegirCartasBot(bot, mano) {
-  const vidaBaja = bot.hp / bot.maxHp < 0.35;
-  const astucia  = bot.astucia || 0.2;
-
-  const valor = (c) => {
-    let v = vidaBaja
-      ? c.heal * 3 + c.shield * 2 + c.dmg
-      : c.dmg * (1 + astucia) + c.shield * 0.8 + c.heal;
-    // Los estados valen más cuanto más listo es el bot (rondas altas).
-    if (c.applies === 'poison') v += 0.9 * (1 + astucia);
-    if (c.applies === 'stun')   v += 0.7 * (1 + astucia);
-    if (c.applies === 'weak')   v += 0.5 * (1 + astucia);
-    if (c.self === 'regen' && vidaBaja) v += 1.2;
-    if (c.self === 'thorns')    v += 0.4;
-    if (c.self === 'focus')     v += 0.5 * astucia;
-    if (c.lifesteal)            v += c.lifesteal * (vidaBaja ? 1.6 : 0.8);
-    if (c.energyNext)           v += 0.6;
-    return v;
-  };
-
-  const tope = energiaDelTurno(bot);
-  let elegidas = [], mejor = -Infinity;
-  // Sólo 32 subconjuntos con una mano de 5: comparar combinaciones evita
-  // malgastar energía por elegir primero una carta cara. No lee la mano ni
-  // la elección del rival; decide al repartir, antes del envío del humano.
-  for (let mask = 0; mask < (1 << mano.length); mask++) {
-    const indices = [], cartas = [];
-    let energia = 0, puntos = 0;
-    for (let i = 0; i < mano.length; i++) if (mask & (1 << i)) {
-      const c = BATTLE_CARDS[mano[i]];
-      indices.push(i); cartas.push(c);
-      energia += c.cost; puntos += valor(c);
-    }
-    if (energia > tope) continue;
-    const combos = combosActivos(cartas.map(c => c.id));
-    for (const c of combos) {
-      puntos += ((c.dmgMult || 1) - 1) * cartas.reduce((s, x) => s + x.dmg, 0);
-      puntos += ((c.shieldMult || 1) - 1) * cartas.reduce((s, x) => s + x.shield, 0);
-      puntos += (c.poisonBoost || 0) * 0.18 + (c.lifestealBonus || 0) * 0.8;
-    }
-    // No valorar una curación que la vida máxima impediría recibir.
-    const cura = cartas.reduce((s, c) => s + c.heal, 0);
-    puntos -= Math.max(0, cura - (bot.maxHp - bot.hp) / bot.attack) * (vidaBaja ? 3 : 1);
-    puntos += Math.min(BATTLE_MAX_ENERGY_BANK, tope - energia) * 0.12;
-    if (puntos > mejor) { mejor = puntos; elegidas = indices; }
-  }
-  elegidas.sort((i, j) => BATTLE_CARDS[mano[j]].dmg - BATTLE_CARDS[mano[i]].dmg);
-  // Elegir no gasta ni modifica energía: validarJugada lo hace exactamente
-  // una vez al resolver, igual que para el jugador humano.
-  return elegidas;
-}
-
-// Resuelve el turno con las cartas de ambos lados, ya con estados y combos.
-// Devuelve { dmgToA, dmgToB, curaA, curaB, escudoA, escudoB, texto, combos… }
-function resolverCartas(a, b, cartasA, cartasB) {
-  // El daño base coincide con la carta. El azar está en el reparto, no en
-  // perder un combate porque la misma jugada pega distinto según el asiento.
-  const valor = (v) => Math.max(0, Math.round(v));
-  iniciarEstados(a); iniciarEstados(b);
-
-  // Resolver simultáneamente, sin que calcular A cambie los modificadores
-  // de B. Limpieza/disipación ganan a los estados aplicados este mismo turno.
-  const limpiaA = cartasA.some(c => c.cleanse), limpiaB = cartasB.some(c => c.cleanse);
-  const disipaA = cartasA.some(c => c.dispel), disipaB = cartasB.some(c => c.dispel);
-  const preparar = (p, cartas, limpia, disipado) => {
-    const estados = { ...p.estados };
-    if (limpia) BATTLE_ESTADOS_MALOS.forEach(e => { delete estados[e]; });
-    if (disipado) BATTLE_ESTADOS_BUENOS.forEach(e => { delete estados[e]; });
-    // Armadura/espinas protegen ya, junto al escudo. Focus y las
-    // penalizaciones del rival se reservan para la próxima mano.
-    if (!disipado) for (const c of cartas) {
-      if (c.self === 'armor' || c.self === 'thorns') {
-        estados[c.self] = Math.max(estados[c.self] || 0, BATTLE_STATUS_TURNS[c.self]);
-      }
-    }
-    return estados;
-  };
-  const estadosA = preparar(a, cartasA, limpiaA, disipaB);
-  const estadosB = preparar(b, cartasB, limpiaB, disipaA);
-
-  // Suma de una mano, aplicando sus propios modificadores.
-  const sumar = (jugador, estados, cartas) => {
-    const combos = combosActivos(cartas.map(c => c.id));
-    const dmgMult    = combos.reduce((m, c) => m * (c.dmgMult    || 1), 1);
-    const shieldMult = combos.reduce((m, c) => m * (c.shieldMult || 1), 1);
-    const lifeBonus  = combos.reduce((s, c) => s + (c.lifestealBonus || 0), 0);
-    const venenoExtra= combos.reduce((s, c) => s + (c.poisonBoost   || 0), 0);
-
-    // 'focus' venía de un turno anterior: potencia el ataque de ESTE turno.
-    let focusDisponible = estados.focus > 0;
-    // 'weak' lo puso el rival: pega menos.
-    const weakMult  = estados.weak > 0 ? 0.65 : 1;
-
-    let dmg = 0, shield = 0, heal = 0, lifesteal = 0, energyNext = 0;
-    for (const c of cartas) {
-      const focusMult = c.dmg > 0 && focusDisponible ? 1.5 : 1;
-      if (c.dmg > 0) focusDisponible = false;
-      dmg    += valor(jugador.attack * c.dmg) * focusMult;
-      shield += valor(jugador.attack * c.shield);
-      heal   += valor(jugador.attack * c.heal);
-      if (c.lifesteal)  lifesteal = Math.max(lifesteal, c.lifesteal + lifeBonus);
-      if (c.energyNext) energyNext += c.energyNext;
-    }
-
-    dmg    = Math.round(dmg * dmgMult * weakMult);
-
-    // 'expose' del rival: los escudos que levanta valen la mitad.
-    shield = Math.round(shield * shieldMult * (estados.expose > 0 ? 0.5 : 1));
-
-    return { dmg, shield, heal, lifesteal, energyNext, combos, venenoExtra };
-  };
-
-  const A = sumar(a, estadosA, cartasA);
-  const B = sumar(b, estadosB, cartasB);
-
-  // ARMADURA: reduce a la mitad el daño que se recibe y dura varios turnos,
-  // al contrario que el escudo, que se gasta en el turno. `expose` la anula:
-  // ésa es la forma de romper a alguien que se atrinchera.
-  const reduccionPorArmadura = (estados) =>
-    (estados.armor > 0 && !(estados.expose > 0)) ? 0.5 : 1;
-
-  // El escudo del rival absorbe daño de ESTE turno; la armadura recorta lo que
-  // se cuela después.
-  const dmgToB = Math.round(Math.max(0, A.dmg - B.shield) * reduccionPorArmadura(estadosB));
-  const dmgToA = Math.round(Math.max(0, B.dmg - A.shield) * reduccionPorArmadura(estadosA));
-
-  // Robo de vida sobre el daño REALMENTE hecho
-  const roboA = A.lifesteal ? Math.round(dmgToB * A.lifesteal) : 0;
-  const roboB = B.lifesteal ? Math.round(dmgToA * B.lifesteal) : 0;
-
-  // Espinas: devuelve el 25% del daño recibido, saltándose el escudo del que pega
-  const espinasA = estadosA.thorns > 0 ? Math.round(dmgToA * 0.25) : 0;
-  const espinasB = estadosB.thorns > 0 ? Math.round(dmgToB * 0.25) : 0;
-
-  // Consumir estados usados este turno antes de añadir los del próximo.
-  const avanzar = (p, estados) => {
-    p.estados = {};
-    for (const [id, turnos] of Object.entries(estados)) {
-      const restantes = turnos - (id === 'poison' || id === 'regen' ? 0 : 1);
-      if (restantes > 0) p.estados[id] = restantes;
-    }
-  };
-  avanzar(a, estadosA); avanzar(b, estadosB);
-  const siguientes = (p, rival, cartas, resumen, disipado, rivalLimpia) => {
-    for (const c of cartas) {
-      if (c.applies && !rivalLimpia) aplicarEstado(rival, c.applies,
-        c.applies === 'poison' ? resumen.venenoExtra : 0);
-      if (c.self && !disipado && c.self !== 'armor' && c.self !== 'thorns') {
-        aplicarEstado(p, c.self);
-      }
-    }
-  };
-  siguientes(a, b, cartasA, A, disipaB, limpiaB);
-  siguientes(b, a, cartasB, B, disipaA, limpiaA);
-
-  // Energía guardada para el turno siguiente
-  a.energiaExtra = A.energyNext;
-  b.energiaExtra = B.energyNext;
-
-  const nombres = (cartas) => cartas.length
-    ? cartas.map(c => `${c.emoji} ${c.name}`).join(' + ')
-    : 'nothing (no energy spent)';
-
-  const textoCombos = (combos, quien) =>
-    combos.length ? `  ${combos.map(c => `${c.emoji} ${quien} COMBO: ${c.name}!`).join(' ')}` : '';
-
-  const texto =
-    `${a.petName}: ${nombres(cartasA)} → ${dmgToB} dmg` +
-    (A.heal ? ` (+${A.heal} HP)` : '') + (roboA ? ` (drains ${roboA})` : '') +
-    textoCombos(A.combos, a.petName) +
-    `  |  ${b.petName}: ${nombres(cartasB)} → ${dmgToA} dmg` +
-    (B.heal ? ` (+${B.heal} HP)` : '') + (roboB ? ` (drains ${roboB})` : '') +
-    textoCombos(B.combos, b.petName) +
-    (espinasA ? `  🦔 ${b.petName} takes ${espinasA} from thorns` : '') +
-    (espinasB ? `  🦔 ${a.petName} takes ${espinasB} from thorns` : '');
-
-  return {
-    // El daño de espinas se suma al del rival correspondiente
-    dmgToA: dmgToA + espinasB,
-    dmgToB: dmgToB + espinasA,
-    curaA: A.heal + roboA,
-    curaB: B.heal + roboB,
-    escudoA: A.shield, escudoB: B.shield,
-    combosA: A.combos.map(c => ({ id: c.id, name: c.name, emoji: c.emoji })),
-    combosB: B.combos.map(c => ({ id: c.id, name: c.name, emoji: c.emoji })),
-    texto
-  };
-}
-
-function clearBattleTurnTimer(match) {
-  if (match && match.turnTimer) {
-    clearTimeout(match.turnTimer);
-    match.turnTimer = null;
-  }
-}
-
-// Una sola referencia cubre introducción, selección y pausa entre turnos.
-// Cerrar la batalla cancela cualquiera de las tres y no deja callbacks vivos.
-function scheduleBattleTurn(match, delay) {
-  clearBattleTurnTimer(match);
-  if (!match || match.ended) return;
-  match.phase = 'waiting';
-  match.turnTimer = setTimeout(() => {
-    match.turnTimer = null;
-    if (!match.ended && battleMatches.get(match.id) === match) startBattleTurn(match);
-  }, delay);
-}
-
 function emitBattle(socket, event, payload) {
   try { if (socket && socket.connected !== false) socket.emit(event, payload); }
   catch (e) { console.warn('No se pudo enviar ' + event + ':', e.message); }
-}
-
-async function saveBattleResult(match, winnerKey, reason) {
-  try {
-    const season = await getCurrentBattleSeason();
-    const winner = winnerKey ? match[winnerKey] : null;
-    const loser = winnerKey ? match[winnerKey === 'a' ? 'b' : 'a'] : null;
-
-    const bump = async (p, gano) => {
-      if (!p || !p.playerName || p.playerName === '---') return;
-      if (p.isBot) return; // el bot no entra en la clasificación
-
-      // Puntos: P2P → 3 por ganar, 1 por participar.
-      //         Bot  → 1 por ganar, 0 por perder (tope de 5 batallas al día,
-      //         así no se puede farmear la tabla contra la máquina).
-      const puntos = match.esBot ? (gano ? 1 : 0) : (gano ? 3 : 1);
-
-      const doc = await BattleScore.findOneAndUpdate(
-        { seasonNumber: season.seasonNumber, playerName: p.playerName },
-        {
-          $set: { address: p.address || '', petName: p.petName || '---', lastBattleAt: new Date() },
-          $inc: {
-            points: puntos,
-            wins: gano ? 1 : 0,
-            losses: gano ? 0 : 1,
-            battles: 1
-          }
-        },
-        { upsert: true, new: true, setDefaultsOnInsert: true }
-      );
-
-      // Racha
-      const nuevaRacha = gano ? (doc.streak || 0) + 1 : 0;
-      await BattleScore.updateOne(
-        { _id: doc._id },
-        { $set: { streak: nuevaRacha, bestStreak: Math.max(doc.bestStreak || 0, nuevaRacha) } }
-      );
-
-      // NIVEL DE LA MASCOTA: sube con las batallas. Se guarda en GamePlayer para
-      // que viaje en /api/load y en los paquetes de multijugador (así los demás
-      // jugadores también ven el nivel junto al nombre del perro).
-      try {
-        const nivelPet = computePetLevel(doc.wins || 0, doc.battles || 0);
-        await GamePlayer.updateOne({ playerName: p.playerName }, { $set: { petLevel: nivelPet } });
-        // Avisar al jugador de su nuevo nivel de mascota. Sin esto el cliente
-        // solo lo leía en /api/load, así que el nivel del perro se quedaba
-        // congelado hasta recargar la página aunque ya hubieras ganado.
-        try { p.socket && p.socket.emit('petLevelUpdate', { petLevel: nivelPet }); } catch (_) {}
-      } catch (e) {
-        console.warn('⚠️  No se pudo actualizar petLevel:', e.message);
-      }
-    };
-
-    if (winner && loser) {
-      await bump(winner, true);
-      await bump(loser, false);
-    }
-
-    await BattleLog.create({
-      seasonNumber: season.seasonNumber,
-      matchId: match.id,
-      winner: winner ? winner.playerName : '',
-      loser: loser ? loser.playerName : '',
-      turns: match.turn,
-      reason: reason || 'ko'
-    });
-  } catch (e) {
-    console.error('❌ Error guardando resultado de batalla:', e);
-  }
 }
 
 /**
@@ -17853,14 +17228,13 @@ async function saveBattleResult(match, winnerKey, reason) {
  *
  * POR QUÉ HACE FALTA — "el juego se atasca en las batallas":
  *
- * `endBattle` marca la partida como terminada y apaga el reloj del turno
- * ANTES de esperar a la base de datos. A partir de ese punto no hay más
- * turnos, y lo único que puede sacar al jugador de la pantalla de combate es
- * el `battle:end` que se emite DESPUÉS de esa espera.
+ * `brawlAlTerminar` marca la partida como terminada (el motor ya no la mueve)
+ * ANTES de esperar a la base de datos, y lo único que puede sacar al jugador
+ * de la arena es el `brawl:fin` que se emite DESPUÉS de esa espera.
  *
- * `saveBattleResult` captura sus propios errores, así que no puede fallar —
- * pero sí puede TARDAR: si Mongo no responde, una consulta se queda esperando
- * y esa espera no tiene fin. Y mientras tanto: no llega el `battle:end`, no se
+ * `guardarResultadoBrawl` captura sus propios errores, así que no puede fallar
+ * — pero sí puede TARDAR: si Mongo no responde, una consulta se queda esperando
+ * y esa espera no tiene fin. Y mientras tanto: no llega el `brawl:fin`, no se
  * borra la entrada de `socketMatch` (o sea que el siguiente intento de pelear
  * responde 'already_in_battle') y la partida se queda en memoria para siempre.
  * Un tropiezo de la base de datos deja al jugador encerrado y sin poder volver
@@ -17885,234 +17259,6 @@ function conPlazo(promesa, ms, valorSiTarda) {
 }
 
 const BATTLE_PLAZO_BD_MS = 6000;
-
-async function endBattle(match, winnerKey, reason) {
-  if (!match || match.ended) return;
-  match.ended = true;
-  match.phase = 'ended';
-  clearBattleTurnTimer(match);
-
-  await conPlazo(saveBattleResult(match, winnerKey, reason), BATTLE_PLAZO_BD_MS, null);
-
-  // Contador de batallas diarias contra bot (solo si esta era una de ellas).
-  // El contador vive ENTERO en el backend: se incrementa aquí y el valor
-  // resultante se manda al cliente, que solo lo pinta.
-  let dailyInfo = null;
-  if (match.esBot && match.a && match.a.playerName && match.a.playerName !== '---') {
-    try {
-      /* Con plazo, por lo mismo de arriba. Si no llega a tiempo, `doc` es null
-         y el cliente recibe `daily: null`: enseña el resultado sin la línea de
-         "Daily battles: x/5" en vez de no enseñar nada. El contador de verdad
-         lo vuelve a pedir el mundo con `battle:dailyStatus` al volver al mapa,
-         así que el jugador no se queda sin saber cuántas le quedan. */
-      const doc = await conPlazo(BattleDaily.findOneAndUpdate(
-        { playerName: match.a.playerName, day: match.dailyDay || battleTodayKey() },
-        { $inc: { done: 1, wins: winnerKey === 'a' ? 1 : 0 } },
-        { upsert: true, new: true, setDefaultsOnInsert: true }
-      ), BATTLE_PLAZO_BD_MS, null);
-      if (!doc) throw new Error('la base de datos no contestó a tiempo');
-      const done = doc.done;
-      dailyInfo = {
-        done,
-        max: BATTLE_DAILY_MAX,
-        remaining: Math.max(0, BATTLE_DAILY_MAX - done),
-        nextRound: Math.min(BATTLE_DAILY_MAX, done + 1),
-        wins: doc.wins || 0
-      };
-      console.log(`🗓️  Batallas diarias de ${match.a.playerName}: ${done}/${BATTLE_DAILY_MAX}`);
-    } catch (e) {
-      console.error('❌ Error actualizando batallas diarias:', e);
-    }
-  }
-
-  /* CADA JUGADOR EN SU PROPIO try.
-     Si el aviso a uno reventara —un socket a medio cerrar, un error al
-     serializar— antes se llevaba por delante todo lo que venía detrás: el
-     OTRO jugador no recibía su `battle:end` (se quedaba mirando el combate sin
-     salida), no se borraban las entradas de `socketMatch` (los dos con
-     'already_in_battle' a partir de ahí) y la partida se quedaba en memoria.
-     Un fallo al enviar un mensaje no puede costar eso. */
-  ['a', 'b'].forEach(key => {
-   try {
-    const p = match[key];
-    if (!p || !p.socket) return;   // el bot no tiene socket
-    const gano = winnerKey === key;
-    p.socket.emit('battle:end', {
-      matchId: match.id,
-      turn: match.turn,
-      result: winnerKey ? (gano ? 'win' : 'lose') : 'draw',
-      reason: reason || 'ko',
-      // Contra bot se da 1 punto por victoria (máximo 5 batallas al día);
-      // en P2P, 3 por ganar y 1 por participar.
-      pointsEarned: winnerKey ? (match.esBot ? (gano ? 1 : 0) : (gano ? 3 : 1)) : 0,
-      mode: match.esBot ? 'bot' : 'pvp',
-      round: match.esBot ? match.ronda : null,
-      daily: dailyInfo,
-      you: battlePublicPlayer(p),
-      rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
-    });
-    // Además del 'battle:end', se manda el contador por su propio evento: así
-    // el hub del mundo lo repinta aunque el jugador ya hubiera salido de la
-    // escena de batalla, sin tener que volver a preguntar.
-    if (dailyInfo && key === 'a') {
-      try { p.socket.emit('battle:daily', dailyInfo); } catch (_) {}
-    }
-    if (socketMatch.get(p.socket.id) === match.id) socketMatch.delete(p.socket.id);
-   } catch (e) {
-    console.error(`❌ No se pudo avisar del final al jugador ${key}:`, e);
-    // El candado se suelta IGUAL: es lo que impide volver a pelear.
-    const p = match[key];
-    if (p && p.socket && socketMatch.get(p.socket.id) === match.id) {
-      try { socketMatch.delete(p.socket.id); } catch (_) {}
-    }
-   }
-  });
-
-  for (const p of [match.a, match.b]) {
-    if (p && p.socket) releaseBattleAdmission(p.socket, p.battleTicket);
-  }
-  battleMatches.delete(match.id);
-}
-
-function startBattleTurn(match) {
-  if (!match || match.ended || battleMatches.get(match.id) !== match) return;
-  clearBattleTurnTimer(match);
-  match.phase = 'choosing';
-  match.actions = { a: null, b: null };
-  match.turn += 1;
-
-  // ── ESTADOS AL INICIO DEL TURNO ─────────────────────────────────────────
-  // Veneno y regeneración se resuelven ANTES de repartir. Si alguien cae por
-  // el veneno, la batalla termina aquí sin repartir mano.
-  const notasEstado = [...tickEstados(match.a), ...tickEstados(match.b)];
-  if (match.a.hp <= 0 || match.b.hp <= 0) {
-    const ganador = match.a.hp <= 0 && match.b.hp <= 0 ? null : (match.a.hp <= 0 ? 'b' : 'a');
-    ['a', 'b'].forEach(k => {
-      const p = match[k];
-      if (p && p.socket && notasEstado.length) {
-        emitBattle(p.socket, 'battle:status', { matchId: match.id, turn: match.turn, notes: notasEstado });
-      }
-    });
-    /* `.catch` obligatorio: esta llamada NO se espera (la función de arriba no
-       es async en este punto), así que sin él un fallo aquí sería una promesa
-       rechazada sin dueño. */
-    Promise.resolve(endBattle(match, ganador, 'poison'))
-      .catch((e) => console.error('❌ endBattle (veneno):', e));
-    return;
-  }
-
-  // Mano nueva para cada uno en cada turno, ponderada por el nivel de SU
-  // mascota: cuanto más alta, más a menudo salen cartas raras y épicas.
-  match.hands = {
-    a: repartirMano(match.a && match.a.level),
-    b: repartirMano(match.b && match.b.level)
-  };
-
-  match.deadlineAt = Date.now() + BATTLE_TURN_MS;
-
-  ['a', 'b'].forEach(key => {
-    const p = match[key];
-    if (p && p.socket) {
-      emitBattle(p.socket, 'battle:turnStart', {
-        matchId: match.id,
-        turn: match.turn,
-        msToChoose: BATTLE_TURN_MS,
-        deadlineAt: match.deadlineAt,
-        serverNow: Date.now(),
-        // Energía REAL de este turno: base + banco + extra − aturdimiento.
-        energy: energiaDelTurno(p),
-        energyBase: BATTLE_ENERGY_PER_TURN,
-        energyBank: p.energiaBanco || 0,
-        // Cada carta lleva ya sus valores reales para ESTE jugador (según su
-        // ataque), así la UI muestra "Deal 24 / Shield 15" como en Axie.
-        hand: match.hands[key].map(cid => cartaPublica(cid, p)),
-        // Estados activos de los dos lados, para pintarlos como iconos.
-        statusYou:   estadosPublicos(p),
-        statusRival: estadosPublicos(match[key === 'a' ? 'b' : 'a']),
-        statusNotes: notasEstado,
-        combos: BATTLE_COMBOS.map(c => ({ id: c.id, name: c.name, emoji: c.emoji, need: c.need, desc: c.desc })),
-        you: battlePublicPlayer(p),
-        rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
-      });
-    }
-  });
-
-  // El bot juega al momento (el jugador no ve sus cartas hasta resolver)
-  if (match.b && match.b.isBot) {
-    match.actions.b = elegirCartasBot(match.b, match.hands.b);
-  }
-
-  // Si alguien no juega a tiempo, pasa turno sin gastar energía
-  match.turnTimer = setTimeout(() => {
-    if (match.ended || match.phase !== 'choosing') return;
-    if (!match.actions.a) match.actions.a = [];
-    if (!match.actions.b) match.actions.b = [];
-    Promise.resolve(resolveBattleTurn(match)).catch(e => console.error('Battle timeout:', e));
-  }, BATTLE_TURN_MS);
-}
-
-async function resolveBattleTurn(match) {
-  if (!match || match.ended || match.phase !== 'choosing') return;
-  match.phase = 'resolving';
-  clearBattleTurnTimer(match);
-
-  // Se pasa el jugador para que el tope de energía sea el REAL de este turno
-  // (con banco, energía extra y aturdimiento) y para guardar lo no gastado.
-  const jugadaA = validarJugada(match.hands.a, match.actions.a || [], match.a);
-  const jugadaB = validarJugada(match.hands.b, match.actions.b || [], match.b);
-
-  const res = resolverCartas(match.a, match.b, jugadaA.cartas, jugadaB.cartas);
-  const { dmgToA, dmgToB, texto } = res;
-
-  match.a.hp = Math.max(0, Math.min(match.a.maxHp, match.a.hp - dmgToA + res.curaA));
-  match.b.hp = Math.max(0, Math.min(match.b.maxHp, match.b.hp - dmgToB + res.curaB));
-
-  ['a', 'b'].forEach(key => {
-    const p = match[key];
-    if (!p || !p.socket) return;
-    const mia = key === 'a' ? jugadaA : jugadaB;
-    const suya = key === 'a' ? jugadaB : jugadaA;
-    const rivalP = match[key === 'a' ? 'b' : 'a'];
-    emitBattle(p.socket, 'battle:turn', {
-      matchId: match.id,
-      turn: match.turn,
-      yourCards: mia.cartas.map(c => cartaPublica(c.id, p)),
-      rivalCards: suya.cartas.map(c => cartaPublica(c.id, rivalP)),
-      damageToYou: key === 'a' ? dmgToA : dmgToB,
-      damageToRival: key === 'a' ? dmgToB : dmgToA,
-      healYou: key === 'a' ? res.curaA : res.curaB,
-      shieldYou: key === 'a' ? res.escudoA : res.escudoB,
-      shieldRival: key === 'a' ? res.escudoB : res.escudoA,
-      log: texto,
-      // Combos y estados, para que la UI los pueda anunciar.
-      combosYou:   key === 'a' ? res.combosA : res.combosB,
-      combosRival: key === 'a' ? res.combosB : res.combosA,
-      statusYou:   estadosPublicos(p),
-      statusRival: estadosPublicos(rivalP),
-      you: battlePublicPlayer(p),
-      rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
-    });
-  });
-
-  const muertoA = match.a.hp <= 0;
-  const muertoB = match.b.hp <= 0;
-
-  if (muertoA || muertoB || match.turn >= BATTLE_MAX_TURNS) {
-    let ganador = null;
-    if (muertoA && !muertoB) ganador = 'b';
-    else if (muertoB && !muertoA) ganador = 'a';
-    else if (!muertoA && !muertoB) {
-      // Al alcanzar el límite gana quien conserva más porcentaje de vida,
-      // sin favorecer por defecto a la mascota con mayor vida máxima.
-      const ventaja = match.a.hp * match.b.maxHp - match.b.hp * match.a.maxHp;
-      ganador = ventaja === 0 ? null : (ventaja > 0 ? 'a' : 'b');
-    }
-    await endBattle(match, ganador, muertoA || muertoB ? 'ko' : 'timeout');
-    return;
-  }
-
-  scheduleBattleTurn(match, 1200);
-}
 
 /**
  * Nombre CANÓNICO del jugador de un socket. Es la clave con la que se cuentan
@@ -18162,44 +17308,21 @@ async function construirJugadorDeSocket(socket) {
   let playerName = await resolveBattlePlayerName(socket);
   if (!playerName) playerName = '---';
 
-  // petHealth NO estaba declarado y el select() tampoco lo traia: la asignacion
-  // creaba un global suelto y el valor siempre acababa siendo el 100 por
-  // defecto, con lo que la vida de la mascota nunca habria llegado a la batalla.
   let nivel = 1, petName = 'Pet', petHealth = 100;
   try {
     const gp = await GamePlayer.findOne({ playerName })
-      .select('nivel nivel_exp petName petHealth petLevel').lean();
+      .select('nivel_exp petName petHealth petLevel petWins petBattles').lean();
     if (gp) {
-      // ANTI-TRAMPA: el nivel de combate se DERIVA de la experiencia, que está
-      // respaldada por el contrato, en vez de leer `gp.nivel` — que hasta ahora
-      // lo escribía el cliente y bastaba para entrar a PvP con estadísticas de
-      // nivel 150. Ver nivelPorExperiencia().
-      const nivelPersonaje = Math.max(1, nivelPorExperiencia(gp.nivel_exp));
+      /* EL NIVEL LO CALCULA EL SERVIDOR, Y ES EL MISMO QUE SE VE EN EL MAPA.
+         Sale de nivelMascotaEfectivo(): el mayor entre el del personaje (de la
+         experiencia, respaldada por el contrato — ver nivelPorExperiencia) y
+         el que la mascota ha ganado peleando. Nunca de `gp.nivel`, que lo
+         escribía el cliente y bastaba para entrar con nivel 150.
 
-      /* ═══════════════════════════════════════════════════════════════════
-         EL NIVEL DE LA MASCOTA CUENTA
-         ───────────────────────────────────────────────────────────────────
-         LO QUE ESTO ARREGLA: el combate usaba SOLO el nivel del personaje
-         (el de la experiencia). El nivel de la MASCOTA —el que sale junto a
-         su nombre en el HUD y en la tarjeta de la batalla, el que sube al
-         pelear— no entraba en la cuenta por ningún lado: era un adorno. Se
-         podían encadenar veinte victorias, ver "Lv.9" bajo el perro y seguir
-         peleando exactamente con la misma fuerza que el primer día.
-
-         Ahora se toma EL MAYOR de los dos. Con eso:
-           · Nadie pierde fuerza respecto a antes (el del personaje sigue
-             valiendo si es el más alto).
-           · Entrenar a la mascota peleando SÍ la hace más fuerte, que es de
-             lo que se trata.
-           · Y sigue sin poder tocarlo el cliente: `petLevel` lo calcula el
-             servidor en `saveBattleResult` a partir de las victorias y las
-             batallas guardadas (`computePetLevel`), igual que el otro sale
-             de la experiencia respaldada por el contrato. La puerta que se
-             cerró con `nivelPorExperiencia` sigue cerrada.
-         ═══════════════════════════════════════════════════════════════════ */
-      const nivelMascota = Math.max(1, Math.min(50, Number(gp.petLevel) || 1));
-      nivel = Math.max(nivelPersonaje, nivelMascota);
-
+         Antes el combate usaba este número y el mapa enseñaba solo el de las
+         peleas: el mismo perro salía "Lv.7" en la batalla y "Lv.2" en el
+         mapa, en la tienda, en la mina y en la isla. */
+      nivel = nivelMascotaEfectivo(gp);
       petName = gp.petName && gp.petName !== '---' ? gp.petName : 'Pet';
       petHealth = gp.petHealth == null ? 100 : gp.petHealth;
     }
@@ -18207,14 +17330,9 @@ async function construirJugadorDeSocket(socket) {
 
   const stats = battleStatsForLevel(nivel);
 
-  // LA MASCOTA ENTRA CON LA VIDA QUE LE QUEDE.
-  // `maxHp` sigue siendo el del nivel (la barra mide lo mismo), pero la vida
-  // con la que ARRANCA el combate es el porcentaje que tenga la mascota en el
-  // mundo. Si la mordió un cocodrilo y va al 40%, entra al 40%. Si está muerta
-  // (0) entra con 1: no se puede empezar un combate ya perdido de salida, pero
-  // se nota muchísimo.
+  // LA MASCOTA ENTRA CON LA VIDA QUE LE QUEDE (el motor le pone un suelo del
+  // 20 %: en tiempo real entrar con un 3 % es caer sin haber jugado).
   const saludPet = Math.max(0, Math.min(100, Number(petHealth) || 0));
-  const hpEntrada = Math.max(1, Math.round(stats.maxHp * saludPet / 100));
 
   return {
     socket,
@@ -18225,7 +17343,6 @@ async function construirJugadorDeSocket(socket) {
     level: nivel,
     petHealthPct: saludPet,
     maxHp: stats.maxHp,
-    hp: hpEntrada,
     attack: stats.attack
   };
 }
@@ -18245,150 +17362,1958 @@ async function estadoBatallasDiarias(playerName) {
   };
 }
 
-async function tryBattleMatchmaking() {
-  // Las fichas se cargan antes de entrar en la cola. Emparejar no contiene
-  // awaits: nadie puede ocupar los mismos sockets mientras se consulta Mongo.
-  for (let i = battleQueue.length - 1; i >= 0; i--) {
-    const s = battleQueue[i];
-    if (!isBattleAdmissionCurrent(s, s._battleTicket)) battleQueue.splice(i, 1);
+// <<BRAWL-MOTOR-INICIO>>
+// Copia de gf-brawl-motor.js (el juego). NO SE EDITA AQUÍ: se cambia aquel
+// archivo y se copia con `node tools/brawl-a-servidor.js`.
+const GFBrawlMotor = (function () {
+  const module = { exports: {} };
+/*!
+ * gf-brawl-motor.js — el motor de las batallas de arena (Grassland Forest)
+ * ===========================================================================
+ *
+ * Batallas en tiempo real al estilo de un "brawl": cada jugador ES su perro,
+ * se mueve por una arena de casillas, dispara, se esconde en la hierba alta,
+ * rompe cajas para coger huesos de poder y aguanta mientras la niebla cierra
+ * el campo. Gana el último que queda en pie.
+ *
+ * UN SOLO MOTOR PARA LOS TRES SITIOS
+ * ---------------------------------------------------------------------------
+ * Este archivo lo usan tres sitios, y por eso no depende de nada:
+ *
+ *   · El SERVIDOR (server2.js lleva una copia incrustada entre las marcas
+ *     <<BRAWL-MOTOR>>; ver tools/brawl-a-servidor.js). Allí manda: mueve las
+ *     balas, reparte el daño, decide quién cae y lleva a los bots.
+ *   · El CLIENTE (BattleScene.js), que usa las MISMAS funciones de choque para
+ *     mover a su propio perro sin esperar al servidor —si no, con 150 ms de
+ *     red el perro iría "a tirones de goma"— y para dibujar dónde se paran las
+ *     balas contra los muros.
+ *   · Los bancos de prueba (tools/brawl-prueba-*.js y _prueba_brawl.html),
+ *     que juegan partidas enteras sin servidor.
+ *
+ * Si la física del cliente y la del servidor fueran dos copias escritas a
+ * mano, tarde o temprano dirían cosas distintas y el perro daría saltos al
+ * corregirse. Con un único archivo eso no puede pasar. tools/brawl-prueba-
+ * motor.js comprueba además que la copia de server2.js es ESTE archivo.
+ *
+ * QUIÉN DECIDE QUÉ (anti-trampas)
+ * ---------------------------------------------------------------------------
+ *   · El movimiento lo predice el cliente y lo VALIDA el servidor: cada
+ *     posición que llega se recorta a lo que el perro puede andar en ese
+ *     tiempo (con un margen para la red) y se pasa por la misma física de
+ *     choques. Si no cuadra, el servidor manda la buena y el cliente se
+ *     recoloca. No se puede correr más ni atravesar muros.
+ *   · Los disparos los decide el servidor entero: munición, cadencia, daño,
+ *     a quién da. El cliente solo dice "disparo hacia este ángulo".
+ *   · La hierba alta esconde DE VERDAD: el servidor no manda la posición de un
+ *     enemigo escondido (salvo que esté muy cerca o se haya delatado), así que
+ *     un cliente trucado tampoco lo ve.
+ *
+ * EL MOTOR NO SABE NADA DE SOCKETS
+ * ---------------------------------------------------------------------------
+ * Para hablar con fuera usa dos funciones que le da quien lo usa:
+ *
+ *   opciones.enviar(luchador, evento, datos)   un mensaje a UN luchador
+ *   opciones.alTerminar(partida, resumen)      la partida ha acabado
+ *
+ * y el reloj (`opciones.ahora`) y el azar (`opciones.azar`) también se le
+ * pasan, para que las pruebas puedan jugar una partida entera en un instante y
+ * con la misma tirada siempre.
+ *
+ * EL PROTOCOLO (eventos del servidor al cliente; el cliente manda los suyos
+ * con el host, ver BattleScene.js):
+ *
+ *   brawl:inicio   la partida: arena, luchadores, reglas, cuenta atrás
+ *   brawl:ya       empieza el combate (fin de la cuenta atrás)
+ *   brawl:snap     20 veces por segundo: dónde está cada uno que ves
+ *   brawl:balas    alguien ha disparado (para dibujar las balas)
+ *   brawl:golpe    una bala ha dado a alguien
+ *   brawl:caja     una caja ha recibido un golpe o se ha roto
+ *   brawl:objeto   ha aparecido un hueso en el suelo
+ *   brawl:recoger  alguien ha cogido un hueso
+ *   brawl:ko       alguien ha caído
+ *   brawl:fin      (lo manda el host, con los puntos ya guardados)
+ */
+(function (raiz, fabrica) {
+  var api = fabrica();
+  if (typeof module === 'object' && module && module.exports) module.exports = api;
+  else raiz.GFBrawlMotor = api;
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  var VERSION = 1;
+
+  /* <<ARENAS>> — lo escribe tools/generar-arenas.py a partir de los mapas.
+     No se edita a mano: se cambia el mapa (o el diseño del generador) y se
+     vuelve a lanzar. Leyenda: "#" muro, "~" agua, "*" arbusto, "c" caja,
+     "o" caja dorada, "=" puente, "." libre. Apariciones en casillas. */
+  var ARENAS = {
+    pradera: {
+      nombre: 'Meadow', ancho: 30, alto: 22, celda: 32,
+      filas: [
+        '..............................',
+        '.....#....***.........c.......',
+        '.....#....****................',
+        '.....###...***................',
+        '.......................###....',
+        '........c..........****..#....',
+        '.**............o...****..#....',
+        '.***c..##.....................',
+        '.......##.....................',
+        '.............~~~~....##..***..',
+        '............~~~~~~............',
+        '............~~~~~~............',
+        '..***..##....~~~~.............',
+        '.....................##.......',
+        '.....................##..c***.',
+        '....#..****...o............**.',
+        '....#..****..........c........',
+        '....###.......................',
+        '................***...###.....',
+        '................****....#.....',
+        '.......c.........***....#.....',
+        '..............................'
+      ],
+      apariciones: [[2,2],[27,2],[3,9],[27,19],[2,19],[26,12]]
+    },
+    ruinas: {
+      nombre: 'Ruins', ancho: 30, alto: 22, celda: 32,
+      filas: [
+        '..............................',
+        '.............****........c....',
+        '......####....................',
+        '......#..............#........',
+        '......***..c.........###......',
+        '**....**.....##...............',
+        '**............................',
+        '**..c....#......o....***......',
+        '..................#..***..##..',
+        '.............~~~~.#...........',
+        '.............~~~~.............',
+        '.............~~~~.............',
+        '...........#.~~~~.............',
+        '..##..***..#..................',
+        '......***....o......#....c..**',
+        '............................**',
+        '...............##.....**....**',
+        '......###.........c..***......',
+        '........#..............#......',
+        '....................####......',
+        '....c........****.............',
+        '..............................'
+      ],
+      apariciones: [[3,3],[26,3],[3,10],[26,18],[3,18],[26,11]]
+    },
+    rio: {
+      nombre: 'River', ancho: 30, alto: 22, celda: 32,
+      filas: [
+        '..............................',
+        '..................c...........',
+        '.........###..........#.......',
+        '.........#..........###.......',
+        '***........***................',
+        '...c.......****.#......***....',
+        '....##..........#......***c...',
+        '.............o................',
+        '...........~~~~~........~~~...',
+        '~~~~~~==~~~~~~~~~~~~~~==~~~~~~',
+        '~~~~~~==~~~~~~~~~~~~~~==~~~~~~',
+        '~~~~~~==~~~~~~~~~~~~~~==~~~~~~',
+        '~~~~~~==~~~~~~~~~~~~~~==~~~~~~',
+        '...~~~........~~~~~...........',
+        '................o.............',
+        '...c***......#..........##....',
+        '....***......#.****.......c...',
+        '................***........***',
+        '.......###..........#.........',
+        '.......#..........###.........',
+        '...........c..................',
+        '..............................'
+      ],
+      apariciones: [[2,2],[27,2],[14,3],[27,19],[2,19],[15,18]]
+    }
+  };
+  /* <</ARENAS>> */
+
+  // =========================================================================
+  // REGLAS
+  // =========================================================================
+  /* Las cifras salen de jugar, no de una fórmula, pero tienen su porqué:
+   *
+   *  · VELOCIDAD 104 px/s = 3,25 casillas por segundo. El perro mide una
+   *    casilla, así que cruza la arena (30 casillas) en unos 9 segundos: da
+   *    tiempo a pensar por dónde ir, y una persecución no se eterniza.
+   *  · VIDA ×10 y DAÑO ×12 sobre la curva de siempre (battleStatsForLevel:
+   *    80 + 12·nivel de vida, 10 + 2·nivel de ataque). Con eso un perro cae
+   *    con 6 ladridos a nivel 1 y con 5-6 a nivel 10: los combates duran lo
+   *    que tarda en recargarse dos veces el cargador, que es lo que hace que
+   *    apuntar importe más que tener nivel.
+   *  · La NIEBLA empieza a cerrar a los 40 s y deja el centro a los 140 s.
+   *    Sin ella, dos jugadores prudentes se pasan la partida escondidos en la
+   *    hierba; con ella, la partida acaba sí o sí en menos de tres minutos.
+   *  · La VIDA se REGENERA sola a los 3 s sin pegar ni recibir: premia saber
+   *    retirarse, y castiga quedarse a pegar con poca vida.
+   */
+  var REGLAS = {
+    TICK_MS: 50,                 // 20 pasos de simulación por segundo
+    RADIO: 11,                   // el círculo con el que choca un luchador
+    VEL: 104,                    // px/s del perro
+    ESCALA_VIDA: 10,
+    ESCALA_DANO: 12,
+    MUNICION: 3,
+    REGEN_ESPERA_MS: 3000,
+    REGEN_POR_S: 0.10,           // de la vida máxima
+    CUENTA_MS: 3000,
+    ZONA_INICIO_MS: 40000,
+    ZONA_FIN_MS: 140000,
+    DURACION_MAX_MS: 170000,
+    ZONA_RADIO_FINAL: 80,
+    ZONA_DANO_S: 0.07,           // de la vida máxima, por segundo, fuera
+    ZONA_DANO_FINAL_S: 0.16,     // cuando ya se ha cerrado del todo
+    VISION_ARBUSTO: 84,          // a esta distancia ves a quien está en la hierba
+    REVELA_MS: 1200,             // disparar o recibir te delata este rato
+    CAJA_VIDA: 2,                // golpes que aguanta una caja
+    CAJA_ORO_VIDA: 4,
+    HUESO_MULT: 0.10,            // +10 % de daño y de vida por hueso
+    HUESO_MAX: 8,
+    HUESO_RADIO: 22,
+    PRESUPUESTO_MS: 350,         // margen de red para el movimiento
+    TOLERANCIA: 1.25,
+    CORRECCION_MIN: 2.5,         // px de diferencia para recolocar al cliente
+    SALUD_MINIMA_ENTRADA: 0.20   // nadie entra con menos de esto (ver abajo)
+  };
+
+  // =========================================================================
+  // ARMAS
+  // =========================================================================
+  /* Cada especie tiene su ataque y su súper. Las cifras de daño están hechas
+     para que el daño por segundo "si acierta todo" sea parecido (~0,8 de la
+     unidad de daño): unos pegan de lejos y poco, otros de cerca y mucho, pero
+     ninguno es simplemente mejor.
+
+       balas     cuántas salen a la vez
+       abanico   el ángulo total del abanico, en grados
+       vel       px/s
+       alcance   px que recorre antes de deshacerse
+       radio     px del círculo de choque de la bala
+       dano      múltiplo de la unidad de daño (ataque × 12), POR BALA
+       cadencia  ms mínimos entre dos disparos
+       recarga   ms para recuperar una carga de munición
+       carga     súper que da cada bala que acierta (1 = súper lista)
+       atraviesa pasa a través de los luchadores (no de los muros)
+       empuje    px que retrocede quien la recibe
+       rompe     destroza cualquier caja de un golpe
+       tipo      cómo se dibuja (BattleScene.js) */
+  var ARMAS = {
+    // ── ataques ──
+    ladrido:    { nombre: 'Bark',      balas: 1, abanico: 0,  vel: 360, alcance: 232, radio: 9,  dano: 1.00, cadencia: 360, recarga: 1250, carga: 0.34, tipo: 'onda' },
+    mordisco:   { nombre: 'Bite',      balas: 1, abanico: 0,  vel: 430, alcance: 122, radio: 11, dano: 0.85, cadencia: 300, recarga: 950,  carga: 0.30, tipo: 'mordisco' },
+    colmillos:  { nombre: 'Tusks',     balas: 2, abanico: 14, vel: 340, alcance: 158, radio: 8,  dano: 0.62, cadencia: 380, recarga: 1350, carga: 0.17, tipo: 'colmillo' },
+    plumas:     { nombre: 'Feathers',  balas: 3, abanico: 20, vel: 410, alcance: 262, radio: 6,  dano: 0.36, cadencia: 400, recarga: 1300, carga: 0.12, tipo: 'pluma' },
+    zarpazo:    { nombre: 'Claw',      balas: 1, abanico: 0,  vel: 380, alcance: 204, radio: 9,  dano: 0.95, cadencia: 340, recarga: 1150, carga: 0.33, tipo: 'zarpa' },
+    dentellada: { nombre: 'Chomp',     balas: 1, abanico: 0,  vel: 360, alcance: 132, radio: 14, dano: 1.45, cadencia: 450, recarga: 1500, carga: 0.36, tipo: 'diente' },
+    escupitajo: { nombre: 'Spit',      balas: 1, abanico: 0,  vel: 330, alcance: 250, radio: 8,  dano: 0.90, cadencia: 380, recarga: 1200, carga: 0.32, tipo: 'veneno' },
+    // ── súpers ──
+    aullido:    { nombre: 'Howl',      balas: 1, abanico: 0,  vel: 300, alcance: 262, radio: 20, dano: 2.20, cadencia: 300, recarga: 0, carga: 0, atraviesa: true, empuje: 64, rompe: true, tipo: 'aullido' },
+    estampida:  { nombre: 'Stampede',  balas: 5, abanico: 50, vel: 420, alcance: 142, radio: 9,  dano: 0.55, cadencia: 300, recarga: 0, carga: 0, tipo: 'mordisco' },
+    embestida:  { nombre: 'Charge',    balas: 1, abanico: 0,  vel: 320, alcance: 172, radio: 22, dano: 1.90, cadencia: 300, recarga: 0, carga: 0, atraviesa: true, empuje: 80, rompe: true, tipo: 'embestida' },
+    bandada:    { nombre: 'Flock',     balas: 7, abanico: 40, vel: 420, alcance: 262, radio: 7,  dano: 0.42, cadencia: 300, recarga: 0, carga: 0, tipo: 'pluma' },
+    fuego:      { nombre: 'Wisp',      balas: 1, abanico: 0,  vel: 250, alcance: 282, radio: 16, dano: 2.30, cadencia: 300, recarga: 0, carga: 0, rompe: true, tipo: 'fuego' }
+  };
+
+  var ESPECIES = {
+    perro:     { vel: 1.00, vida: 1.00, arma: 'ladrido',    super: 'aullido',   etiqueta: 'Dog' },
+    conejo:    { vel: 1.16, vida: 0.92, arma: 'mordisco',   super: 'estampida', etiqueta: 'Rabbit' },
+    cerdo:     { vel: 0.90, vida: 1.12, arma: 'colmillos',  super: 'embestida', etiqueta: 'Boar' },
+    cuervo:    { vel: 1.06, vida: 0.90, arma: 'plumas',     super: 'bandada',   etiqueta: 'Crow' },
+    zorro:     { vel: 1.08, vida: 0.96, arma: 'zarpazo',    super: 'fuego',     etiqueta: 'Fox' },
+    zorra:     { vel: 1.08, vida: 0.96, arma: 'zarpazo',    super: 'bandada',   etiqueta: 'Vixen' },
+    cocodrilo: { vel: 0.88, vida: 1.18, arma: 'dentellada', super: 'embestida', etiqueta: 'Croc' },
+    vibora:    { vel: 1.02, vida: 0.94, arma: 'escupitajo', super: 'fuego',     etiqueta: 'Viper' },
+    coral:     { vel: 1.02, vida: 0.94, arma: 'escupitajo', super: 'bandada',   etiqueta: 'Coral' },
+    topo:      { vel: 0.96, vida: 1.05, arma: 'mordisco',   super: 'embestida', etiqueta: 'Mole' },
+    vaca:      { vel: 0.90, vida: 1.15, arma: 'colmillos',  super: 'embestida', etiqueta: 'Bull' }
+  };
+
+  function especie(id) { return ESPECIES[id] || ESPECIES.perro; }
+
+  // =========================================================================
+  // LA REJILLA
+  // =========================================================================
+  /* Una letra por casilla (la leyenda de ARENAS):
+       '#' muro      bloquea el paso y las balas
+       '~' agua      bloquea el paso, NO las balas (se dispara por encima)
+       'c' caja      bloquea las dos cosas hasta que se rompe
+       'o' caja oro  igual, y al romperse suelta un hueso
+       '*' arbusto   se atraviesa; quien está dentro no se ve
+       '=' puente    se anda por encima del agua
+       '.' libre */
+  function crearRejilla(def) {
+    var W = def.ancho | 0, Hh = def.alto | 0, C = def.celda || 32;
+    var celdas = new Array(W * Hh);
+    var cajas = {};
+    for (var y = 0; y < Hh; y++) {
+      var fila = String((def.filas && def.filas[y]) || '');
+      for (var x = 0; x < W; x++) {
+        var ch = fila.charAt(x) || '#';
+        if ('#~*co=.'.indexOf(ch) < 0) ch = '.';
+        celdas[y * W + x] = ch;
+        if (ch === 'c') cajas[y * W + x] = { vida: REGLAS.CAJA_VIDA, max: REGLAS.CAJA_VIDA, oro: false };
+        if (ch === 'o') cajas[y * W + x] = { vida: REGLAS.CAJA_ORO_VIDA, max: REGLAS.CAJA_ORO_VIDA, oro: true };
+      }
+    }
+    return { ancho: W, alto: Hh, celda: C, celdas: celdas, cajas: cajas, anchoPx: W * C, altoPx: Hh * C };
   }
-  while (battleQueue.length >= 2) {
-    let ia = -1, ib = -1;
-    for (let i = 0; i < battleQueue.length - 1 && ia < 0; i++) {
-      const a = battleQueue[i]._battleTicket.player;
-      let distancia = Infinity;
-      for (let j = i + 1; j < battleQueue.length; j++) {
-        const b = battleQueue[j]._battleTicket.player;
-        const d = Math.abs(a.level - b.level);
-        if (a.playerName !== b.playerName && battleLevelsCompatible(a, b) && d < distancia) {
-          ia = i; ib = j; distancia = d;
+
+  /** La rejilla como filas de texto (lo que se manda al cliente). */
+  function filasDe(R) {
+    var out = [];
+    for (var y = 0; y < R.alto; y++) out.push(R.celdas.slice(y * R.ancho, (y + 1) * R.ancho).join(''));
+    return out;
+  }
+
+  function celdaEn(R, cx, cy) {
+    if (cx < 0 || cy < 0 || cx >= R.ancho || cy >= R.alto) return '#';
+    return R.celdas[cy * R.ancho + cx];
+  }
+
+  function celdaDePunto(R, x, y) {
+    return celdaEn(R, Math.floor(x / R.celda), Math.floor(y / R.celda));
+  }
+
+  function bloqueaPaso(ch) { return ch === '#' || ch === '~' || ch === 'c' || ch === 'o'; }
+  function bloqueaBala(ch) { return ch === '#' || ch === 'c' || ch === 'o'; }
+
+  /** Quita una caja rota: la casilla pasa a ser suelo. */
+  function romperCaja(R, idx) {
+    delete R.cajas[idx];
+    R.celdas[idx] = '.';
+  }
+
+  // =========================================================================
+  // CHOQUES (idénticos en el cliente y en el servidor)
+  // =========================================================================
+  /* Un luchador es un CÍRCULO, no un cuadrado: así resbala por las esquinas
+     de los muros en vez de engancharse en ellas, que es lo que hace cómodo
+     moverse con el joystick.
+
+     El empuje hacia fuera mira las casillas que toca el círculo y lo saca por
+     el punto más cercano de cada una. Se repite hasta 3 veces porque en un
+     rincón al salir de una casilla se puede entrar en la de al lado. */
+  function empujarFuera(R, x, y, r) {
+    var C = R.celda;
+    for (var vuelta = 0; vuelta < 3; vuelta++) {
+      var movido = false;
+      var cx0 = Math.floor((x - r) / C), cx1 = Math.floor((x + r) / C);
+      var cy0 = Math.floor((y - r) / C), cy1 = Math.floor((y + r) / C);
+      for (var cy = cy0; cy <= cy1; cy++) {
+        for (var cx = cx0; cx <= cx1; cx++) {
+          if (!bloqueaPaso(celdaEn(R, cx, cy))) continue;
+          var rx0 = cx * C, rx1 = rx0 + C, ry0 = cy * C, ry1 = ry0 + C;
+          var px = x < rx0 ? rx0 : (x > rx1 ? rx1 : x);
+          var py = y < ry0 ? ry0 : (y > ry1 ? ry1 : y);
+          var dx = x - px, dy = y - py;
+          var d2 = dx * dx + dy * dy;
+          if (d2 >= r * r) continue;
+          if (d2 > 1e-9) {
+            var d = Math.sqrt(d2);
+            var pen = r - d;
+            x += dx / d * pen;
+            y += dy / d * pen;
+          } else {
+            // El centro dentro de la casilla: se sale por el lado más cercano.
+            var izq = x - rx0, der = rx1 - x, arr = y - ry0, aba = ry1 - y;
+            var m = Math.min(izq, der, arr, aba);
+            if (m === izq) x = rx0 - r;
+            else if (m === der) x = rx1 + r;
+            else if (m === arr) y = ry0 - r;
+            else y = ry1 + r;
+          }
+          movido = true;
+        }
+      }
+      if (!movido) break;
+    }
+    return [x, y];
+  }
+
+  /**
+   * Mueve un círculo (x, y, r) un desplazamiento (dx, dy) resbalando por los
+   * muros. En pasos de menos de un radio, para no atravesar una casilla de
+   * lado a lado en un fotograma lento.
+   */
+  function moverCirculo(R, x, y, dx, dy, r) {
+    var largo = Math.max(Math.abs(dx), Math.abs(dy));
+    var pasos = Math.max(1, Math.ceil(largo / (r * 0.9)));
+    var sx = dx / pasos, sy = dy / pasos;
+    var p = [x, y];
+    for (var i = 0; i < pasos; i++) {
+      p = empujarFuera(R, p[0] + sx, p[1] + sy, r);
+    }
+    // Y nunca fuera de la arena.
+    p[0] = Math.max(r, Math.min(R.anchoPx - r, p[0]));
+    p[1] = Math.max(r, Math.min(R.altoPx - r, p[1]));
+    return p;
+  }
+
+  /**
+   * Avanza una bala `dist` px. Devuelve null si sigue volando, o lo que la
+   * paró: { muro: true } o { caja: indice }. Se mira en pasos de 6 px, que es
+   * menos que el radio de cualquier bala: no se cuela por una esquina.
+   * (El choque con los luchadores lo hace el servidor aparte.)
+   */
+  function avanzarBala(R, b, dist, alPaso) {
+    var n = Math.max(1, Math.ceil(dist / 6));
+    var paso = dist / n;
+    for (var i = 0; i < n; i++) {
+      b.x += b.dx * paso;
+      b.y += b.dy * paso;
+      b.resto -= paso;
+      var cx = Math.floor(b.x / R.celda), cy = Math.floor(b.y / R.celda);
+      var ch = celdaEn(R, cx, cy);
+      if (bloqueaBala(ch)) {
+        if (ch === 'c' || ch === 'o') return { caja: cy * R.ancho + cx };
+        return { muro: true };
+      }
+      if (alPaso && alPaso(b)) return { luchador: true };
+      if (b.resto <= 0) return { fin: true };
+    }
+    return null;
+  }
+
+  /** ¿Pasa una bala de A a B? (los arbustos y el agua no tapan). */
+  function lineaDeTiro(R, x0, y0, x1, y1) {
+    var dx = x1 - x0, dy = y1 - y0;
+    var largo = Math.sqrt(dx * dx + dy * dy);
+    var n = Math.max(1, Math.ceil(largo / 8));
+    for (var i = 1; i < n; i++) {
+      var t = i / n;
+      if (bloqueaBala(celdaDePunto(R, x0 + dx * t, y0 + dy * t))) return false;
+    }
+    return true;
+  }
+
+  // =========================================================================
+  // LA PARTIDA
+  // =========================================================================
+  function dist2(a, b) { var dx = a.x - b.x, dy = a.y - b.y; return dx * dx + dy * dy; }
+  function redondea(v, k) { var m = k || 1; return Math.round(v * m) / m; }
+
+  /**
+   * Crea una partida.
+   *
+   * opciones = {
+   *   id, modo: 'bot'|'pvp'|'practica', ronda,
+   *   arena: id de ARENAS, o { ancho, alto, celda, filas, apariciones },
+   *   luchadores: [{ clave, humano, playerName, petName, especie, nivel,
+   *                  maxHp, ataque, salud (0..1), astucia (bots) }],
+   *   ahora(), azar(), enviar(l, ev, datos), alTerminar(P, resumen)
+   * }
+   */
+  function crearPartida(op) {
+    var ahora = op.ahora || function () { return Date.now(); };
+    var azar = op.azar || Math.random;
+    var def = typeof op.arena === 'string' ? ARENAS[op.arena] : op.arena;
+    if (!def) throw new Error('arena desconocida: ' + op.arena);
+    var R = crearRejilla(def);
+    var t0 = ahora();
+    var P = {
+      id: op.id || ('x_' + t0),
+      modo: op.modo || 'pvp',
+      ronda: op.ronda || null,
+      arenaId: typeof op.arena === 'string' ? op.arena : (def.id || 'personalizada'),
+      arenaNombre: def.nombre || '',
+      def: def,
+      R: R,
+      luchadores: [],
+      porId: {},
+      balas: [],
+      sigBala: 1,
+      objetos: [],
+      sigObjeto: 1,
+      fase: 'cuenta',
+      tCreada: t0,
+      tCombate: t0 + REGLAS.CUENTA_MS,
+      tUltimo: t0,
+      tick: 0,
+      caidas: [],          // ids, en el orden en que cayeron
+      ahora: ahora,
+      azar: azar,
+      enviar: op.enviar || function () {},
+      alTerminar: op.alTerminar || function () {},
+      zona: null,
+      resumen: null,
+      extraInicio: op.extraInicio || null
+    };
+
+    var apar = (def.apariciones || []).slice();
+    // Orden de uso: cada uno con su gemelo girado enfrente (1-4, 2-5, 3-6),
+    // así en un 1 contra 1 los dos salen en esquinas opuestas.
+    var orden = [0, 3, 1, 4, 2, 5].filter(function (i) { return i < apar.length; });
+    for (var i = 0; i < op.luchadores.length; i++) {
+      var spec = op.luchadores[i];
+      var ap = apar[orden[i % orden.length]] || [1, 1];
+      P.luchadores.push(crearLuchador(P, spec, i + 1, (ap[0] + 0.5) * R.celda, (ap[1] + 0.5) * R.celda));
+    }
+    P.luchadores.forEach(function (l) { P.porId[l.id] = l; });
+
+    var cx = R.anchoPx / 2, cy = R.altoPx / 2;
+    /* `x`/`y` además de `cx`/`cy`: dist2() lee x e y. Sin ellos la distancia a
+       la zona salía NaN, "fuera de la niebla" no era nunca verdad y la niebla
+       no hacía daño a nadie (ni los bots huían de ella). Lo cazó
+       tools/brawl-prueba-motor.js. */
+    P.zona = {
+      cx: cx, cy: cy, x: cx, y: cy,
+      r0: Math.sqrt(cx * cx + cy * cy) + R.celda,
+      rFin: REGLAS.ZONA_RADIO_FINAL,
+      r: Math.sqrt(cx * cx + cy * cy) + R.celda
+    };
+
+    P.luchadores.forEach(function (l) { enviarInicio(P, l); });
+    return P;
+  }
+
+  /*  LA SALUD CON LA QUE SE ENTRA.
+      Las batallas por cartas hacían entrar a la mascota con la vida que le
+      quedara en el mapa, y eso se mantiene: cuidar al perro sigue contando.
+      Pero en tiempo real entrar con el 3 % es caer al primer ladrido sin haber
+      llegado a jugar, así que hay un suelo del 20 %. */
+  function crearLuchador(P, s, id, x, y) {
+    var esp = especie(s.especie);
+    /* `vidaFija`: los bots de las batallas diarias traen su vida ya medida
+       por la escalera de rondas (crearBotDeRonda, con su techo sobre la
+       mascota). Si encima se les sumara el extra de su especie, el cocodrilo
+       de la ronda 5 se pasaría de ese techo. */
+    var multVida = s.vidaFija ? 1 : esp.vida;
+    var maxHp = Math.max(1, Math.round((Number(s.maxHp) || 92) * REGLAS.ESCALA_VIDA * multVida));
+    var salud = Number.isFinite(Number(s.salud)) ? Math.max(0, Math.min(1, Number(s.salud))) : 1;
+    salud = Math.max(REGLAS.SALUD_MINIMA_ENTRADA, salud);
+    var l = {
+      id: id,
+      clave: s.clave || ('l' + id),
+      humano: !!s.humano,
+      bot: !s.humano,
+      playerName: String(s.playerName || 'Player').slice(0, 40),
+      petName: String(s.petName || 'Pet').slice(0, 24),
+      address: String(s.address || ''),
+      especie: ESPECIES[s.especie] ? s.especie : 'perro',
+      nivel: Math.max(1, Number(s.nivel) || 1),
+      maxHp: maxHp,
+      hp: Math.max(1, Math.round(maxHp * salud)),
+      ataque: Math.max(1, Number(s.ataque) || 12),
+      x: x, y: y, r: REGLAS.RADIO,
+      vel: REGLAS.VEL * esp.vel,
+      arma: ARMAS[esp.arma],
+      armaId: esp.arma,
+      superArma: ARMAS[esp.super],
+      superId: esp.super,
+      municion: REGLAS.MUNICION,
+      ultimoDisparo: 0,
+      superCarga: 0,
+      vivo: true,
+      potencia: 0,
+      regenDesde: 0,
+      reveladoHasta: 0,
+      enArbusto: false,
+      // el movimiento que manda el cliente
+      seq: 0,
+      ultimaEntrada: 0,
+      presupuesto: 0,
+      correccion: 0,
+      cAck: 0,              // la última corrección que el cliente dice haber aplicado
+      corregir: false,
+      entradasSegundo: 0,
+      ventanaEntradas: 0,
+      empuje: null,
+      // lo que se ve
+      apunta: 0,
+      moviendo: false,
+      mira: 1,
+      vx: 0, vy: 0,
+      // marcador
+      bajas: 0,
+      dano: 0,
+      puesto: null,
+      muertoEn: null,
+      fuera: false,          // se fue de la partida (rendición o desconexión)
+      ia: null
+    };
+    if (l.bot) l.ia = crearIA(s.astucia);
+    return l;
+  }
+
+  function publico(l) {
+    return {
+      id: l.id, playerName: l.playerName, petName: l.petName,
+      address: l.address ? (l.address.length > 10 ? l.address.slice(0, 6) + '…' + l.address.slice(-4) : l.address) : '',
+      especie: l.especie, etiqueta: especie(l.especie).etiqueta,
+      nivel: l.nivel, maxHp: l.maxHp, hp: l.hp, x: redondea(l.x, 2), y: redondea(l.y, 2),
+      vel: l.vel, bot: l.bot, arma: l.armaId, super: l.superId
+    };
+  }
+
+  function armaPublica(a) {
+    return {
+      nombre: a.nombre, balas: a.balas, abanico: a.abanico, vel: a.vel, alcance: a.alcance,
+      radio: a.radio, cadencia: a.cadencia, recarga: a.recarga, tipo: a.tipo,
+      atraviesa: !!a.atraviesa, empuje: a.empuje || 0
+    };
+  }
+
+  function enviarInicio(P, l) {
+    if (!l.humano) return;
+    var armas = {};
+    Object.keys(ARMAS).forEach(function (k) { armas[k] = armaPublica(ARMAS[k]); });
+    var cajas = [];
+    Object.keys(P.R.cajas).forEach(function (k) {
+      var c = P.R.cajas[k];
+      cajas.push([Number(k), c.vida, c.max, c.oro ? 1 : 0]);
+    });
+    P.enviar(l, 'brawl:inicio', {
+      matchId: P.id,
+      modo: P.modo,
+      ronda: P.ronda,
+      version: VERSION,
+      yo: l.id,
+      arena: {
+        id: P.arenaId, nombre: P.arenaNombre, ancho: P.R.ancho, alto: P.R.alto,
+        celda: P.R.celda, filas: filasDe(P.R), cajas: cajas
+      },
+      luchadores: P.luchadores.map(publico),
+      armas: armas,
+      reglas: {
+        tick: REGLAS.TICK_MS, municion: REGLAS.MUNICION, radio: REGLAS.RADIO,
+        visionArbusto: REGLAS.VISION_ARBUSTO, huesoMult: REGLAS.HUESO_MULT,
+        huesoMax: REGLAS.HUESO_MAX
+      },
+      zona: {
+        cx: P.zona.cx, cy: P.zona.cy, r0: P.zona.r0, rFin: P.zona.rFin,
+        inicioMs: REGLAS.ZONA_INICIO_MS, finMs: REGLAS.ZONA_FIN_MS, maxMs: REGLAS.DURACION_MAX_MS
+      },
+      cuentaMs: Math.max(0, P.tCombate - P.ahora()),
+      serverNow: P.ahora(),
+      extra: P.extraInicio
+    });
+  }
+
+  function difundir(P, ev, datos) {
+    for (var i = 0; i < P.luchadores.length; i++) {
+      var l = P.luchadores[i];
+      if (l.humano && !l.fuera) P.enviar(l, ev, datos);
+    }
+  }
+
+  function vivos(P) {
+    var n = 0;
+    for (var i = 0; i < P.luchadores.length; i++) if (P.luchadores[i].vivo) n++;
+    return n;
+  }
+
+  // =========================================================================
+  // LO QUE MANDA EL JUGADOR
+  // =========================================================================
+  /**
+   * El cliente dice dónde está su perro (lo ha movido él mismo). Se acepta lo
+   * que se pueda andar en el tiempo transcurrido, con las mismas paredes.
+   *
+   * EL PRESUPUESTO. Los paquetes no llegan cada 50 ms clavados: a veces llegan
+   * tres juntos tras un parón de la red. Si cada uno solo pudiera mover lo de
+   * "50 ms", tras el parón se recortarían los tres y el perro daría un salto
+   * atrás. Por eso se lleva una cuenta de cuánto se ha podido andar, que se
+   * llena con el tiempo (hasta 350 ms) y se gasta al moverse.
+   */
+  function entrada(P, id, datos) {
+    var l = P.porId[id];
+    if (!l || !l.vivo || l.fuera || P.fase !== 'combate' || !datos) return;
+    var ahora = P.ahora();
+    var seq = Number(datos.s);
+    var x = Number(datos.x), y = Number(datos.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(seq)) return;
+    if (seq <= l.seq) return;                        // viejo o repetido
+    // Tope de paquetes: 40 por segundo bastan para 20 Hz con margen.
+    if (ahora - l.ventanaEntradas > 1000) { l.ventanaEntradas = ahora; l.entradasSegundo = 0; }
+    if (++l.entradasSegundo > 40) return;
+    l.seq = seq;
+    if (l.empuje) return;                            // le estamos moviendo nosotros
+    /* LAS ENTRADAS VIEJAS NO VALEN. Si el servidor ha recolocado al perro (un
+       empujón, o una posición que no cuadraba), las entradas que el cliente
+       mandó ANTES de enterarse siguen viajando por la red con la posición
+       vieja. Aceptarlas devolvería al perro hacia atrás y habría que
+       corregirle otra vez: el efecto goma. Cada entrada lleva el número de la
+       última corrección que el cliente ha aplicado (`c`); si va por detrás, se
+       ignora hasta que se ponga al día. */
+    var c = Number(datos.c);
+    if (Number.isFinite(c)) l.cAck = Math.max(l.cAck, c);
+    if (Number.isFinite(c) && c < l.correccion) return;
+
+    var dt = Math.max(0, Math.min(REGLAS.PRESUPUESTO_MS, ahora - (l.ultimaEntrada || ahora)));
+    l.ultimaEntrada = ahora;
+    var tope = l.vel * REGLAS.PRESUPUESTO_MS / 1000;
+    l.presupuesto = Math.min(tope, l.presupuesto + l.vel * dt / 1000 * REGLAS.TOLERANCIA);
+
+    var dx = x - l.x, dy = y - l.y;
+    var largo = Math.sqrt(dx * dx + dy * dy);
+    if (largo > l.presupuesto + 0.5) {
+      var k = l.presupuesto / Math.max(1e-6, largo);
+      dx *= k; dy *= k;
+    }
+    var p = moverCirculo(P.R, l.x, l.y, dx, dy, l.r);
+    var andado = Math.sqrt((p[0] - l.x) * (p[0] - l.x) + (p[1] - l.y) * (p[1] - l.y));
+    l.presupuesto = Math.max(0, l.presupuesto - andado);
+    l.moviendo = andado > 0.3;
+    if (Math.abs(p[0] - l.x) > 0.3) l.mira = p[0] > l.x ? 1 : -1;
+    l.x = p[0]; l.y = p[1];
+    var fallo = Math.max(Math.abs(p[0] - x), Math.abs(p[1] - y));
+    if (fallo > REGLAS.CORRECCION_MIN) { l.correccion++; l.corregir = true; }
+    if (Number.isFinite(Number(datos.a))) l.apunta = Number(datos.a);
+  }
+
+  /**
+   * El cliente pide disparar hacia el ángulo `a` (radianes). `sup` = la súper.
+   * `s` es un número del cliente para casar su bala dibujada con la de
+   * verdad; aquí no se usa para nada más.
+   */
+  function disparar(P, id, datos) {
+    var l = P.porId[id];
+    if (!l || !l.vivo || l.fuera || P.fase !== 'combate' || !datos) return false;
+    var a = Number(datos.a);
+    if (!Number.isFinite(a)) return false;
+    return dispararAngulo(P, l, a, !!datos.sup, datos.s);
+  }
+
+  function dispararAngulo(P, l, a, sup, seqCliente) {
+    var ahora = P.ahora();
+    var arma = sup ? l.superArma : l.arma;
+    if (ahora - l.ultimoDisparo < arma.cadencia) return false;
+    if (sup) {
+      if (l.superCarga < 1) return false;
+      l.superCarga = 0;
+    } else {
+      if (l.municion < 1) return false;
+      l.municion -= 1;
+    }
+    l.ultimoDisparo = ahora;
+    l.apunta = a;
+    if (Math.abs(Math.cos(a)) > 0.2) l.mira = Math.cos(a) > 0 ? 1 : -1;
+    l.reveladoHasta = ahora + REGLAS.REVELA_MS;
+    l.regenDesde = ahora + REGLAS.REGEN_ESPERA_MS;
+
+    var mult = 1 + REGLAS.HUESO_MULT * l.potencia;
+    var unidad = l.ataque * REGLAS.ESCALA_DANO * mult;
+    var nuevas = [];
+    for (var i = 0; i < arma.balas; i++) {
+      var off = arma.balas > 1 ? (i / (arma.balas - 1) - 0.5) * arma.abanico * Math.PI / 180 : 0;
+      var ang = a + off;
+      var b = {
+        id: P.sigBala++,
+        duenio: l.id,
+        x: l.x, y: l.y,
+        dx: Math.cos(ang), dy: Math.sin(ang),
+        ang: ang,
+        vel: arma.vel,
+        resto: arma.alcance,
+        radio: arma.radio,
+        dano: Math.max(1, Math.round(unidad * arma.dano)),
+        atraviesa: !!arma.atraviesa,
+        empuje: arma.empuje || 0,
+        rompe: !!arma.rompe,
+        carga: sup ? 0 : arma.carga,
+        tipo: arma.tipo,
+        golpeados: {}
+      };
+      P.balas.push(b);
+      nuevas.push([b.id, redondea(b.x, 2), redondea(b.y, 2), redondea(ang, 1000), b.vel, arma.alcance, b.radio, b.tipo]);
+    }
+    difundir(P, 'brawl:balas', { o: l.id, sup: sup ? 1 : 0, s: seqCliente == null ? null : seqCliente, b: nuevas });
+    return true;
+  }
+
+  /**
+   * Rendirse o desconectarse: cuenta como caer, sin asesino.
+   * `op.irse` = se va del todo (deja de recibir mensajes). Sin él, se rinde
+   * pero se queda mirando cómo acaba la partida.
+   */
+  function abandonar(P, id, op) {
+    var l = P.porId[id];
+    if (!l) return;
+    if (!op || op.irse !== false) l.fuera = true;
+    if (l.vivo && P.fase !== 'fin') caer(P, l, null);
+    if (P.fase === 'cuenta' && humanosVivos(P) === 0) terminar(P, 'abandono');
+  }
+
+  function humanosVivos(P) {
+    var n = 0;
+    for (var i = 0; i < P.luchadores.length; i++) {
+      var l = P.luchadores[i];
+      if (l.humano && l.vivo && !l.fuera) n++;
+    }
+    return n;
+  }
+
+  // =========================================================================
+  // EL PASO DE LA SIMULACIÓN
+  // =========================================================================
+  /**
+   * Lo llama el host cada ~50 ms. Hace los pasos de simulación que tocan
+   * según el reloj (como mucho 4 de golpe: si el proceso se ha atascado, mejor
+   * perder un poco de tiempo de partida que congelar el servidor recuperándolo)
+   * y manda una instantánea a cada jugador.
+   */
+  function paso(P) {
+    if (!P || P.fase === 'fin') return;
+    var ahora = P.ahora();
+    if (P.fase === 'cuenta') {
+      if (ahora < P.tCombate) return;
+      P.fase = 'combate';
+      P.tUltimo = P.tCombate;
+      P.luchadores.forEach(function (l) { l.ultimaEntrada = ahora; l.presupuesto = 0; });
+      difundir(P, 'brawl:ya', { serverNow: ahora });
+    }
+    var n = Math.floor((ahora - P.tUltimo) / REGLAS.TICK_MS);
+    if (n <= 0) return;
+    if (n > 4) { P.tUltimo = ahora - 4 * REGLAS.TICK_MS; n = 4; }
+    for (var i = 0; i < n && P.fase !== 'fin'; i++) {
+      P.tUltimo += REGLAS.TICK_MS;
+      tick(P, P.tUltimo);
+    }
+    if (P.fase !== 'fin') enviarInstantaneas(P, ahora);
+  }
+
+  function tick(P, t) {
+    P.tick++;
+    var dt = REGLAS.TICK_MS / 1000;
+    var enCombate = t - P.tCombate;
+    actualizarZona(P, enCombate);
+
+    for (var i = 0; i < P.luchadores.length; i++) {
+      var l = P.luchadores[i];
+      if (!l.vivo) continue;
+      // munición
+      if (l.municion < REGLAS.MUNICION) {
+        l.municion = Math.min(REGLAS.MUNICION, l.municion + REGLAS.TICK_MS / l.arma.recarga);
+      }
+      // empujón en curso (lo mueve el servidor)
+      if (l.empuje) {
+        var e = l.empuje;
+        var p = moverCirculo(P.R, l.x, l.y, e.vx * dt, e.vy * dt, l.r);
+        l.x = p[0]; l.y = p[1];
+        if (t >= e.hasta) l.empuje = null;
+        l.correccion++; l.corregir = true;
+      }
+      // los bots piensan y andan
+      if (l.bot) pensarBot(P, l, t, dt);
+      l.enArbusto = celdaDePunto(P.R, l.x, l.y) === '*';
+      // niebla
+      var fuera = Math.sqrt(dist2(l, P.zona)) > P.zona.r;
+      if (fuera && enCombate >= REGLAS.ZONA_INICIO_MS) {
+        var frac = enCombate >= REGLAS.ZONA_FIN_MS ? REGLAS.ZONA_DANO_FINAL_S : REGLAS.ZONA_DANO_S;
+        var d = Math.max(1, Math.round(l.maxHp * frac * dt));
+        l.hp -= d;
+        l.regenDesde = t + REGLAS.REGEN_ESPERA_MS;
+        if (l.hp <= 0) { l.hp = 0; caer(P, l, null); continue; }
+      } else if (t >= l.regenDesde && l.hp < l.maxHp) {
+        // regeneración
+        l.hp = Math.min(l.maxHp, l.hp + Math.max(1, Math.round(l.maxHp * REGLAS.REGEN_POR_S * dt)));
+      }
+    }
+
+    moverBalas(P, t, dt);
+    recogerObjetos(P, t);
+
+    // ¿Se acabó?
+    var quedan = vivos(P);
+    if (quedan <= 1) { terminar(P, 'ko'); return; }
+    if ((P.modo === 'bot' || P.modo === 'practica') && humanosVivos(P) === 0) { terminar(P, 'ko'); return; }
+    if (enCombate >= REGLAS.DURACION_MAX_MS) terminar(P, 'tiempo');
+  }
+
+  function actualizarZona(P, enCombate) {
+    var z = P.zona;
+    if (enCombate <= REGLAS.ZONA_INICIO_MS) { z.r = z.r0; return; }
+    var f = Math.min(1, (enCombate - REGLAS.ZONA_INICIO_MS) / (REGLAS.ZONA_FIN_MS - REGLAS.ZONA_INICIO_MS));
+    // suave al principio y al final
+    var s = f * f * (3 - 2 * f);
+    z.r = z.r0 + (z.rFin - z.r0) * s;
+  }
+
+  function moverBalas(P, t, dt) {
+    var R = P.R;
+    var quedan = [];
+    for (var i = 0; i < P.balas.length; i++) {
+      var b = P.balas[i];
+      var duenio = P.porId[b.duenio];
+      var choque = avanzarBala(R, b, Math.min(b.resto, b.vel * dt), function (bb) {
+        // ¿da a alguien en este punto?
+        for (var j = 0; j < P.luchadores.length; j++) {
+          var l = P.luchadores[j];
+          if (!l.vivo || l.id === bb.duenio || bb.golpeados[l.id]) continue;
+          var rr = l.r + bb.radio;
+          if (dist2(l, bb) <= rr * rr) {
+            golpear(P, bb, duenio, l, t);
+            if (!bb.atraviesa) return true;
+          }
+        }
+        return false;
+      });
+      if (choque && choque.caja != null) {
+        golpearCaja(P, choque.caja, b, t);
+        // La súper que rompe sigue su camino si la caja ya no está.
+        if (b.rompe && R.celdas[choque.caja] === '.' && b.resto > 0) { quedan.push(b); continue; }
+        continue;
+      }
+      if (choque) continue;
+      if (b.resto > 0) quedan.push(b);
+    }
+    P.balas = quedan;
+  }
+
+  function golpear(P, b, duenio, l, t) {
+    b.golpeados[l.id] = true;
+    var d = b.dano;
+    l.hp = Math.max(0, l.hp - d);
+    l.regenDesde = t + REGLAS.REGEN_ESPERA_MS;
+    l.reveladoHasta = t + REGLAS.REVELA_MS;
+    if (duenio) {
+      duenio.regenDesde = t + REGLAS.REGEN_ESPERA_MS;
+      duenio.dano += d;
+      if (b.carga) duenio.superCarga = Math.min(1, duenio.superCarga + b.carga);
+    }
+    if (b.empuje) {
+      var v = b.empuje / 0.18;          // recorre `empuje` px en 180 ms
+      l.empuje = { vx: b.dx * v, vy: b.dy * v, hasta: t + 180 };
+    }
+    difundir(P, 'brawl:golpe', {
+      b: b.id, t: l.id, o: b.duenio, d: d, hp: l.hp,
+      x: redondea(b.x, 2), y: redondea(b.y, 2), sup: b.carga ? 0 : 1
+    });
+    if (l.hp <= 0) caer(P, l, duenio);
+  }
+
+  function golpearCaja(P, idx, b, t) {
+    var c = P.R.cajas[idx];
+    if (!c) return;
+    c.vida = b.rompe ? 0 : c.vida - 1;
+    var x = (idx % P.R.ancho + 0.5) * P.R.celda, y = (Math.floor(idx / P.R.ancho) + 0.5) * P.R.celda;
+    var rota = c.vida <= 0;
+    if (rota) romperCaja(P.R, idx);
+    difundir(P, 'brawl:caja', { i: idx, vida: Math.max(0, c.vida), max: c.max, rota: rota ? 1 : 0, oro: c.oro ? 1 : 0 });
+    if (rota && c.oro) soltarHuesos(P, x, y, 1);
+  }
+
+  function soltarHuesos(P, x, y, n) {
+    var R = P.R;
+    for (var i = 0; i < n; i++) {
+      // Un poco repartidos, y nunca dentro de un muro o del agua.
+      var ang = P.azar() * Math.PI * 2;
+      var d = n > 1 ? 10 + P.azar() * 18 : 0;
+      var p = moverCirculo(R, x, y, Math.cos(ang) * d, Math.sin(ang) * d, 8);
+      var o = { id: P.sigObjeto++, x: p[0], y: p[1], tipo: 'hueso' };
+      P.objetos.push(o);
+      difundir(P, 'brawl:objeto', { id: o.id, x: redondea(o.x, 2), y: redondea(o.y, 2), tipo: o.tipo });
+    }
+  }
+
+  function recogerObjetos(P, t) {
+    if (!P.objetos.length) return;
+    var quedan = [];
+    for (var i = 0; i < P.objetos.length; i++) {
+      var o = P.objetos[i];
+      var quien = null;
+      for (var j = 0; j < P.luchadores.length; j++) {
+        var l = P.luchadores[j];
+        if (!l.vivo) continue;
+        var rr = l.r + REGLAS.HUESO_RADIO * 0.5;
+        if (dist2(l, o) <= rr * rr) { quien = l; break; }
+      }
+      if (!quien) { quedan.push(o); continue; }
+      if (quien.potencia < REGLAS.HUESO_MAX) {
+        quien.potencia++;
+        // La vida máxima sube y lo que sube se cura: coger un hueso en mitad
+        // de la pelea tiene que notarse.
+        var extra = Math.round(quien.maxHp / (1 + REGLAS.HUESO_MULT * (quien.potencia - 1)) * REGLAS.HUESO_MULT);
+        quien.maxHp += extra;
+        quien.hp = Math.min(quien.maxHp, quien.hp + extra);
+      }
+      difundir(P, 'brawl:recoger', { id: o.id, por: quien.id, potencia: quien.potencia, maxHp: quien.maxHp, hp: quien.hp });
+    }
+    P.objetos = quedan;
+  }
+
+  function caer(P, l, asesino) {
+    if (!l.vivo) return;
+    l.vivo = false;
+    l.hp = 0;
+    l.muertoEn = P.ahora();
+    l.empuje = null;
+    var puesto = vivos(P) + 1;
+    l.puesto = puesto;
+    P.caidas.push(l.id);
+    if (asesino && asesino !== l) asesino.bajas++;
+    // Suelta sus huesos (y uno más): ir a por el que acaba de caer tiene premio.
+    var n = Math.min(4, l.potencia + 1);
+    if (P.fase === 'combate') soltarHuesos(P, l.x, l.y, n);
+    difundir(P, 'brawl:ko', {
+      t: l.id, k: asesino ? asesino.id : 0, puesto: puesto,
+      quedan: vivos(P), x: redondea(l.x, 2), y: redondea(l.y, 2)
+    });
+  }
+
+  /**
+   * Fin de la partida. Los que siguen vivos se ordenan por la vida que les
+   * queda (en proporción, para no premiar a la especie con más vida); los
+   * caídos, al revés de como cayeron.
+   */
+  function terminar(P, motivo) {
+    if (P.fase === 'fin') return;
+    P.fase = 'fin';
+    var enPie = P.luchadores.filter(function (l) { return l.vivo; });
+    enPie.sort(function (a, b) { return b.hp / b.maxHp - a.hp / a.maxHp; });
+    var puesto = 1;
+    enPie.forEach(function (l) { l.puesto = puesto++; });
+    for (var i = P.caidas.length - 1; i >= 0; i--) {
+      var c = P.porId[P.caidas[i]];
+      c.puesto = puesto++;
+    }
+    P.balas = [];
+    var ganador = P.luchadores.filter(function (l) { return l.puesto === 1; })[0] || null;
+    P.resumen = {
+      motivo: motivo || 'ko',
+      ganador: ganador ? ganador.id : 0,
+      duracionMs: Math.max(0, P.ahora() - P.tCombate),
+      puestos: P.luchadores.map(function (l) {
+        return {
+          id: l.id, clave: l.clave, humano: l.humano, playerName: l.playerName,
+          petName: l.petName, especie: l.especie, nivel: l.nivel,
+          puesto: l.puesto, bajas: l.bajas, dano: Math.round(l.dano),
+          potencia: l.potencia, vivo: l.vivo, fuera: l.fuera
+        };
+      }).sort(function (a, b) { return a.puesto - b.puesto; })
+    };
+    try { P.alTerminar(P, P.resumen); } catch (e) {
+      if (typeof console !== 'undefined') console.error('alTerminar:', e);
+    }
+  }
+
+  // =========================================================================
+  // LO QUE VE CADA UNO
+  // =========================================================================
+  function loVe(P, obs, l, ahora) {
+    if (!obs || obs === l || !obs.vivo) return true;
+    if (!l.enArbusto) return true;
+    if (l.reveladoHasta > ahora) return true;
+    return dist2(obs, l) <= REGLAS.VISION_ARBUSTO * REGLAS.VISION_ARBUSTO;
+  }
+
+  /* La instantánea, en listas cortas para que pese poco (20 por segundo):
+       f: [id, x, y, hp, banderas, potencia, maxHp]
+          banderas: 1 vivo · 2 andando · 4 en la hierba · 8 mira a la izq.
+       y: lo tuyo — munición y súper en centésimas, y la posición buena si
+          hay que recolocarte (c = número de corrección). */
+  function enviarInstantaneas(P, ahora) {
+    var zr = Math.round(P.zona.r);
+    for (var i = 0; i < P.luchadores.length; i++) {
+      var yo = P.luchadores[i];
+      if (!yo.humano || yo.fuera) continue;
+      var f = [];
+      for (var j = 0; j < P.luchadores.length; j++) {
+        var l = P.luchadores[j];
+        if (!l.vivo) continue;
+        if (!loVe(P, yo, l, ahora)) continue;
+        var band = 1 | (l.moviendo ? 2 : 0) | (l.enArbusto ? 4 : 0) | (l.mira < 0 ? 8 : 0);
+        f.push([l.id, redondea(l.x, 2), redondea(l.y, 2), l.hp, band, l.potencia, l.maxHp]);
+      }
+      var y = {
+        m: Math.round(yo.municion * 100),
+        s: Math.round(yo.superCarga * 100),
+        c: yo.correccion,
+        hp: yo.hp
+      };
+      /* La posición buena va en TODAS las instantáneas hasta que el cliente
+         confirme (con la `c` de sus entradas) que ya la ha aplicado. Mandarla
+         una sola vez bastaría con una red perfecta; con una pestaña que se
+         queda atrás un momento, esa instantánea se pisa con la siguiente y el
+         perro no se recolocaría nunca. */
+      if (yo.corregir || yo.cAck < yo.correccion) { y.x = redondea(yo.x, 2); y.y = redondea(yo.y, 2); }
+      P.enviar(yo, 'brawl:snap', { t: ahora, k: P.tick, f: f, y: y, z: zr });
+    }
+    for (var k = 0; k < P.luchadores.length; k++) P.luchadores[k].corregir = false;
+    // 'moviendo' de los humanos se apaga si ya no llegan entradas.
+    for (var q = 0; q < P.luchadores.length; q++) {
+      var h = P.luchadores[q];
+      if (h.humano && ahora - h.ultimaEntrada > 120) h.moviendo = false;
+    }
+  }
+
+  // =========================================================================
+  // LOS BOTS
+  // =========================================================================
+  /* No hacen trampas: ven lo mismo que vería un jugador en su sitio (la
+     hierba alta les esconde a la gente igual), disparan con la misma munición
+     y cadencia, y fallan. Lo que cambia con la ronda es la ASTUCIA (0,2 en la
+     primera batalla del día, 0,6 en la quinta):
+
+       · puntería: el error del disparo va de ±14° a ±7°;
+       · adelantar el tiro a donde vas a estar, en vez de a donde estás;
+       · cuánto tardan en reaccionar al verte (450 ms → 180 ms);
+       · a partir de 0,4 se esconden en la hierba, y a partir de 0,5 se
+         retiran a curarse cuando van mal de vida. */
+  function crearIA(astucia) {
+    var a = Number.isFinite(Number(astucia)) ? Math.max(0, Math.min(1, Number(astucia))) : 0.35;
+    return {
+      astucia: a,
+      objetivo: null,
+      vistoDesde: 0,
+      perdidoDesde: 0,
+      proxima: 0,
+      dirX: 0, dirY: 0,
+      ruta: null,
+      rutaHasta: 0,
+      rutaObjetivo: null,
+      estrafe: 1,
+      cambioEstrafe: 0,
+      proximoDisparo: 0,
+      destino: null,
+      destinoHasta: 0,
+      atascado: 0,
+      ultX: 0, ultY: 0
+    };
+  }
+
+  function celdaCentro(R, cx, cy) {
+    return { x: (cx + 0.5) * R.celda, y: (cy + 0.5) * R.celda };
+  }
+
+  /** Camino por casillas (BFS con diagonales que no muerden esquinas). */
+  function buscarRuta(R, x0, y0, x1, y1, maxNodos) {
+    var W = R.ancho, Hh = R.alto;
+    var a = Math.floor(x0 / R.celda) + Math.floor(y0 / R.celda) * W;
+    var bx = Math.floor(x1 / R.celda), by = Math.floor(y1 / R.celda);
+    // Si el destino no se puede pisar (un muro, el agua), el vecino libre más cercano.
+    if (bloqueaPaso(celdaEn(R, bx, by))) {
+      var mejor = null, md = Infinity;
+      for (var oy = -2; oy <= 2; oy++) for (var ox = -2; ox <= 2; ox++) {
+        if (!bloqueaPaso(celdaEn(R, bx + ox, by + oy))) {
+          var dd = ox * ox + oy * oy;
+          if (dd < md) { md = dd; mejor = [bx + ox, by + oy]; }
+        }
+      }
+      if (!mejor) return null;
+      bx = mejor[0]; by = mejor[1];
+    }
+    var b = bx + by * W;
+    if (a === b) return [];
+    var previo = new Int32Array(W * Hh).fill(-1);
+    previo[a] = a;
+    var cola = [a], cab = 0;
+    var vecinos = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    var limite = maxNodos || 2000;
+    while (cab < cola.length && cab < limite) {
+      var c = cola[cab++];
+      if (c === b) break;
+      var cx = c % W, cy = (c - cx) / W;
+      for (var k = 0; k < vecinos.length; k++) {
+        var nx = cx + vecinos[k][0], ny = cy + vecinos[k][1];
+        if (nx < 0 || ny < 0 || nx >= W || ny >= Hh) continue;
+        var n = nx + ny * W;
+        if (previo[n] !== -1 || bloqueaPaso(R.celdas[n])) continue;
+        if (k >= 4 && (bloqueaPaso(celdaEn(R, cx + vecinos[k][0], cy)) || bloqueaPaso(celdaEn(R, cx, cy + vecinos[k][1])))) continue;
+        previo[n] = c;
+        cola.push(n);
+      }
+    }
+    if (previo[b] === -1) return null;
+    var ruta = [];
+    for (var p = b; p !== a; p = previo[p]) ruta.push(p);
+    ruta.reverse();
+    return ruta.map(function (i) { return celdaCentro(R, i % W, Math.floor(i / W)); });
+  }
+
+  function gauss(azar) {
+    var u = Math.max(1e-6, azar()), v = azar();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  function pensarBot(P, l, t, dt) {
+    var ia = l.ia;
+    var R = P.R;
+    var enCombate = t - P.tCombate;
+    var az = P.azar;
+
+    // ── decidir (5-7 veces por segundo, no en cada paso) ──
+    if (t >= ia.proxima) {
+      ia.proxima = t + 140 + az() * 120 * (1.2 - ia.astucia);
+      decidirBot(P, l, t, enCombate);
+    }
+
+    // ── andar ──
+    var mx = ia.dirX, my = ia.dirY;
+    var largo = Math.sqrt(mx * mx + my * my);
+    var antesX = l.x, antesY = l.y;
+    if (largo > 0.01) {
+      var v = l.vel * dt / largo;
+      var p = moverCirculo(R, l.x, l.y, mx * v, my * v, l.r);
+      l.x = p[0]; l.y = p[1];
+    }
+    var movido = Math.abs(l.x - antesX) + Math.abs(l.y - antesY);
+    l.moviendo = movido > 0.2;
+    l.vx = (l.x - antesX) / dt;
+    l.vy = (l.y - antesY) / dt;
+    if (Math.abs(l.x - antesX) > 0.2) l.mira = l.x > antesX ? 1 : -1;
+    // atascado contra algo: se le cambia el rumbo
+    if (largo > 0.01 && movido < 0.4) {
+      ia.atascado += dt;
+      if (ia.atascado > 0.6) { ia.ruta = null; ia.estrafe *= -1; ia.atascado = 0; ia.proxima = t; }
+    } else ia.atascado = 0;
+
+    // ── disparar ──
+    var obj = ia.objetivo ? P.porId[ia.objetivo] : null;
+    if (obj && obj.vivo && t >= ia.proximoDisparo && t - ia.vistoDesde >= ia.reaccion) {
+      var d = Math.sqrt(dist2(l, obj));
+      var usarSuper = l.superCarga >= 1 && d <= l.superArma.alcance * 0.85;
+      var arma = usarSuper ? l.superArma : l.arma;
+      if (d <= arma.alcance * 0.96 && lineaDeTiro(R, l.x, l.y, obj.x, obj.y) && (usarSuper || l.municion >= 1)) {
+        // apuntar: adelantar el tiro según la astucia, y fallar un poco
+        var tVuelo = d / arma.vel;
+        var px = obj.x + (obj.vx || 0) * tVuelo * ia.astucia;
+        var py = obj.y + (obj.vy || 0) * tVuelo * ia.astucia;
+        var ang = Math.atan2(py - l.y, px - l.x) + gauss(az) * (1 - ia.astucia) * 0.30;
+        // No vaciar el cargador de golpe si no hace falta: los listos guardan una.
+        var guarda = !usarSuper && ia.astucia >= 0.45 && l.municion < 2 && d > arma.alcance * 0.6;
+        if (!guarda && dispararAngulo(P, l, ang, usarSuper, null)) {
+          ia.proximoDisparo = t + arma.cadencia + az() * 420 * (1.1 - ia.astucia);
+        }
+      }
+    } else if (!obj && t >= ia.proximoDisparo) {
+      // Sin nadie a la vista: si tiene una caja dorada a tiro, a por ella.
+      var caja = cajaOroCerca(P, l);
+      if (caja && l.municion >= 2) {
+        var a2 = Math.atan2(caja.y - l.y, caja.x - l.x);
+        if (dispararAngulo(P, l, a2, false, null)) ia.proximoDisparo = t + l.arma.cadencia + 300;
+      }
+    }
+  }
+
+  function cajaOroCerca(P, l) {
+    var R = P.R, mejor = null, md = Infinity;
+    Object.keys(R.cajas).forEach(function (k) {
+      var c = R.cajas[k];
+      if (!c.oro) return;
+      var i = Number(k);
+      var pt = celdaCentro(R, i % R.ancho, Math.floor(i / R.ancho));
+      var d = dist2(l, pt);
+      if (d < md && d <= l.arma.alcance * l.arma.alcance * 0.8 && lineaDeTiro(R, l.x, l.y, pt.x, pt.y)) {
+        md = d; mejor = pt;
+      }
+    });
+    return mejor;
+  }
+
+  function decidirBot(P, l, t, enCombate) {
+    var ia = l.ia, R = P.R, az = P.azar;
+    if (ia.reaccion == null) ia.reaccion = 450 - 450 * ia.astucia + 90;
+
+    // 1) ¿A quién ve?
+    var mejor = null, md = Infinity;
+    for (var i = 0; i < P.luchadores.length; i++) {
+      var o = P.luchadores[i];
+      if (o === l || !o.vivo) continue;
+      if (!loVe(P, l, o, t)) continue;
+      var d = dist2(l, o);
+      // Prefiere seguir con el que ya tenía (no salta de uno a otro).
+      if (o.id === ia.objetivo) d *= 0.6;
+      if (d < md) { md = d; mejor = o; }
+    }
+    if (mejor) {
+      if (ia.objetivo !== mejor.id) ia.vistoDesde = t;
+      ia.objetivo = mejor.id;
+      ia.perdidoDesde = 0;
+    } else if (ia.objetivo) {
+      if (!ia.perdidoDesde) ia.perdidoDesde = t;
+      if (t - ia.perdidoDesde > 1500) ia.objetivo = null;
+    }
+    var obj = ia.objetivo ? P.porId[ia.objetivo] : null;
+    if (obj && !obj.vivo) { ia.objetivo = null; obj = null; }
+
+    // 2) La niebla manda sobre todo lo demás.
+    var z = P.zona;
+    var dz = Math.sqrt(dist2(l, z));
+    if (enCombate >= REGLAS.ZONA_INICIO_MS - 4000 && dz > z.r - R.celda * 1.6) {
+      irHacia(P, l, z.cx, z.cy, t);
+      return;
+    }
+
+    // 3) Mal de vida y listo: a esconderse a curarse.
+    var vida = l.hp / l.maxHp;
+    if (obj && vida < 0.32 && ia.astucia >= 0.5) {
+      var hx = l.x - obj.x, hy = l.y - obj.y;
+      var hl = Math.sqrt(hx * hx + hy * hy) || 1;
+      var arb = arbustoCerca(P, l, 6);
+      if (arb && dist2(arb, obj) > dist2(l, obj)) irHacia(P, l, arb.x, arb.y, t);
+      else fijarDir(ia, hx / hl, hy / hl);
+      return;
+    }
+
+    if (obj) {
+      var dd = Math.sqrt(dist2(l, obj));
+      var alcance = l.arma.alcance;
+      var ideal = alcance < 150 ? alcance * 0.45 : alcance * 0.68;
+      var tiro = lineaDeTiro(R, l.x, l.y, obj.x, obj.y);
+      if (!tiro || dd > alcance * 0.92) {
+        irHacia(P, l, obj.x, obj.y, t);
+        return;
+      }
+      // A tiro: moverse de lado (esquivar) y corregir la distancia.
+      if (t >= ia.cambioEstrafe) {
+        ia.estrafe = az() < 0.5 ? -1 : 1;
+        ia.cambioEstrafe = t + 500 + az() * 900;
+      }
+      var ux = (obj.x - l.x) / (dd || 1), uy = (obj.y - l.y) / (dd || 1);
+      var acerca = dd > ideal * 1.15 ? 0.7 : (dd < ideal * 0.75 ? -0.7 : 0);
+      var lado = 0.55 + 0.45 * ia.astucia;
+      fijarDir(ia, ux * acerca + -uy * ia.estrafe * lado, uy * acerca + ux * ia.estrafe * lado);
+      ia.ruta = null;
+      return;
+    }
+
+    // 4) Nadie a la vista: un hueso cerca, o explorar (los listos, por la hierba).
+    var hueso = null, mh = (R.celda * 7) * (R.celda * 7);
+    for (var h = 0; h < P.objetos.length; h++) {
+      var dh = dist2(l, P.objetos[h]);
+      if (dh < mh) { mh = dh; hueso = P.objetos[h]; }
+    }
+    if (hueso) { irHacia(P, l, hueso.x, hueso.y, t); return; }
+
+    if (!ia.destino || t >= ia.destinoHasta || dist2(l, ia.destino) < 20 * 20) {
+      var arb2 = ia.astucia >= 0.4 && az() < 0.5 ? arbustoCerca(P, l, 9) : null;
+      ia.destino = arb2 || puntoLibreAlAzar(P, l);
+      ia.destinoHasta = t + 2500 + az() * 2500;
+      ia.ruta = null;
+    }
+    if (ia.destino) irHacia(P, l, ia.destino.x, ia.destino.y, t);
+  }
+
+  function fijarDir(ia, x, y) {
+    var n = Math.sqrt(x * x + y * y);
+    if (n < 1e-3) { ia.dirX = 0; ia.dirY = 0; return; }
+    ia.dirX = x / n; ia.dirY = y / n;
+  }
+
+  function irHacia(P, l, x, y, t) {
+    var ia = l.ia, R = P.R;
+    // En línea recta si se puede (y no hay agua ni muro en medio).
+    if (lineaLibre(R, l.x, l.y, x, y, l.r)) {
+      ia.ruta = null;
+      fijarDir(ia, x - l.x, y - l.y);
+      return;
+    }
+    var clave = Math.floor(x / R.celda) + ',' + Math.floor(y / R.celda);
+    if (!ia.ruta || t >= ia.rutaHasta || ia.rutaObjetivo !== clave) {
+      ia.ruta = buscarRuta(R, l.x, l.y, x, y) || [];
+      ia.rutaHasta = t + 700;
+      ia.rutaObjetivo = clave;
+    }
+    while (ia.ruta.length && dist2(l, ia.ruta[0]) < 8 * 8) ia.ruta.shift();
+    // Atajo: si el punto siguiente al siguiente ya se ve, se salta uno.
+    if (ia.ruta.length > 1 && lineaLibre(R, l.x, l.y, ia.ruta[1].x, ia.ruta[1].y, l.r)) ia.ruta.shift();
+    var sig = ia.ruta[0];
+    if (sig) fijarDir(ia, sig.x - l.x, sig.y - l.y);
+    else fijarDir(ia, x - l.x, y - l.y);
+  }
+
+  /** ¿Se puede ir andando en línea recta? (con el ancho del cuerpo) */
+  function lineaLibre(R, x0, y0, x1, y1, r) {
+    var dx = x1 - x0, dy = y1 - y0;
+    var largo = Math.sqrt(dx * dx + dy * dy);
+    if (largo < 1) return true;
+    var nx = -dy / largo * r * 0.9, ny = dx / largo * r * 0.9;
+    var n = Math.max(1, Math.ceil(largo / 8));
+    for (var i = 1; i <= n; i++) {
+      var t = i / n;
+      var px = x0 + dx * t, py = y0 + dy * t;
+      if (bloqueaPaso(celdaDePunto(R, px, py)) ||
+          bloqueaPaso(celdaDePunto(R, px + nx, py + ny)) ||
+          bloqueaPaso(celdaDePunto(R, px - nx, py - ny))) return false;
+    }
+    return true;
+  }
+
+  function arbustoCerca(P, l, radioCeldas) {
+    var R = P.R;
+    var cx = Math.floor(l.x / R.celda), cy = Math.floor(l.y / R.celda);
+    var mejor = null, md = Infinity;
+    for (var y = cy - radioCeldas; y <= cy + radioCeldas; y++) {
+      for (var x = cx - radioCeldas; x <= cx + radioCeldas; x++) {
+        if (celdaEn(R, x, y) !== '*') continue;
+        var p = celdaCentro(R, x, y);
+        var d = dist2(l, p);
+        if (d < md) { md = d; mejor = p; }
+      }
+    }
+    return mejor;
+  }
+
+  function puntoLibreAlAzar(P, l) {
+    var R = P.R;
+    for (var i = 0; i < 30; i++) {
+      var cx = Math.floor(P.azar() * R.ancho), cy = Math.floor(P.azar() * R.alto);
+      if (bloqueaPaso(celdaEn(R, cx, cy))) continue;
+      var p = celdaCentro(R, cx, cy);
+      if (Math.sqrt(dist2(p, P.zona)) > P.zona.r - R.celda * 2) continue;
+      return p;
+    }
+    return { x: P.zona.cx, y: P.zona.cy };
+  }
+
+  // =========================================================================
+  return {
+    VERSION: VERSION,
+    ARENAS: ARENAS,
+    REGLAS: REGLAS,
+    ARMAS: ARMAS,
+    ESPECIES: ESPECIES,
+    // física compartida
+    crearRejilla: crearRejilla,
+    filasDe: filasDe,
+    celdaEn: celdaEn,
+    celdaDePunto: celdaDePunto,
+    bloqueaPaso: bloqueaPaso,
+    bloqueaBala: bloqueaBala,
+    romperCaja: romperCaja,
+    empujarFuera: empujarFuera,
+    moverCirculo: moverCirculo,
+    avanzarBala: avanzarBala,
+    lineaDeTiro: lineaDeTiro,
+    buscarRuta: buscarRuta,
+    // la partida (servidor y bancos de prueba)
+    crearPartida: crearPartida,
+    paso: paso,
+    entrada: entrada,
+    disparar: disparar,
+    abandonar: abandonar,
+    terminar: terminar,
+    loVe: loVe
+  };
+});
+  return module.exports;
+})();
+// <<BRAWL-MOTOR-FIN>>
+
+// ---------------------------------------------------------------------------
+// LAS PARTIDAS DE ARENA (el "host" del motor)
+// ---------------------------------------------------------------------------
+const BRAWL_ARENAS = Object.keys(GFBrawlMotor.ARENAS);
+const BRAWL_MAX_JUGADORES = 6;
+const BRAWL_SALA_MS = 8000;            // juntados dos, se espera esto a que entren más
+const BRAWL_ESPERA_LIBRE_MS = 20000;   // tras esto en cola, se empareja con cualquier nivel
+
+/** La arena sale del id de la partida: todos los de una partida ven la misma. */
+function brawlElegirArena(semilla) {
+  let h = 0;
+  const txt = String(semilla || '');
+  for (let i = 0; i < txt.length; i++) h = (h * 131 + txt.charCodeAt(i)) >>> 0;
+  return BRAWL_ARENAS[h % BRAWL_ARENAS.length];
+}
+
+/* UN SOLO RELOJ PARA TODAS LAS PARTIDAS.
+   Cada 50 ms avanza las que haya. Cuando no queda ninguna se para solo, así
+   que un servidor sin batallas no gasta nada en esto. */
+let brawlReloj = null;
+function brawlArrancarReloj() {
+  if (brawlReloj) return;
+  brawlReloj = setInterval(() => {
+    if (battleMatches.size === 0) {
+      clearInterval(brawlReloj);
+      brawlReloj = null;
+      return;
+    }
+    for (const match of battleMatches.values()) {
+      if (match.ended || !match.P) continue;
+      try {
+        GFBrawlMotor.paso(match.P);
+      } catch (e) {
+        /* Un fallo en UNA partida no puede tumbar las demás ni dejar a sus
+           jugadores encerrados: se da por terminada y se les suelta. */
+        console.error('❌ Batalla ' + match.id + ' rota; se cierra:', e);
+        try { GFBrawlMotor.terminar(match.P, 'error'); } catch (_) {
+          match.ended = true;
+          brawlSoltarJugadores(match);
+          battleMatches.delete(match.id);
         }
       }
     }
-    if (ia < 0) return; // seguir esperando a un rival de nivel comparable
-    const sb = battleQueue.splice(ib, 1)[0];
-    const sa = battleQueue.splice(ia, 1)[0];
-    const a = sa._battleTicket.player, b = sb._battleTicket.player;
-    a.battleTicket = sa._battleTicket; b.battleTicket = sb._battleTicket;
+  }, GFBrawlMotor.REGLAS.TICK_MS);
+}
 
-    // NUNCA emparejar a alguien consigo mismo. Pasa con dos pestañas abiertas
-    // (o al reconectar dejando el socket viejo en la cola): la partida salía
-    // "jugador vs jugador" pero el rival era uno mismo, con el nombre por
-    // defecto de la mascota, y parecía una batalla contra un bot.
-    if (a.playerName && a.playerName === b.playerName) {
-      console.log(`↩️  Cola: ${a.playerName} estaba dos veces; se descarta el socket viejo`);
-      // Se conserva el más reciente (sb) y se descarta el anterior.
-      try { sa.emit('battle:error', { error: 'duplicate_session' }); } catch (_) {}
-      releaseBattleAdmission(sa);
-      battleQueue.unshift(sb);
-      continue;
-    }
+/**
+ * Crea una partida y la echa a andar.
+ *   humanos: [{ socket, ticket, player }]  (player = construirJugadorDeSocket)
+ *   bots:    fichas de crearBotDeRonda / de práctica
+ */
+function brawlNuevaPartida(modo, humanos, bots, extra) {
+  extra = extra || {};
+  const pref = modo === 'bot' ? 'b' : (modo === 'practica' ? 'p' : 'm');
+  const id = `${pref}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const match = {
+    id, modo,
+    esBot: modo === 'bot',
+    ronda: extra.ronda || null,
+    dailyDay: extra.dailyDay || null,
+    ended: false,
+    creada: Date.now(),
+    P: null,
+    porClave: new Map(),     // socket.id → registro del jugador
+    humanos: []
+  };
 
-    const match = {
-      id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      a, b, turn: 0, ended: false, esBot: false,
-      actions: { a: null, b: null },
-      turnTimer: null
-    };
-
-    battleMatches.set(match.id, match);
-    socketMatch.set(sa.id, match.id);
-    socketMatch.set(sb.id, match.id);
-
-    ['a', 'b'].forEach(key => {
-      const p = match[key];
-      emitBattle(p.socket, 'battle:matched', {
-        matchId: match.id,
-        // Se marca explícitamente el modo: así el cliente puede rechazar una
-        // partida que no sea la que pidió.
-        mode: 'pvp',
-        you: battlePublicPlayer(p),
-        rival: battlePublicPlayer(match[key === 'a' ? 'b' : 'a'])
-      });
+  const specs = [];
+  for (const h of humanos) {
+    const reg = { socket: h.socket, ticket: h.ticket, player: h.player, salio: false, luchadorId: null };
+    match.porClave.set(h.socket.id, reg);
+    match.humanos.push(reg);
+    specs.push({
+      clave: h.socket.id, humano: true,
+      playerName: h.player.playerName, petName: h.player.petName, address: h.player.address,
+      especie: 'perro', nivel: h.player.level, maxHp: h.player.maxHp, ataque: h.player.attack,
+      salud: (h.player.petHealthPct == null ? 100 : h.player.petHealthPct) / 100
     });
+  }
+  bots.forEach((b, i) => specs.push({
+    clave: 'bot' + (i + 1), humano: false,
+    playerName: b.playerName, petName: b.petName, especie: b.species,
+    nivel: b.level, maxHp: b.maxHp, ataque: b.attack,
+    salud: b.salud == null ? 1 : b.salud, astucia: b.astucia, vidaFija: !!b.vidaFija
+  }));
 
-    console.log(`⚔️ Batalla ${match.id}: ${a.playerName} vs ${b.playerName}`);
-    scheduleBattleTurn(match, 2500);
+  battleMatches.set(id, match);
+  for (const reg of match.humanos) socketMatch.set(reg.socket.id, id);
+
+  match.P = GFBrawlMotor.crearPartida({
+    id, modo, ronda: match.ronda,
+    arena: brawlElegirArena(id),
+    luchadores: specs,
+    extraInicio: extra.extraInicio || null,
+    enviar: (l, ev, datos) => {
+      const reg = match.porClave.get(l.clave);
+      if (reg && !reg.salio) emitBattle(reg.socket, ev, datos);
+    },
+    alTerminar: (P, resumen) => {
+      Promise.resolve(brawlAlTerminar(match, resumen))
+        .catch((e) => console.error('❌ Cierre de la batalla ' + match.id + ':', e));
+    }
+  });
+  for (const l of match.P.luchadores) {
+    const reg = match.porClave.get(l.clave);
+    if (reg) reg.luchadorId = l.id;
+  }
+  brawlArrancarReloj();
+  return match;
+}
+
+/** Suelta los candados de todos los jugadores de una partida. */
+function brawlSoltarJugadores(match) {
+  for (const reg of match.humanos) {
+    if (socketMatch.get(reg.socket.id) === match.id) socketMatch.delete(reg.socket.id);
+    releaseBattleAdmission(reg.socket, reg.ticket);
+  }
+}
+
+/**
+ * Siembra los contadores de TODA LA VIDA de la mascota la primera vez.
+ *
+ * EL FALLO QUE ESTO ARREGLA: el nivel de la mascota se calculaba con las
+ * victorias de la TEMPORADA, y la temporada se reinicia cada 15 días — así que
+ * con la primera batalla de cada temporada el nivel guardado se pisaba con uno
+ * calculado desde cero. Ahora hay `petWins`/`petBattles` en GamePlayer, que no
+ * se reinician nunca. A quien aún no los tiene se le rellenan con lo que jugó
+ * en todas las temporadas, ANTES de sumar la batalla de ahora.
+ */
+async function sembrarContadoresMascota(playerName) {
+  const gp = await GamePlayer.findOne({ playerName, petBattles: { $exists: false } }).select('_id').lean();
+  if (!gp) return;
+  const agg = await BattleScore.aggregate([
+    { $match: { playerName } },
+    { $group: { _id: null, w: { $sum: '$wins' }, b: { $sum: '$battles' } } }
+  ]);
+  const w = agg[0] ? agg[0].w : 0;
+  const b = agg[0] ? agg[0].b : 0;
+  await GamePlayer.updateOne({ _id: gp._id, petBattles: { $exists: false } },
+    { $set: { petWins: w, petBattles: b } });
+}
+
+/**
+ * Guarda el resultado: puntos de la temporada para cada humano y el nivel de
+ * su mascota. Devuelve { socket.id: nivelNuevo }.
+ *
+ *   PvP    → 3 puntos el primero, 1 los demás (participar también cuenta).
+ *   Diaria → 1 punto si ganas, 0 si no (tope de 5 al día: no se puede
+ *            "granjear" la tabla contra la máquina).
+ *   Práctica → nada. Es para entrenar: si diera puntos, se jugaría contra
+ *            bots sin parar.
+ */
+async function guardarResultadoBrawl(match, resumen) {
+  const niveles = {};
+  if (match.modo === 'practica') return niveles;
+  const season = await getCurrentBattleSeason();
+
+  for (const fila of resumen.puestos) {
+    if (!fila.humano) continue;
+    const reg = match.porClave.get(fila.clave);
+    const p = reg && reg.player;
+    if (!p || !p.playerName || p.playerName === '---') continue;
+    const playerName = p.playerName;
+    const gano = fila.puesto === 1;
+    const puntos = match.esBot ? (gano ? 1 : 0) : (gano ? 3 : 1);
+    try {
+      await sembrarContadoresMascota(playerName);
+
+      const doc = await BattleScore.findOneAndUpdate(
+        { seasonNumber: season.seasonNumber, playerName },
+        {
+          $set: { address: p.address || '', petName: p.petName || '---', lastBattleAt: new Date() },
+          $inc: { points: puntos, wins: gano ? 1 : 0, losses: gano ? 0 : 1, battles: 1 }
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      const nuevaRacha = gano ? (doc.streak || 0) + 1 : 0;
+      await BattleScore.updateOne(
+        { _id: doc._id },
+        { $set: { streak: nuevaRacha, bestStreak: Math.max(doc.bestStreak || 0, nuevaRacha) } }
+      );
+
+      // NIVEL DE LA MASCOTA: contadores de toda la vida y `$max`, que nunca baja.
+      const gp = await GamePlayer.findOneAndUpdate(
+        { playerName },
+        { $inc: { petWins: gano ? 1 : 0, petBattles: 1 } },
+        { new: true, projection: { petWins: 1, petBattles: 1, petLevel: 1, nivel_exp: 1 } }
+      ).lean();
+      if (gp) {
+        const nivelPet = nivelMascotaEfectivo(gp);
+        if (nivelPet > (Number(gp.petLevel) || 1)) {
+          await GamePlayer.updateOne({ playerName }, { $max: { petLevel: nivelPet } });
+        }
+        niveles[fila.clave] = nivelPet;
+        /* Se avisa SIEMPRE, también a quien ya se fue de la arena: si cayó y
+           volvió al mapa antes de que acabara la partida, el perro del mapa
+           se tiene que poner al día igual (GameScene escucha esto). */
+        try {
+          if (reg.socket && reg.socket.connected !== false) reg.socket.emit('petLevelUpdate', { petLevel: nivelPet });
+        } catch (_) {}
+      }
+    } catch (e) {
+      console.warn('⚠️  No se pudo guardar el resultado de ' + playerName + ':', e.message);
+    }
+  }
+
+  try {
+    const ganador = resumen.puestos.find((f) => f.puesto === 1);
+    await BattleLog.create({
+      seasonNumber: season.seasonNumber,
+      matchId: match.id,
+      winner: ganador ? ganador.playerName : '',
+      loser: resumen.puestos.filter((f) => f.puesto !== 1).map((f) => f.playerName).join(', ').slice(0, 300),
+      turns: Math.round((resumen.duracionMs || 0) / 1000),     // segundos de combate
+      reason: resumen.motivo || 'ko'
+    });
+  } catch (e) {
+    console.warn('⚠️  No se pudo registrar la batalla:', e.message);
+  }
+  return niveles;
+}
+
+/**
+ * La partida ha terminado (lo avisa el motor). Se guarda, se cuenta la diaria
+ * y se manda a cada jugador su resultado.
+ *
+ * Todo con plazo (conPlazo): si Mongo no contesta, se pierden los puntos de
+ * esta partida —queda en el registro de errores— pero NADIE se queda
+ * encerrado en la arena esperando un mensaje que no llega.
+ */
+async function brawlAlTerminar(match, resumen) {
+  if (match.ended) return;
+  match.ended = true;
+
+  const niveles = (await conPlazo(guardarResultadoBrawl(match, resumen), BATTLE_PLAZO_BD_MS, {})) || {};
+
+  let dailyInfo = null;
+  if (match.esBot) {
+    const reg = match.humanos[0];
+    const p = reg && reg.player;
+    if (p && p.playerName && p.playerName !== '---') {
+      try {
+        const fila = resumen.puestos.find((f) => f.clave === reg.socket.id);
+        const gano = !!fila && fila.puesto === 1;
+        const doc = await conPlazo(BattleDaily.findOneAndUpdate(
+          { playerName: p.playerName, day: match.dailyDay || battleTodayKey() },
+          { $inc: { done: 1, wins: gano ? 1 : 0 } },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        ), BATTLE_PLAZO_BD_MS, null);
+        if (!doc) throw new Error('la base de datos no contestó a tiempo');
+        dailyInfo = {
+          done: doc.done,
+          max: BATTLE_DAILY_MAX,
+          remaining: Math.max(0, BATTLE_DAILY_MAX - doc.done),
+          nextRound: Math.min(BATTLE_DAILY_MAX, doc.done + 1),
+          wins: doc.wins || 0
+        };
+        console.log(`🗓️  Batallas diarias de ${p.playerName}: ${doc.done}/${BATTLE_DAILY_MAX}`);
+      } catch (e) {
+        console.error('❌ Error actualizando batallas diarias:', e);
+      }
+    }
+  }
+
+  const total = resumen.puestos.length;
+  const tabla = resumen.puestos.map((f) => ({
+    id: f.id, playerName: f.playerName, petName: f.petName, especie: f.especie,
+    nivel: f.nivel, puesto: f.puesto, bajas: f.bajas, dano: f.dano,
+    potencia: f.potencia, humano: f.humano
+  }));
+  /* CADA JUGADOR EN SU PROPIO try: si el aviso a uno revienta, los demás
+     tienen que recibir el suyo igual (ver el fallo de 'battle:end' que dejaba
+     al otro jugador mirando el combate sin salida). */
+  for (const reg of match.humanos) {
+    try {
+      const fila = resumen.puestos.find((f) => f.clave === reg.socket.id);
+      const gano = !!fila && fila.puesto === 1;
+      const puntos = match.modo === 'practica' ? 0 : (match.esBot ? (gano ? 1 : 0) : (gano ? 3 : 1));
+      if (!reg.salio && socketMatch.get(reg.socket.id) === match.id) {
+        emitBattle(reg.socket, 'brawl:fin', {
+          matchId: match.id, modo: match.modo, ronda: match.ronda,
+          resultado: gano ? 'win' : 'lose',
+          puesto: fila ? fila.puesto : total, de: total,
+          yo: fila ? fila.id : null,
+          puntos, motivo: resumen.motivo, duracionMs: resumen.duracionMs,
+          daily: dailyInfo, petLevel: niveles[reg.socket.id] || null,
+          tabla
+        });
+      }
+      if (dailyInfo && reg.socket.connected !== false) emitBattle(reg.socket, 'battle:daily', dailyInfo);
+    } catch (e) {
+      console.error('❌ No se pudo avisar del final de ' + match.id + ':', e);
+    }
+  }
+  brawlSoltarJugadores(match);
+  battleMatches.delete(match.id);
+  console.log(`🏁 Batalla ${match.id} (${match.modo}) terminada: ${resumen.motivo}, ` +
+              `gana ${(resumen.puestos[0] || {}).playerName || '—'} en ${Math.round((resumen.duracionMs || 0) / 1000)} s`);
+}
+
+/**
+ * Un jugador sale de la batalla (o de la cola).
+ *   'forfeit'    → se rinde: cae, pero sigue mirando hasta el final.
+ *   'leave'      → se va al mapa: si seguía vivo, cuenta como rendirse.
+ *   'disconnect' → igual que 'leave'.
+ */
+function brawlSalir(socket, motivo) {
+  removeBattleQueueSocket(socket);
+  brawlQuitarDeSala(socket);
+  const matchId = socketMatch.get(socket.id);
+  if (!matchId) { releaseBattleAdmission(socket); return; }
+  const match = battleMatches.get(matchId);
+  if (!match) { socketMatch.delete(socket.id); releaseBattleAdmission(socket); return; }
+  const reg = match.porClave.get(socket.id);
+  const quedarse = motivo === 'forfeit';
+  if (reg && !quedarse) reg.salio = true;
+  if (reg && match.P && !match.ended) {
+    try { GFBrawlMotor.abandonar(match.P, reg.luchadorId, { irse: !quedarse }); }
+    catch (e) { console.error('❌ abandonar', e); }
+  }
+  if (!quedarse) {
+    // El candado se suelta YA: puede volver a jugar aunque esta partida siga.
+    if (socketMatch.get(socket.id) === matchId) socketMatch.delete(socket.id);
+    releaseBattleAdmission(socket, reg && reg.ticket);
   }
 }
 
 // ---------------------------------------------------------------------------
-// BATALLA DIARIA CONTRA BOT (5 al día, cada una más difícil)
+// LA COLA Y LA SALA DE ESPERA (PvP)
 // ---------------------------------------------------------------------------
-async function iniciarBatallaBot(socket, ticket) {
+/* Cuando hay dos jugadores de nivel parecido se abre una SALA y se esperan 8 s
+   por si llegan más (hasta 6); al llenarse o al acabar la espera, empieza.
+   Así una partida de dos no tiene que esperar a que haya seis, y si hay
+   gente, se juega con más gente. Pasados 20 s en cola, se empareja con
+   cualquier nivel: mejor una partida algo desigual que ninguna. */
+let brawlSala = null;    // { regs: [{ socket, ticket, player }], empiezaEn, reloj }
+
+function brawlRegDeSocket(s) {
+  return { socket: s, ticket: s._battleTicket, player: s._battleTicket && s._battleTicket.player };
+}
+
+function brawlCompatibles(a, b, ahora) {
+  if (!a.player || !b.player) return false;
+  if (a.player.playerName === b.player.playerName) return false;
+  if (battleLevelsCompatible(a.player, b.player)) return true;
+  return (ahora - a.ticket.createdAt > BRAWL_ESPERA_LIBRE_MS) &&
+         (ahora - b.ticket.createdAt > BRAWL_ESPERA_LIBRE_MS);
+}
+
+function brawlAvisarSala() {
+  if (!brawlSala) return;
+  const datos = {
+    jugadores: brawlSala.regs.length, max: BRAWL_MAX_JUGADORES,
+    empiezaEnMs: Math.max(0, brawlSala.empiezaEn - Date.now())
+  };
+  for (const r of brawlSala.regs) emitBattle(r.socket, 'brawl:sala', datos);
+}
+
+function brawlAvisarCola() {
+  battleQueue.forEach((s, i) => emitBattle(s, 'brawl:enCola', { posicion: i + 1, enCola: battleQueue.length }));
+}
+
+function brawlDeshacerSala() {
+  const sala = brawlSala;
+  if (!sala) return;
+  clearTimeout(sala.reloj);
+  brawlSala = null;
+  // Los que quedaban vuelven al PRINCIPIO de la cola: llevaban esperando más.
+  for (let i = sala.regs.length - 1; i >= 0; i--) {
+    const r = sala.regs[i];
+    if (isBattleAdmissionCurrent(r.socket, r.ticket)) battleQueue.unshift(r.socket);
+  }
+}
+
+function brawlQuitarDeSala(socket) {
+  if (!brawlSala) return;
+  const antes = brawlSala.regs.length;
+  brawlSala.regs = brawlSala.regs.filter((r) => r.socket.id !== socket.id);
+  if (brawlSala.regs.length === antes) return;
+  if (brawlSala.regs.length < 2) { brawlDeshacerSala(); brawlAvisarCola(); brawlEmparejar(); }
+  else brawlAvisarSala();
+}
+
+function brawlLanzarSala() {
+  const sala = brawlSala;
+  if (!sala) return;
+  clearTimeout(sala.reloj);
+  brawlSala = null;
+  const validos = sala.regs.filter((r) => isBattleAdmissionCurrent(r.socket, r.ticket));
+  if (validos.length < 2) {
+    for (let i = validos.length - 1; i >= 0; i--) battleQueue.unshift(validos[i].socket);
+    brawlEmparejar();
+    return;
+  }
+  const match = brawlNuevaPartida('pvp', validos, [], {});
+  console.log(`⚔️  Batalla ${match.id}: ${validos.map((r) => r.player.playerName).join(' vs ')} en ${match.P.arenaId}`);
+  brawlEmparejar();
+}
+
+function brawlEmparejar() {
+  const ahora = Date.now();
+  for (let i = battleQueue.length - 1; i >= 0; i--) {
+    const s = battleQueue[i];
+    if (!isBattleAdmissionCurrent(s, s._battleTicket) || !s._battleTicket.player) battleQueue.splice(i, 1);
+  }
+  if (brawlSala) {
+    brawlSala.regs = brawlSala.regs.filter((r) => isBattleAdmissionCurrent(r.socket, r.ticket));
+    if (brawlSala.regs.length < 2) brawlDeshacerSala();
+  }
+
+  if (brawlSala) {
+    // ¿Entra alguien más en la sala abierta? Se compara con el primero.
+    const ancla = brawlSala.regs[0];
+    for (let i = 0; i < battleQueue.length && brawlSala.regs.length < BRAWL_MAX_JUGADORES;) {
+      const cand = brawlRegDeSocket(battleQueue[i]);
+      if (brawlCompatibles(ancla, cand, ahora)) { brawlSala.regs.push(cand); battleQueue.splice(i, 1); }
+      else i++;
+    }
+    if (brawlSala.regs.length >= BRAWL_MAX_JUGADORES) { brawlLanzarSala(); return; }
+    brawlAvisarSala();
+    brawlAvisarCola();
+    return;
+  }
+
+  // Abrir una sala con el que más lleva esperando y los que le casen.
+  for (let i = 0; i < battleQueue.length; i++) {
+    const a = brawlRegDeSocket(battleQueue[i]);
+    const grupo = [a];
+    for (let j = 0; j < battleQueue.length && grupo.length < BRAWL_MAX_JUGADORES; j++) {
+      if (j === i) continue;
+      const b = brawlRegDeSocket(battleQueue[j]);
+      if (brawlCompatibles(a, b, ahora)) grupo.push(b);
+    }
+    if (grupo.length < 2) continue;
+    for (const g of grupo) removeBattleQueueSocket(g.socket);
+    brawlSala = { regs: grupo, empiezaEn: ahora + BRAWL_SALA_MS, reloj: setTimeout(brawlLanzarSala, BRAWL_SALA_MS) };
+    if (grupo.length >= BRAWL_MAX_JUGADORES) { brawlLanzarSala(); return; }
+    brawlAvisarSala();
+    break;
+  }
+  brawlAvisarCola();
+}
+
+/* Quien espera solo también necesita que se le vuelva a mirar: a los 20 s
+   pasa a valer cualquier nivel, pero nadie llamaría a brawlEmparejar si no
+   entra nadie nuevo. Un repaso cada 5 s mientras haya cola. */
+setInterval(() => {
+  if (battleQueue.length >= 2 || brawlSala) {
+    try { brawlEmparejar(); } catch (e) { console.error('❌ brawlEmparejar', e); }
+  }
+}, 5000).unref();
+
+// ---------------------------------------------------------------------------
+// LAS 5 BATALLAS DIARIAS Y LA PRÁCTICA
+// ---------------------------------------------------------------------------
+async function brawlIniciarDiaria(socket, ticket) {
   const jugador = await conPlazo(construirJugadorDeSocket(socket), BATTLE_PLAZO_BD_MS, null);
   if (!isBattleAdmissionCurrent(socket, ticket)) return;
   if (!jugador) {
     releaseBattleAdmission(socket, ticket);
-    return emitBattle(socket, 'battle:error', { error: 'bot_failed' });
+    return emitBattle(socket, 'brawl:error', { error: 'bot_failed' });
   }
   if (!jugador.playerName || jugador.playerName === '---') {
     releaseBattleAdmission(socket, ticket);
-    return socket.emit('battle:error', { error: 'not_authenticated' });
+    return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
   }
-
   const estado = await conPlazo(estadoBatallasDiarias(jugador.playerName), BATTLE_PLAZO_BD_MS, null);
   if (!isBattleAdmissionCurrent(socket, ticket)) return;
   if (!estado) {
     releaseBattleAdmission(socket, ticket);
-    return emitBattle(socket, 'battle:error', { error: 'bot_failed' });
+    return emitBattle(socket, 'brawl:error', { error: 'bot_failed' });
   }
   if (estado.remaining <= 0) {
     releaseBattleAdmission(socket, ticket);
-    return socket.emit('battle:error', { error: 'daily_limit', daily: estado });
+    return emitBattle(socket, 'brawl:error', { error: 'daily_limit', daily: estado });
   }
 
   const ronda = estado.nextRound;
   const bot = crearBotDeRonda(ronda, jugador.level);
+  /* EL RIVAL LLEGA COMO LLEGUES TÚ (ver crearBotDeRonda): en la misma
+     proporción de vida que tu mascota, con suelo del 75 %. */
+  const fraccion = Math.max(0, Math.min(1, (Number(jugador.petHealthPct) || 100) / 100));
+  bot.salud = Math.max(0.75, fraccion);
+  bot.vidaFija = true;
 
-  /* ═══════════════════════════════════════════════════════════════════
-     EL RIVAL LLEGA COMO LLEGUES TÚ
-     ───────────────────────────────────────────────────────────────────
-     LA INJUSTICIA QUE ESTO ARREGLA: la mascota entra al combate con la
-     vida que le quede en el mapa —si la mordió un cocodrilo, al 40 %—
-     mientras que el bot entraba SIEMPRE al 100 %. Sumado a que el bot ya
-     pegaba y aguantaba más por la ronda, una batalla diaria con la
-     mascota tocada estaba perdida antes de repartir cartas.
-
-     Ahora el bot llega en la misma proporción, con un suelo del 75 %: es
-     un animal salvaje, no está recién curado, pero tampoco medio muerto.
-     Así seguir cuidando a la mascota SIGUE importando —a media vida el
-     combate es mucho más corto y un mal turno te tumba— pero deja de ser
-     una derrota automática.
-     ═══════════════════════════════════════════════════════════════════ */
-  const saludJugador = Number(jugador.petHealthPct);
-  const fraccionJugador = Math.max(0, Math.min(1,
-    (Number.isFinite(saludJugador) ? saludJugador : 100) / 100));
-  const fraccionBot = Math.max(0.75, fraccionJugador);
-  bot.hp = Math.max(1, Math.round(bot.maxHp * fraccionBot));
-
-  jugador.battleTicket = ticket;
-  const match = {
-    id: `b_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    a: jugador, b: bot,
-    turn: 0, ended: false,
-    esBot: true, ronda, dailyDay: estado.day,
-    actions: { a: null, b: null },
-    ultimaAccionJugador: null,
-    turnTimer: null
-  };
-
-  battleMatches.set(match.id, match);
-  socketMatch.set(socket.id, match.id);
-
-  emitBattle(socket, 'battle:matched', {
-    matchId: match.id,
-    mode: 'bot',
-    round: ronda,
-    daily: estado,
-    you: battlePublicPlayer(jugador),
-    rival: battlePublicPlayer(bot)
+  const match = brawlNuevaPartida('bot', [{ socket, ticket, player: jugador }], [bot], {
+    ronda, dailyDay: estado.day, extraInicio: { daily: estado, igualado: !!bot.igualado }
   });
-
-  console.log(`🤖 Batalla diaria ${match.id}: ${jugador.playerName} vs ${bot.petName} (ronda ${ronda})`);
-  scheduleBattleTurn(match, 2000);
+  console.log(`🤖 Batalla diaria ${match.id}: ${jugador.playerName} vs ${bot.petName} (${bot.species}, ronda ${ronda}) en ${match.P.arenaId}`);
 }
 
+async function brawlIniciarPractica(socket, ticket) {
+  const jugador = await conPlazo(construirJugadorDeSocket(socket), BATTLE_PLAZO_BD_MS, null);
+  if (!isBattleAdmissionCurrent(socket, ticket)) return;
+  if (!jugador || !jugador.playerName || jugador.playerName === '---') {
+    releaseBattleAdmission(socket, ticket);
+    return emitBattle(socket, 'brawl:error', { error: jugador ? 'not_authenticated' : 'bot_failed' });
+  }
+  // Tres rivales distintos, del nivel de tu mascota y de listos a medio gas.
+  const fichas = BATTLE_BOTS.concat(BATTLE_BOTS_EXTRA).slice();
+  for (let i = fichas.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [fichas[i], fichas[j]] = [fichas[j], fichas[i]];
+  }
+  const stats = battleStatsForLevel(jugador.level);
+  const bots = fichas.slice(0, 3).map((f, i) => ({
+    species: f.species, petName: f.petName, playerName: f.playerName + ' · Practice',
+    level: jugador.level, maxHp: stats.maxHp, attack: stats.attack,
+    astucia: 0.30 + 0.08 * i, salud: 1
+  }));
+  const match = brawlNuevaPartida('practica', [{ socket, ticket, player: jugador }], bots, {});
+  console.log(`🎯 Práctica ${match.id}: ${jugador.playerName} en ${match.P.arenaId}`);
+}
+
+// ---------------------------------------------------------------------------
+// SOCKETS
+// ---------------------------------------------------------------------------
 io.on('connection', (socket) => {
   socket.on('battle:dailyStatus', async () => {
     try {
@@ -18402,141 +19327,114 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('battle:bot', async () => {
+  socket.on('brawl:bot', async () => {
     let ticket = null;
     try {
-      if (!socket.authenticatedAddress) {
-        return socket.emit('battle:error', { error: 'not_authenticated' });
-      }
+      if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
       ticket = reserveBattleAdmission(socket, 'bot');
-      if (!ticket) {
-        return socket.emit('battle:error', { error: 'already_in_battle' });
-      }
-      await iniciarBatallaBot(socket, ticket);
+      if (!ticket) return emitBattle(socket, 'brawl:error', { error: 'already_in_battle' });
+      await brawlIniciarDiaria(socket, ticket);
     } catch (e) {
       releaseBattleAdmission(socket, ticket);
-      console.error('❌ battle:bot', e);
-      socket.emit('battle:error', { error: 'bot_failed' });
+      console.error('❌ brawl:bot', e);
+      emitBattle(socket, 'brawl:error', { error: 'bot_failed' });
     }
   });
 
-  socket.on('battle:queue', async () => {
+  socket.on('brawl:practica', async () => {
     let ticket = null;
     try {
-      // Solo jugadores autenticados (la tabla es por playerName)
-      if (!socket.authenticatedAddress) {
-        return socket.emit('battle:error', { error: 'not_authenticated' });
+      if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
+      // Quien estaba en la cola y se cansa de esperar pasa directo a practicar.
+      if (socket._battleTicket && socket._battleTicket.mode === 'pvp' && !socketMatch.has(socket.id)) {
+        removeBattleQueueSocket(socket);
+        brawlQuitarDeSala(socket);
+        releaseBattleAdmission(socket);
       }
-      if (socket._battleTicket && socket._battleTicket.mode === 'pvp' &&
-          !socketMatch.has(socket.id)) return;
+      ticket = reserveBattleAdmission(socket, 'practica');
+      if (!ticket) return emitBattle(socket, 'brawl:error', { error: 'already_in_battle' });
+      await brawlIniciarPractica(socket, ticket);
+    } catch (e) {
+      releaseBattleAdmission(socket, ticket);
+      console.error('❌ brawl:practica', e);
+      emitBattle(socket, 'brawl:error', { error: 'bot_failed' });
+    }
+  });
+
+  socket.on('brawl:cola', async () => {
+    let ticket = null;
+    try {
+      if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
+      if (socket._battleTicket && socket._battleTicket.mode === 'pvp' && !socketMatch.has(socket.id)) return;
       ticket = reserveBattleAdmission(socket, 'pvp');
-      if (!ticket) {
-        return socket.emit('battle:error', { error: 'already_in_battle' });
-      }
+      if (!ticket) return emitBattle(socket, 'brawl:error', { error: 'already_in_battle' });
       const player = await conPlazo(construirJugadorDeSocket(socket), BATTLE_PLAZO_BD_MS, null);
       if (!isBattleAdmissionCurrent(socket, ticket)) return;
       if (!player || !player.playerName || player.playerName === '---') {
         releaseBattleAdmission(socket, ticket);
-        return emitBattle(socket, 'battle:error', { error: 'queue_failed' });
+        return emitBattle(socket, 'brawl:error', { error: 'queue_failed' });
       }
       ticket.player = player;
       battleQueue.push(socket);
-      emitBattle(socket, 'battle:queued', {
-        position: battleQueue.length, level: player.level,
-        maxLevelGap: Math.max(2, Math.ceil(player.level * 0.20))
+      emitBattle(socket, 'brawl:enCola', {
+        posicion: battleQueue.length, enCola: battleQueue.length, nivel: player.level
       });
-      await tryBattleMatchmaking();
+      brawlEmparejar();
     } catch (e) {
       removeBattleQueueSocket(socket);
       releaseBattleAdmission(socket, ticket);
-      console.error('❌ battle:queue', e);
-      socket.emit('battle:error', { error: 'queue_failed' });
+      console.error('❌ brawl:cola', e);
+      emitBattle(socket, 'brawl:error', { error: 'queue_failed' });
     }
   });
 
-  socket.on('battle:leaveQueue', () => {
+  socket.on('brawl:salirCola', () => {
     removeBattleQueueSocket(socket);
+    brawlQuitarDeSala(socket);
     if (!socketMatch.has(socket.id)) releaseBattleAdmission(socket);
-    socket.emit('battle:leftQueue', {});
+    emitBattle(socket, 'brawl:fueraCola', {});
+    brawlAvisarCola();
   });
 
-  socket.on('battle:action', (data) => {
+  // Lo más frecuente (20 por segundo): sin await, sin base de datos.
+  socket.on('brawl:mover', (datos) => {
     try {
       const matchId = socketMatch.get(socket.id);
       if (!matchId) return;
       const match = battleMatches.get(matchId);
-      if (!match || match.ended || match.phase !== 'choosing') return;
-      if (data && data.matchId != null && data.matchId !== match.id) return;
-      if (data && data.turn != null && data.turn !== match.turn) return;
-      if (Date.now() > match.deadlineAt) return;
-
-      const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
-      if (match.actions[key]) return; // ya jugó en este turno
-
-      // El cliente manda los ÍNDICES de las cartas de su mano; la validación
-      // (que existan, que no repita y que quepan en la energía) se hace aquí,
-      // nunca en el navegador.
-      const indices = (data && Array.isArray(data.cards)) ? data.cards.slice(0, BATTLE_HAND_SIZE) : [];
-      match.actions[key] = indices;
-
-      // Avisar al rival de que ya eligió (sin decir qué)
-      const rival = match[key === 'a' ? 'b' : 'a'];
-      if (rival && rival.socket) emitBattle(rival.socket, 'battle:rivalReady', { matchId: match.id, turn: match.turn });
-
-      if (match.actions.a && match.actions.b) {
-        Promise.resolve(resolveBattleTurn(match)).catch(e => console.error('Battle action:', e));
-      }
-    } catch (e) {
-      console.error('❌ battle:action', e);
-    }
+      if (!match || match.ended || !match.P) return;
+      const reg = match.porClave.get(socket.id);
+      if (!reg || reg.salio) return;
+      GFBrawlMotor.entrada(match.P, reg.luchadorId, datos);
+    } catch (e) { /* un paquete raro no puede tumbar nada */ }
   });
 
-  socket.on('battle:forfeit', async () => {
-    const matchId = socketMatch.get(socket.id);
-    if (!matchId) return;
-    const match = battleMatches.get(matchId);
-    if (!match || match.ended) return;
-    const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
-    await endBattle(match, key === 'a' ? 'b' : 'a', 'forfeit');
+  socket.on('brawl:disparo', (datos) => {
+    try {
+      const matchId = socketMatch.get(socket.id);
+      if (!matchId) return;
+      const match = battleMatches.get(matchId);
+      if (!match || match.ended || !match.P) return;
+      const reg = match.porClave.get(socket.id);
+      if (!reg || reg.salio) return;
+      GFBrawlMotor.disparar(match.P, reg.luchadorId, datos);
+    } catch (e) { console.error('❌ brawl:disparo', e); }
   });
 
-  socket.on('disconnect', async () => {
-    removeBattleQueueSocket(socket);
-
-    const matchId = socketMatch.get(socket.id);
-    // El candado se suelta SIEMPRE. Antes se hacía `return` cuando el combate
-    // ya no existía o ya había terminado, y la entrada de socketMatch se
-    // quedaba puesta: a partir de ahí, cualquier intento de empezar otra
-    // batalla respondía 'already_in_battle' y el jugador no podía entrar más.
-    socketMatch.delete(socket.id);
-    if (!matchId) { releaseBattleAdmission(socket); return; }
-    const match = battleMatches.get(matchId);
-    if (!match) { releaseBattleAdmission(socket); return; }
-    if (match.ended) return;
-    const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
-    await endBattle(match, key === 'a' ? 'b' : 'a', 'forfeit');
+  socket.on('brawl:rendirse', () => {
+    try { brawlSalir(socket, 'forfeit'); } catch (e) { console.error('❌ brawl:rendirse', e); }
   });
 
-  // Salir de la escena de batalla sin haber terminado (volver al mundo, cerrar
-  // el panel…). Sin esto el candado seguía puesto en el MISMO socket y el
-  // jugador se quedaba con 'already_in_battle' hasta recargar la página.
-  socket.on('battle:leave', async () => {
-    const matchId = socketMatch.get(socket.id);
-    removeBattleQueueSocket(socket);
-    if (!matchId) { releaseBattleAdmission(socket); return; }
-    const match = battleMatches.get(matchId);
-    if (!match) {
-      socketMatch.delete(socket.id);
-      releaseBattleAdmission(socket);
-      return;
-    }
-    if (match.ended) return;
-    const key = (match.a.socket && match.a.socket.id === socket.id) ? 'a' : 'b';
-    await endBattle(match, key === 'a' ? 'b' : 'a', 'forfeit');
+  socket.on('brawl:salir', () => {
+    try { brawlSalir(socket, 'leave'); } catch (e) { console.error('❌ brawl:salir', e); }
+  });
+
+  socket.on('disconnect', () => {
+    try { brawlSalir(socket, 'disconnect'); } catch (e) { console.error('❌ brawl disconnect', e); }
   });
 });
 
-console.log('✅ Battle routes cargados: GET /api/battle/leaderboard + sockets battle:*');
+console.log('✅ Battle routes cargados: GET /api/battle/leaderboard + sockets brawl:* (arenas: ' + BRAWL_ARENAS.join(', ') + ')');
 
 
 // =============================================================================
