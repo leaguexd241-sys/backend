@@ -18263,7 +18263,7 @@ const GFBrawlMotor = (function () {
   /* El inicio de la partida. También se manda a mitad (reconectar): por eso
      lleva el ESTADO de ahora —quién sigue vivo, las cajas que quedan, lo que
      hay en el suelo, en qué fase va la niebla— y no solo el del principio. */
-  function enviarInicio(P, l) {
+  function enviarInicio(P, l, reanudar) {
     if (!l.humano || l.sinConexion) return;
     var armas = {};
     Object.keys(ARMAS).forEach(function (k) { armas[k] = armaPublica(ARMAS[k]); });
@@ -18300,7 +18300,7 @@ const GFBrawlMotor = (function () {
       objetos: P.objetos.map(function (o) { return [o.id, redondea(o.x, 2), redondea(o.y, 2), o.tipo]; }),
       curas: P.curas.map(function (c) { return [redondea(c.x), redondea(c.y)]; }),
       fase: P.fase,
-      reanudar: P.fase !== 'cuenta',
+      reanudar: !!reanudar || P.fase !== 'cuenta',
       enCombateMs: P.fase === 'combate' ? Math.max(0, ahora - P.tCombate) : 0,
       cuentaMs: Math.max(0, P.tCombate - ahora),
       serverNow: ahora,
@@ -18490,7 +18490,15 @@ const GFBrawlMotor = (function () {
     l.seq = 0;
     l.correccion++;
     l.corregir = true;
-    enviarInicio(P, l);
+    enviarInicio(P, l, true);
+    return true;
+  }
+
+  // Reenvía el estado completo sin reiniciar secuencias ni el piloto automático.
+  function resincronizar(P, id) {
+    var l = P.porId[id];
+    if (!l || !l.humano || l.fuera || l.sinConexion || P.fase === 'fin') return false;
+    enviarInicio(P, l, true);
     return true;
   }
 
@@ -19558,6 +19566,7 @@ const GFBrawlMotor = (function () {
     abandonar: abandonar,
     desconectar: desconectar,
     reconectar: reconectar,
+    resincronizar: resincronizar,
     terminar: terminar,
     loVe: loVe,
     esCaja: esCaja
@@ -19757,6 +19766,16 @@ function brawlEsperarVuelta(match, reg) {
 
 /** 'brawl:volver': el socket nuevo de alguien que se cayó recupera su perro. */
 function brawlVolver(socket, datos) {
+  // Un socket aún enlazado también puede perder instantáneas o brawl:inicio.
+  const actualId = socketMatch.get(socket.id);
+  const actual = actualId && battleMatches.get(actualId);
+  const actualReg = actual && brawlRegDe(actual, socket);
+  if (actualReg && !actualReg.salio && !actual.ended && actual.P &&
+      brawlCuenta(socket) === String(actualReg.ticket.account).toLowerCase() &&
+      (!datos || !datos.matchId || datos.matchId === actualId)) {
+    GFBrawlMotor.resincronizar(actual.P, actualReg.luchadorId);
+    return;
+  }
   const cuenta = brawlCuenta(socket);
   const caido = cuenta ? brawlCaidos.get(cuenta) : null;
   const pedido = datos && typeof datos.matchId === 'string' ? datos.matchId : null;
@@ -20235,6 +20254,27 @@ async function brawlIniciarPractica(socket, ticket) {
 // ---------------------------------------------------------------------------
 // SOCKETS
 // ---------------------------------------------------------------------------
+// Un reintento legítimo contesta con su estado actual; jamás crea otra partida.
+function brawlRecuperarSolicitud(socket, modo) {
+  const id = socketMatch.get(socket.id);
+  const match = id && battleMatches.get(id);
+  const reg = match && brawlRegDe(match, socket);
+  if (reg && !reg.salio && !match.ended && match.P && match.modo === modo &&
+      brawlCuenta(socket) === String(reg.ticket.account).toLowerCase()) {
+    GFBrawlMotor.resincronizar(match.P, reg.luchadorId);
+    return true;
+  }
+  const caido = brawlCaidos.get(brawlCuenta(socket));
+  if (caido) { brawlVolver(socket, { matchId: caido.matchId }); return true; }
+  if (socket._battleTicket && socket._battleTicket.mode === modo && !id) {
+    if (modo === 'pvp' && socket._battleTicket.player) {
+      emitBattle(socket, 'brawl:enCola', { enCola: battleQueue.length });
+      if (brawlSala && brawlSala.regs.some(r => r.socket === socket)) brawlAvisarSala();
+    }
+    return true;
+  }
+  return false;
+}
 io.on('connection', (socket) => {
   socket.on('battle:dailyStatus', async () => {
     try {
@@ -20252,6 +20292,7 @@ io.on('connection', (socket) => {
     let ticket = null;
     try {
       if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
+      if (brawlRecuperarSolicitud(socket, 'bot')) return;
       ticket = reserveBattleAdmission(socket, 'bot');
       if (!ticket) return emitBattle(socket, 'brawl:error', { error: 'already_in_battle' });
       await brawlIniciarDiaria(socket, ticket);
@@ -20272,6 +20313,7 @@ io.on('connection', (socket) => {
         brawlQuitarDeSala(socket);
         releaseBattleAdmission(socket);
       }
+      if (brawlRecuperarSolicitud(socket, 'practica')) return;
       ticket = reserveBattleAdmission(socket, 'practica');
       if (!ticket) return emitBattle(socket, 'brawl:error', { error: 'already_in_battle' });
       await brawlIniciarPractica(socket, ticket);
@@ -20286,7 +20328,8 @@ io.on('connection', (socket) => {
     let ticket = null;
     try {
       if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
-      if (socket._battleTicket && socket._battleTicket.mode === 'pvp' && !socketMatch.has(socket.id)) return;
+      // brawlRecuperarSolicitud también vuelve a confirmar la cola.
+      if (brawlRecuperarSolicitud(socket, 'pvp')) return;
       ticket = reserveBattleAdmission(socket, 'pvp');
       if (!ticket) return emitBattle(socket, 'brawl:error', { error: 'already_in_battle' });
       const player = await conPlazo(construirJugadorDeSocket(socket), BATTLE_PLAZO_BD_MS, null);
