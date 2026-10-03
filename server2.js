@@ -594,7 +594,8 @@ const gamePlayerSchema = new mongoose.Schema({
   tutorial: { type: Number, default: 0 },
   // Primera finalización observada por el servidor. Históricos sin fecha: null.
   tutorialCompletedAt: { type: Date, default: null },
-  // Nivel de la MASCOTA. Sube con las batallas (ver computePetLevel/bump).
+  // Nivel de la MASCOTA: es el del personaje (ver nivelMascotaEfectivo). Se
+  // guarda para que los demás jugadores lo vean sin calcular nada.
   // Se muestra junto al nombre del perro, propio y de los demás jugadores.
   petLevel: { type: Number, default: 1, min: 1 },
   // Contadores de TODA LA VIDA de la mascota (los de BattleScore son de la
@@ -636,6 +637,66 @@ const gamePlayerSchema = new mongoose.Schema({
 
 gamePlayerSchema.index({ tutorial: 1, tutorialCompletedAt: -1, playerName: 1 });
 const GamePlayer = mongoose.model('GamePlayer', gamePlayerSchema);
+
+// =============================================================================
+// FANTASMAS: lo que un muerto NO puede hacer                     (2026-10-02)
+// -----------------------------------------------------------------------------
+// FALLO QUE ESTO CIERRA: muerto (isGhost) se podía seguir sembrando, regando,
+// cortando, cosechando, talando, minando, usando el horno, cogiendo agua del
+// pozo y completando misiones. El cliente ya avisa y ni lo intenta
+// (GFMuerte.bloquear en gf-muerte.js), pero la regla de verdad vive aquí.
+//
+// Cada punto de ENTRADA de una acción productiva pregunta esFantasma() y, si
+// lo es, responde 423 { error: 'fantasma' }. Moverse, vender, revivir, chatear
+// y mirar SÍ se puede.
+//
+// A PROPÓSITO no se toca /api/relay/transaction: por ahí viajan también los
+// objetos de algo hecho JUSTO antes de morir (talas, lo crafteado, los
+// reintentos del hub). Cortarlos ahí sería quitarle al jugador lo que ya ganó.
+// Talar y minar pasan antes por /consume, que sí está cerrado.
+//
+// Caché de 3 s porque talar/minar llaman en ráfaga. Morir y revivir la borran.
+// Va aquí, fuera de todo io.on('connection'): lo usan los tres bloques.
+// =============================================================================
+const _cacheFantasma = new Map();     // 'n:<playerName>' | 'a:<address>' → { v, t }
+const FANTASMA_CACHE_MS = 3000;
+
+async function esFantasma({ playerName, address } = {}) {
+  const dir = address ? String(address).toLowerCase() : '';
+  const clave = playerName ? 'n:' + playerName : (dir ? 'a:' + dir : '');
+  if (!clave) return false;
+  const ahora = Date.now();
+  const c = _cacheFantasma.get(clave);
+  if (c && ahora - c.t < FANTASMA_CACHE_MS) return c.v;
+  let gp = null;
+  try {
+    if (playerName) {
+      gp = await GamePlayer.findOne({ playerName }).select('isGhost').lean();
+    } else {
+      const auth = await PlayerAuth.findOne({ address: dir }).select('playerName').lean();
+      if (auth && auth.playerName) {
+        gp = await GamePlayer.findOne({ playerName: auth.playerName }).select('isGhost').lean();
+      }
+    }
+  } catch (e) {
+    // Si la base de datos falla no se bloquea por esto: cada endpoint tiene
+    // sus propias lecturas y fallaría igual un paso más allá.
+    return false;
+  }
+  const v = !!(gp && gp.isGhost);
+  if (_cacheFantasma.size > 5000) _cacheFantasma.clear();      // tope duro
+  _cacheFantasma.set(clave, { v, t: ahora });
+  return v;
+}
+
+function olvidarFantasma(playerName, address) {
+  if (playerName) _cacheFantasma.delete('n:' + playerName);
+  if (address) _cacheFantasma.delete('a:' + String(address).toLowerCase());
+}
+
+function responderFantasma(res) {
+  return res.status(423).json({ error: 'fantasma', message: 'You are a ghost — revive first.' });
+}
 
 function isTutorialCompleted(value) {
   const step = Number(value);
@@ -4718,8 +4779,13 @@ const io = new Server(server, {
     exposedHeaders: ["Set-Cookie", "X-CSRF-Token"]
   },
   transports: ['websocket', 'polling'],
-  pingTimeout: 60000,
-  pingInterval: 25000,
+  /* LATIDOS MÁS RÁPIDOS (2026-10-02). Con 25 s + 60 s una conexión muerta
+     tardaba hasta 85 s en darse por perdida: el "clon" en la sala, el
+     candado de batalla y la partida colgada duraban todo ese rato. Con
+     10 s + 20 s son 30 s como mucho, y un ping cada 10 s no pesa nada.
+     La arena no depende de esto: tiene su propia gracia (BRAWL_GRACIA_MS). */
+  pingTimeout: 20000,
+  pingInterval: 10000,
   cookie: {
     name: 'io',
     httpOnly: true,
@@ -5343,6 +5409,9 @@ io.on("connection", (socket) => {
         return responder({ ok: false, error: 'not_your_plot' });
       }
 
+      if (await esFantasma({ playerName: socket.authenticatedPlayer, address: socket.authenticatedAddress })) {
+        return responder({ ok: false, error: 'You are a ghost — revive first.', fantasma: true });
+      }
       const bloqueo = isPlantLocked(userId);
       if (bloqueo.locked) {
         const min = Math.ceil(bloqueo.secondsRemaining / 60);
@@ -5364,6 +5433,9 @@ io.on("connection", (socket) => {
     try {
       const { userId, plotId, seedType, userStats, successChance } = data;
       if (!assertCropOwner(userId, 'plantError', plotId)) return;
+      if (await esFantasma({ playerName: socket.authenticatedPlayer, address: socket.authenticatedAddress })) {
+        return socket.emit('plantError', { plotId, error: 'You are a ghost — revive first.', fantasma: true });
+      }
 
       const spamCheck = checkAndTrackPlantSpam(userId, seedType);
       if (spamCheck.bloqueado) {
@@ -5386,6 +5458,9 @@ io.on("connection", (socket) => {
     try {
       const { userId, plotId } = data;
       if (!assertCropOwner(userId, 'waterError')) return;
+      if (await esFantasma({ playerName: socket.authenticatedPlayer, address: socket.authenticatedAddress })) {
+        return socket.emit('waterError', { plotId, error: 'You are a ghost — revive first.', fantasma: true });
+      }
       const crop = await cropController.waterCrop(userId, plotId);
       socket.emit('waterSuccess', { plotId, crop });
     } catch (error) {
@@ -5397,6 +5472,9 @@ io.on("connection", (socket) => {
     try {
       const { userId, plotId } = data;
       if (!assertCropOwner(userId, 'harvestError', plotId)) return;
+      if (await esFantasma({ playerName: socket.authenticatedPlayer, address: socket.authenticatedAddress })) {
+        return socket.emit('harvestError', { plotId, error: 'You are a ghost — revive first.', fantasma: true });
+      }
       const result = await cropController.harvestCrop(userId, plotId);
       socket.emit('harvestSuccess', { plotId, rewards: result.rewards });
     } catch (error) {
@@ -5411,6 +5489,9 @@ io.on("connection", (socket) => {
     try {
       const { userId, plotId } = data;
       if (!assertCropOwner(userId, 'cutError', plotId)) return;
+      if (await esFantasma({ playerName: socket.authenticatedPlayer, address: socket.authenticatedAddress })) {
+        return socket.emit('cutError', { plotId, error: 'You are a ghost — revive first.', fantasma: true });
+      }
       const result = await cropController.cutCrop(userId, plotId);
       socket.emit('cutSuccess', { 
         plotId, 
@@ -7692,6 +7773,7 @@ app.post('/api/tree/deforestation',
         return res.status(400).json({ errors: errors.array() });
       }
       const { treeType, increment } = req.body;
+      if (await esFantasma({ address: req.user && req.user.address })) return responderFantasma(res);
 
       const deforest = await Deforestation.findOneAndUpdate(
         { treeType },
@@ -8190,6 +8272,7 @@ app.post('/api/gather/claim',
 
       const address = req.user.address.toLowerCase();
       const { nodeKey, toolId } = req.body;
+      if (await esFantasma({ address })) return responderFantasma(res);
 
       const node = gatherNodeTypeFromKey(nodeKey);
       if (!node) return res.status(400).json({ error: 'invalid_node' });
@@ -9595,12 +9678,13 @@ app.get('/api/load/:playerName',
       }
 
       // EL NIVEL DE LA MASCOTA, el mismo que usa la arena (ver
-      // nivelMascotaEfectivo). Si sale más alto que el guardado —porque el
-      // personaje ha subido de nivel— se guarda (`$max`: nunca baja).
+      // nivelMascotaEfectivo): el del personaje. Se guarda si no coincide,
+      // TAMBIÉN hacia abajo: así se corrigen solas las cuentas que se quedaron
+      // con el 34 o el 52 del fallo de los contadores de toda la vida.
       try {
         const nivelPet = nivelMascotaEfectivo(p);
-        if (nivelPet > (Number(p.petLevel) || 1)) {
-          await GamePlayer.updateOne({ playerName }, { $max: { petLevel: nivelPet } });
+        if (nivelPet !== (Number(p.petLevel) || 1)) {
+          await GamePlayer.updateOne({ playerName }, { $set: { petLevel: nivelPet } });
         }
         p.petLevel = nivelPet;
       } catch (e) { /* se queda el guardado */ }
@@ -9670,6 +9754,7 @@ app.post('/api/water/collect',
         return res.status(403).json({ error: 'No autorizado' });
       }
       
+      if (await esFantasma({ playerName })) return responderFantasma(res);
       const result = await waterCollectionController.collectWater(playerName);
       res.json(result);
     } catch (error) {
@@ -9987,6 +10072,7 @@ app.post('/api/player/death', apiLimiter, authMiddleware, csrfProtection, async 
     gp.deathCount = Math.max(0, Number(gp.deathCount) || 0) + 1;
     gp.isGhost = true;
     await gp.save();
+    olvidarFantasma(gp.playerName, gp.address);
 
     // Se para el reloj de la vida: un muerto no se cura solo esperando.
     if (stats && !stats.vidaCongelada) {
@@ -10041,6 +10127,7 @@ app.post('/api/player/revive', apiLimiter, authMiddleware, csrfProtection, async
 
     gp.isGhost = false;
     await gp.save();
+    olvidarFantasma(gp.playerName, gp.address);
 
     console.log(`💖 ${gp.playerName} revive por ${precio} de plata ` +
                 `(le quedan ${stats.plata}) — vida al ${REVIVIR_VIDA}%`);
@@ -11355,6 +11442,7 @@ app.post('/api/missions/daily/complete',
       const auth = await PlayerAuth.findOne({ address }).exec();
       if (!auth || !auth.playerName) return res.status(404).json({ error: 'player_not_found' });
       const playerName = auth.playerName;
+      if (await esFantasma({ playerName })) return responderFantasma(res);
 
       const npcId     = String(req.body.npcId);
       const missionId = String(req.body.missionId);
@@ -15346,13 +15434,31 @@ const skillsSchema = new mongoose.Schema({
 }, { collection: 'player_skills' });
 const PlayerSkills = mongoose.model('PlayerSkills', skillsSchema);
 
+/* EL NIVEL DEL PERSONAJE NO VIVE AQUÍ.                          (2026-10-02)
+   Este espejo guardaba también `level` y `exp.level` —el nivel y la exp del
+   personaje— y los fusionaba "solo hacia arriba". Bastaba UNA foto con un
+   valor raro para que se quedara para siempre, y el cliente la adoptaba al
+   abrir el panel de habilidades: el nivel saltaba de 5 a 34 "a veces", justo
+   cuando se cargaba el panel. El nivel y su exp viven en GamePlayer y en la
+   factura de exp; aquí ni se guardan ni se devuelven. */
+function sinNivelDelPersonaje(skills) {
+  if (!skills || typeof skills !== 'object') return skills;
+  const limpio = { ...skills };
+  delete limpio.level;
+  if (limpio.exp && typeof limpio.exp === 'object') {
+    limpio.exp = { ...limpio.exp };
+    delete limpio.exp.level;
+  }
+  return limpio;
+}
+
 app.get('/api/skills/:playerName', authMiddleware, async (req, res) => {
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
     // FIX IDOR: no comprobaba dueño — filtraba las habilidades de cualquiera.
     if (!await requireOwner(req, res, playerName)) return;
     const doc = await PlayerSkills.findOne({ playerName }).lean();
-    return res.json({ skills: doc ? doc.skills : {}, skillPoints: doc ? doc.skillPoints : 0 });
+    return res.json({ skills: sinNivelDelPersonaje(doc ? doc.skills : {}), skillPoints: doc ? doc.skillPoints : 0 });
   } catch (err) { return res.status(500).json({ error: 'Internal server error' }); }
 });
 
@@ -15363,7 +15469,8 @@ app.post('/api/skills/:playerName', authMiddleware, csrfProtection, async (req, 
     // cuando el GamePlayer no existía todavía, y con `upsert:true` permitía
     // crear habilidades sobre nombres ajenos aún no registrados.
     if (!await requireOwner(req, res, playerName)) return;
-    const { skills, skillPoints } = req.body;
+    const { skillPoints } = req.body;
+    const skills = sinNivelDelPersonaje(req.body.skills);
     if (!skills || typeof skills !== 'object') return res.status(400).json({ error: 'Invalid' });
 
     // LAS HABILIDADES SOLO SUBEN. Este endpoint es un ESPEJO del panel, y el
@@ -15372,7 +15479,7 @@ app.post('/api/skills/:playerName', authMiddleware, csrfProtection, async (req, 
     // borraría el progreso hecho mientras tanto. Se conserva el mayor de los
     // dos, igual que en /api/save.
     const previo  = await PlayerSkills.findOne({ playerName }).lean();
-    const anterior = (previo && previo.skills) || {};
+    const anterior = sinNivelDelPersonaje((previo && previo.skills) || {});
 
     const mayor = (a, b) => {
       const x = Number(a), y = Number(b);
@@ -15654,6 +15761,7 @@ app.post('/api/furnace/:playerName', authMiddleware, csrfProtection, async (req,
     // FIX IDOR: no comprobaba dueño — se podía sobrescribir (y sabotear) el
     // horno de cualquier otro jugador, incluido su resultado en curso.
     if (!await requireOwner(req, res, playerName)) return;
+    if (await esFantasma({ playerName })) return responderFantasma(res);
     const { oreItem, coalItem, timestamp } = req.body;
     await FurnaceState.findOneAndUpdate(
       { playerName },
@@ -16145,6 +16253,8 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
       return res.status(403).json({ error: 'Forbidden' });
     }
 
+    if (await esFantasma({ playerName })) return responderFantasma(res);
+
     // ── EL COSTE LO DECIDE EL SERVIDOR ────────────────────────────────────
     // ANTES: el coste llegaba en `req.body.costs`. El servidor solo comprobaba
     // que el jugador tuviera saldo suficiente para lo que ÉL MISMO decía que
@@ -16542,11 +16652,23 @@ function computePetLevel(wins, battles) {
  * el que sale de sus victorias de TODA LA VIDA (petWins / petBattles).
  */
 function nivelMascotaEfectivo(gp) {
+  /* EL PERRO TIENE TU NIVEL.                                    (2026-10-02)
+
+     SEGUNDO FALLO, el que trajo el arreglo de arriba: "tengo nivel 5 o 6 y de
+     pronto me dice 34 o 52". El nivel ganado peleando pasó a contarse con las
+     batallas de TODA LA VIDA (5 puntos = 1 nivel, tope 50). Con unas cuantas
+     decenas de partidas la mascota se iba a 30 o 40 mientras el personaje
+     seguía en 5, y como aquí se cogía el MAYOR de los dos —y además se
+     guardaba con $max, que no baja nunca— ese número era el que salía en el
+     cartel del perro, en el panel de la mascota y en la arena. Dos niveles
+     distintos para la misma persona: para el jugador, un nivel "roto".
+
+     Ahora hay UN nivel: el del personaje, que sale de la experiencia. Pelear
+     sigue haciendo subir —la arena da EXP (ver expDeArena)— y lo que se gana
+     ahí lo nota el personaje y, con él, el perro. petWins/petBattles se siguen
+     contando (estadísticas) pero ya no deciden el nivel. */
   if (!gp) return 1;
-  const personaje = Math.max(1, nivelPorExperiencia(gp.nivel_exp));
-  const guardado = Math.max(1, Number(gp.petLevel) || 1);
-  const entrenado = gp.petBattles == null ? 1 : computePetLevel(gp.petWins, gp.petBattles);
-  return Math.min(MAX_LEVEL_PERSONAJE, Math.max(personaje, guardado, entrenado));
+  return Math.min(MAX_LEVEL_PERSONAJE, Math.max(1, nivelPorExperiencia(gp.nivel_exp)));
 }
 
 const battleScoreSchema = new mongoose.Schema({
@@ -16806,12 +16928,14 @@ app.get('/api/battle/leaderboard', apiLimiter, authMiddleware, async (req, res) 
 //    brawl:practica    partida de práctica contra 3 bots (sin puntos)
 //    brawl:mover       { s, x, y, c, a }  dónde está mi perro (20 por segundo)
 //    brawl:disparo     { a, sup, s }       disparo hacia el ángulo a
+//    brawl:volver      { matchId }  se me cortó la red y vuelvo (ver brawlVolver)
 //    brawl:rendirse    caigo, pero me quedo mirando
 //    brawl:salir       me voy (cuenta como rendirse si seguía vivo)
 //
 //  Servidor → cliente: brawl:enCola, brawl:sala, brawl:inicio, brawl:ya,
 //    brawl:snap, brawl:balas, brawl:golpe, brawl:caja, brawl:objeto,
-//    brawl:recoger, brawl:ko, brawl:fin, brawl:error, brawl:fueraCola
+//    brawl:recoger, brawl:boom, brawl:ko, brawl:fin, brawl:error,
+//    brawl:fueraCola, brawl:volverError
 //    (y battle:daily, que es el contador de las diarias que pinta el mapa)
 // ---------------------------------------------------------------------------
 const battleQueue = [];              // sockets esperando rival
@@ -17223,6 +17347,15 @@ function emitBattle(socket, event, payload) {
   catch (e) { console.warn('No se pudo enviar ' + event + ':', e.message); }
 }
 
+/* Las instantáneas (20 por segundo) van "volátiles": si el socket no puede
+   con más ahora mismo (red lenta), esta se DESCARTA en vez de ponerse a la
+   cola. La siguiente llega 50 ms después y la sustituye entera; encolarlas
+   solo acumula retraso, que es lo que se nota como "lag que va a más". */
+function emitBattleVolatil(socket, event, payload) {
+  try { if (socket && socket.connected !== false) (socket.volatile || socket).emit(event, payload); }
+  catch (e) { /* una instantánea perdida no importa */ }
+}
+
 /**
  * Espera a una promesa, pero no para siempre.
  *
@@ -17314,10 +17447,10 @@ async function construirJugadorDeSocket(socket) {
       .select('nivel_exp petName petHealth petLevel petWins petBattles').lean();
     if (gp) {
       /* EL NIVEL LO CALCULA EL SERVIDOR, Y ES EL MISMO QUE SE VE EN EL MAPA.
-         Sale de nivelMascotaEfectivo(): el mayor entre el del personaje (de la
-         experiencia, respaldada por el contrato — ver nivelPorExperiencia) y
-         el que la mascota ha ganado peleando. Nunca de `gp.nivel`, que lo
-         escribía el cliente y bastaba para entrar con nivel 150.
+         Sale de nivelMascotaEfectivo(): el del personaje, de la experiencia
+         (respaldada por el contrato — ver nivelPorExperiencia). Nunca de
+         `gp.nivel`, que lo escribía el cliente y bastaba para entrar con
+         nivel 150.
 
          Antes el combate usaba este número y el mapa enseñaba solo el de las
          peleas: el mismo perro salía "Lv.7" en la batalla y "Lv.2" en el
@@ -17428,10 +17561,19 @@ const GFBrawlMotor = (function () {
  *   brawl:balas    alguien ha disparado (para dibujar las balas)
  *   brawl:golpe    una bala ha dado a alguien
  *   brawl:caja     una caja ha recibido un golpe o se ha roto
- *   brawl:objeto   ha aparecido un hueso en el suelo
- *   brawl:recoger  alguien ha cogido un hueso
+ *   brawl:objeto   ha aparecido algo en el suelo: un hueso o carne (cura)
+ *   brawl:recoger  alguien lo ha cogido
+ *   brawl:boom     ha explotado un barril (x, y, radio)
  *   brawl:ko       alguien ha caído
  *   brawl:fin      (lo manda el host, con los puntos ya guardados)
+ *
+ * SI SE CAE LA CONEXIÓN (2026-10-02)
+ * ---------------------------------------------------------------------------
+ *   desconectar(P, id)   el perro NO cae: lo lleva un piloto automático flojo
+ *                        y no se le manda nada mientras tanto.
+ *   reconectar(P, id)    vuelve: se le manda la partida tal y como está (un
+ *                        brawl:inicio con `reanudar`) y recupera el mando.
+ * El host decide cuánto se espera; si se cansa, llama a abandonar().
  */
 (function (raiz, fabrica) {
   var api = fabrica();
@@ -17440,12 +17582,13 @@ const GFBrawlMotor = (function () {
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  var VERSION = 1;
+  var VERSION = 2;
 
   /* <<ARENAS>> — lo escribe tools/generar-arenas.py a partir de los mapas.
      No se edita a mano: se cambia el mapa (o el diseño del generador) y se
      vuelve a lanzar. Leyenda: "#" muro, "~" agua, "*" arbusto, "c" caja,
-     "o" caja dorada, "=" puente, "." libre. Apariciones en casillas. */
+     "o" caja dorada, "x" barril, "+" comedero, "=" puente, "." libre.
+     Apariciones en casillas. */
   var ARENAS = {
     pradera: {
       nombre: 'Meadow', ancho: 30, alto: 22, celda: 32,
@@ -17453,22 +17596,22 @@ const GFBrawlMotor = (function () {
         '..............................',
         '.....#....***.........c.......',
         '.....#....****................',
-        '.....###...***................',
+        '.....###...***+...............',
         '.......................###....',
         '........c..........****..#....',
         '.**............o...****..#....',
-        '.***c..##.....................',
+        '.***c..##..xx.................',
         '.......##.....................',
         '.............~~~~....##..***..',
         '............~~~~~~............',
         '............~~~~~~............',
         '..***..##....~~~~.............',
         '.....................##.......',
-        '.....................##..c***.',
+        '.................xx..##..c***.',
         '....#..****...o............**.',
         '....#..****..........c........',
         '....###.......................',
-        '................***...###.....',
+        '...............+***...###.....',
         '................****....#.....',
         '.......c.........***....#.....',
         '..............................'
@@ -17482,9 +17625,9 @@ const GFBrawlMotor = (function () {
         '.............****........c....',
         '......####....................',
         '......#..............#........',
-        '......***..c.........###......',
+        '......***..c....xx...###......',
         '**....**.....##...............',
-        '**............................',
+        '**......................+.....',
         '**..c....#......o....***......',
         '..................#..***..##..',
         '.............~~~~.#...........',
@@ -17493,9 +17636,9 @@ const GFBrawlMotor = (function () {
         '...........#.~~~~.............',
         '..##..***..#..................',
         '......***....o......#....c..**',
-        '............................**',
+        '.....+......................**',
         '...............##.....**....**',
-        '......###.........c..***......',
+        '......###...xx....c..***......',
         '........#..............#......',
         '....................####......',
         '....c........****.............',
@@ -17510,26 +17653,82 @@ const GFBrawlMotor = (function () {
         '..................c...........',
         '.........###..........#.......',
         '.........#..........###.......',
-        '***........***................',
+        '***........***...+............',
         '...c.......****.#......***....',
         '....##..........#......***c...',
-        '.............o................',
+        '.............o......xx........',
         '...........~~~~~........~~~...',
         '~~~~~~==~~~~~~~~~~~~~~==~~~~~~',
         '~~~~~~==~~~~~~~~~~~~~~==~~~~~~',
         '~~~~~~==~~~~~~~~~~~~~~==~~~~~~',
         '~~~~~~==~~~~~~~~~~~~~~==~~~~~~',
         '...~~~........~~~~~...........',
-        '................o.............',
+        '........xx......o.............',
         '...c***......#..........##....',
         '....***......#.****.......c...',
-        '................***........***',
+        '............+...***........***',
         '.......###..........#.........',
         '.......#..........###.........',
         '...........c..................',
         '..............................'
       ],
       apariciones: [[2,2],[27,2],[14,3],[27,19],[2,19],[15,18]]
+    },
+    nieve: {
+      nombre: 'Frostfield', ancho: 30, alto: 22, celda: 32,
+      filas: [
+        '..............................',
+        '.....##.....+.......c.........',
+        '.....#..***...................',
+        '........****..........###.....',
+        '........................#.....',
+        '**........c...................',
+        '**..~~.............x....***...',
+        '....~~.........o........***...',
+        '.......x....##................',
+        '..................#...........',
+        '..............................',
+        '..............................',
+        '...........#..................',
+        '................##....x.......',
+        '...***........o.........~~....',
+        '...***....x.............~~..**',
+        '...................c........**',
+        '.....#........................',
+        '.....###..........****........',
+        '...................***..#.....',
+        '.........c.......+.....##.....',
+        '..............................'
+      ],
+      apariciones: [[2,2],[27,2],[14,3],[27,19],[2,19],[15,18]]
+    },
+    canon: {
+      nombre: 'Canyon', ancho: 30, alto: 22, celda: 32,
+      filas: [
+        '.......................##.....',
+        '.....###...+.c.........##.....',
+        '.....###...............##.....',
+        '........xx....................',
+        '.................#............',
+        '.................#........x...',
+        '**..............o.............',
+        '***.......##..................',
+        '...c...............x....**....',
+        '........***..~~~~.......**....',
+        '.............~~~~.............',
+        '.............~~~~.............',
+        '....**.......~~~~..***........',
+        '....**....x...............c...',
+        '..................##.......***',
+        '.............o..............**',
+        '...x........#.................',
+        '............#.................',
+        '....................xx........',
+        '.....##...............###.....',
+        '.....##.........c.+...###.....',
+        '.....##.......................'
+      ],
+      apariciones: [[2,2],[27,3],[13,4],[27,19],[2,18],[16,17]]
     }
   };
   /* <</ARENAS>> */
@@ -17547,11 +17746,22 @@ const GFBrawlMotor = (function () {
    *    con 6 ladridos a nivel 1 y con 5-6 a nivel 10: los combates duran lo
    *    que tarda en recargarse dos veces el cargador, que es lo que hace que
    *    apuntar importe más que tener nivel.
-   *  · La NIEBLA empieza a cerrar a los 40 s y deja el centro a los 140 s.
-   *    Sin ella, dos jugadores prudentes se pasan la partida escondidos en la
-   *    hierba; con ella, la partida acaba sí o sí en menos de tres minutos.
+   *  · La NIEBLA cierra en TRES FASES (ver ZONA_FASES). Antes empezaba a los
+   *    40 s cubriendo hasta las esquinas y encogía con una curva que apenas se
+   *    movía al principio: con la cámara siguiendo al perro y partidas de 1
+   *    contra 1 que acababan en un minuto, no se llegaba a ver nunca ("la zona
+   *    que se cierra no está"). Ahora el anillo de la PRÓXIMA zona segura se
+   *    ve desde el primer segundo, la niebla entra a los 15 s, cada fase
+   *    mueve el centro a un sitio al azar (hay que moverse, no basta con
+   *    quedarse en medio) y pega más que la anterior. Todo cerrado a los 80 s.
    *  · La VIDA se REGENERA sola a los 3 s sin pegar ni recibir: premia saber
    *    retirarse, y castiga quedarse a pegar con poca vida.
+   *  · BARRILES ('x'): aguantan dos golpes y al romperse EXPLOTAN — quitan
+   *    hasta un 32 % de la vida máxima a quien pille cerca (también a quien
+   *    dispara, si está encima), empujan, rompen cajas y encienden a los
+   *    barriles de al lado. Un muro en medio protege.
+   *  · COMEDEROS ('+'): cada 15 s sale carne que cura un 35 %. Solo la coge
+   *    quien está herido: no se puede "gastar" para que no la pille otro.
    */
   var REGLAS = {
     TICK_MS: 50,                 // 20 pasos de simulación por segundo
@@ -17563,12 +17773,28 @@ const GFBrawlMotor = (function () {
     REGEN_ESPERA_MS: 3000,
     REGEN_POR_S: 0.10,           // de la vida máxima
     CUENTA_MS: 3000,
-    ZONA_INICIO_MS: 40000,
-    ZONA_FIN_MS: 140000,
-    DURACION_MAX_MS: 170000,
+    /* Las fases de la niebla, en ms de combate. `frac` = radio final de la
+       fase en proporción a la mitad del lado largo de la arena (0 = el radio
+       final); `dano` = vida máxima que quita por segundo a quien está fuera,
+       desde que empieza esa fase hasta que empieza la siguiente. */
+    ZONA_FASES: [
+      { desde: 15000, hasta: 30000, frac: 0.72, dano: 0.05 },
+      { desde: 42000, hasta: 57000, frac: 0.40, dano: 0.08 },
+      { desde: 67000, hasta: 80000, frac: 0,    dano: 0.12 }
+    ],
+    ZONA_INICIO_MS: 15000,       // = la primera fase (el reloj del cliente lo usa)
+    ZONA_FIN_MS: 80000,          // cerrada del todo
+    DURACION_MAX_MS: 115000,
     ZONA_RADIO_FINAL: 80,
-    ZONA_DANO_S: 0.07,           // de la vida máxima, por segundo, fuera
     ZONA_DANO_FINAL_S: 0.16,     // cuando ya se ha cerrado del todo
+    BARRIL_VIDA: 2,
+    BARRIL_RADIO: 76,
+    BARRIL_DANO: 0.32,           // de la vida máxima, en el centro (0,14 en el borde)
+    BARRIL_EMPUJE: 74,
+    BARRIL_CADENA_MS: 160,       // lo que tarda en saltar el barril de al lado
+    CURA_PRIMERA_MS: 9000,
+    CURA_CADA_MS: 15000,
+    CURA_VIDA: 0.35,
     VISION_ARBUSTO: 84,          // a esta distancia ves a quien está en la hierba
     REVELA_MS: 1200,             // disparar o recibir te delata este rato
     CAJA_VIDA: 2,                // golpes que aguanta una caja
@@ -17646,22 +17872,27 @@ const GFBrawlMotor = (function () {
        'o' caja oro  igual, y al romperse suelta un hueso
        '*' arbusto   se atraviesa; quien está dentro no se ve
        '=' puente    se anda por encima del agua
+       'x' barril    como una caja, pero al romperse explota
+       '+' comedero  se pisa; de vez en cuando sale carne que cura
        '.' libre */
   function crearRejilla(def) {
     var W = def.ancho | 0, Hh = def.alto | 0, C = def.celda || 32;
     var celdas = new Array(W * Hh);
     var cajas = {};
+    var curas = [];
     for (var y = 0; y < Hh; y++) {
       var fila = String((def.filas && def.filas[y]) || '');
       for (var x = 0; x < W; x++) {
         var ch = fila.charAt(x) || '#';
-        if ('#~*co=.'.indexOf(ch) < 0) ch = '.';
+        if ('#~*cox+=.'.indexOf(ch) < 0) ch = '.';
         celdas[y * W + x] = ch;
         if (ch === 'c') cajas[y * W + x] = { vida: REGLAS.CAJA_VIDA, max: REGLAS.CAJA_VIDA, oro: false };
         if (ch === 'o') cajas[y * W + x] = { vida: REGLAS.CAJA_ORO_VIDA, max: REGLAS.CAJA_ORO_VIDA, oro: true };
+        if (ch === 'x') cajas[y * W + x] = { vida: REGLAS.BARRIL_VIDA, max: REGLAS.BARRIL_VIDA, oro: false, barril: true };
+        if (ch === '+') curas.push(y * W + x);
       }
     }
-    return { ancho: W, alto: Hh, celda: C, celdas: celdas, cajas: cajas, anchoPx: W * C, altoPx: Hh * C };
+    return { ancho: W, alto: Hh, celda: C, celdas: celdas, cajas: cajas, curas: curas, anchoPx: W * C, altoPx: Hh * C };
   }
 
   /** La rejilla como filas de texto (lo que se manda al cliente). */
@@ -17680,8 +17911,9 @@ const GFBrawlMotor = (function () {
     return celdaEn(R, Math.floor(x / R.celda), Math.floor(y / R.celda));
   }
 
-  function bloqueaPaso(ch) { return ch === '#' || ch === '~' || ch === 'c' || ch === 'o'; }
-  function bloqueaBala(ch) { return ch === '#' || ch === 'c' || ch === 'o'; }
+  function bloqueaPaso(ch) { return ch === '#' || ch === '~' || ch === 'c' || ch === 'o' || ch === 'x'; }
+  function bloqueaBala(ch) { return ch === '#' || ch === 'c' || ch === 'o' || ch === 'x'; }
+  function esCaja(ch) { return ch === 'c' || ch === 'o' || ch === 'x'; }
 
   /** Quita una caja rota: la casilla pasa a ser suelo. */
   function romperCaja(R, idx) {
@@ -17771,7 +18003,7 @@ const GFBrawlMotor = (function () {
       var cx = Math.floor(b.x / R.celda), cy = Math.floor(b.y / R.celda);
       var ch = celdaEn(R, cx, cy);
       if (bloqueaBala(ch)) {
-        if (ch === 'c' || ch === 'o') return { caja: cy * R.ancho + cx };
+        if (esCaja(ch)) return { caja: cy * R.ancho + cx };
         return { muro: true };
       }
       if (alPaso && alPaso(b)) return { luchador: true };
@@ -17841,6 +18073,8 @@ const GFBrawlMotor = (function () {
       enviar: op.enviar || function () {},
       alTerminar: op.alTerminar || function () {},
       zona: null,
+      curas: [],
+      pendientes: [],      // barriles que van a saltar en cadena { t, idx, duenio }
       resumen: null,
       extraInicio: op.extraInicio || null
     };
@@ -17856,20 +18090,84 @@ const GFBrawlMotor = (function () {
     }
     P.luchadores.forEach(function (l) { P.porId[l.id] = l; });
 
-    var cx = R.anchoPx / 2, cy = R.altoPx / 2;
     /* `x`/`y` además de `cx`/`cy`: dist2() lee x e y. Sin ellos la distancia a
        la zona salía NaN, "fuera de la niebla" no era nunca verdad y la niebla
        no hacía daño a nadie (ni los bots huían de ella). Lo cazó
-       tools/brawl-prueba-motor.js. */
+       tools/brawl-prueba-motor.js. Ahora además el centro SE MUEVE en cada
+       fase (ver planDeZona y actualizarZona), así que x/y/cx/cy son el centro
+       de AHORA, no el de la arena. */
+    var plan = planDeZona(P);
     P.zona = {
-      cx: cx, cy: cy, x: cx, y: cy,
-      r0: Math.sqrt(cx * cx + cy * cy) + R.celda,
-      rFin: REGLAS.ZONA_RADIO_FINAL,
-      r: Math.sqrt(cx * cx + cy * cy) + R.celda
+      cx: plan.cx, cy: plan.cy, x: plan.cx, y: plan.cy,
+      r0: plan.r0, rFin: REGLAS.ZONA_RADIO_FINAL, r: plan.r0,
+      plan: plan.fases,
+      activa: false, estado: 0, sig: null, cambioEn: 0, dano: 0
     };
+    actualizarZona(P, 0);
+
+    P.curas = (R.curas || []).map(function (idx) {
+      var c = celdaCentro(R, idx % R.ancho, Math.floor(idx / R.ancho));
+      return { idx: idx, x: c.x, y: c.y, proxima: REGLAS.CURA_PRIMERA_MS, objeto: 0 };
+    });
 
     P.luchadores.forEach(function (l) { enviarInicio(P, l); });
     return P;
+  }
+
+  /**
+   * EL PLAN DE LA NIEBLA, decidido al empezar (con el azar de la partida: las
+   * pruebas lo repiten igual). Cada fase encoge hacia un centro NUEVO que cae
+   * dentro del círculo anterior —el nuevo círculo entero dentro del viejo,
+   * así nadie que estaba a salvo se queda fuera de golpe— y sobre suelo que
+   * se pisa (nunca en el agua ni en un muro). La primera se mueve poco: si
+   * no, media arena quedaría lejísimos de la zona buena desde el principio.
+   */
+  /** El centro de la casilla pisable más cercana a `p`, a `max` px como mucho. */
+  function celdaPisableCerca(R, p, max, margen) {
+    var cx = Math.floor(p.x / R.celda), cy = Math.floor(p.y / R.celda);
+    var mejor = null, md = Infinity, radio = Math.ceil(max / R.celda);
+    for (var y = cy - radio; y <= cy + radio; y++) {
+      for (var x = cx - radio; x <= cx + radio; x++) {
+        if (x < 0 || y < 0 || x >= R.ancho || y >= R.alto || bloqueaPaso(celdaEn(R, x, y))) continue;
+        var q = celdaCentro(R, x, y);
+        if (q.x < margen || q.y < margen || q.x > R.anchoPx - margen || q.y > R.altoPx - margen) continue;
+        var d = Math.sqrt((q.x - p.x) * (q.x - p.x) + (q.y - p.y) * (q.y - p.y));
+        if (d <= max && d < md) { md = d; mejor = q; }
+      }
+    }
+    return mejor;
+  }
+
+  function planDeZona(P) {
+    var R = P.R, az = P.azar;
+    var cx = R.anchoPx / 2, cy = R.altoPx / 2;
+    var rBase = Math.max(cx, cy);
+    var r0 = Math.sqrt(cx * cx + cy * cy) + R.celda;     // cubre hasta las esquinas
+    var fases = [], prev = { x: cx, y: cy, r: r0 };
+    for (var i = 0; i < REGLAS.ZONA_FASES.length; i++) {
+      var f = REGLAS.ZONA_FASES[i];
+      var r = f.frac > 0 ? Math.max(REGLAS.ZONA_RADIO_FINAL, rBase * f.frac) : REGLAS.ZONA_RADIO_FINAL;
+      var maxDesv = i === 0 ? rBase * 0.16 : Math.max(0, (prev.r - r) * 0.75);
+      var margen = Math.min(r, rBase * 0.5) * 0.6 + R.celda;
+      var c = { x: prev.x, y: prev.y };
+      var hallado = false;
+      for (var k = 0; k < 16 && !hallado; k++) {
+        var ang = az() * Math.PI * 2, d = Math.sqrt(az()) * maxDesv;
+        var x = Math.max(margen, Math.min(R.anchoPx - margen, prev.x + Math.cos(ang) * d));
+        var y = Math.max(margen, Math.min(R.altoPx - margen, prev.y + Math.sin(ang) * d));
+        if (bloqueaPaso(celdaDePunto(R, x, y))) continue;
+        c = { x: x, y: y };
+        hallado = true;
+      }
+      // Ninguna tirada cayó en suelo (un estanque en medio de la arena): la
+      // casilla pisable más cercana al centro anterior que siga dejando el
+      // círculo nuevo dentro del viejo.
+      if (!hallado) c = celdaPisableCerca(R, prev, prev.r - r, margen) || c;
+      fases.push({ desde: f.desde, hasta: f.hasta, dano: f.dano,
+                   x0: prev.x, y0: prev.y, r0: prev.r, x1: c.x, y1: c.y, r1: r });
+      prev = { x: c.x, y: c.y, r: r };
+    }
+    return { cx: cx, cy: cy, r0: r0, fases: fases };
   }
 
   /*  LA SALUD CON LA QUE SE ENTRA.
@@ -17935,9 +18233,11 @@ const GFBrawlMotor = (function () {
       puesto: null,
       muertoEn: null,
       fuera: false,          // se fue de la partida (rendición o desconexión)
+      sinConexion: 0,        // desde cuándo no tiene conexión (lo lleva el piloto)
+      ultimoGolpe: null,     // { id, t } quién le pegó por última vez
       ia: null
     };
-    if (l.bot) l.ia = crearIA(s.astucia);
+    if (l.bot) l.ia = crearIA(s.astucia, P.azar);
     return l;
   }
 
@@ -17947,7 +18247,8 @@ const GFBrawlMotor = (function () {
       address: l.address ? (l.address.length > 10 ? l.address.slice(0, 6) + '…' + l.address.slice(-4) : l.address) : '',
       especie: l.especie, etiqueta: especie(l.especie).etiqueta,
       nivel: l.nivel, maxHp: l.maxHp, hp: l.hp, x: redondea(l.x, 2), y: redondea(l.y, 2),
-      vel: l.vel, bot: l.bot, arma: l.armaId, super: l.superId
+      vel: l.vel, bot: l.bot, arma: l.armaId, super: l.superId,
+      vivo: l.vivo, potencia: l.potencia
     };
   }
 
@@ -17959,15 +18260,20 @@ const GFBrawlMotor = (function () {
     };
   }
 
+  /* El inicio de la partida. También se manda a mitad (reconectar): por eso
+     lleva el ESTADO de ahora —quién sigue vivo, las cajas que quedan, lo que
+     hay en el suelo, en qué fase va la niebla— y no solo el del principio. */
   function enviarInicio(P, l) {
-    if (!l.humano) return;
+    if (!l.humano || l.sinConexion) return;
     var armas = {};
     Object.keys(ARMAS).forEach(function (k) { armas[k] = armaPublica(ARMAS[k]); });
     var cajas = [];
     Object.keys(P.R.cajas).forEach(function (k) {
       var c = P.R.cajas[k];
-      cajas.push([Number(k), c.vida, c.max, c.oro ? 1 : 0]);
+      cajas.push([Number(k), c.vida, c.max, c.oro ? 1 : 0, c.barril ? 1 : 0]);
     });
+    var ahora = P.ahora();
+    var z = P.zona;
     P.enviar(l, 'brawl:inicio', {
       matchId: P.id,
       modo: P.modo,
@@ -17986,11 +18292,18 @@ const GFBrawlMotor = (function () {
         huesoMax: REGLAS.HUESO_MAX
       },
       zona: {
-        cx: P.zona.cx, cy: P.zona.cy, r0: P.zona.r0, rFin: P.zona.rFin,
-        inicioMs: REGLAS.ZONA_INICIO_MS, finMs: REGLAS.ZONA_FIN_MS, maxMs: REGLAS.DURACION_MAX_MS
+        cx: z.x, cy: z.y, r0: z.r0, rFin: z.rFin, r: z.r,
+        inicioMs: REGLAS.ZONA_INICIO_MS, finMs: REGLAS.ZONA_FIN_MS, maxMs: REGLAS.DURACION_MAX_MS,
+        // [desde, hasta, x, y, r] del final de cada fase (el cliente pinta el anillo siguiente)
+        fases: z.plan.map(function (f) { return [f.desde, f.hasta, redondea(f.x1), redondea(f.y1), redondea(f.r1)]; })
       },
-      cuentaMs: Math.max(0, P.tCombate - P.ahora()),
-      serverNow: P.ahora(),
+      objetos: P.objetos.map(function (o) { return [o.id, redondea(o.x, 2), redondea(o.y, 2), o.tipo]; }),
+      curas: P.curas.map(function (c) { return [redondea(c.x), redondea(c.y)]; }),
+      fase: P.fase,
+      reanudar: P.fase !== 'cuenta',
+      enCombateMs: P.fase === 'combate' ? Math.max(0, ahora - P.tCombate) : 0,
+      cuentaMs: Math.max(0, P.tCombate - ahora),
+      serverNow: ahora,
       extra: P.extraInicio
     });
   }
@@ -17998,7 +18311,7 @@ const GFBrawlMotor = (function () {
   function difundir(P, ev, datos) {
     for (var i = 0; i < P.luchadores.length; i++) {
       var l = P.luchadores[i];
-      if (l.humano && !l.fuera) P.enviar(l, ev, datos);
+      if (l.humano && !l.fuera && !l.sinConexion) P.enviar(l, ev, datos);
     }
   }
 
@@ -18023,7 +18336,7 @@ const GFBrawlMotor = (function () {
    */
   function entrada(P, id, datos) {
     var l = P.porId[id];
-    if (!l || !l.vivo || l.fuera || P.fase !== 'combate' || !datos) return;
+    if (!l || !l.vivo || l.fuera || l.sinConexion || P.fase !== 'combate' || !datos) return;
     var ahora = P.ahora();
     var seq = Number(datos.s);
     var x = Number(datos.x), y = Number(datos.y);
@@ -18074,7 +18387,7 @@ const GFBrawlMotor = (function () {
    */
   function disparar(P, id, datos) {
     var l = P.porId[id];
-    if (!l || !l.vivo || l.fuera || P.fase !== 'combate' || !datos) return false;
+    if (!l || !l.vivo || l.fuera || l.sinConexion || P.fase !== 'combate' || !datos) return false;
     var a = Number(datos.a);
     if (!Number.isFinite(a)) return false;
     return dispararAngulo(P, l, a, !!datos.sup, datos.s);
@@ -18118,6 +18431,7 @@ const GFBrawlMotor = (function () {
         rompe: !!arma.rompe,
         carga: sup ? 0 : arma.carga,
         tipo: arma.tipo,
+        nacio: ahora,
         golpeados: {}
       };
       P.balas.push(b);
@@ -18140,10 +18454,52 @@ const GFBrawlMotor = (function () {
     if (P.fase === 'cuenta' && humanosVivos(P) === 0) terminar(P, 'abandono');
   }
 
+  /**
+   * SE HA CAÍDO LA CONEXIÓN de un humano (lo dice el host).
+   *
+   * FALLO QUE ESTO ARREGLA (2026-10-02): "cuando hay reconexión a veces se
+   * sale de la partida y no reconecta". Un corte de red de dos segundos
+   * —un túnel, cambiar de wifi a datos— contaba como irse: el perro caía al
+   * instante y, al volver, el jugador ya no tenía partida.
+   *
+   * Ahora no cae: lo lleva un piloto automático flojo (astucia 0,3, el mismo
+   * cerebro que los bots) para que no sea un saco de boxeo quieto, y no se le
+   * manda nada. Si vuelve, reconectar(); si el host se cansa, abandonar().
+   */
+  function desconectar(P, id) {
+    var l = P.porId[id];
+    if (!l || !l.humano || l.fuera || P.fase === 'fin') return false;
+    if (!l.sinConexion) l.sinConexion = P.ahora();
+    if (!l.ia) l.ia = crearIA(0.3, P.azar);
+    l.ia.proxima = 0;
+    l.moviendo = false;
+    return true;
+  }
+
+  /** Vuelve la conexión: se le manda la partida tal y como está ahora. */
+  function reconectar(P, id) {
+    var l = P.porId[id];
+    if (!l || !l.humano || l.fuera || P.fase === 'fin') return false;
+    l.sinConexion = 0;
+    if (l.ia) { l.ia.dirX = l.ia.dirY = l.ia.velX = l.ia.velY = 0; l.ia.esquiva = null; }
+    l.ultimaEntrada = P.ahora();
+    l.presupuesto = 0;
+    // El cliente que vuelve empieza a contar sus entradas desde cero, y tiene
+    // que coger la posición buena antes de que se le acepte ninguna (ver `c`
+    // en entrada()): por eso se abre una corrección nueva.
+    l.seq = 0;
+    l.correccion++;
+    l.corregir = true;
+    enviarInicio(P, l);
+    return true;
+  }
+
   function humanosVivos(P) {
     var n = 0;
     for (var i = 0; i < P.luchadores.length; i++) {
       var l = P.luchadores[i];
+      // El que está sin conexión cuenta como vivo: si no, una práctica se
+      // acabaría sola en cuanto se corta la red un segundo.
       if (l.humano && l.vivo && !l.fuera) n++;
     }
     return n;
@@ -18199,14 +18555,14 @@ const GFBrawlMotor = (function () {
         if (t >= e.hasta) l.empuje = null;
         l.correccion++; l.corregir = true;
       }
-      // los bots piensan y andan
-      if (l.bot) pensarBot(P, l, t, dt);
+      // los bots piensan y andan (y el piloto de quien se quedó sin conexión)
+      if (l.bot || l.sinConexion) pensarBot(P, l, t, dt);
       l.enArbusto = celdaDePunto(P.R, l.x, l.y) === '*';
-      // niebla
-      var fuera = Math.sqrt(dist2(l, P.zona)) > P.zona.r;
-      if (fuera && enCombate >= REGLAS.ZONA_INICIO_MS) {
-        var frac = enCombate >= REGLAS.ZONA_FIN_MS ? REGLAS.ZONA_DANO_FINAL_S : REGLAS.ZONA_DANO_S;
-        var d = Math.max(1, Math.round(l.maxHp * frac * dt));
+      // niebla: quita lo que diga la fase en la que va
+      var z = P.zona;
+      var fuera = z.activa && Math.sqrt(dist2(l, z)) > z.r;
+      if (fuera) {
+        var d = Math.max(1, Math.round(l.maxHp * z.dano * dt));
         l.hp -= d;
         l.regenDesde = t + REGLAS.REGEN_ESPERA_MS;
         if (l.hp <= 0) { l.hp = 0; caer(P, l, null); continue; }
@@ -18216,8 +18572,29 @@ const GFBrawlMotor = (function () {
       }
     }
 
+    // Barriles que saltan en cadena (los encendió otra explosión).
+    if (P.pendientes.length) {
+      var aun = [];
+      for (var q = 0; q < P.pendientes.length; q++) {
+        var pe = P.pendientes[q];
+        if (t >= pe.t) golpearCaja(P, pe.idx, { rompe: true, duenio: pe.duenio }, t);
+        else aun.push(pe);
+      }
+      P.pendientes = aun;
+    }
+
     moverBalas(P, t, dt);
     recogerObjetos(P, t);
+
+    // Los comederos: sale carne cuando toca.
+    for (var c = 0; c < P.curas.length; c++) {
+      var cu = P.curas[c];
+      if (cu.objeto || enCombate < cu.proxima) continue;
+      var o = { id: P.sigObjeto++, x: cu.x, y: cu.y, tipo: 'carne', cura: c };
+      P.objetos.push(o);
+      cu.objeto = o.id;
+      difundir(P, 'brawl:objeto', { id: o.id, x: redondea(o.x, 2), y: redondea(o.y, 2), tipo: 'carne' });
+    }
 
     // ¿Se acabó?
     var quedan = vivos(P);
@@ -18226,13 +18603,39 @@ const GFBrawlMotor = (function () {
     if (enCombate >= REGLAS.DURACION_MAX_MS) terminar(P, 'tiempo');
   }
 
+  /**
+   * Dónde está la niebla AHORA. Tres estados, que el cliente pinta distinto:
+   *   0 esperando  — quieta; ya se ve el anillo de la siguiente zona segura
+   *   1 cerrando   — encoge y se desplaza hacia ese anillo
+   *   2 cerrada    — el último círculo; fuera pega lo máximo
+   * `sig` es el anillo hacia el que va (null cuando ya está cerrada) y
+   * `cambioEn` cuándo pasa al estado siguiente (ms de combate).
+   */
   function actualizarZona(P, enCombate) {
-    var z = P.zona;
-    if (enCombate <= REGLAS.ZONA_INICIO_MS) { z.r = z.r0; return; }
-    var f = Math.min(1, (enCombate - REGLAS.ZONA_INICIO_MS) / (REGLAS.ZONA_FIN_MS - REGLAS.ZONA_INICIO_MS));
-    // suave al principio y al final
-    var s = f * f * (3 - 2 * f);
-    z.r = z.r0 + (z.rFin - z.r0) * s;
+    var z = P.zona, plan = z.plan;
+    z.activa = enCombate >= plan[0].desde;
+    var i = 0;
+    while (i < plan.length && enCombate >= plan[i].hasta) i++;
+    if (i >= plan.length) {
+      var u = plan[plan.length - 1];
+      z.x = z.cx = u.x1; z.y = z.cy = u.y1; z.r = u.r1;
+      z.estado = 2; z.sig = null; z.cambioEn = 0; z.dano = REGLAS.ZONA_DANO_FINAL_S;
+      return;
+    }
+    var f = plan[i];
+    if (enCombate < f.desde) {
+      z.x = z.cx = f.x0; z.y = z.cy = f.y0; z.r = f.r0;
+      z.estado = 0; z.cambioEn = f.desde;
+      z.dano = i > 0 ? plan[i - 1].dano : 0;
+    } else {
+      // Lineal: a velocidad constante se entiende mejor hacia dónde va.
+      var k = (enCombate - f.desde) / (f.hasta - f.desde);
+      z.x = z.cx = f.x0 + (f.x1 - f.x0) * k;
+      z.y = z.cy = f.y0 + (f.y1 - f.y0) * k;
+      z.r = f.r0 + (f.r1 - f.r0) * k;
+      z.estado = 1; z.cambioEn = f.hasta; z.dano = f.dano;
+    }
+    z.sig = { x: f.x1, y: f.y1, r: f.r1 };
   }
 
   function moverBalas(P, t, dt) {
@@ -18276,6 +18679,7 @@ const GFBrawlMotor = (function () {
       duenio.regenDesde = t + REGLAS.REGEN_ESPERA_MS;
       duenio.dano += d;
       if (b.carga) duenio.superCarga = Math.min(1, duenio.superCarga + b.carga);
+      anotarGolpe(l, duenio, t);
     }
     if (b.empuje) {
       var v = b.empuje / 0.18;          // recorre `empuje` px en 180 ms
@@ -18288,6 +18692,13 @@ const GFBrawlMotor = (function () {
     if (l.hp <= 0) caer(P, l, duenio);
   }
 
+  /** Quién le pegó (para que los bots se defiendan de quien les ataca). */
+  function anotarGolpe(l, duenio, t) {
+    if (!duenio || duenio === l) return;
+    l.ultimoGolpe = { id: duenio.id, t: t };
+    if (l.ia) l.ia.amenazas[duenio.id] = { t: t };
+  }
+
   function golpearCaja(P, idx, b, t) {
     var c = P.R.cajas[idx];
     if (!c) return;
@@ -18295,8 +18706,67 @@ const GFBrawlMotor = (function () {
     var x = (idx % P.R.ancho + 0.5) * P.R.celda, y = (Math.floor(idx / P.R.ancho) + 0.5) * P.R.celda;
     var rota = c.vida <= 0;
     if (rota) romperCaja(P.R, idx);
-    difundir(P, 'brawl:caja', { i: idx, vida: Math.max(0, c.vida), max: c.max, rota: rota ? 1 : 0, oro: c.oro ? 1 : 0 });
+    difundir(P, 'brawl:caja', { i: idx, vida: Math.max(0, c.vida), max: c.max, rota: rota ? 1 : 0, oro: c.oro ? 1 : 0, barril: c.barril ? 1 : 0 });
     if (rota && c.oro) soltarHuesos(P, x, y, 1);
+    if (rota && c.barril) explotar(P, x, y, b.duenio, t);
+  }
+
+  /**
+   * UN BARRIL EXPLOTA en (x, y). Quita vida a quien esté cerca (menos cuanto
+   * más lejos), le empuja hacia fuera, da un golpe a las cajas de alrededor y
+   * enciende a los barriles vecinos, que saltan un instante después: así una
+   * fila de barriles es una mecha y se ve correr.
+   * Un muro entre el barril y el luchador le protege (lineaDeTiro).
+   * El daño se le apunta a quien rompió el barril; si se pilla a sí mismo,
+   * no cuenta como baja.
+   */
+  function explotar(P, x, y, duenioId, t) {
+    var R = P.R, rad = REGLAS.BARRIL_RADIO;
+    var duenio = duenioId ? P.porId[duenioId] : null;
+    difundir(P, 'brawl:boom', { x: redondea(x, 2), y: redondea(y, 2), r: rad });
+    for (var i = 0; i < P.luchadores.length; i++) {
+      var l = P.luchadores[i];
+      if (!l.vivo) continue;
+      var dx = l.x - x, dy = l.y - y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d > rad + l.r || !lineaDeTiro(R, x, y, l.x, l.y)) continue;
+      var k = 1 - 0.55 * Math.min(1, d / rad);
+      var dano = Math.max(1, Math.round(l.maxHp * REGLAS.BARRIL_DANO * k));
+      l.hp = Math.max(0, l.hp - dano);
+      l.regenDesde = t + REGLAS.REGEN_ESPERA_MS;
+      l.reveladoHasta = t + REGLAS.REVELA_MS;
+      if (duenio && duenio !== l) duenio.dano += dano;
+      anotarGolpe(l, duenio, t);
+      var ux = d > 1 ? dx / d : 1, uy = d > 1 ? dy / d : 0;
+      var v = REGLAS.BARRIL_EMPUJE * k / 0.18;
+      l.empuje = { vx: ux * v, vy: uy * v, hasta: t + 180 };
+      difundir(P, 'brawl:golpe', {
+        b: 0, t: l.id, o: duenio ? duenio.id : 0, d: dano, hp: l.hp,
+        x: redondea(l.x, 2), y: redondea(l.y, 2), sup: 0, boom: 1
+      });
+      if (l.hp <= 0) caer(P, l, duenio && duenio !== l ? duenio : null);
+    }
+    // Lo de alrededor: un golpe a cada caja y la mecha a los barriles.
+    var C = R.celda;
+    var cx0 = Math.max(0, Math.floor((x - rad) / C)), cx1 = Math.min(R.ancho - 1, Math.floor((x + rad) / C));
+    var cy0 = Math.max(0, Math.floor((y - rad) / C)), cy1 = Math.min(R.alto - 1, Math.floor((y + rad) / C));
+    for (var cy = cy0; cy <= cy1; cy++) {
+      for (var cx = cx0; cx <= cx1; cx++) {
+        var idx = cy * R.ancho + cx;
+        var c = R.cajas[idx];
+        if (!c) continue;
+        var px = (cx + 0.5) * C - x, py = (cy + 0.5) * C - y;
+        if (px * px + py * py > rad * rad) continue;
+        if (c.barril) {
+          if (!c.encendido) {
+            c.encendido = true;
+            P.pendientes.push({ t: t + REGLAS.BARRIL_CADENA_MS, idx: idx, duenio: duenioId });
+          }
+        } else {
+          golpearCaja(P, idx, { rompe: false, duenio: duenioId }, t);
+        }
+      }
+    }
   }
 
   function soltarHuesos(P, x, y, n) {
@@ -18318,13 +18788,25 @@ const GFBrawlMotor = (function () {
     for (var i = 0; i < P.objetos.length; i++) {
       var o = P.objetos[i];
       var quien = null;
+      var esCarne = o.tipo === 'carne';
       for (var j = 0; j < P.luchadores.length; j++) {
         var l = P.luchadores[j];
         if (!l.vivo) continue;
+        // La carne solo la coge quien está herido: pasar por encima con la
+        // vida llena no la gasta (si no, se "robaría" para que no cure a otro).
+        if (esCarne && l.hp >= l.maxHp) continue;
         var rr = l.r + REGLAS.HUESO_RADIO * 0.5;
         if (dist2(l, o) <= rr * rr) { quien = l; break; }
       }
       if (!quien) { quedan.push(o); continue; }
+      if (esCarne) {
+        var cura = Math.round(quien.maxHp * REGLAS.CURA_VIDA);
+        quien.hp = Math.min(quien.maxHp, quien.hp + cura);
+        var cu = P.curas[o.cura];
+        if (cu) { cu.objeto = 0; cu.proxima = (t - P.tCombate) + REGLAS.CURA_CADA_MS; }
+        difundir(P, 'brawl:recoger', { id: o.id, por: quien.id, tipo: 'carne', cura: cura, potencia: quien.potencia, maxHp: quien.maxHp, hp: quien.hp });
+        continue;
+      }
       if (quien.potencia < REGLAS.HUESO_MAX) {
         quien.potencia++;
         // La vida máxima sube y lo que sube se cura: coger un hueso en mitad
@@ -18333,7 +18815,7 @@ const GFBrawlMotor = (function () {
         quien.maxHp += extra;
         quien.hp = Math.min(quien.maxHp, quien.hp + extra);
       }
-      difundir(P, 'brawl:recoger', { id: o.id, por: quien.id, potencia: quien.potencia, maxHp: quien.maxHp, hp: quien.hp });
+      difundir(P, 'brawl:recoger', { id: o.id, por: quien.id, tipo: 'hueso', potencia: quien.potencia, maxHp: quien.maxHp, hp: quien.hp });
     }
     P.objetos = quedan;
   }
@@ -18408,11 +18890,19 @@ const GFBrawlMotor = (function () {
           banderas: 1 vivo · 2 andando · 4 en la hierba · 8 mira a la izq.
        y: lo tuyo — munición y súper en centésimas, y la posición buena si
           hay que recolocarte (c = número de corrección). */
+  /* z: la niebla — [radio, x, y, radio siguiente, x sig., y sig., estado,
+        ms hasta el próximo cambio]; los tres "siguiente" valen -1 cuando ya
+        está cerrada. Ver actualizarZona. */
   function enviarInstantaneas(P, ahora) {
-    var zr = Math.round(P.zona.r);
+    var Z = P.zona, sig = Z.sig;
+    var zr = [
+      Math.round(Z.r), Math.round(Z.x), Math.round(Z.y),
+      sig ? Math.round(sig.r) : -1, sig ? Math.round(sig.x) : -1, sig ? Math.round(sig.y) : -1,
+      Z.estado, Math.max(0, Math.round(Z.cambioEn - (ahora - P.tCombate)))
+    ];
     for (var i = 0; i < P.luchadores.length; i++) {
       var yo = P.luchadores[i];
-      if (!yo.humano || yo.fuera) continue;
+      if (!yo.humano || yo.fuera || yo.sinConexion) continue;
       var f = [];
       for (var j = 0; j < P.luchadores.length; j++) {
         var l = P.luchadores[j];
@@ -18439,7 +18929,7 @@ const GFBrawlMotor = (function () {
     // 'moviendo' de los humanos se apaga si ya no llegan entradas.
     for (var q = 0; q < P.luchadores.length; q++) {
       var h = P.luchadores[q];
-      if (h.humano && ahora - h.ultimaEntrada > 120) h.moviendo = false;
+      if (h.humano && !h.sinConexion && ahora - h.ultimaEntrada > 120) h.moviendo = false;
     }
   }
 
@@ -18449,32 +18939,74 @@ const GFBrawlMotor = (function () {
   /* No hacen trampas: ven lo mismo que vería un jugador en su sitio (la
      hierba alta les esconde a la gente igual), disparan con la misma munición
      y cadencia, y fallan. Lo que cambia con la ronda es la ASTUCIA (0,2 en la
-     primera batalla del día, 0,6 en la quinta):
+     primera batalla del día, 0,6 en la quinta): puntería, adelantar el tiro,
+     reflejos, esquivar, cubrirse...
 
-       · puntería: el error del disparo va de ±14° a ±7°;
-       · adelantar el tiro a donde vas a estar, en vez de a donde estás;
-       · cuánto tardan en reaccionar al verte (450 ms → 180 ms);
-       · a partir de 0,4 se esconden en la hierba, y a partir de 0,5 se
-         retiran a curarse cuando van mal de vida. */
-  function crearIA(astucia) {
+     MÁS NATURALES, Y PELEAN ENTRE ELLOS (2026-10-02). El jugador lo dijo así:
+     "que también peleen entre ellos, no solo me busquen a mí". Antes cada bot
+     iba a por el más cercano que veía y nada más: en una práctica los tres
+     acababan encima del humano, y se movían como robots (giros en seco,
+     esquivas perfectas en zigzag, nunca se escondían para recargar).
+
+     Ahora cada uno PUNTÚA a los que ve (ver elegirObjetivo):
+       · quien le está pegando va primero (se defiende y se venga);
+       · el que está tocado apetece más (rematar);
+       · si a alguien ya van otros, busca otro: los bots se REPARTEN y por eso
+         se acaban cruzando y peleando entre ellos;
+       · y cada uno tiene un "rival" al que le tiene un poco más de ganas.
+     Y además:
+       · tienen CARÁCTER (agresivo, cauto o cazador): a qué distancia pelean,
+         cuándo se retiran, cuánto les gusta la hierba. El cazador espera a
+         que otros se peleen y entra cuando uno ya está tocado;
+       · ESQUIVAN las balas que les vienen derechas (más cuanto más listos);
+       · al quedarse sin munición se ponen A CUBIERTO tras un muro;
+       · van a por la CARNE cuando están heridos y a por los huesos;
+       · disparan a los BARRILES que tienen enemigos al lado;
+       · se adelantan a la NIEBLA (los listos, con más antelación);
+       · el rumbo GIRA en vez de cambiar de golpe, y a veces se paran a mirar. */
+  var ESTILOS = {
+    // ideal: fracción del alcance a la que les gusta pelear
+    // retirada: vida (0..1) por debajo de la cual se van a curar
+    // arbusto: ganas de esconderse en la hierba cuando no ven a nadie
+    // paciencia: ms que el cazador espera a que otros se peleen antes de entrar
+    agresivo: { ideal: 0.50, retirada: 0.22, arbusto: 0.25, paciencia: 0 },
+    cauto:    { ideal: 0.82, retirada: 0.42, arbusto: 0.65, paciencia: 0 },
+    cazador:  { ideal: 0.72, retirada: 0.32, arbusto: 0.55, paciencia: 3500 }
+  };
+
+  function crearIA(astucia, azar) {
     var a = Number.isFinite(Number(astucia)) ? Math.max(0, Math.min(1, Number(astucia))) : 0.35;
+    var az = typeof azar === 'function' ? azar : Math.random;
+    var r = az();
+    var estilo = r < 0.36 ? 'agresivo' : (r < 0.70 ? 'cauto' : 'cazador');
     return {
       astucia: a,
+      estilo: estilo,
+      E: ESTILOS[estilo],
       objetivo: null,
+      rival: null,           // el que le cae peor (se elige al ver a los demás)
       vistoDesde: 0,
       perdidoDesde: 0,
       proxima: 0,
-      dirX: 0, dirY: 0,
+      reaccion: null,
+      dirX: 0, dirY: 0,      // el rumbo que quiere
+      velX: 0, velY: 0,      // el rumbo que lleva (gira hacia el que quiere)
       ruta: null,
       rutaHasta: 0,
       rutaObjetivo: null,
-      estrafe: 1,
+      estrafe: az() < 0.5 ? 1 : -1,
       cambioEstrafe: 0,
       proximoDisparo: 0,
       destino: null,
       destinoHasta: 0,
+      pausaHasta: 0,
       atascado: 0,
-      ultX: 0, ultY: 0
+      amenazas: {},          // id → { t } de quien le ha pegado
+      recuerdo: null,        // { x, y, t } donde vio por última vez a su objetivo
+      esquiva: null,         // { x, y, hasta }
+      acechoDesde: 0,
+      acechando: false,
+      barril: null           // un barril al que disparar { x, y }
     };
   }
 
@@ -18538,19 +19070,31 @@ const GFBrawlMotor = (function () {
     var enCombate = t - P.tCombate;
     var az = P.azar;
 
-    // ── decidir (5-7 veces por segundo, no en cada paso) ──
+    // ── decidir (6-8 veces por segundo, no en cada paso) ──
     if (t >= ia.proxima) {
-      ia.proxima = t + 140 + az() * 120 * (1.2 - ia.astucia);
+      ia.proxima = t + 130 + az() * 110 * (1.25 - ia.astucia);
       decidirBot(P, l, t, enCombate);
     }
 
     // ── andar ──
+    // Esquivar manda sobre el rumbo durante un instante.
     var mx = ia.dirX, my = ia.dirY;
-    var largo = Math.sqrt(mx * mx + my * my);
+    if (ia.esquiva && t < ia.esquiva.hasta) { mx = ia.esquiva.x; my = ia.esquiva.y; }
+    else ia.esquiva = null;
+    // El rumbo no cambia de golpe: GIRA hacia el que quiere (más rápido los
+    // listos). Al girar fuerte frena un poco, como cualquiera que da la vuelta.
+    // La esquiva, no: un paso de lado para apartarse de una bala es brusco.
+    if (ia.esquiva) { ia.velX = mx; ia.velY = my; }
+    else {
+      var giro = Math.min(1, dt * (8 + 8 * ia.astucia));
+      ia.velX += (mx - ia.velX) * giro;
+      ia.velY += (my - ia.velY) * giro;
+    }
+    var largo = Math.sqrt(ia.velX * ia.velX + ia.velY * ia.velY);
     var antesX = l.x, antesY = l.y;
-    if (largo > 0.01) {
-      var v = l.vel * dt / largo;
-      var p = moverCirculo(R, l.x, l.y, mx * v, my * v, l.r);
+    if (largo > 0.04) {
+      var v = l.vel * dt * Math.min(1, largo) / largo;
+      var p = moverCirculo(R, l.x, l.y, ia.velX * v, ia.velY * v, l.r);
       l.x = p[0]; l.y = p[1];
     }
     var movido = Math.abs(l.x - antesX) + Math.abs(l.y - antesY);
@@ -18559,36 +19103,49 @@ const GFBrawlMotor = (function () {
     l.vy = (l.y - antesY) / dt;
     if (Math.abs(l.x - antesX) > 0.2) l.mira = l.x > antesX ? 1 : -1;
     // atascado contra algo: se le cambia el rumbo
-    if (largo > 0.01 && movido < 0.4) {
+    var quiere = Math.abs(mx) + Math.abs(my) > 0.01;
+    if (quiere && movido < 0.4) {
       ia.atascado += dt;
-      if (ia.atascado > 0.6) { ia.ruta = null; ia.estrafe *= -1; ia.atascado = 0; ia.proxima = t; }
+      if (ia.atascado > 0.6) { ia.ruta = null; ia.estrafe *= -1; ia.atascado = 0; ia.proxima = t; ia.esquiva = null; ia.pausaHasta = 0; }
     } else ia.atascado = 0;
 
     // ── disparar ──
+    if (t < ia.proximoDisparo) return;
+    // Un barril con enemigos al lado vale más que un tiro normal.
+    if (ia.barril && l.municion >= 1) {
+      var ab = Math.atan2(ia.barril.y - l.y, ia.barril.x - l.x) + gauss(az) * (1 - ia.astucia) * 0.08;
+      if (dispararAngulo(P, l, ab, false, null)) { ia.proximoDisparo = t + l.arma.cadencia + 200; ia.barril = null; }
+      return;
+    }
     var obj = ia.objetivo ? P.porId[ia.objetivo] : null;
-    if (obj && obj.vivo && t >= ia.proximoDisparo && t - ia.vistoDesde >= ia.reaccion) {
+    if (obj && obj.vivo && !ia.acechando && t - ia.vistoDesde >= ia.reaccion && loVe(P, l, obj, t)) {
       var d = Math.sqrt(dist2(l, obj));
-      var usarSuper = l.superCarga >= 1 && d <= l.superArma.alcance * 0.85;
+      var vidaObj = obj.hp / obj.maxHp;
+      var usarSuper = l.superCarga >= 1 && d <= l.superArma.alcance * 0.85 &&
+        (vidaObj < 0.55 || l.hp / l.maxHp < 0.4 || grupoCerca(P, obj, l, 90) >= 1 || ia.astucia < 0.35);
       var arma = usarSuper ? l.superArma : l.arma;
       if (d <= arma.alcance * 0.96 && lineaDeTiro(R, l.x, l.y, obj.x, obj.y) && (usarSuper || l.municion >= 1)) {
-        // apuntar: adelantar el tiro según la astucia, y fallar un poco
+        // Apuntar: adelantar el tiro según la astucia, y fallar un poco. El
+        // pulso se asienta mientras lo sigue: el primer tiro es el peor.
         var tVuelo = d / arma.vel;
         var px = obj.x + (obj.vx || 0) * tVuelo * ia.astucia;
         var py = obj.y + (obj.vy || 0) * tVuelo * ia.astucia;
-        var ang = Math.atan2(py - l.y, px - l.x) + gauss(az) * (1 - ia.astucia) * 0.30;
+        var seguimiento = Math.min(1, (t - ia.vistoDesde) / 1500);
+        var err = (1 - ia.astucia) * 0.32 * (1.35 - 0.55 * seguimiento);
+        var ang = Math.atan2(py - l.y, px - l.x) + gauss(az) * err;
         // No vaciar el cargador de golpe si no hace falta: los listos guardan una.
-        var guarda = !usarSuper && ia.astucia >= 0.45 && l.municion < 2 && d > arma.alcance * 0.6;
+        var guarda = !usarSuper && ia.astucia >= 0.45 && l.municion < 2 && d > arma.alcance * 0.6 && vidaObj > 0.3;
         if (!guarda && dispararAngulo(P, l, ang, usarSuper, null)) {
           ia.proximoDisparo = t + arma.cadencia + az() * 420 * (1.1 - ia.astucia);
         }
       }
-    } else if (!obj && t >= ia.proximoDisparo) {
-      // Sin nadie a la vista: si tiene una caja dorada a tiro, a por ella.
-      var caja = cajaOroCerca(P, l);
-      if (caja && l.municion >= 2) {
-        var a2 = Math.atan2(caja.y - l.y, caja.x - l.x);
-        if (dispararAngulo(P, l, a2, false, null)) ia.proximoDisparo = t + l.arma.cadencia + 300;
-      }
+      return;
+    }
+    // Sin nadie a la vista: si tiene una caja dorada a tiro, a por ella.
+    var caja = !obj ? cajaOroCerca(P, l) : null;
+    if (caja && l.municion >= 2) {
+      var a2 = Math.atan2(caja.y - l.y, caja.x - l.x);
+      if (dispararAngulo(P, l, a2, false, null)) ia.proximoDisparo = t + l.arma.cadencia + 300;
     }
   }
 
@@ -18607,87 +19164,283 @@ const GFBrawlMotor = (function () {
     return mejor;
   }
 
-  function decidirBot(P, l, t, enCombate) {
-    var ia = l.ia, R = P.R, az = P.azar;
-    if (ia.reaccion == null) ia.reaccion = 450 - 450 * ia.astucia + 90;
+  /** ¿Cuántos OTROS bots van ya a por `o`? (para repartirse) */
+  function cazadoresDe(P, o, yo) {
+    var n = 0;
+    for (var i = 0; i < P.luchadores.length; i++) {
+      var b = P.luchadores[i];
+      if (b === yo || !b.vivo || !b.ia || b.humano) continue;
+      if (b.ia.objetivo === o.id) n++;
+    }
+    return n;
+  }
 
-    // 1) ¿A quién ve?
-    var mejor = null, md = Infinity;
+  /** ¿Cuántos enemigos de `yo` hay a menos de `radio` de `o`? (súper en grupo) */
+  function grupoCerca(P, o, yo, radio) {
+    var n = 0;
+    for (var i = 0; i < P.luchadores.length; i++) {
+      var b = P.luchadores[i];
+      if (b === o || b === yo || !b.vivo) continue;
+      if (dist2(b, o) <= radio * radio) n++;
+    }
+    return n;
+  }
+
+  /** ¿Está `o` peleándose con otro que no soy yo? (el cazador espera) */
+  function ocupado(P, o, yo, t) {
+    if (o.ia && o.ia.objetivo && o.ia.objetivo !== yo.id) return true;
+    return !!(o.ultimoGolpe && o.ultimoGolpe.id !== yo.id && t - o.ultimoGolpe.t < 2000);
+  }
+
+  function elegirObjetivo(P, l, t) {
+    var ia = l.ia;
+    var mejor = null, mejorNota = Infinity;
     for (var i = 0; i < P.luchadores.length; i++) {
       var o = P.luchadores[i];
-      if (o === l || !o.vivo) continue;
-      if (!loVe(P, l, o, t)) continue;
+      if (o === l || !o.vivo || !loVe(P, l, o, t)) continue;
+      if (ia.rival == null) ia.rival = o.id;
+      var nota = Math.sqrt(dist2(l, o));
+      if (o.id === ia.objetivo) nota *= 0.72;                 // no saltar de uno a otro
+      var am = ia.amenazas[o.id];
+      if (am && t - am.t < 4500) nota *= 0.5;                 // quien me pega, primero
+      nota *= 0.62 + 0.38 * (o.hp / o.maxHp);                 // el tocado apetece más
+      nota *= 1 + 0.6 * cazadoresDe(P, o, l);                 // si ya van otros, busca otro
+      if (o.id === ia.rival) nota *= 0.88;
+      if (nota < mejorNota) { mejorNota = nota; mejor = o; }
+    }
+    return mejor;
+  }
+
+  /**
+   * Una bala que viene derecha: devuelve hacia dónde apartarse, o null.
+   * Como una persona: no la ve hasta pasado su tiempo de reacción, y decide
+   * UNA vez por bala si se aparta (26 % el más torpe, 48 % el más listo). Si
+   * lo decidiera en cada vistazo (7 por segundo) las esquivaría casi todas.
+   */
+  function balaQueViene(P, l, t) {
+    var R = P.R, ia = l.ia;
+    for (var i = 0; i < P.balas.length; i++) {
+      var b = P.balas[i];
+      // Los reflejos ante una bala son algo más rápidos que la reacción a
+      // ver a alguien aparecer.
+      if (b.duenio === l.id || t - (b.nacio || 0) < ia.reaccion * 0.7) continue;
+      if (!b.vistaPor) b.vistaPor = {};
+      if (b.vistaPor[l.id]) continue;
+      var rx = l.x - b.x, ry = l.y - b.y;
+      var delante = rx * b.dx + ry * b.dy;                    // lo que le falta para llegar
+      if (delante <= 0 || delante > Math.min(b.resto, b.vel * 0.5)) continue;
+      var lado = rx * -b.dy + ry * b.dx;                      // a qué lado de la línea está
+      if (Math.abs(lado) > l.r + b.radio + 4) continue;
+      b.vistaPor[l.id] = 1;
+      if (P.azar() > 0.15 + 0.55 * ia.astucia) continue;
+      var s = lado >= 0 ? 1 : -1;
+      var ex = -b.dy * s, ey = b.dx * s;
+      // Si por ese lado hay un muro, por el otro.
+      var p = moverCirculo(R, l.x, l.y, ex * 14, ey * 14, l.r);
+      if (Math.abs(p[0] - l.x) + Math.abs(p[1] - l.y) < 6) { ex = -ex; ey = -ey; }
+      return { x: ex, y: ey };
+    }
+    return null;
+  }
+
+  /** Una casilla cerca de `l` desde la que `obj` NO le ve (un muro en medio). */
+  function cobertura(P, l, obj) {
+    var R = P.R;
+    var cx = Math.floor(l.x / R.celda), cy = Math.floor(l.y / R.celda);
+    var mejor = null, md = Infinity;
+    for (var y = cy - 4; y <= cy + 4; y++) {
+      for (var x = cx - 4; x <= cx + 4; x++) {
+        var ch = celdaEn(R, x, y);
+        if (bloqueaPaso(ch)) continue;
+        var p = celdaCentro(R, x, y);
+        if (lineaDeTiro(R, obj.x, obj.y, p.x, p.y)) continue;
+        var d = dist2(l, p);
+        if (d < md) { md = d; mejor = p; }
+      }
+    }
+    return mejor;
+  }
+
+  /** Un barril a tiro con algún enemigo al lado (y yo lejos de él). */
+  function barrilUtil(P, l, t) {
+    var R = P.R, rad = REGLAS.BARRIL_RADIO, alc = l.arma.alcance;
+    var mejor = null, mejorN = 0;
+    var claves = Object.keys(R.cajas);
+    for (var k = 0; k < claves.length; k++) {
+      var c = R.cajas[claves[k]];
+      if (!c.barril) continue;
+      var i = Number(claves[k]);
+      var p = celdaCentro(R, i % R.ancho, Math.floor(i / R.ancho));
+      var d2 = dist2(l, p);
+      if (d2 < (rad * 1.2) * (rad * 1.2) || d2 > alc * alc * 0.9) continue;
+      // La línea hasta el borde del barril (el barril mismo para las balas).
+      var d = Math.sqrt(d2);
+      var bx = p.x - (p.x - l.x) / d * 18, by = p.y - (p.y - l.y) / d * 18;
+      if (!lineaDeTiro(R, l.x, l.y, bx, by)) continue;
+      var n = 0;
+      for (var j = 0; j < P.luchadores.length; j++) {
+        var o = P.luchadores[j];
+        if (o === l || !o.vivo || !loVe(P, l, o, t)) continue;
+        if (dist2(o, p) <= (rad * 0.8) * (rad * 0.8)) n++;
+      }
+      if (n > mejorN) { mejorN = n; mejor = p; }
+    }
+    return mejor;
+  }
+
+  function objetoCerca(P, l, tipo, radio) {
+    var mejor = null, md = radio * radio;
+    for (var h = 0; h < P.objetos.length; h++) {
+      var o = P.objetos[h];
+      if (tipo && o.tipo !== tipo) continue;
       var d = dist2(l, o);
-      // Prefiere seguir con el que ya tenía (no salta de uno a otro).
-      if (o.id === ia.objetivo) d *= 0.6;
       if (d < md) { md = d; mejor = o; }
     }
+    return mejor;
+  }
+
+  function decidirBot(P, l, t, enCombate) {
+    var ia = l.ia, R = P.R, az = P.azar, E = ia.E;
+    if (ia.reaccion == null) ia.reaccion = 120 + 360 * (1 - ia.astucia) + az() * 120;
+    ia.barril = null;
+    ia.acechando = false;
+    // La pausa "a mirar" solo dura mientras siga paseando: cualquier otra
+    // decisión (un enemigo, la niebla) la corta.
+    var pausa = ia.pausaHasta;
+    ia.pausaHasta = 0;
+
+    // 1) A QUIÉN (ver elegirObjetivo).
+    var mejor = elegirObjetivo(P, l, t);
     if (mejor) {
       if (ia.objetivo !== mejor.id) ia.vistoDesde = t;
       ia.objetivo = mejor.id;
       ia.perdidoDesde = 0;
+      ia.recuerdo = { x: mejor.x, y: mejor.y, t: t };
     } else if (ia.objetivo) {
       if (!ia.perdidoDesde) ia.perdidoDesde = t;
       if (t - ia.perdidoDesde > 1500) ia.objetivo = null;
     }
     var obj = ia.objetivo ? P.porId[ia.objetivo] : null;
     if (obj && !obj.vivo) { ia.objetivo = null; obj = null; }
+    var dd = obj ? Math.sqrt(dist2(l, obj)) : Infinity;
+    var alcance = l.arma.alcance;
 
-    // 2) La niebla manda sobre todo lo demás.
+    // 2) ESQUIVAR una bala que viene derecha (ver balaQueViene).
+    if (!ia.esquiva) {
+      var e = balaQueViene(P, l, t);
+      if (e) ia.esquiva = { x: e.x, y: e.y, hasta: t + 200 + 160 * ia.astucia };
+    }
+
+    // 3) LA NIEBLA manda sobre todo lo demás.
     var z = P.zona;
-    var dz = Math.sqrt(dist2(l, z));
-    if (enCombate >= REGLAS.ZONA_INICIO_MS - 4000 && dz > z.r - R.celda * 1.6) {
-      irHacia(P, l, z.cx, z.cy, t);
+    if (z.activa && Math.sqrt(dist2(l, z)) > z.r - R.celda * 1.4) {
+      irHacia(P, l, z.x, z.y, t);
       return;
     }
+    // Y antes de que cierre la fase siguiente, ir colocándose: los listos con
+    // más antelación. Si está en plena pelea, aguanta hasta el último momento.
+    if (z.sig) {
+      var sx = l.x - z.sig.x, sy = l.y - z.sig.y;
+      var fueraSig = Math.sqrt(sx * sx + sy * sy) > z.sig.r - R.celda * 1.5;
+      var queda = z.cambioEn - enCombate;
+      var antelacion = (z.estado === 1 ? 4000 : 2500) + 6000 * ia.astucia;
+      if (fueraSig && queda < antelacion && !(obj && dd < alcance && queda > 2500)) {
+        irHacia(P, l, z.sig.x, z.sig.y, t);
+        return;
+      }
+    }
 
-    // 3) Mal de vida y listo: a esconderse a curarse.
+    // 4) MAL DE VIDA: a curarse.
     var vida = l.hp / l.maxHp;
-    if (obj && vida < 0.32 && ia.astucia >= 0.5) {
-      var hx = l.x - obj.x, hy = l.y - obj.y;
-      var hl = Math.sqrt(hx * hx + hy * hy) || 1;
+    var carne = vida < 0.7 ? objetoCerca(P, l, 'carne', R.celda * 11) : null;
+    if (obj && vida < E.retirada + 0.08 * ia.astucia && dd < alcance * 1.3) {
+      if (carne && dist2(carne, obj) > dist2(l, obj)) { irHacia(P, l, carne.x, carne.y, t); return; }
+      var cub = cobertura(P, l, obj);
       var arb = arbustoCerca(P, l, 6);
-      if (arb && dist2(arb, obj) > dist2(l, obj)) irHacia(P, l, arb.x, arb.y, t);
-      else fijarDir(ia, hx / hl, hy / hl);
+      if (arb && dist2(arb, obj) > dist2(l, obj) && (!cub || dist2(l, arb) < dist2(l, cub))) { irHacia(P, l, arb.x, arb.y, t); return; }
+      if (cub) { irHacia(P, l, cub.x, cub.y, t); return; }
+      var hx = l.x - obj.x, hy = l.y - obj.y, hl = Math.sqrt(hx * hx + hy * hy) || 1;
+      fijarDir(ia, hx / hl, hy / hl);
+      ia.ruta = null;
       return;
     }
+    if (carne && (!obj || dd > alcance * 1.2)) { irHacia(P, l, carne.x, carne.y, t); return; }
 
+    // 5) SIN MUNICIÓN: a cubierto hasta recargar (el agresivo, no: aprieta).
+    if (obj && l.municion < 1 && ia.estilo !== 'agresivo' && ia.astucia >= 0.3 && dd < alcance * 1.2) {
+      var cub2 = cobertura(P, l, obj);
+      if (cub2) { irHacia(P, l, cub2.x, cub2.y, t); return; }
+    }
+
+    // 6) UN BARRIL con enemigos al lado: dispararle (lo hace pensarBot).
+    if (ia.astucia >= 0.25) ia.barril = barrilUtil(P, l, t);
+
+    // 7) LA PELEA.
     if (obj) {
-      var dd = Math.sqrt(dist2(l, obj));
-      var alcance = l.arma.alcance;
-      var ideal = alcance < 150 ? alcance * 0.45 : alcance * 0.68;
-      var tiro = lineaDeTiro(R, l.x, l.y, obj.x, obj.y);
+      var ideal = alcance * (alcance < 150 ? E.ideal * 0.8 : E.ideal);
+      var visible = loVe(P, l, obj, t);
+      // El cazador deja que otros se peleen y entra cuando uno ya está tocado.
+      if (E.paciencia && ia.astucia >= 0.35 && visible && ocupado(P, obj, l, t) && obj.hp / obj.maxHp > 0.55) {
+        if (!ia.acechoDesde) ia.acechoDesde = t;
+        if (t - ia.acechoDesde < E.paciencia) {
+          ia.acechando = true;
+          var arbA = arbustoCerca(P, l, 5);
+          if (arbA && Math.sqrt(dist2(arbA, obj)) > alcance * 0.95 && Math.sqrt(dist2(arbA, obj)) < alcance * 1.5) {
+            irHacia(P, l, arbA.x, arbA.y, t);
+          } else {
+            var ux0 = (obj.x - l.x) / (dd || 1), uy0 = (obj.y - l.y) / (dd || 1);
+            var k0 = dd > alcance * 1.25 ? 0.6 : (dd < alcance * 1.05 ? -0.6 : 0);
+            fijarDir(ia, ux0 * k0 - uy0 * ia.estrafe * 0.3, uy0 * k0 + ux0 * ia.estrafe * 0.3);
+            ia.ruta = null;
+          }
+          return;
+        }
+      } else ia.acechoDesde = 0;
+
+      if (!visible) {
+        // Lo ha perdido de vista hace nada: a donde lo vio por última vez.
+        if (ia.recuerdo) { irHacia(P, l, ia.recuerdo.x, ia.recuerdo.y, t); return; }
+      }
+      var tiro = visible && lineaDeTiro(R, l.x, l.y, obj.x, obj.y);
       if (!tiro || dd > alcance * 0.92) {
         irHacia(P, l, obj.x, obj.y, t);
         return;
       }
-      // A tiro: moverse de lado (esquivar) y corregir la distancia.
+      // A tiro: moverse de lado (esquivar) y corregir la distancia. Los cambios
+      // de lado no son un metrónomo: a ratos largos, a ratos cortos.
       if (t >= ia.cambioEstrafe) {
-        ia.estrafe = az() < 0.5 ? -1 : 1;
-        ia.cambioEstrafe = t + 500 + az() * 900;
+        ia.estrafe = az() < 0.55 ? -ia.estrafe : ia.estrafe;
+        ia.cambioEstrafe = t + 380 + az() * 1100 * (1.2 - ia.astucia);
       }
       var ux = (obj.x - l.x) / (dd || 1), uy = (obj.y - l.y) / (dd || 1);
       var acerca = dd > ideal * 1.15 ? 0.7 : (dd < ideal * 0.75 ? -0.7 : 0);
-      var lado = 0.55 + 0.45 * ia.astucia;
+      var lado = 0.45 + 0.5 * ia.astucia;
       fijarDir(ia, ux * acerca + -uy * ia.estrafe * lado, uy * acerca + ux * ia.estrafe * lado);
       ia.ruta = null;
       return;
     }
 
-    // 4) Nadie a la vista: un hueso cerca, o explorar (los listos, por la hierba).
-    var hueso = null, mh = (R.celda * 7) * (R.celda * 7);
-    for (var h = 0; h < P.objetos.length; h++) {
-      var dh = dist2(l, P.objetos[h]);
-      if (dh < mh) { mh = dh; hueso = P.objetos[h]; }
+    // 8) NADIE A LA VISTA.
+    // Lo acaba de perder: a donde lo vio por última vez.
+    if (ia.recuerdo && t - ia.recuerdo.t < 5000 && dist2(l, ia.recuerdo) > 40 * 40) {
+      irHacia(P, l, ia.recuerdo.x, ia.recuerdo.y, t);
+      return;
     }
+    var hueso = objetoCerca(P, l, 'hueso', R.celda * 7);
     if (hueso) { irHacia(P, l, hueso.x, hueso.y, t); return; }
 
-    if (!ia.destino || t >= ia.destinoHasta || dist2(l, ia.destino) < 20 * 20) {
-      var arb2 = ia.astucia >= 0.4 && az() < 0.5 ? arbustoCerca(P, l, 9) : null;
-      ia.destino = arb2 || puntoLibreAlAzar(P, l);
+    // Explorar: a un sitio libre dentro de la zona buena (los listos, por la
+    // hierba). Al llegar, a veces se para a mirar un momento.
+    var llego = ia.destino && dist2(l, ia.destino) < 20 * 20;
+    if (!ia.destino || t >= ia.destinoHasta || llego) {
+      if (llego && az() < 0.35) pausa = t + 300 + az() * 600;
+      var arb2 = az() < E.arbusto * (0.5 + ia.astucia) ? arbustoCerca(P, l, 9) : null;
+      if (arb2 && !dentroDeZona(P, arb2, R.celda * 2)) arb2 = null;
+      ia.destino = arb2 || puntoLibreAlAzar(P);
       ia.destinoHasta = t + 2500 + az() * 2500;
       ia.ruta = null;
     }
+    if (t < pausa) { ia.pausaHasta = pausa; fijarDir(ia, 0, 0); return; }
     if (ia.destino) irHacia(P, l, ia.destino.x, ia.destino.y, t);
   }
 
@@ -18751,16 +19504,30 @@ const GFBrawlMotor = (function () {
     return mejor;
   }
 
-  function puntoLibreAlAzar(P, l) {
+  /** ¿Está `p` dentro de la zona buena, con `margen` px de holgura? Si ya se
+      sabe cuál será la siguiente, dentro de esa también (si no, se iría a
+      esconder justo donde va a entrar la niebla). */
+  function dentroDeZona(P, p, margen) {
+    var z = P.zona;
+    if (Math.sqrt(dist2(p, z)) > z.r - margen) return false;
+    if (z.sig) {
+      var dx = p.x - z.sig.x, dy = p.y - z.sig.y;
+      if (Math.sqrt(dx * dx + dy * dy) > z.sig.r - margen) return false;
+    }
+    return true;
+  }
+
+  function puntoLibreAlAzar(P) {
     var R = P.R;
     for (var i = 0; i < 30; i++) {
       var cx = Math.floor(P.azar() * R.ancho), cy = Math.floor(P.azar() * R.alto);
       if (bloqueaPaso(celdaEn(R, cx, cy))) continue;
       var p = celdaCentro(R, cx, cy);
-      if (Math.sqrt(dist2(p, P.zona)) > P.zona.r - R.celda * 2) continue;
+      if (!dentroDeZona(P, p, R.celda * 2)) continue;
       return p;
     }
-    return { x: P.zona.cx, y: P.zona.cy };
+    var z = P.zona;
+    return z.sig ? { x: z.sig.x, y: z.sig.y } : { x: z.x, y: z.y };
   }
 
   // =========================================================================
@@ -18789,8 +19556,11 @@ const GFBrawlMotor = (function () {
     entrada: entrada,
     disparar: disparar,
     abandonar: abandonar,
+    desconectar: desconectar,
+    reconectar: reconectar,
     terminar: terminar,
-    loVe: loVe
+    loVe: loVe,
+    esCaja: esCaja
   };
 });
   return module.exports;
@@ -18866,7 +19636,10 @@ function brawlNuevaPartida(modo, humanos, bots, extra) {
 
   const specs = [];
   for (const h of humanos) {
-    const reg = { socket: h.socket, ticket: h.ticket, player: h.player, salio: false, luchadorId: null };
+    // `clave` es el id del socket CON EL QUE EMPEZÓ: no cambia aunque se
+    // reconecte (entonces cambia `socket`). Ver brawlVolver.
+    const reg = { socket: h.socket, clave: h.socket.id, ticket: h.ticket, player: h.player, salio: false,
+                  luchadorId: null, sinConexion: 0, graciaReloj: null };
     match.porClave.set(h.socket.id, reg);
     match.humanos.push(reg);
     specs.push({
@@ -18893,7 +19666,9 @@ function brawlNuevaPartida(modo, humanos, bots, extra) {
     extraInicio: extra.extraInicio || null,
     enviar: (l, ev, datos) => {
       const reg = match.porClave.get(l.clave);
-      if (reg && !reg.salio) emitBattle(reg.socket, ev, datos);
+      if (!reg || reg.salio || reg.sinConexion) return;
+      if (ev === 'brawl:snap') emitBattleVolatil(reg.socket, ev, datos);
+      else emitBattle(reg.socket, ev, datos);
     },
     alTerminar: (P, resumen) => {
       Promise.resolve(brawlAlTerminar(match, resumen))
@@ -18912,8 +19687,124 @@ function brawlNuevaPartida(modo, humanos, bots, extra) {
 function brawlSoltarJugadores(match) {
   for (const reg of match.humanos) {
     if (socketMatch.get(reg.socket.id) === match.id) socketMatch.delete(reg.socket.id);
+    if (reg.graciaReloj) { clearTimeout(reg.graciaReloj); reg.graciaReloj = null; }
+    const cuenta = reg.ticket && reg.ticket.account;
+    if (cuenta && brawlCaidos.get(cuenta) && brawlCaidos.get(cuenta).matchId === match.id) brawlCaidos.delete(cuenta);
     releaseBattleAdmission(reg.socket, reg.ticket);
   }
+}
+
+/* LA RECONEXIÓN.                                                (2026-10-02)
+
+   FALLO QUE ESTO ARREGLA: "cuando hay reconexión a veces se sale de la
+   partida y no reconecta". Un corte de red de dos segundos —un túnel, pasar
+   de wifi a datos— contaba como irse: 'disconnect' → brawlSalir → el perro
+   caía al instante. Y al volver, el socket nuevo tiene OTRO id, así que para
+   el servidor era otra persona sin partida.
+
+   Ahora un 'disconnect' en mitad de una partida NO la abandona: el motor
+   lleva al perro con un piloto automático (GFBrawlMotor.desconectar) y se
+   espera BRAWL_GRACIA_MS. El cliente, al reconectarse, manda 'brawl:volver';
+   si la CUENTA autenticada del socket nuevo es la del que se cayó, recupera
+   su perro (GFBrawlMotor.reconectar) con la partida tal y como va. Si no
+   vuelve a tiempo, cuenta como irse.
+
+   La identidad es la cuenta del socket (la pone el middleware al conectar,
+   con la cookie), nunca algo que mande el cliente: decir el id de una
+   partida no sirve para quedarse con el perro de otro. */
+const BRAWL_GRACIA_MS = 20000;
+const brawlCaidos = new Map();      // cuenta → { matchId, clave }
+
+/** El registro de este socket en la partida (también si se reconectó). */
+function brawlRegDe(match, socket) {
+  if (!match || !socket) return null;
+  const directo = match.porClave.get(socket.id);
+  if (directo && directo.socket === socket) return directo;
+  for (const reg of match.humanos) if (reg.socket === socket) return reg;
+  return null;
+}
+
+function brawlCuenta(socket) {
+  return String((socket && socket.authenticatedAddress) || '').toLowerCase();
+}
+
+/** Se ha caído la conexión en plena partida: piloto automático y a esperar. */
+function brawlEsperarVuelta(match, reg) {
+  const cuenta = String((reg.ticket && reg.ticket.account) || brawlCuenta(reg.socket) || '').toLowerCase();
+  if (!cuenta || !GFBrawlMotor.desconectar(match.P, reg.luchadorId)) return false;
+  reg.sinConexion = Date.now();
+  if (socketMatch.get(reg.socket.id) === match.id) socketMatch.delete(reg.socket.id);
+  brawlCaidos.set(cuenta, { matchId: match.id, clave: reg.clave });
+  if (reg.graciaReloj) clearTimeout(reg.graciaReloj);
+  reg.graciaReloj = setTimeout(() => {
+    reg.graciaReloj = null;
+    if (!reg.sinConexion || reg.salio) return;
+    const c = brawlCaidos.get(cuenta);
+    if (c && c.matchId === match.id) brawlCaidos.delete(cuenta);
+    reg.salio = true;
+    if (match.P && !match.ended) {
+      try { GFBrawlMotor.abandonar(match.P, reg.luchadorId, { irse: true }); }
+      catch (e) { console.error('❌ abandonar tras la espera', e); }
+    }
+    releaseBattleAdmission(reg.socket, reg.ticket);
+    console.log(`🔌 ${(reg.player && reg.player.playerName) || '?'} no volvió a ${match.id}: cuenta como irse`);
+  }, BRAWL_GRACIA_MS);
+  if (reg.graciaReloj && reg.graciaReloj.unref) reg.graciaReloj.unref();
+  console.log(`🔌 ${(reg.player && reg.player.playerName) || '?'} sin conexión en ${match.id}: ` +
+              `piloto automático durante ${BRAWL_GRACIA_MS / 1000} s`);
+  return true;
+}
+
+/** 'brawl:volver': el socket nuevo de alguien que se cayó recupera su perro. */
+function brawlVolver(socket, datos) {
+  const cuenta = brawlCuenta(socket);
+  const caido = cuenta ? brawlCaidos.get(cuenta) : null;
+  const pedido = datos && typeof datos.matchId === 'string' ? datos.matchId : null;
+  if (!caido || (pedido && pedido !== caido.matchId)) {
+    return emitBattle(socket, 'brawl:volverError', { error: 'no_match' });
+  }
+  const match = battleMatches.get(caido.matchId);
+  const reg = match && match.porClave.get(caido.clave);
+  if (!match || match.ended || !reg || reg.salio || !reg.sinConexion) {
+    brawlCaidos.delete(cuenta);
+    return emitBattle(socket, 'brawl:volverError', { error: 'ended' });
+  }
+  if (socketMatch.has(socket.id) || socket._battleTicket) {
+    return emitBattle(socket, 'brawl:volverError', { error: 'already_in_battle' });
+  }
+  if (reg.graciaReloj) { clearTimeout(reg.graciaReloj); reg.graciaReloj = null; }
+  brawlCaidos.delete(cuenta);
+  // El candado de admisión es de la CUENTA: pasa tal cual al socket nuevo.
+  const viejo = reg.socket;
+  if (viejo && viejo._battleTicket === reg.ticket) viejo._battleTicket = null;
+  reg.socket = socket;
+  reg.sinConexion = 0;
+  if (reg.ticket) {
+    reg.ticket.socket = socket;
+    socket._battleTicket = reg.ticket;
+    battleAdmissions.set(reg.ticket.account, reg.ticket);
+  }
+  socketMatch.set(socket.id, match.id);
+  GFBrawlMotor.reconectar(match.P, reg.luchadorId);
+  console.log(`🔌 ${(reg.player && reg.player.playerName) || '?'} ha vuelto a ${match.id}`);
+}
+
+/* EXP DE LA ARENA.                                              (2026-10-02)
+   El perro tiene el nivel del personaje (ver nivelMascotaEfectivo), así que
+   pelear tiene que hacer subir al PERSONAJE: cada partida da experiencia.
+   Talar da 50 y regar 5, como referencia. La práctica no da nada (se jugaría
+   contra bots sin parar) y la diaria va por debajo de la PvP porque son cinco
+   al día contra la máquina. */
+const BRAWL_EXP = {
+  diaria: { gana: 60, pierde: 15 },
+  pvp: [100, 60, 40, 25]                 // por puesto; del 4.º en adelante, 25
+};
+
+function expDeArena(match, fila) {
+  if (!fila || !match || match.modo === 'practica') return 0;
+  if (match.esBot) return fila.puesto === 1 ? BRAWL_EXP.diaria.gana : BRAWL_EXP.diaria.pierde;
+  const i = Math.min(BRAWL_EXP.pvp.length - 1, Math.max(0, (Number(fila.puesto) || 99) - 1));
+  return BRAWL_EXP.pvp[i];
 }
 
 /**
@@ -18951,7 +19842,8 @@ async function sembrarContadoresMascota(playerName) {
  */
 async function guardarResultadoBrawl(match, resumen) {
   const niveles = {};
-  if (match.modo === 'practica') return niveles;
+  const exps = {};                        // clave → { exp, expTotal }
+  if (match.modo === 'practica') return { niveles, exps };
   const season = await getCurrentBattleSeason();
 
   for (const fila of resumen.puestos) {
@@ -18979,23 +19871,45 @@ async function guardarResultadoBrawl(match, resumen) {
         { $set: { streak: nuevaRacha, bestStreak: Math.max(doc.bestStreak || 0, nuevaRacha) } }
       );
 
-      // NIVEL DE LA MASCOTA: contadores de toda la vida y `$max`, que nunca baja.
+      // EXPERIENCIA y contadores (estos ya solo son estadística). La exp va a
+      // los DOS sitios donde vive: GamePlayer.nivel_exp (/api/load) y la
+      // factura de exp (PlayerStats.exp, que es la que manda al cargar si
+      // existe). La cadena la escribe el liquidador, como las vitales.
+      const exp = expDeArena(match, fila);
       const gp = await GamePlayer.findOneAndUpdate(
         { playerName },
-        { $inc: { petWins: gano ? 1 : 0, petBattles: 1 } },
+        { $inc: { petWins: gano ? 1 : 0, petBattles: 1, nivel_exp: exp } },
         { new: true, projection: { petWins: 1, petBattles: 1, petLevel: 1, nivel_exp: 1 } }
       ).lean();
+      let expTotal = gp ? Math.max(0, Number(gp.nivel_exp) || 0) : null;
+      if (exp > 0) {
+        try {
+          const st = await PlayerStats.findOne({ playerName });
+          if (st) {
+            st.exp = clampStat('exp', (Number(st.exp) || 0) + exp);
+            marcarPendienteDeCadena(st, ['exp']);
+            await st.save();
+            expTotal = Math.max(expTotal || 0, st.exp);
+          }
+        } catch (e) {
+          console.warn('⚠️  arena: no se pudo apuntar la exp en la factura de ' + playerName + ':', e.message);
+        }
+      }
       if (gp) {
-        const nivelPet = nivelMascotaEfectivo(gp);
-        if (nivelPet > (Number(gp.petLevel) || 1)) {
-          await GamePlayer.updateOne({ playerName }, { $max: { petLevel: nivelPet } });
+        const nivelPet = nivelMascotaEfectivo({ nivel_exp: expTotal });
+        if (nivelPet !== (Number(gp.petLevel) || 1)) {
+          await GamePlayer.updateOne({ playerName }, { $set: { petLevel: nivelPet } });
         }
         niveles[fila.clave] = nivelPet;
+        exps[fila.clave] = { exp, expTotal };
         /* Se avisa SIEMPRE, también a quien ya se fue de la arena: si cayó y
-           volvió al mapa antes de que acabara la partida, el perro del mapa
-           se tiene que poner al día igual (GameScene escucha esto). */
+           volvió al mapa antes de que acabara la partida, el mapa se tiene que
+           poner al día igual (GameScene y la tienda escuchan esto y adoptan
+           expTotal si va por delante de la suya). */
         try {
-          if (reg.socket && reg.socket.connected !== false) reg.socket.emit('petLevelUpdate', { petLevel: nivelPet });
+          if (reg.socket && reg.socket.connected !== false) {
+            reg.socket.emit('petLevelUpdate', { petLevel: nivelPet, exp, expTotal });
+          }
         } catch (_) {}
       }
     } catch (e) {
@@ -19016,7 +19930,7 @@ async function guardarResultadoBrawl(match, resumen) {
   } catch (e) {
     console.warn('⚠️  No se pudo registrar la batalla:', e.message);
   }
-  return niveles;
+  return { niveles, exps };
 }
 
 /**
@@ -19031,7 +19945,9 @@ async function brawlAlTerminar(match, resumen) {
   if (match.ended) return;
   match.ended = true;
 
-  const niveles = (await conPlazo(guardarResultadoBrawl(match, resumen), BATTLE_PLAZO_BD_MS, {})) || {};
+  const guardado = (await conPlazo(guardarResultadoBrawl(match, resumen), BATTLE_PLAZO_BD_MS, {})) || {};
+  const niveles = guardado.niveles || {};
+  const exps = guardado.exps || {};
 
   let dailyInfo = null;
   if (match.esBot) {
@@ -19039,7 +19955,7 @@ async function brawlAlTerminar(match, resumen) {
     const p = reg && reg.player;
     if (p && p.playerName && p.playerName !== '---') {
       try {
-        const fila = resumen.puestos.find((f) => f.clave === reg.socket.id);
+        const fila = resumen.puestos.find((f) => f.clave === reg.clave);
         const gano = !!fila && fila.puesto === 1;
         const doc = await conPlazo(BattleDaily.findOneAndUpdate(
           { playerName: p.playerName, day: match.dailyDay || battleTodayKey() },
@@ -19072,7 +19988,7 @@ async function brawlAlTerminar(match, resumen) {
      al otro jugador mirando el combate sin salida). */
   for (const reg of match.humanos) {
     try {
-      const fila = resumen.puestos.find((f) => f.clave === reg.socket.id);
+      const fila = resumen.puestos.find((f) => f.clave === reg.clave);
       const gano = !!fila && fila.puesto === 1;
       const puntos = match.modo === 'practica' ? 0 : (match.esBot ? (gano ? 1 : 0) : (gano ? 3 : 1));
       if (!reg.salio && socketMatch.get(reg.socket.id) === match.id) {
@@ -19082,7 +19998,9 @@ async function brawlAlTerminar(match, resumen) {
           puesto: fila ? fila.puesto : total, de: total,
           yo: fila ? fila.id : null,
           puntos, motivo: resumen.motivo, duracionMs: resumen.duracionMs,
-          daily: dailyInfo, petLevel: niveles[reg.socket.id] || null,
+          daily: dailyInfo, petLevel: niveles[reg.clave] || null,
+          exp: exps[reg.clave] ? exps[reg.clave].exp : 0,
+          expTotal: exps[reg.clave] ? exps[reg.clave].expTotal : null,
           tabla
         });
       }
@@ -19110,7 +20028,10 @@ function brawlSalir(socket, motivo) {
   if (!matchId) { releaseBattleAdmission(socket); return; }
   const match = battleMatches.get(matchId);
   if (!match) { socketMatch.delete(socket.id); releaseBattleAdmission(socket); return; }
-  const reg = match.porClave.get(socket.id);
+  const reg = brawlRegDe(match, socket);
+  // Un corte de red en plena partida no es irse: se espera a que vuelva.
+  if (motivo === 'disconnect' && reg && !reg.salio && match.P && !match.ended &&
+      match.P.fase !== 'fin' && reg.luchadorId && brawlEsperarVuelta(match, reg)) return;
   const quedarse = motivo === 'forfeit';
   if (reg && !quedarse) reg.salio = true;
   if (reg && match.P && !match.ended) {
@@ -19403,7 +20324,7 @@ io.on('connection', (socket) => {
       if (!matchId) return;
       const match = battleMatches.get(matchId);
       if (!match || match.ended || !match.P) return;
-      const reg = match.porClave.get(socket.id);
+      const reg = brawlRegDe(match, socket);
       if (!reg || reg.salio) return;
       GFBrawlMotor.entrada(match.P, reg.luchadorId, datos);
     } catch (e) { /* un paquete raro no puede tumbar nada */ }
@@ -19415,10 +20336,14 @@ io.on('connection', (socket) => {
       if (!matchId) return;
       const match = battleMatches.get(matchId);
       if (!match || match.ended || !match.P) return;
-      const reg = match.porClave.get(socket.id);
+      const reg = brawlRegDe(match, socket);
       if (!reg || reg.salio) return;
       GFBrawlMotor.disparar(match.P, reg.luchadorId, datos);
     } catch (e) { console.error('❌ brawl:disparo', e); }
+  });
+
+  socket.on('brawl:volver', (datos) => {
+    try { brawlVolver(socket, datos); } catch (e) { console.error('❌ brawl:volver', e); }
   });
 
   socket.on('brawl:rendirse', () => {
@@ -20572,6 +21497,14 @@ app.use((err, req, res, next) => {
 });
 
 // --- INICIAR SERVIDOR ---
+/* CONEXIONES QUE SE REUTILIZAN (2026-10-02). Node cierra una conexión HTTP
+   inactiva a los 5 s; el proxy de delante (Render, Railway) la guarda abierta
+   más tiempo y la reutiliza: si Node ya la cerró, la petición falla con un
+   502 o tiene que abrir otra (otra vuelta de TLS: lo que se nota como "va
+   lento"). Con el keep-alive por encima del del proxy, eso no pasa.
+   headersTimeout tiene que ser MAYOR que keepAliveTimeout. */
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
 server.listen(PORT, HOST, () => {
   console.log(`=================================`);
   console.log(`🚀 Grassland Forest Backend COMPLETO v5.0 CORREGIDO`);
