@@ -19098,7 +19098,8 @@ const GFBrawlMotor = (function () {
       esquiva: null,         // { x, y, hasta }
       acechoDesde: 0,
       acechando: false,
-      barril: null           // un barril al que disparar { x, y }
+      barril: null,          // un barril al que disparar { x, y }
+      modo: 'explorar', plan: null, contenerFuego: false
     };
   }
 
@@ -19202,7 +19203,7 @@ const GFBrawlMotor = (function () {
     } else ia.atascado = 0;
 
     // ── disparar ──
-    if (t < ia.proximoDisparo) return;
+    if (t < ia.proximoDisparo || ia.contenerFuego) return;
     // Un barril con enemigos al lado vale más que un tiro normal.
     if (ia.barril && l.municion >= 1) {
       var ab = Math.atan2(ia.barril.y - l.y, ia.barril.x - l.x) + gauss(az) * (1 - ia.astucia) * 0.08;
@@ -19290,6 +19291,7 @@ const GFBrawlMotor = (function () {
     for (var i = 0; i < P.luchadores.length; i++) {
       var o = P.luchadores[i];
       if (o === l || !o.vivo || !loVe(P, l, o, t)) continue;
+      if (dist2(l, o) > Math.pow(P.R.celda * 13, 2) || !lineaDeTiro(P.R, l.x, l.y, o.x, o.y)) continue;
       if (ia.rival == null) ia.rival = o.id;
       var nota = Math.sqrt(dist2(l, o));
       if (o.id === ia.objetivo) nota *= 0.72;                 // no saltar de uno a otro
@@ -19391,11 +19393,57 @@ const GFBrawlMotor = (function () {
     return mejor;
   }
 
+  // Escoge una posición de combate, no la posición del enemigo. El plan
+  // dura un rato para no cambiar de intención en cada instantánea.
+  function posicionTactica(P, l, obj, radio, retirada) {
+    var ia = l.ia, R = P.R, mejor = null, notaMejor = Infinity;
+    var base = Math.atan2(l.y - obj.y, l.x - obj.x);
+    for (var i = 0; i < 10; i++) {
+      var a = base + (i - 4.5) * 0.30 * ia.estrafe;
+      var p = { x: obj.x + Math.cos(a) * radio, y: obj.y + Math.sin(a) * radio };
+      if (bloqueaPaso(celdaDePunto(R, p.x, p.y)) || !dentroDeZona(P, p, l.r + 4)) continue;
+      var libre = lineaDeTiro(R, obj.x, obj.y, p.x, p.y);
+      var nota = Math.sqrt(dist2(l, p));
+      nota += retirada ? (libre ? 180 : -60) : (libre ? 0 : 120);
+      if (!lineaLibre(R, l.x, l.y, p.x, p.y, l.r)) nota += 50;
+      // Separación entre atacantes: evita que todos lleguen por el mismo lado.
+      for (var j = 0; j < P.luchadores.length; j++) {
+        var o = P.luchadores[j];
+        if (o === l || !o.vivo || !loVe(P, l, o, P.tUltimo)) continue;
+        if (dist2(o, p) < 60 * 60) nota += 80;
+      }
+      if (nota < notaMejor) { notaMejor = nota; mejor = p; }
+    }
+    return mejor;
+  }
+
+  function ejecutarPlan(P, l, p, modo, t, duracion) {
+    if (!p) return false;
+    l.ia.modo = modo;
+    l.ia.plan = { x: p.x, y: p.y, modo: modo, hasta: t + duracion, objetivo: l.ia.objetivo };
+    irHacia(P, l, p.x, p.y, t);
+    return true;
+  }
+
+  function entradaSegura(P, l, z) {
+    var R = P.R, margen = Math.min(R.celda * 2, z.r * 0.35);
+    var a = Math.atan2(l.y - z.y, l.x - z.x);
+    for (var i = 0; i < 12; i++) {
+      var ang = a + (i % 2 ? 1 : -1) * Math.ceil(i / 2) * 0.24;
+      var p = { x: z.x + Math.cos(ang) * Math.max(0, z.r - margen),
+        y: z.y + Math.sin(ang) * Math.max(0, z.r - margen) };
+      if (!bloqueaPaso(celdaDePunto(R, p.x, p.y))) return p;
+    }
+    return celdaPisableCerca(R, z, Math.max(0, z.r - l.r), l.r) || z;
+  }
+
   function decidirBot(P, l, t, enCombate) {
     var ia = l.ia, R = P.R, az = P.azar, E = ia.E;
     if (ia.reaccion == null) ia.reaccion = 120 + 360 * (1 - ia.astucia) + az() * 120;
     ia.barril = null;
     ia.acechando = false;
+    ia.contenerFuego = false;
+    ia.modo = 'explorar';
     // La pausa "a mirar" solo dura mientras siga paseando: cualquier otra
     // decisión (un enemigo, la niebla) la corta.
     var pausa = ia.pausaHasta;
@@ -19414,6 +19462,8 @@ const GFBrawlMotor = (function () {
     }
     var obj = ia.objetivo ? P.porId[ia.objetivo] : null;
     if (obj && !obj.vivo) { ia.objetivo = null; obj = null; }
+    // Al perderlo, solo queda el recuerdo; no consultar dónde está escondido.
+    if (obj && !loVe(P, l, obj, t)) obj = null;
     var dd = obj ? Math.sqrt(dist2(l, obj)) : Infinity;
     var alcance = l.arma.alcance;
 
@@ -19425,8 +19475,10 @@ const GFBrawlMotor = (function () {
 
     // 3) LA NIEBLA manda sobre todo lo demás.
     var z = P.zona;
-    if (z.activa && Math.sqrt(dist2(l, z)) > z.r - R.celda * 1.4) {
-      irHacia(P, l, z.x, z.y, t);
+    if (z.activa && Math.sqrt(dist2(l, z)) > z.r - Math.min(R.celda * 1.4, z.r * 0.25)) {
+      ia.plan = null; ia.modo = 'zona'; ia.esquiva = null;
+      var entrada = entradaSegura(P, l, z);
+      irHacia(P, l, entrada.x, entrada.y, t);
       return;
     }
     // Y antes de que cierre la fase siguiente, ir colocándose: los listos con
@@ -19437,7 +19489,9 @@ const GFBrawlMotor = (function () {
       var queda = z.cambioEn - enCombate;
       var antelacion = (z.estado === 1 ? 4000 : 2500) + 6000 * ia.astucia;
       if (fueraSig && queda < antelacion && !(obj && dd < alcance && queda > 2500)) {
-        irHacia(P, l, z.sig.x, z.sig.y, t);
+        ia.plan = null; ia.modo = 'zona';
+        var entradaSig = entradaSegura(P, l, z.sig);
+        irHacia(P, l, entradaSig.x, entradaSig.y, t);
         return;
       }
     }
@@ -19445,12 +19499,26 @@ const GFBrawlMotor = (function () {
     // 4) MAL DE VIDA: a curarse.
     var vida = l.hp / l.maxHp;
     var carne = vida < 0.7 ? objetoCerca(P, l, 'carne', R.celda * 11) : null;
+    if (carne && !dentroDeZona(P, carne, l.r)) carne = null;
+    var plan = ia.plan;
+    if (plan && t < plan.hasta && dentroDeZona(P, plan, l.r) &&
+        ((plan.modo === 'recuperar' && vida < 0.72) || (plan.modo === 'recargar' && l.municion < 2))) {
+      ia.modo = plan.modo; ia.contenerFuego = true;
+      irHacia(P, l, plan.x, plan.y, t); return;
+    }
     if (obj && vida < E.retirada + 0.08 * ia.astucia && dd < alcance * 1.3) {
-      if (carne && dist2(carne, obj) > dist2(l, obj)) { irHacia(P, l, carne.x, carne.y, t); return; }
+      if (carne && dist2(carne, obj) > dist2(l, obj)) { ia.modo = 'recurso'; irHacia(P, l, carne.x, carne.y, t); return; }
       var cub = cobertura(P, l, obj);
       var arb = arbustoCerca(P, l, 6);
-      if (arb && dist2(arb, obj) > dist2(l, obj) && (!cub || dist2(l, arb) < dist2(l, cub))) { irHacia(P, l, arb.x, arb.y, t); return; }
-      if (cub) { irHacia(P, l, cub.x, cub.y, t); return; }
+      if (arb && dentroDeZona(P, arb, l.r) && dist2(arb, obj) > dist2(l, obj) && (!cub || dist2(l, arb) < dist2(l, cub))) {
+        ia.contenerFuego = true; ejecutarPlan(P, l, arb, 'recuperar', t, REGLAS.REGEN_ESPERA_MS + 1700); return;
+      }
+      if (cub && dentroDeZona(P, cub, l.r)) {
+        ia.contenerFuego = true;
+        ejecutarPlan(P, l, cub, 'recuperar', t, REGLAS.REGEN_ESPERA_MS + 1700); return;
+      }
+      var retirada = posicionTactica(P, l, obj, alcance * 1.25, true);
+      if (retirada) { ia.contenerFuego = true; ejecutarPlan(P, l, retirada, 'recuperar', t, 2200); return; }
       var hx = l.x - obj.x, hy = l.y - obj.y, hl = Math.sqrt(hx * hx + hy * hy) || 1;
       fijarDir(ia, hx / hl, hy / hl);
       ia.ruta = null;
@@ -19459,9 +19527,11 @@ const GFBrawlMotor = (function () {
     if (carne && (!obj || dd > alcance * 1.2)) { irHacia(P, l, carne.x, carne.y, t); return; }
 
     // 5) SIN MUNICIÓN: a cubierto hasta recargar (el agresivo, no: aprieta).
-    if (obj && l.municion < 1 && ia.estilo !== 'agresivo' && ia.astucia >= 0.3 && dd < alcance * 1.2) {
+    if (obj && l.municion < 1 && dd < alcance * 1.2) {
       var cub2 = cobertura(P, l, obj);
-      if (cub2) { irHacia(P, l, cub2.x, cub2.y, t); return; }
+      if (cub2 && !dentroDeZona(P, cub2, l.r)) cub2 = null;
+      cub2 = cub2 || posicionTactica(P, l, obj, alcance * 1.15, true);
+      if (cub2) { ia.contenerFuego = true; ejecutarPlan(P, l, cub2, 'recargar', t, l.arma.recarga * 2 + 300); return; }
     }
 
     // 6) UN BARRIL con enemigos al lado: dispararle (lo hace pensarBot).
@@ -19469,6 +19539,7 @@ const GFBrawlMotor = (function () {
 
     // 7) LA PELEA.
     if (obj) {
+      ia.modo = 'combatir';
       var ideal = alcance * (alcance < 150 ? E.ideal * 0.8 : E.ideal);
       var visible = loVe(P, l, obj, t);
       // El cazador deja que otros se peleen y entra cuando uno ya está tocado.
@@ -19495,7 +19566,15 @@ const GFBrawlMotor = (function () {
       }
       var tiro = visible && lineaDeTiro(R, l.x, l.y, obj.x, obj.y);
       if (!tiro || dd > alcance * 0.92) {
-        irHacia(P, l, obj.x, obj.y, t);
+        if (ia.plan && ia.plan.modo === 'flanquear' && ia.plan.objetivo === obj.id && t < ia.plan.hasta &&
+            dist2(l, ia.plan) > 18 * 18 && dentroDeZona(P, ia.plan, l.r)) {
+          ia.modo = 'flanquear'; irHacia(P, l, ia.plan.x, ia.plan.y, t); return;
+        }
+        var flanco = posicionTactica(P, l, obj, ideal, false);
+        if (flanco && ejecutarPlan(P, l, flanco, 'flanquear', t, 1100 + az() * 700)) return;
+        // Interceptar solo con información visible y una predicción corta.
+        var adelanto = Math.min(0.35, dd / l.vel * 0.15) * ia.astucia;
+        irHacia(P, l, obj.x + (obj.vx || 0) * adelanto, obj.y + (obj.vy || 0) * adelanto, t);
         return;
       }
       // A tiro: moverse de lado (esquivar) y corregir la distancia. Los cambios
@@ -19507,7 +19586,12 @@ const GFBrawlMotor = (function () {
       var ux = (obj.x - l.x) / (dd || 1), uy = (obj.y - l.y) / (dd || 1);
       var acerca = dd > ideal * 1.15 ? 0.7 : (dd < ideal * 0.75 ? -0.7 : 0);
       var lado = 0.45 + 0.5 * ia.astucia;
-      fijarDir(ia, ux * acerca + -uy * ia.estrafe * lado, uy * acerca + ux * ia.estrafe * lado);
+      var mx = ux * acerca + -uy * ia.estrafe * lado, my = uy * acerca + ux * ia.estrafe * lado;
+      if (!lineaLibre(R, l.x, l.y, l.x + mx * 28, l.y + my * 28, l.r)) {
+        ia.estrafe *= -1;
+        mx = ux * acerca + -uy * ia.estrafe * lado; my = uy * acerca + ux * ia.estrafe * lado;
+      }
+      fijarDir(ia, mx, my);
       ia.ruta = null;
       return;
     }
@@ -19519,7 +19603,7 @@ const GFBrawlMotor = (function () {
       return;
     }
     var hueso = objetoCerca(P, l, 'hueso', R.celda * 7);
-    if (hueso) { irHacia(P, l, hueso.x, hueso.y, t); return; }
+    if (hueso && dentroDeZona(P, hueso, l.r)) { ia.modo = 'recurso'; irHacia(P, l, hueso.x, hueso.y, t); return; }
 
     // Explorar: a un sitio libre dentro de la zona buena (los listos, por la
     // hierba). Al llegar, a veces se para a mirar un momento.
@@ -19544,6 +19628,7 @@ const GFBrawlMotor = (function () {
 
   function irHacia(P, l, x, y, t) {
     var ia = l.ia, R = P.R;
+    if (dist2(l, { x: x, y: y }) < 6 * 6) { fijarDir(ia, 0, 0); ia.ruta = null; return; }
     // En línea recta si se puede (y no hay agua ni muro en medio).
     if (lineaLibre(R, l.x, l.y, x, y, l.r)) {
       ia.ruta = null;
