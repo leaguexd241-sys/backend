@@ -594,8 +594,9 @@ const gamePlayerSchema = new mongoose.Schema({
   tutorial: { type: Number, default: 0 },
   // Primera finalización observada por el servidor. Históricos sin fecha: null.
   tutorialCompletedAt: { type: Date, default: null },
-  // Nivel de la MASCOTA: es el del personaje (ver nivelMascotaEfectivo). Se
-  // guarda para que los demás jugadores lo vean sin calcular nada.
+  // Nivel de la MASCOTA: sale de su propia experiencia, `petExp` (ver
+  // nivelMascotaEfectivo). Se guarda para que los demás jugadores lo vean
+  // sin calcular nada.
   // Se muestra junto al nombre del perro, propio y de los demás jugadores.
   petLevel: { type: Number, default: 1, min: 1 },
   // Contadores de TODA LA VIDA de la mascota (los de BattleScore son de la
@@ -605,6 +606,12 @@ const gamePlayerSchema = new mongoose.Schema({
   // sembrado con lo jugado en temporadas anteriores".
   petWins: { type: Number, min: 0 },
   petBattles: { type: Number, min: 0 },
+  // EXPERIENCIA PROPIA DE LA MASCOTA (2026-10-03). De ella sale su nivel
+  // (nivelMascotaPorExp) y se gana peleando en la arena. Sin valor por
+  // defecto A PROPÓSITO, igual que los contadores de arriba: "no existe" =
+  // "aún no sembrada"; sembrarExpMascota() la arranca en el nivel que el
+  // jugador veía hasta ahora, para que ninguna mascota baje de nivel.
+  petExp: { type: Number, min: 0 },
 
   // ── MASCOTA: vida, modo de comportamiento y muerte ──────────────────────
   // La vida va de 0 a 100 y es un PORCENTAJE: con ella entra a las batallas
@@ -2948,6 +2955,42 @@ class RelayManager {
     }
   }
 
+  // Las tablas `nivel`, `nombre` y `cons_parcelas` las escribe SOLO el
+  // servidor (ver TABLAS_SOLO_SERVIDOR). Siempre activo, sin bandera: una
+  // llamada al relay bastaría si no para ponerse nivel 150 en la cadena,
+  // quedarse el nombre de otro o "colocar" parcelas sin comprarlas.
+  async blockClientServerTables(contract, functionName, parameters) {
+    const ESCRITURAS = ['createInvoice', 'increaseInvoiceQuantity', 'decreaseInvoiceQuantity',
+                        'deleteInvoice', 'transferInvoice', 'transferQuantityBetweenInvoices'];
+    if (!ESCRITURAS.includes(functionName)) return;
+    const args = Array.isArray(parameters) ? parameters : Object.values(parameters || {});
+    const tipoDe = async (id) => {
+      const n = Number(id);
+      if (!(n > 0)) return null;
+      try { const inv = await contract.getInvoice(n); return String(inv.tipo || ''); } catch (_) { return null; }
+    };
+    const tipos = [];
+    if (functionName === 'createInvoice') tipos.push(String(args[1] || ''));        // (owner, tipo, cantidad, manualId)
+    else if (functionName === 'transferInvoice') tipos.push(await tipoDe(args[2]));  // (from, to, id, amount, manualId)
+    else if (functionName === 'transferQuantityBetweenInvoices') {                   // (fromId, toId, amount)
+      tipos.push(await tipoDe(args[0]));
+      tipos.push(await tipoDe(args[1]));
+    } else tipos.push(await tipoDe(args[0]));                                        // (id, ...)
+    const prohibida = tipos.find(t => t && TABLAS_SOLO_SERVIDOR.has(t));
+    if (prohibida) {
+      throw new Error(`server_table_blocked: la tabla '${prohibida}' solo la escribe el servidor`);
+    }
+    /* Los peces: crear o aumentar, no; bajar, borrar o pasar entre facturas
+       propias (lo que hacen comer y vender), sí. Una transferencia entre
+       facturas de un pez no crea peces, así que también vale. */
+    if (functionName === 'createInvoice' || functionName === 'increaseInvoiceQuantity') {
+      const soloAcuna = tipos.find(t => t && TABLAS_SOLO_ACUNA_SERVIDOR.has(t));
+      if (soloAcuna) {
+        throw new Error(`server_mint_only: '${soloAcuna}' solo lo acuña el servidor (se pesca)`);
+      }
+    }
+  }
+
   /**
    * ¿El error viene de que el NODO no responde, y no de la transacción en sí?
    *
@@ -3101,6 +3144,7 @@ class RelayManager {
       // esos SOLO los acuña el servidor en /api/gather/claim. Inerte si el flag
       // está apagado.
       await this.blockClientGatherMint(contract, functionName, parameters);
+      await this.blockClientServerTables(contract, functionName, parameters);
 
       // 3.7. CUPO DE LA TABLA DEL ÍTEM. Ver ensureItemTipoOnChain: si el tipo
       // que se va a acuñar no existe todavía en el contrato, o se quedó sin
@@ -4905,6 +4949,33 @@ function salaBase(sala) {
   return String(sala || '').split('#')[0];
 }
 
+/* LAS ISLAS SON UNA SALA POR DUEÑO (2026-10-04).
+
+   'isla@<cuenta>' con la cuenta pasada por encodeURIComponent, así que nunca
+   lleva '#' y `salaBase` no la parte. Quien está en su isla y quien la visita
+   comparten sala y se ven; dos islas distintas no se mezclan. Antes la isla
+   y la mina entraban en 'game' (heredaban initSocket de GameScene) y el
+   servidor no sabía que estaban allí. */
+function islaDeSala(sala) {
+  const base = salaBase(sala);
+  if (!base.startsWith('isla@')) return null;
+  try {
+    const d = decodeURIComponent(base.slice(5));
+    return d && d.length <= 80 ? d : null;
+  } catch (_) { return null; }
+}
+
+/** Dónde está alguien, en palabras del panel de amigos. */
+function zonaDeSala(sala) {
+  const b = salaBase(sala);
+  if (b === 'game') return 'world';
+  if (b === 'tienda') return 'shop';
+  if (b === 'mina') return 'mine';
+  if (b === 'isla' || b.startsWith('isla@')) return 'island';
+  if (b.startsWith('batalla') || b.startsWith('battle') || b.startsWith('arena')) return 'battle';
+  return 'travel';
+}
+
 /**
  * Quita de una sala a los que ya no tienen socket vivo, y avisa a los demás.
  *
@@ -5414,6 +5485,11 @@ io.on("connection", (socket) => {
       if (await esFantasma({ playerName: socket.authenticatedPlayer, address: socket.authenticatedAddress })) {
         return responder({ ok: false, error: 'You are a ghost — revive first.', fantasma: true });
       }
+      // Las parcelas de la isla tienen que ser TUYAS y estar colocadas.
+      if (String(plotId || '').startsWith('isla_') &&
+          !(await parcelaIslaDeJugador(socket.authenticatedAddress, plotId))) {
+        return responder({ ok: false, error: 'That plot is not yours.' });
+      }
       const bloqueo = isPlantLocked(userId);
       if (bloqueo.locked) {
         const min = Math.ceil(bloqueo.secondsRemaining / 60);
@@ -5437,6 +5513,10 @@ io.on("connection", (socket) => {
       if (!assertCropOwner(userId, 'plantError', plotId)) return;
       if (await esFantasma({ playerName: socket.authenticatedPlayer, address: socket.authenticatedAddress })) {
         return socket.emit('plantError', { plotId, error: 'You are a ghost — revive first.', fantasma: true });
+      }
+      if (String(plotId || '').startsWith('isla_') &&
+          !(await parcelaIslaDeJugador(socket.authenticatedAddress, plotId))) {
+        return socket.emit('plantError', { plotId, error: 'That plot is not yours.' });
       }
 
       const spamCheck = checkAndTrackPlantSpam(userId, seedType);
@@ -5541,7 +5621,11 @@ io.on("connection", (socket) => {
     // A partir de aquí `room` es la sala completa, con canal, y el resto del
     // manejador funciona exactamente igual que antes.
     const canal = socket.playerData.canal || 1;
-    const room  = salaConCanal(salaBase(salaPedida), canal);
+    // Una isla con un dueño que no se puede leer se queda en la isla genérica,
+    // y un nombre de sala desmedido no llega a crear una entrada en `rooms`.
+    let baseSala = salaBase(salaPedida).slice(0, 120);
+    if (baseSala.startsWith('isla@') && !islaDeSala(baseSala)) baseSala = 'isla';
+    const room  = salaConCanal(baseSala, canal);
 
     console.log(`🔵 joinRoom: ${socket.id} -> ${room}, último escena: ${lastScene}`);
 
@@ -5634,6 +5718,9 @@ io.on("connection", (socket) => {
     socket.playerData.room = room;
     socket.playerData.username = username || '---';
     socket.playerData.lastScene = lastScene || 'unknown';
+    // De quién es la isla en la que está (null fuera de las islas). Lo lee el
+    // teletransporte del panel de amigos ('friends:ir').
+    socket.playerData.islaDe = islaDeSala(room);
     
     if (!rooms[room]) {
       rooms[room] = {};
@@ -5678,10 +5765,14 @@ io.on("connection", (socket) => {
     // Si el socket es nuevo, vale la entrada del doble que se acaba de echar.
     const previo = (rooms[room] && rooms[room][socket.id]) || duplicado || null;
 
+    /* La posición con la que entra, si la manda y es razonable. Antes era
+       siempre (0,0) hasta el primer paso: los demás lo veían en la esquina, y
+       el teletransporte del panel de amigos no sabía adónde llevar a nadie. */
+    const coord = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 && n <= 20000 ? n : 0; };
     rooms[room][socket.id] = {
       id: socket.id,
-      x: previo ? previo.x : 0,
-      y: previo ? previo.y : 0,
+      x: previo ? previo.x : coord(data.x),
+      y: previo ? previo.y : coord(data.y),
       username: username || '---',
       // Identidad REAL del socket (no la que diga el cliente): la usa el
       // submenú de jugador (perfil / verificador / reporte) para saber a quién
@@ -6971,7 +7062,39 @@ const CICLO_TOTAL_MS = CICLO_DIA_MS + CICLO_NOCHE_MS;
 // instancias detrás de un balanceador irían desincronizadas.
 const CICLO_EPOCA_MS = Date.UTC(2024, 0, 1, 0, 0, 0);
 
-function estadoDelMundo(ahoraMs) {
+/* LA HORA LA PUEDE MOVER EL ADMINISTRADOR (climas.html, 2026-10-04).
+
+     auto    el reloj corre solo. `desfaseMs` lo adelanta: con "poner de
+             noche" se le suma justo lo que falta para las 21:00 y desde ahí
+             sigue corriendo. Con desfase 0 es la hora de siempre.
+     manual  la hora se queda QUIETA en `fijoMinutos` (minuto del día de
+             juego, 0..1439). La respuesta lleva `congelado: true` y el
+             cliente deja de extrapolar.
+
+   Vive en memoria (`_relojMundo`) porque /api/world/time es síncrona y la
+   pide todo el mundo; se carga de Mongo al arrancar y cada minuto (por si
+   hay varias instancias), y al instante cuando la cambia el administrador. */
+const _relojMundo = { modo: 'auto', desfaseMs: 0, fijoMinutos: null };
+
+/** El instante del ciclo que corresponde a un minuto del día de juego. */
+function tDelCicloParaMinuto(min) {
+  const m = ((Math.round(Number(min)) % 1440) + 1440) % 1440;
+  if (m >= 360 && m < 1080) return ((m - 360) / 720) * CICLO_DIA_MS;
+  const enNoche = (m - 1080 + 1440) % 1440;
+  return CICLO_DIA_MS + (enNoche / 720) * CICLO_NOCHE_MS;
+}
+
+/** La hora del mundo que se le dice al jugador, con lo que mande el admin. */
+function ahoraDelMundo(ahoraMs) {
+  if (_relojMundo.modo === 'manual' && Number.isFinite(_relojMundo.fijoMinutos)) {
+    const base = ahoraMs - ((((ahoraMs - CICLO_EPOCA_MS) % CICLO_TOTAL_MS) + CICLO_TOTAL_MS) % CICLO_TOTAL_MS);
+    return base + tDelCicloParaMinuto(_relojMundo.fijoMinutos);
+  }
+  return ahoraMs + (Number(_relojMundo.desfaseMs) || 0);
+}
+
+function estadoDelMundo(ahoraMsReal) {
+  const ahoraMs = ahoraDelMundo(ahoraMsReal);
   let t = (ahoraMs - CICLO_EPOCA_MS) % CICLO_TOTAL_MS;
   if (t < 0) t += CICLO_TOTAL_MS;
 
@@ -7004,7 +7127,10 @@ function estadoDelMundo(ahoraMs) {
     msParaCambio,
     cicloMs: CICLO_TOTAL_MS,
     diaMs: CICLO_DIA_MS,
-    nocheMs: CICLO_NOCHE_MS
+    nocheMs: CICLO_NOCHE_MS,
+    // La hora la ha fijado el administrador: el cliente no debe avanzarla.
+    congelado: _relojMundo.modo === 'manual' && Number.isFinite(_relojMundo.fijoMinutos),
+    modoReloj: _relojMundo.modo
   };
 }
 
@@ -8298,12 +8424,16 @@ async function mintGatherReward(address, tipo, quantity) {
     if (pil > 0) perInvoiceLimit = pil;
   } catch (_) {}
 
-  // Buscar una factura activa del tipo con cupo.
+  // Buscar una factura activa del tipo con cupo. Nunca una guardada en un
+  // cofre de la isla: lo acuñado iría a parar DENTRO del cofre.
   let target = null;
   try {
+    const guardadas = (typeof facturasGuardadasEnCofres === 'function')
+      ? await facturasGuardadasEnCofres(address) : new Set();
     const snap = await c.getUserInventorySnapshot(address);
     for (const inv of snap) {
-      if (inv.active && String(inv.tipo) === tipo && Number(inv.cantidad) + quantity <= perInvoiceLimit) {
+      if (inv.active && String(inv.tipo) === tipo && !guardadas.has(Number(inv.id)) &&
+          Number(inv.cantidad) + quantity <= perInvoiceLimit) {
         target = { id: Number(inv.id), manualId: inv.manualId, cantidad: Number(inv.cantidad) };
         break;
       }
@@ -9602,6 +9732,7 @@ app.post('/api/save/:playerName',
       delete update.petLevel;
       delete update.petWins;
       delete update.petBattles;
+      delete update.petExp;
       // Mismo motivo que petLevel: estos los decide el servidor. `petMode`
       // manda sobre a quién atacan los animales, `petHealth` sobre con cuánta
       // vida entra la mascota a las batallas, y el trío de la muerte sobre lo
@@ -9665,6 +9796,16 @@ app.post('/api/save/:playerName',
       }
 
       await saveGamePlayerWithTutorial(playerName, update);
+
+      // A LA CADENA, sin hacer esperar al jugador: nivel y nombre (tablas
+      // `nivel` y `nombre`) y, si cambió el inventario, en qué casilla está
+      // cada objeto (contrato v3). Los dos se agrupan con antirrebote, así que
+      // un guardado cada pocos segundos no es una transacción cada pocos
+      // segundos. Ver programarIdentidadEnCadena / programarCasillasEnCadena.
+      try {
+        programarIdentidadEnCadena(playerName);
+        if (update.inventory || update.chest) programarCasillasEnCadena(playerName);
+      } catch (e) { console.warn('⚠️  save: programar escritura en cadena:', e.message); }
 
       if (missionsData && typeof missionsData === 'object') {
         await MissionsPlayer.findOneAndUpdate(
@@ -9762,16 +9903,27 @@ app.get('/api/load/:playerName',
       }
 
       // EL NIVEL DE LA MASCOTA, el mismo que usa la arena (ver
-      // nivelMascotaEfectivo): el del personaje. Se guarda si no coincide,
-      // TAMBIÉN hacia abajo: así se corrigen solas las cuentas que se quedaron
-      // con el 34 o el 52 del fallo de los contadores de toda la vida.
+      // nivelMascotaEfectivo).
+      //
+      // DESDE 2026-10-03 LA MASCOTA TIENE SU PROPIO NIVEL (ver
+      // nivelMascotaEfectivo). Aquí se siembra su experiencia la primera vez y
+      // se devuelve la barra (petExp, petExpBase, petExpSiguiente) para que el
+      // jugador VEA cuánto le falta: un número sin barra no se distingue de
+      // uno inventado.
       try {
-        const nivelPet = nivelMascotaEfectivo(p);
-        if (nivelPet !== (Number(p.petLevel) || 1)) {
-          await GamePlayer.updateOne({ playerName }, { $set: { petLevel: nivelPet } });
+        if (p.petExp === undefined || p.petExp === null) {
+          await sembrarExpMascota(playerName);
+          const s = await GamePlayer.findOne({ playerName }).select('petExp petLevel').lean();
+          if (s) { p.petExp = s.petExp; p.petLevel = s.petLevel; }
         }
-        p.petLevel = nivelPet;
+        const prog = progresoMascota(p.petExp);
+        if (prog.petLevel !== (Number(p.petLevel) || 1)) {
+          await GamePlayer.updateOne({ playerName }, { $set: { petLevel: prog.petLevel } });
+        }
+        Object.assign(p, prog);
       } catch (e) { /* se queda el guardado */ }
+      // Rellena la cadena (tablas `nivel` y `nombre`) si le falta algo.
+      try { programarIdentidadEnCadena(playerName); } catch (_) {}
 
       let a = await Admin.findById('config').lean().exec();
       if (!a) {
@@ -10267,6 +10419,11 @@ app.post('/api/crops/crow', apiLimiter, authMiddleware, csrfProtection, async (r
     const plotId = String((req.body && req.body.plotId) || '').slice(0, 60);
     if (!plotId) return res.status(400).json({ error: 'falta_plotId' });
 
+    // Con un espantapájaros puesto, el cuervo se posa en él y no come.
+    if (await espantapajarosActivo(gp.playerName, plotId)) {
+      return res.json({ ok: true, resultado: 'espantapajaros', plotId });
+    }
+
     /* Se incluyen también las MUERTAS: una planta seca en la parcela es
        comida para un cuervo igual que una buena, y el jugador se quejó de que
        esas no desaparecían. Solo se excluyen las ya recogidas, que ya no
@@ -10310,6 +10467,335 @@ app.post('/api/crops/crow', apiLimiter, authMiddleware, csrfProtection, async (r
   }
 });
 
+
+
+// =============================================================================
+// LA PESCA EN EL RÍO DEL PUEBLO                                    (2026-10-05)
+// -----------------------------------------------------------------------------
+// El pez lo decide y lo ACUÑA el servidor (las tablas pes1..3 están en
+// TABLAS_SOLO_ACUNA_SERVIDOR: el cliente no puede crearlas). El cliente solo
+// lanza la caña y recoge el sedal a tiempo:
+//
+//   POST /api/pesca/lanzar   { x, y }   (los pies del jugador)
+//     · tiene que tener la caña EN LA CADENA (tabla `caña_pescar`)
+//     · tiene que estar en la orilla: el punto cae a menos de 3 casillas del
+//       agua del río (PESCA_AGUA_RLE, sacada del mapa con el tileset) y, si
+//       el servidor le ve en la sala del mapa, cerca de donde le ve
+//     · devuelve cuándo pica el pez (picaEnMs) y cuánto dura la picada
+//   POST /api/pesca/recoger  { sesion }
+//     · antes de la picada: se espanta; después de la ventana: se escapó
+//     · a tiempo: tirada de especie y acuñado (mintGatherReward)
+//
+// LA LUCHA (2026-10-05). Al picar ya no se recoge sin más: hay que pelear.
+//   POST /api/pesca/enganchar { sesion }   (en la ventana de la picada)
+//     · tirada de especie AQUÍ, y se le dice al cliente cómo pelea ese pez:
+//       el tamaño de su cuadro, lo rápido que va, lo nervioso que es, si
+//       encoge y si da tirones (PESCA_DIFICULTAD)
+//   POST /api/pesca/recoger { sesion, exito }
+//     · exito=false: se soltó. exito=true: se acuña, pero solo si la pelea
+//       ha durado lo que se tarda de verdad en llenar la barra
+//       (PESCA_LUCHA_MIN_MS) y no más de PESCA_LUCHA_MAX_MS.
+//   Un cliente viejo que llama a /recoger sin enganchar sigue funcionando
+//   con las reglas de antes.
+//
+// La experiencia de la habilidad la suma el CLIENTE, como las demás: el
+// guardado de la partida manda pesca_exp y pisaría lo que pusiera aquí.
+// =============================================================================
+const PESCA_AGUA_RLE = (
+  '278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-29' +
+  '7;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-' +
+  '297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;27' +
+  '8-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;' +
+  '278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;267-297;267-297;267-29' +
+  '7;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-' +
+  '297;267-297;267-297;267-297;267-297;267-288;267-288;267-288;267-288;267-288;267-288;267-288;267-288;267-288;26' +
+  '7-288;267-288;267-288;267-288;267-288;267-288;267-288;267-288;267-288;267-288;267-288;267-288;267-288;267-288;' +
+  '267-288;267-288;267-288;267-288;267-288;267-288;267-288;267-297;267-297;267-297;267-297;267-297;267-297;267-29' +
+  '7;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-297;267-' +
+  '297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;27' +
+  '8-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;' +
+  '278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-29' +
+  '7;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-' +
+  '297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;27' +
+  '8-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;278-297;' +
+  '278-297;278-297;249-297;249-297;249-297;249-297;249-297;249-297;249-297;249-297;249-297;249-297;249-297;249-29' +
+  '7;249-297;249-297;249-297;249-297;249-297;249-297;249-297;249-297;249-297;249-270;249-270;249-270;249-270;249-' +
+  '270;249-270;249-270;249-270;249-270;249-270;249-270;249-270;249-270;249-270;249-270;249-270;249-270;249-270;24' +
+  '9-270;249-270;249-270;249-270;249-270;224-270;224-270;224-270;224-270;224-270;224-270;224-270;224-270;224-270;' +
+  '224-270;224-270;224-270;224-270;224-270;224-270;224-270;224-270;224-270;224-270;224-270;224-270;224-245;224-24' +
+  '5;224-245;224-245;224-245;224-245;224-245;224-245;224-245;224-245;224-245;224-245;224-245;224-245;224-245;224-' +
+  '245;224-245;224-245;224-245;224-245;224-245;224-245;224-245;224-245;224-245;224-245'
+);
+const PESCA_CASILLA = 16;
+const PESCA_ANCHO = 313;
+const PESCA_COOLDOWN_MS = 3500;
+const PESCA_PICA_MIN = 2500, PESCA_PICA_MAX = 9000;
+const PESCA_VENTANA_MS = 1700;
+const PESCA_MARGEN_MS = 900;           // la red: lo que tarda el clic en llegar
+const PESCA_SESION_MS = 90 * 1000;
+const PESCA_ESPECIES = [               // [itemId, probabilidad acumulada, exp]
+  ['pes1', 0.58, 15],
+  ['pes2', 0.90, 25],
+  ['pes3', 1.00, 60]
+];
+const PESCA_ESCAPA = 0.12;             // a veces se suelta igual (solo sin lucha)
+/* Cómo pelea cada pez. `tam`: el alto de su cuadro (fracción de la pista);
+   `vel`: pistas por segundo a las que puede ir; `nervio`: cuántas veces por
+   segundo cambia de idea; `mengua`: cuánto encoge su cuadro al final;
+   `rafaga`: probabilidad por segundo de un tirón (va al doble un momento). */
+const PESCA_DIFICULTAD = {
+  // Afinados con una simulación (reflejos de 120 ms): la trucha común casi
+  // siempre, la carpa unos 7 s de pelea, la dorada la mitad de las veces.
+  pes1: { tam: 0.42, vel: 0.32, nervio: 0.70, mengua: 0.00, rafaga: 0.00 },
+  pes2: { tam: 0.32, vel: 0.54, nervio: 1.20, mengua: 0.12, rafaga: 0.16 },
+  pes3: { tam: 0.29, vel: 0.60, nervio: 1.35, mengua: 0.22, rafaga: 0.22 }
+};
+const PESCA_LUCHA_MIN_MS = 1900;       // de 35 % a 100 % al ritmo máximo
+const PESCA_LUCHA_MAX_MS = 45000;
+
+const _pescaAgua = (() => {
+  const filas = PESCA_AGUA_RLE.split(';');
+  const m = new Uint8Array(PESCA_ANCHO * filas.length);
+  filas.forEach((fila, y) => {
+    if (!fila) return;
+    fila.split(',').forEach((r) => {
+      const [a, b] = r.split('-').map(Number);
+      for (let x = a; x <= b; x++) m[y * PESCA_ANCHO + x] = 1;
+    });
+  });
+  return { m, alto: filas.length };
+})();
+
+/** ¿Hay agua del río a `radio` casillas de (px, py)? */
+function pescaCercaDelAgua(px, py, radio = 3) {
+  const cx = Math.floor(px / PESCA_CASILLA), cy = Math.floor(py / PESCA_CASILLA);
+  for (let y = cy - radio; y <= cy + radio; y++) {
+    if (y < 0 || y >= _pescaAgua.alto) continue;
+    for (let x = cx - radio; x <= cx + radio; x++) {
+      if (x < 0 || x >= PESCA_ANCHO) continue;
+      if (_pescaAgua.m[y * PESCA_ANCHO + x]) return true;
+    }
+  }
+  return false;
+}
+
+/** Donde le ve el servidor (sala del mapa), o null si no le ve. */
+function pescaPosicionVista(playerName) {
+  for (const s of socketsDeJugador(playerName)) {
+    const sala = s.playerData && s.playerData.room;
+    if (!sala || salaBase(sala) !== 'game' || !rooms[sala] || !rooms[sala][s.id]) continue;
+    const p = rooms[sala][s.id];
+    if (Number.isFinite(p.x) && Number.isFinite(p.y) && (p.x || p.y)) return { x: p.x, y: p.y };
+  }
+  return null;
+}
+
+const _pescaSesiones = new Map();      // playerName -> { id, t0, picaEn }
+const _pescaUltimo = new Map();        // playerName -> último lanzamiento
+
+app.post('/api/pesca/lanzar', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    const ahora = Date.now();
+    if (ahora - (_pescaUltimo.get(gp.playerName) || 0) < PESCA_COOLDOWN_MS) {
+      return res.status(429).json({ error: 'demasiado_pronto' });
+    }
+    const x = Number(req.body && req.body.x), y = Number(req.body && req.body.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'posicion' });
+    if (!pescaCercaDelAgua(x, y)) return res.status(400).json({ error: 'lejos_del_agua' });
+    const vista = pescaPosicionVista(gp.playerName);
+    if (vista && Math.hypot(vista.x - x, vista.y + 40 - y) > 260) {
+      return res.status(400).json({ error: 'lejos_del_agua' });
+    }
+    // La caña, en la cadena: la del inventario local no basta.
+    const address = String(gp.address || '').toLowerCase();
+    let tieneCana = false;
+    try {
+      tieneCana = (await facturasLibresDeCadena(address)).some(f => f.tipo === 'caña_pescar' && f.cantidad > 0);
+    } catch (e) {
+      return res.status(503).json({ error: 'cadena', message: 'The chain is not answering. Try again.' });
+    }
+    if (!tieneCana) return res.status(400).json({ error: 'sin_cana', message: 'You need a fishing rod.' });
+
+    _pescaUltimo.set(gp.playerName, ahora);
+    const sesion = crypto.randomBytes(8).toString('hex');
+    const espera = PESCA_PICA_MIN + Math.random() * (PESCA_PICA_MAX - PESCA_PICA_MIN);
+    _pescaSesiones.set(gp.playerName, { id: sesion, t0: ahora, picaEn: ahora + espera });
+    return res.json({ ok: true, sesion, picaEnMs: Math.round(espera), ventanaMs: PESCA_VENTANA_MS });
+  } catch (e) {
+    console.error('POST /api/pesca/lanzar:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/pesca/enganchar', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const s = _pescaSesiones.get(gp.playerName);
+    const pedida = String((req.body && req.body.sesion) || '');
+    if (!s || s.id !== pedida) return res.json({ ok: false, motivo: 'sin_sesion' });
+    if (s.enganchadoEn) return res.json({ ok: false, motivo: 'sin_sesion' });
+    const ahora = Date.now();
+    if (ahora - s.t0 > PESCA_SESION_MS) { _pescaSesiones.delete(gp.playerName); return res.json({ ok: false, motivo: 'tarde' }); }
+    if (ahora < s.picaEn - 150) { _pescaSesiones.delete(gp.playerName); return res.json({ ok: false, motivo: 'pronto' }); }
+    if (ahora > s.picaEn + PESCA_VENTANA_MS + PESCA_MARGEN_MS) { _pescaSesiones.delete(gp.playerName); return res.json({ ok: false, motivo: 'tarde' }); }
+    const r = Math.random();
+    const [itemId, , exp] = PESCA_ESPECIES.find(e => r <= e[1]) || PESCA_ESPECIES[0];
+    s.especie = itemId; s.exp = exp; s.enganchadoEn = ahora;
+    return res.json({ ok: true, especie: itemId, dificultad: PESCA_DIFICULTAD[itemId], maxMs: PESCA_LUCHA_MAX_MS });
+  } catch (e) {
+    console.error('POST /api/pesca/enganchar:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const s = _pescaSesiones.get(gp.playerName);
+    const pedida = String((req.body && req.body.sesion) || '');
+    if (!s || s.id !== pedida) return res.json({ ok: false, motivo: 'sin_sesion' });
+    _pescaSesiones.delete(gp.playerName);
+    const ahora = Date.now();
+    if (ahora - s.t0 > PESCA_SESION_MS) return res.json({ ok: false, motivo: 'tarde' });
+    let itemId, exp;
+    if (s.enganchadoEn) {
+      // Después de la lucha.
+      if (!(req.body && req.body.exito === true)) return res.json({ ok: false, motivo: 'escapo' });
+      const lucha = ahora - s.enganchadoEn;
+      if (lucha < PESCA_LUCHA_MIN_MS) return res.json({ ok: false, motivo: 'escapo' });
+      if (lucha > PESCA_LUCHA_MAX_MS + PESCA_MARGEN_MS) return res.json({ ok: false, motivo: 'tarde' });
+      itemId = s.especie; exp = s.exp;
+    } else {
+      // Sin lucha (un cliente de antes): las reglas de siempre.
+      if (ahora < s.picaEn - 150) return res.json({ ok: false, motivo: 'pronto' });
+      if (ahora > s.picaEn + PESCA_VENTANA_MS + PESCA_MARGEN_MS) return res.json({ ok: false, motivo: 'tarde' });
+      if (Math.random() < PESCA_ESCAPA) return res.json({ ok: false, motivo: 'escapo' });
+      const r = Math.random();
+      [itemId, , exp] = PESCA_ESPECIES.find(e => r <= e[1]) || PESCA_ESPECIES[0];
+    }
+    const tipo = ITEM_TIPO_MAP[itemId];
+    const address = String(gp.address || '').toLowerCase();
+    const factura = await mintGatherReward(address, tipo, 1);
+    if (!factura || !factura.id) {
+      return res.status(502).json({ ok: false, motivo: 'cadena', message: 'The fish slipped away (chain error). Try again.' });
+    }
+    try {
+      const doc = await GamePlayer.findOne({ playerName: gp.playerName });
+      if (doc) {
+        const r2 = ponerFacturaEnSlots(doc.inventory, doc.chest, itemId, factura);
+        doc.inventory = r2.inventory; doc.chest = r2.chest;
+        doc.markModified('inventory'); doc.markModified('chest');
+        await doc.save();
+      }
+    } catch (e) { console.warn('⚠️  pesca: casilla en Mongo:', e.message); }
+    console.log(`🎣 ${gp.playerName} pescó ${itemId} (factura ${factura.id})`);
+    return res.json({ ok: true, itemId, exp,
+      factura: { invoiceId: factura.id, manualId: factura.manualId, cantidad: factura.cantidad } });
+  } catch (e) {
+    console.error('POST /api/pesca/recoger:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// =============================================================================
+// EL ESPANTAPÁJAROS                                                (2026-10-05)
+// -----------------------------------------------------------------------------
+// Se pone en una parcela SEMBRADA del pueblo (cuadroN) o de la isla del
+// jugador (isla_X_Y). Quema 1 de la tabla `espantapajaros` en la cadena y dura
+// ESPANTAPAJAROS_MS: mientras dure, el cuervo se posa en él y no come
+// (/api/crops/crow lo mira). Mongo lo borra solo al caducar (índice TTL).
+// =============================================================================
+const ESPANTAPAJAROS_MS = 2 * 60 * 60 * 1000;
+const espantapajarosSchema = new mongoose.Schema({
+  playerName: { type: String, required: true, index: true },
+  address:    { type: String, required: true, lowercase: true },
+  plotId:     { type: String, required: true },
+  hasta:      { type: Date, required: true }
+}, { timestamps: true, versionKey: false });
+espantapajarosSchema.index({ playerName: 1, plotId: 1 }, { unique: true });
+espantapajarosSchema.index({ hasta: 1 }, { expireAfterSeconds: 0 });
+const Espantapajaros = mongoose.model('Espantapajaros', espantapajarosSchema);
+
+function plotIdValidoEspantapajaros(plotId) {
+  return /^cuadro[A-Za-z0-9_]{1,12}$/.test(plotId) || /^isla_\d{1,3}_\d{1,3}$/.test(plotId);
+}
+
+async function espantapajarosActivo(playerName, plotId) {
+  try {
+    return !!(await Espantapajaros.exists({ playerName, plotId, hasta: { $gt: new Date() } }));
+  } catch (_) { return false; }
+}
+
+app.get('/api/espantapajaros', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const lista = await Espantapajaros.find({ playerName: gp.playerName, hasta: { $gt: new Date() } })
+      .select('plotId hasta -_id').lean();
+    return res.json({ ok: true, ahora: Date.now(), duracionMs: ESPANTAPAJAROS_MS,
+      lista: lista.map(e => ({ plotId: e.plotId, hasta: new Date(e.hasta).getTime() })) });
+  } catch (e) {
+    console.error('GET /api/espantapajaros:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/espantapajaros/colocar', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    if (!relayerWallet) return res.status(503).json({ error: 'relayer_unavailable' });
+    const plotId = String((req.body && req.body.plotId) || '').slice(0, 40);
+    if (!plotIdValidoEspantapajaros(plotId)) return res.status(400).json({ error: 'parcela_invalida' });
+    const address = String(gp.address || '').toLowerCase();
+    if (plotId.startsWith('isla_') && !(await parcelaIslaDeJugador(address, plotId))) {
+      return res.status(403).json({ error: 'no_es_tuya' });
+    }
+
+    const r = await enColaDelJugador('espanta:' + address, async () => {
+      if (await espantapajarosActivo(gp.playerName, plotId)) {
+        return { status: 409, body: { error: 'ya_hay', message: 'There is already a scarecrow on this plot.' } };
+      }
+      const sembrada = await UserCrop.exists({
+        userId: { $in: [gp.playerName, address, gp.address] }, plotId, isHarvested: false
+      });
+      if (!sembrada) return { status: 400, body: { error: 'sin_siembra', message: 'Plant something first: a scarecrow guards a crop.' } };
+
+      const c = contratoItemsServidor();
+      const facturas = await facturasLibresDeCadena(address);
+      const del = facturas.filter(f => f.tipo === 'espantapajaros' && f.cantidad > 0)
+        .sort((a, b) => a.cantidad - b.cantidad)[0];
+      if (!del) return { status: 400, body: { error: 'no_tienes', message: 'You have no scarecrow.' } };
+      await txRelayer('espantapajaros: quemar', (o) => c.decreaseInvoiceQuantity(del.id, 1, o));
+      const quedan = del.cantidad - 1;
+      const hasta = new Date(Date.now() + ESPANTAPAJAROS_MS);
+      await Espantapajaros.updateOne({ playerName: gp.playerName, plotId },
+        { $set: { address, hasta } }, { upsert: true });
+      try {
+        const doc = await GamePlayer.findOne({ playerName: gp.playerName });
+        if (doc) {
+          const r2 = quitarUnaDeFacturaEnSlots(doc.inventory, doc.chest, del.id, quedan);
+          doc.inventory = r2.inventory; doc.chest = r2.chest;
+          doc.markModified('inventory'); doc.markModified('chest');
+          await doc.save();
+        }
+      } catch (e) { console.warn('⚠️  espantapájaros: casilla en Mongo:', e.message); }
+      console.log(`🧑‍🌾 ${gp.playerName} puso un espantapájaros en ${plotId}`);
+      return { status: 200, body: { ok: true, plotId, hasta: hasta.getTime(), duracionMs: ESPANTAPAJAROS_MS,
+        gastado: { itemId: 'espantapajaros', invoiceId: del.id, manualId: del.manualId, cantidadRestante: quedan } } };
+    });
+    return res.status(r.status).json(r.body);
+  } catch (e) {
+    console.error('POST /api/espantapajaros/colocar:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
 
 // =============================================================================
 // EL ALQUIMISTA
@@ -10782,6 +11268,115 @@ function climaHuella(d) {
           d.estacion, (d.cola || []).length].join('|');
 }
 
+// ── El reloj del mundo: guardado y rutas del administrador ─────────────────
+// (aqui y no junto a estadoDelMundo: `adminAuth` se define mas arriba que
+// esto pero mas abajo que aquel, y un `const` usado antes de su linea es un
+// ReferenceError al arrancar el servidor)
+const relojMundoSchema = new mongoose.Schema({
+  _id:         { type: String, default: 'config' },
+  modo:        { type: String, enum: ['auto', 'manual'], default: 'auto' },
+  desfaseMs:   { type: Number, default: 0 },
+  fijoMinutos: { type: Number, default: null, min: 0, max: 1439 },
+  updatedBy:   { type: String, default: '' }
+}, { timestamps: true, _id: false });
+const RelojMundo = mongoose.model('RelojMundo', relojMundoSchema);
+
+async function cargarRelojMundo() {
+  try {
+    const d = await RelojMundo.findById('config').lean();
+    if (!d) return;
+    _relojMundo.modo = d.modo === 'manual' ? 'manual' : 'auto';
+    _relojMundo.desfaseMs = Number(d.desfaseMs) || 0;
+    _relojMundo.fijoMinutos = Number.isFinite(d.fijoMinutos) ? d.fijoMinutos : null;
+  } catch (e) { /* Mongo aún no está: se reintenta en el siguiente minuto */ }
+}
+setTimeout(cargarRelojMundo, 3000);
+setInterval(cargarRelojMundo, 60 * 1000).unref?.();
+
+function relojEmitir() {
+  try {
+    if (typeof io !== 'undefined' && io && io.emit) io.emit('worldTime', estadoDelMundo(Date.now()));
+  } catch (_) {}
+}
+
+/** Desfase que hace que AHORA sean `min` minutos del día, siempre hacia delante. */
+function desfaseParaMinuto(min, ahoraMs) {
+  const actual = ahoraDelMundo(ahoraMs);
+  let tAhora = (actual - CICLO_EPOCA_MS) % CICLO_TOTAL_MS;
+  if (tAhora < 0) tAhora += CICLO_TOTAL_MS;
+  let salto = tDelCicloParaMinuto(min) - tAhora;
+  if (salto < 0) salto += CICLO_TOTAL_MS;          // adelantar, nunca volver atrás
+  const nuevo = (Number(_relojMundo.desfaseMs) || 0) + salto;
+  return ((nuevo % CICLO_TOTAL_MS) + CICLO_TOTAL_MS) % CICLO_TOTAL_MS;
+}
+
+// GET /api/admin/world-time — la hora y cómo está puesto el reloj.
+app.get('/api/admin/world-time', adminAuth, async (req, res) => {
+  await cargarRelojMundo();
+  return res.json({ ok: true, reloj: { ..._relojMundo }, estado: estadoDelMundo(Date.now()) });
+});
+
+// POST /api/admin/world-time  { accion, hora?, minuto?, horas? }
+//   dia | noche      ahora son las 08:00 / 21:00 (en auto, adelantando; en manual, fijando)
+//   adelantar        +horas de juego (1..23)
+//   fijar            modo manual, hora quieta en hora:minuto
+//   reanudar         modo auto desde la hora que se ve ahora
+//   normal           modo auto con la hora de siempre (desfase 0)
+app.post('/api/admin/world-time', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const accion = String(b.accion || '');
+    const ahora = Date.now();
+    const est = estadoDelMundo(ahora);
+    const minActual = est.hora * 60 + est.minuto;
+    let cambio = null;
+    const minDe = (h, m) => {
+      const hh = parseInt(h, 10), mm = parseInt(m, 10) || 0;
+      if (!Number.isInteger(hh) || hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+      return hh * 60 + mm;
+    };
+
+    if (accion === 'dia' || accion === 'noche') {
+      const objetivo = accion === 'dia' ? 8 * 60 : 21 * 60;
+      cambio = _relojMundo.modo === 'manual'
+        ? { modo: 'manual', fijoMinutos: objetivo }
+        : { modo: 'auto', desfaseMs: desfaseParaMinuto(objetivo, ahora), fijoMinutos: null };
+    } else if (accion === 'adelantar') {
+      const horas = parseInt(b.horas, 10);
+      if (!Number.isInteger(horas) || horas < 1 || horas > 23) return res.status(400).json({ error: 'horas_invalidas' });
+      const objetivo = (minActual + horas * 60) % 1440;
+      cambio = _relojMundo.modo === 'manual'
+        ? { modo: 'manual', fijoMinutos: objetivo }
+        : { modo: 'auto', desfaseMs: desfaseParaMinuto(objetivo, ahora), fijoMinutos: null };
+    } else if (accion === 'fijar') {
+      const m = minDe(b.hora, b.minuto);
+      if (m === null) return res.status(400).json({ error: 'hora_invalida' });
+      cambio = { modo: 'manual', fijoMinutos: m };
+    } else if (accion === 'reanudar') {
+      cambio = { modo: 'auto', fijoMinutos: null, desfaseMs: 0 };
+      _relojMundo.modo = 'auto'; _relojMundo.desfaseMs = 0;     // para medir desde la hora real
+      cambio.desfaseMs = desfaseParaMinuto(minActual, ahora);
+    } else if (accion === 'normal') {
+      cambio = { modo: 'auto', desfaseMs: 0, fijoMinutos: null };
+    } else {
+      return res.status(400).json({ error: 'accion_invalida' });
+    }
+
+    await RelojMundo.findByIdAndUpdate('config',
+      { $set: { ...cambio, updatedBy: (req.admin && req.admin.address) || '' } }, { upsert: true });
+    _relojMundo.modo = cambio.modo;
+    if ('desfaseMs' in cambio) _relojMundo.desfaseMs = cambio.desfaseMs;
+    _relojMundo.fijoMinutos = cambio.modo === 'manual' ? cambio.fijoMinutos : null;
+    const nuevo = estadoDelMundo(Date.now());
+    console.log(`🕒 [admin] reloj del mundo: ${accion} → ${nuevo.horaTexto} (${_relojMundo.modo})`);
+    relojEmitir();
+    return res.json({ ok: true, reloj: { ..._relojMundo }, estado: nuevo });
+  } catch (e) {
+    console.error('POST /api/admin/world-time:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // ── GET /api/world/weather ──────────────────────────────────────────────────
 // Público como /api/world/time: lo pide el juego en cada escena.
 app.get('/api/world/weather', apiLimiter, async (req, res) => {
@@ -11170,6 +11765,31 @@ const ITEM_TIPO_MAP = {
   pocion_mascota:        'pocion_mascota',
   pocion_mascota_grande: 'pocion_mascota_grande',
   elixir_revivir:        'elixir_revivir',
+
+  // CONSTRUCCIÓN (2026-10-03). La parcela que se compra en la tienda y se
+  // coloca en la isla. Su tabla la crea el administrador (ver TABLAS_MANUALES).
+  parcela: 'parcelas',
+  // La pala de construcción (2026-10-04): con ella se recoge lo construido.
+  // La tabla se llama así, `pala_contrucion`, porque es el nombre con el que
+  // la crea el administrador; el id del objeto va bien escrito.
+  pala_construccion: 'pala_contrucion',
+
+  // EQUIPO, GRANJA Y PESCA (2026-10-05). Las tablas llevan el nombre que
+  // pidió el dueño del juego: las espadas en `madera`, `cobre` y `hierro`, la
+  // caña en `caña_pescar`. Se dan de alta solas (ensureItemTipoOnChain).
+  espada_madera:  'madera',
+  espada_cobre:   'cobre',
+  espada_hierro:  'hierro',
+  cana_pescar:    'caña_pescar',
+  espantapajaros: 'espantapajaros',
+  // Los peces: SOLO los acuña el servidor (ver TABLAS_SOLO_ACUNA_SERVIDOR).
+  pes1: 'pes1', pes2: 'pes2', pes3: 'pes3',
+
+  // EL BOTE DE BASURA Y LOS COFRES DE LA ISLA (2026-10-05). Se compran (el
+  // bote y el cofre1) o se craftean (cofre2..4) y se COLOCAN en Lands: ver
+  // TIPOS_DE_CONSTRUCCION. Sus tablas se dan de alta solas.
+  basura: 'basura',
+  cofre1: 'cofre1', cofre2: 'cofre2', cofre3: 'cofre3', cofre4: 'cofre4',
 };
 
 function itemTipoOnChain(itemId) {
@@ -11196,7 +11816,39 @@ const ITEM_MAX_STACK = {
   trigo_buena: 20, trigo_corta: 20, trigo_mala: 20,
   calabaza_buena: 20, calabaza_corta: 20, calabaza_mala: 20,
   fresa_buena: 20, fresa_corta: 20, fresa_mala: 20,
+  parcela: 20,
+  pala_construccion: 1,
+  espada_madera: 1, espada_cobre: 1, espada_hierro: 1,
+  cana_pescar: 1, espantapajaros: 10,
+  pes1: 20, pes2: 20, pes3: 20,
+  basura: 10,
+  cofre1: 5, cofre2: 5, cofre3: 5, cofre4: 5,
 };
+
+// ── TABLAS QUE CREA EL ADMINISTRADOR A MANO (2026-10-03) ────────────────────
+// Ver "IDENTIDAD, CASILLAS Y CONSTRUCCIÓN EN LA CADENA" más abajo.
+const TABLA_NIVEL         = 'nivel';
+const TABLA_NOMBRE        = 'nombre';
+const TABLA_PARCELAS      = 'parcelas';
+const TABLA_CONS_PARCELAS = 'cons_parcelas';
+const TABLA_PALA          = 'pala_contrucion';
+
+/* Lo que el servidor NO toca con setLimit (ver ensureItemTipoOnChain): los
+   límites los pone el administrador. Sin esto, la primera compra de una
+   parcela "ampliaba" su perInvoiceLimit de 20 a 50 y una casilla dejaba de
+   corresponder con una factura. */
+const TABLAS_MANUALES = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_PARCELAS, TABLA_CONS_PARCELAS, TABLA_PALA]);
+/* Tablas que SOLO escribe el servidor. Con el cliente pudiendo escribirlas,
+   bastaría una llamada al relay para ponerse nivel 150 en la cadena o
+   "colocar" parcelas sin haberlas comprado. */
+const TABLAS_SOLO_SERVIDOR = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_CONS_PARCELAS]);
+/* Tablas que SOLO ACUÑA el servidor, pero que el cliente sí puede GASTAR
+   (2026-10-05): los peces. Se pescan (POST /api/pesca/recoger, que acuña con
+   el relayer) y se comen o se venden (el cliente baja la factura por el
+   relay). Lo que el cliente no puede es crearlos ni aumentarlos: si pudiera,
+   bastaría una llamada al relay para llenarse el inventario de truchas
+   doradas. Siempre activo, sin bandera, como TABLAS_SOLO_SERVIDOR. */
+const TABLAS_SOLO_ACUNA_SERVIDOR = new Set(['pes1', 'pes2', 'pes3']);
 
 // =============================================================================
 // CUPO DE LAS TABLAS DE ÍTEM EN EL CONTRATO
@@ -11255,6 +11907,10 @@ function stackMaximoDelTipo(tipo) {
  */
 async function ensureItemTipoOnChain(contract, tipo, cantidad) {
   if (!relayerWallet || !tipo) return;
+  // Las tablas que crea el administrador a mano (parcelas, nivel, nombre,
+  // cons_parcelas) no se tocan: su perInvoiceLimit es una decisión de diseño
+  // (20 parcelas por casilla), no un cupo que haya que ensanchar.
+  if (TABLAS_MANUALES.has(tipo)) return;
   if (!tiposDeItemPermitidos().has(tipo)) return;      // lista blanca
   if (typeof contract.getTipoStats !== 'function') return;
 
@@ -12338,8 +12994,15 @@ app.patch('/api/admin/players/:playerName', adminAuth, strictLimiter, async (req
       setMongo[campo] = valor;
       aplicados.push({ campo, de: actual, a: valor });
     }
+    // El nivel de la mascota sale de su experiencia: tocar solo `petLevel` se
+    // desharía en la siguiente carga. Se mueve la experiencia con él.
+    if (setMongo.petLevel !== undefined) {
+      setMongo.petLevel = Math.max(1, Math.min(MAX_LEVEL_MASCOTA, setMongo.petLevel));
+      setMongo.petExp = expMascotaParaNivel(setMongo.petLevel);
+    }
     if (Object.keys(setMongo).length) {
       await GamePlayer.updateOne({ playerName }, { $set: setMongo });
+      try { _identidadFirma.delete(playerName); programarIdentidadEnCadena(playerName); } catch (_) {}
     }
 
     // 2. Campos que son FACTURAS del contrato
@@ -12417,6 +13080,7 @@ app.delete('/api/admin/players/:playerName', adminAuth, strictLimiter, async (re
     await borrar(MissionsPlayer,      'misiones',     { playerName });
     await borrar(PlayerNotifications, 'notificaciones', { playerName });
     await borrar(FurnaceState,        'horno',        { playerName });
+    await borrar(Construccion,        'construcciones', { playerName });
     if (gp.address) await borrar(PlayerAuth, 'auth', { address: String(gp.address).toLowerCase() });
 
     console.warn(`🗑️  [admin ${req.admin.address || req.admin.role}] BORRÓ la cuenta ${playerName}`);
@@ -14054,6 +14718,236 @@ app.put('/api/admin/leaderboard-config', adminAuth, strictLimiter, async (req, r
 
 console.log('✅ Configuración de clasificación: /api/admin/leaderboard-config');
 
+// =============================================================================
+// LA COLECCIÓN NFT DEL PANEL "MY NFTs" (admin.html)              (2026-10-04)
+// =============================================================================
+// El panel NFT del juego (botón redondo NFT) enseña los NFT que la cartera del
+// jugador tiene de UNA colección concreta. Cuál, lo decide el administrador en
+// admin.html: el NOMBRE (el que se ve en el panel y en MetaMask) y el CONTRATO
+// (sin la dirección no hay forma de leerla en la cadena: un nombre no es
+// único). La red es la del juego si no se dice otra.
+//
+// QUIÉN LEE QUÉ
+// ---------------------------------------------------------------------------
+//   · El SERVIDOR lee en la cadena qué tokens tiene la cartera (balanceOf +
+//     tokenOfOwnerByIndex, o los Transfer recibidos si el contrato no es
+//     "enumerable") y su tokenURI. Devuelve ids y URIs; nada más.
+//   · El NAVEGADOR descarga los metadatos y las imágenes. Así el servidor no
+//     hace peticiones a direcciones que elige un contrato ajeno (un tokenURI
+//     puede apuntar a cualquier sitio: eso sería un SSRF de manual).
+// =============================================================================
+const nftColeccionSchema = new mongoose.Schema({
+  _id:        { type: String, default: 'config' },
+  nombre:     { type: String, default: '', maxlength: 80 },
+  contrato:   { type: String, default: '', lowercase: true },
+  chainId:    { type: Number, default: CHAIN_ID },
+  rpc:        { type: String, default: '', maxlength: 200 },   // vacío = el del juego
+  updatedBy:  { type: String, default: '' }
+}, { timestamps: true, _id: false });
+const NftColeccion = mongoose.model('NftColeccion', nftColeccionSchema);
+
+const NFT_ABI = [
+  'function name() view returns (string)',
+  'function balanceOf(address) view returns (uint256)',
+  'function ownerOf(uint256) view returns (address)',
+  'function tokenURI(uint256) view returns (string)',
+  'function tokenOfOwnerByIndex(address,uint256) view returns (uint256)',
+  'function supportsInterface(bytes4) view returns (bool)'
+];
+const NFT_MAX_TOKENS = 60;            // los que se enseñan como mucho
+const _nftCfgCache = { doc: null, at: 0 };
+const _nftCacheJugador = new Map();   // address → { at, datos }
+const _nftProveedores = new Map();    // rpc → JsonRpcProvider
+
+async function configColeccionNft() {
+  if (_nftCfgCache.doc && Date.now() - _nftCfgCache.at < 30000) return _nftCfgCache.doc;
+  const doc = (await NftColeccion.findById('config').lean()) || { nombre: '', contrato: '', chainId: CHAIN_ID, rpc: '' };
+  _nftCfgCache.doc = doc;
+  _nftCfgCache.at = Date.now();
+  return doc;
+}
+
+function proveedorNft(cfg) {
+  const rpc = String((cfg && cfg.rpc) || '').trim();
+  if (!rpc) return provider;                       // la red del juego
+  if (!_nftProveedores.has(rpc)) {
+    if (_nftProveedores.size > 8) _nftProveedores.clear();
+    _nftProveedores.set(rpc, new ethers.JsonRpcProvider(rpc, Number(cfg.chainId) || undefined, { staticNetwork: true }));
+  }
+  return _nftProveedores.get(rpc);
+}
+
+/** ipfs://… → pasarela https. El resto se deja como está. */
+function uriNftLegible(u) {
+  const s = String(u || '').trim();
+  if (/^ipfs:\/\//i.test(s)) return 'https://ipfs.io/ipfs/' + s.replace(/^ipfs:\/\/(ipfs\/)?/i, '');
+  return s;
+}
+
+async function tokensDeCartera(c, address, cfg) {
+  const n = Number(await c.balanceOf(address));
+  const ids = [];
+  if (n <= 0) return { total: 0, ids };
+  // 1) ERC-721 "enumerable": directo.
+  try {
+    for (let i = 0; i < Math.min(n, NFT_MAX_TOKENS); i++) ids.push((await c.tokenOfOwnerByIndex(address, i)).toString());
+    return { total: n, ids };
+  } catch (_) { ids.length = 0; }
+  // 2) Si no lo es: los Transfer que RECIBIÓ la cartera, de lo más nuevo a lo
+  //    más viejo y en ventanas (los nodos limitan el rango de getLogs), y se
+  //    confirma con ownerOf que los sigue teniendo.
+  const prov = proveedorNft(cfg);
+  const tope = await prov.getBlockNumber();
+  const topicTransfer = ethers.id('Transfer(address,address,uint256)');
+  const destino = ethers.zeroPadValue(address, 32);
+  const vistos = new Set();
+  const VENTANA = 50000;
+  for (let hasta = tope, vueltas = 0; hasta > 0 && vueltas < 40 && ids.length < Math.min(n, NFT_MAX_TOKENS); vueltas++) {
+    const desde = Math.max(0, hasta - VENTANA + 1);
+    let logs = [];
+    try {
+      logs = await prov.getLogs({ address: cfg.contrato, fromBlock: desde, toBlock: hasta, topics: [topicTransfer, null, destino] });
+    } catch (e) { break; }
+    for (let k = logs.length - 1; k >= 0; k--) {
+      const t = logs[k].topics && logs[k].topics[3];
+      if (!t) continue;                                   // ERC-20 (sin tokenId indexado)
+      const id = BigInt(t).toString();
+      if (vistos.has(id)) continue;
+      vistos.add(id);
+      try {
+        if (String(await c.ownerOf(id)).toLowerCase() === address) ids.push(id);
+      } catch (_) {}
+      if (ids.length >= Math.min(n, NFT_MAX_TOKENS)) break;
+    }
+    hasta = desde - 1;
+  }
+  return { total: n, ids };
+}
+
+// GET /api/nft/coleccion — qué colección enseña el panel (sin el RPC).
+app.get('/api/nft/coleccion', apiLimiter, async (req, res) => {
+  try {
+    const cfg = await configColeccionNft();
+    return res.json({
+      ok: true,
+      configurada: !!(cfg.nombre && cfg.contrato),
+      nombre: cfg.nombre || '', contrato: cfg.contrato || '', chainId: Number(cfg.chainId) || CHAIN_ID
+    });
+  } catch (e) {
+    console.error('GET /api/nft/coleccion:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// GET /api/nft/mios — los NFT de esa colección que tiene la cartera de la sesión.
+app.get('/api/nft/mios', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const address = String((req.user && req.user.address) || '').toLowerCase();
+    if (!ethers.isAddress(address)) return res.status(400).json({ error: 'sin_cartera' });
+    const cfg = await configColeccionNft();
+    const coleccion = { nombre: cfg.nombre || '', contrato: cfg.contrato || '', chainId: Number(cfg.chainId) || CHAIN_ID };
+    if (!cfg.nombre || !cfg.contrato) return res.json({ ok: true, configurada: false, coleccion, address, tokens: [] });
+
+    const cache = _nftCacheJugador.get(address);
+    const refrescar = req.query && req.query.refrescar === '1';
+    if (cache && !refrescar && Date.now() - cache.at < 2 * 60 * 1000 && cache.contrato === cfg.contrato) {
+      return res.json(cache.datos);
+    }
+    const c = new ethers.Contract(cfg.contrato, NFT_ABI, proveedorNft(cfg));
+    const { total, ids } = await tokensDeCartera(c, address, cfg);
+    const tokens = [];
+    for (const id of ids) {
+      let uri = '';
+      try { uri = uriNftLegible(await c.tokenURI(id)); } catch (_) {}
+      tokens.push({ id, uri: uri.slice(0, 4096) });
+    }
+    const datos = { ok: true, configurada: true, coleccion, address, total, truncado: total > tokens.length, tokens };
+    if (_nftCacheJugador.size > 1000) _nftCacheJugador.clear();
+    _nftCacheJugador.set(address, { at: Date.now(), contrato: cfg.contrato, datos });
+    return res.json(datos);
+  } catch (e) {
+    console.warn('GET /api/nft/mios:', e.shortMessage || e.message);
+    return res.status(502).json({ error: 'lectura_fallida', message: 'Could not read the collection on-chain right now.' });
+  }
+});
+
+// GET /api/admin/nft-coleccion — la configuración y una comprobación en vivo.
+app.get('/api/admin/nft-coleccion', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    _nftCfgCache.doc = null;
+    const cfg = await configColeccionNft();
+    let nombreEnCadena = null, errorCadena = null;
+    if (cfg.contrato) {
+      try { nombreEnCadena = await new ethers.Contract(cfg.contrato, NFT_ABI, proveedorNft(cfg)).name(); }
+      catch (e) { errorCadena = e.shortMessage || e.message; }
+    }
+    return res.json({ ok: true, config: cfg, nombreEnCadena, errorCadena, chainIdJuego: CHAIN_ID });
+  } catch (e) {
+    console.error('GET /api/admin/nft-coleccion:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// PUT /api/admin/nft-coleccion  { nombre, contrato, chainId?, rpc? }
+app.put('/api/admin/nft-coleccion', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const nombre = String(b.nombre || '').trim().slice(0, 80);
+    const contrato = String(b.contrato || '').trim().toLowerCase();
+    const rpc = String(b.rpc || '').trim();
+    const chainId = parseInt(b.chainId, 10) || CHAIN_ID;
+    // Vaciar las dos cosas = quitar la colección (el panel dice que no hay).
+    if (nombre || contrato) {
+      if (!nombre) return res.status(400).json({ error: 'falta_nombre' });
+      if (!ethers.isAddress(contrato)) return res.status(400).json({ error: 'contrato_invalido' });
+    }
+    if (rpc && (!/^https:\/\/[^\s]{4,190}$/i.test(rpc))) return res.status(400).json({ error: 'rpc_invalido', message: 'The RPC must be an https:// URL.' });
+
+    if (!rpc && chainId !== CHAIN_ID) {
+      return res.status(400).json({ error: 'falta_rpc', message: `Chain ${chainId} is not the game's network: give its RPC URL.` });
+    }
+    // Se comprueba que el contrato conteste a name() ANTES de guardar. Con un
+    // RPC nuevo, con un proveedor de red NO fija (uno fijo diria que la red
+    // coincide sin preguntar) y cerrado al acabar: si no, ethers se queda
+    // reintentando la deteccion de red cada segundo para siempre.
+    let nombreEnCadena = null;
+    if (contrato) {
+      let prov = provider, propio = false;
+      const conTope = (p) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 10000))]);
+      try {
+        if (rpc) {
+          prov = new ethers.JsonRpcProvider(rpc, undefined, { staticNetwork: false });
+          propio = true;
+          const id = Number(await conTope(prov.send('eth_chainId', [])));
+          if (id !== chainId) {
+            return res.status(400).json({ error: 'red_distinta', message: `That RPC is chain ${id}, not ${chainId}.` });
+          }
+        }
+        nombreEnCadena = await conTope(new ethers.Contract(contrato, NFT_ABI, prov).name());
+      } catch (e) {
+        return res.status(400).json({ error: 'contrato_no_responde', message: 'The contract did not answer name() on that network: ' + (e.shortMessage || e.message) });
+      } finally {
+        if (propio) { try { prov.destroy(); } catch (_) {} }
+      }
+    }
+    await NftColeccion.findByIdAndUpdate('config', {
+      $set: { nombre, contrato, chainId, rpc, updatedBy: req.admin.address || '' }
+    }, { upsert: true });
+    _nftCfgCache.doc = null;
+    _nftCacheJugador.clear();
+    console.log(`🖼️  [admin ${req.admin.address}] colección NFT: "${nombre}" ${contrato || '(ninguna)'}`);
+    return res.json({ ok: true, config: await configColeccionNft(), nombreEnCadena,
+      aviso: nombreEnCadena && nombre && nombreEnCadena.trim().toLowerCase() !== nombre.toLowerCase()
+        ? `The contract calls itself "${nombreEnCadena}".` : null });
+  } catch (e) {
+    console.error('PUT /api/admin/nft-coleccion:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+console.log('✅ Colección NFT del panel: /api/nft/mios, /api/admin/nft-coleccion');
+
+
 
 // Marketplace P2P — todas las rutas /api/marketplace/* viven en marketplace-routes.js
 // (se monta más abajo, después de que PlayerStats esté definido — ver "MARKETPLACE ROUTES MOUNT")
@@ -15150,9 +16044,12 @@ async function burnItemOnChain(address, tipo, quantity) {
 
   let facturas = [];
   try {
+    // Lo guardado en un cofre de la isla no se quema por aquí.
+    const guardadas = (typeof facturasGuardadasEnCofres === 'function')
+      ? await facturasGuardadasEnCofres(address) : new Set();
     const snap = await c.getUserInventorySnapshot(address);
     for (const inv of snap) {
-      if (inv.active && String(inv.tipo) === tipo && Number(inv.cantidad) > 0) {
+      if (inv.active && String(inv.tipo) === tipo && Number(inv.cantidad) > 0 && !guardadas.has(Number(inv.id))) {
         facturas.push({ id: Number(inv.id), cantidad: Number(inv.cantidad) });
       }
     }
@@ -15186,6 +16083,1299 @@ async function burnItemOnChain(address, tipo, quantity) {
   }
   return quemadas;
 }
+
+// =============================================================================
+// IDENTIDAD, CASILLAS Y CONSTRUCCIÓN EN LA CADENA                  (2026-10-03)
+// -----------------------------------------------------------------------------
+// Cuatro tablas del contrato que crea el ADMINISTRADOR A MANO (setLimit) y que
+// el servidor nunca da de alta ni amplía por su cuenta:
+//
+//   nivel          2 facturas por jugador: `nv:pj:<wallet>` (nivel del
+//                  personaje) y `nv:pet:<wallet>` (nivel de la mascota). La
+//                  CANTIDAD es el nivel. perInvoiceLimit recomendado: 150.
+//   nombre         2 facturas por jugador: `pj:<nombre>` y `pet:<nombre>`,
+//                  cantidad 1. El nombre va en el manualId, que el contrato no
+//                  deja repetir: dos jugadores no pueden registrar el mismo.
+//   parcelas       el OBJETO "Parcela" (inventario, tienda). 20 por casilla.
+//   cons_parcelas  una factura por parcela COLOCADA en la isla:
+//                  `cp:<x>.<y>:<wallet>`, cantidad 1. La posición va en el
+//                  manualId, así que la misma casilla no se puede ocupar dos
+//                  veces ni aunque se pida dos veces a la vez.
+//
+// Si una tabla todavía no existe, todo lo que dependa de ella se SALTA sin
+// romper nada (y se vuelve a mirar cada minuto): el juego sigue funcionando y
+// empieza a escribir en cuanto el administrador la crea.
+//
+// Las tres primeras (nivel, nombre, cons_parcelas) son SOLO DEL SERVIDOR: el
+// relay no deja que el cliente las acuñe, las suba, las baje ni las borre (ver
+// blockClientServerTables). `parcelas` sí la toca el cliente, porque se compra
+// y se vende en la tienda como cualquier otro objeto.
+//
+// Los nombres de las tablas (TABLA_*) y las listas TABLAS_MANUALES /
+// TABLAS_SOLO_SERVIDOR están más arriba, junto a ITEM_TIPO_MAP: las usa
+// ensureItemTipoOnChain, que vive allí.
+// =============================================================================
+
+/* Límites que se RECOMIENDAN al administrador (los enseña admin.html). El
+   servidor no los aplica: solo compara y avisa si una tabla se queda corta. */
+const TABLAS_RECOMENDADAS = [
+  { tipo: TABLA_NIVEL,         limit: 1_000_000_000, perInvoiceLimit: 150, para: 'Nivel del personaje y de la mascota (2 facturas por jugador)' },
+  { tipo: TABLA_NOMBRE,        limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Nombre del personaje y de la mascota (2 facturas por jugador)' },
+  { tipo: TABLA_PARCELAS,      limit: 1_000_000_000, perInvoiceLimit: 20,  para: 'Objeto Parcela del inventario (20 por casilla)' },
+  { tipo: TABLA_CONS_PARCELAS, limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Parcelas colocadas en la isla (1 por parcela)' },
+  { tipo: TABLA_PALA,          limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Pala de construcción: la herramienta para recoger lo construido (1 por casilla)' }
+];
+
+// ── EL NIVEL PROPIO DE LA MASCOTA ────────────────────────────────────────────
+/* Curva de la mascota: 50·n² + 50·n de experiencia ACUMULADA para el nivel n.
+   Es la mitad de la polinómica del personaje y sin el tramo exponencial: la
+   mascota solo sube peleando (unas pocas partidas al día), así que tiene que
+   notarse. Del 5 al 6 son 600 de experiencia: seis victorias diarias o
+   cuatro PvP. */
+const MAX_LEVEL_MASCOTA = 150;
+
+function expMascotaParaNivel(n) {
+  const L = Math.max(1, Math.min(MAX_LEVEL_MASCOTA, Math.round(Number(n) || 1)));
+  if (L <= 1) return 0;
+  return 50 * L * L + 50 * L;
+}
+
+function nivelMascotaPorExp(exp) {
+  const e = Math.max(0, Math.round(Number(exp) || 0));
+  let n = 1;
+  while (n < MAX_LEVEL_MASCOTA && e >= expMascotaParaNivel(n + 1)) n++;
+  return n;
+}
+
+/* Lo que da cada partida a la MASCOTA (aparte de la experiencia del personaje,
+   que sigue saliendo de expDeArena). La práctica no da nada: se podría jugar
+   contra bots sin parar. */
+const BRAWL_EXP_MASCOTA = {
+  diaria: { gana: 100, pierde: 25 },
+  pvp: [180, 110, 70, 45]             // por puesto; del 4.º en adelante, 45
+};
+
+function expMascotaDeArena(match, fila) {
+  if (!fila || !match || match.modo === 'practica') return 0;
+  if (match.esBot) return fila.puesto === 1 ? BRAWL_EXP_MASCOTA.diaria.gana : BRAWL_EXP_MASCOTA.diaria.pierde;
+  const i = Math.min(BRAWL_EXP_MASCOTA.pvp.length - 1, Math.max(0, (Number(fila.puesto) || 99) - 1));
+  return BRAWL_EXP_MASCOTA.pvp[i];
+}
+
+/**
+ * Siembra `petExp` la primera vez, para que NADIE vea bajar a su mascota.
+ *
+ * Hasta hoy el nivel de la mascota era el del personaje: eso es lo que el
+ * jugador tenía delante. Se arranca en ese mismo nivel (la experiencia justa
+ * para tenerlo) y desde ahí sube con SUS peleas. Atómico: el filtro
+ * `$exists:false` hace que dos peticiones a la vez no siembren dos veces.
+ */
+async function sembrarExpMascota(playerName) {
+  const gp = await GamePlayer.findOne({ playerName, petExp: { $exists: false } })
+    .select('_id nivel_exp').lean();
+  if (!gp) return;
+  const nivelInicial = Math.max(1, Math.min(MAX_LEVEL_MASCOTA, nivelPorExperiencia(gp.nivel_exp)));
+  const petExp = expMascotaParaNivel(nivelInicial);
+  await GamePlayer.updateOne({ _id: gp._id, petExp: { $exists: false } },
+    { $set: { petExp, petLevel: nivelInicial } });
+  console.log(`🐾 ${playerName}: experiencia de la mascota sembrada en ${petExp} (nivel ${nivelInicial})`);
+}
+
+/** Datos de la barra de experiencia de la mascota para el cliente. */
+function progresoMascota(petExp) {
+  const exp = Math.max(0, Math.round(Number(petExp) || 0));
+  const nivel = nivelMascotaPorExp(exp);
+  const base = expMascotaParaNivel(nivel);
+  const siguiente = nivel >= MAX_LEVEL_MASCOTA ? base : expMascotaParaNivel(nivel + 1);
+  return { petLevel: nivel, petExp: exp, petExpBase: base, petExpSiguiente: siguiente };
+}
+
+// ── EL CONTRATO TAL COMO LO USA EL SERVIDOR ──────────────────────────────────
+/* Funciones de la v3 del contrato. Se AÑADEN al ABI cargado de abis/ si no
+   las trae, para que el servidor pueda preguntar por ellas aunque el archivo
+   de ABI del despliegue sea viejo. Contra un contrato v2 la llamada falla y
+   `contratoSoportaCasillas()` lo detecta: nada se rompe. */
+const ABI_ITEMS_V3_EXTRA = [
+  'function CONTRACT_VERSION() view returns (uint256)',
+  'function setInvoiceSlotsBatch(address _owner, uint256[] _ids, uint32[] _slots) returns (uint256 applied)',
+  'function getInvoiceSlot(uint256 _id) view returns (uint32)',
+  'function getUserInventorySnapshotWithSlots(address user) view returns (tuple(uint256 id, string manualId, address owner, string tipo, uint256 cantidad, bool active, uint256 createdAt)[] result, uint32[] slots)'
+];
+let _abiItemsCompleto = null;
+let _contratoItemsServidor = null;
+
+function abiItemsCompleto() {
+  if (_abiItemsCompleto) return _abiItemsCompleto;
+  const base = Array.isArray(CONTRACTS.ITEMS_CONTRACT.abi) ? CONTRACTS.ITEMS_CONTRACT.abi : [];
+  const nombres = new Set(base.filter(f => f && f.type === 'function').map(f => f.name));
+  const extra = ABI_ITEMS_V3_EXTRA.filter(sig => {
+    const nombre = /function\s+(\w+)/.exec(sig)[1];
+    return !nombres.has(nombre);
+  });
+  _abiItemsCompleto = base.concat(extra);
+  return _abiItemsCompleto;
+}
+
+/** Contrato de ítems firmado por el relayer, con las funciones v3 aseguradas. */
+function contratoItemsServidor() {
+  if (!relayerWallet || !CONTRACTS.ITEMS_CONTRACT.address) return null;
+  if (!_contratoItemsServidor) {
+    try {
+      _contratoItemsServidor = new ethers.Contract(
+        CONTRACTS.ITEMS_CONTRACT.address, abiItemsCompleto(), relayerWallet);
+    } catch (e) {
+      console.error('contratoItemsServidor:', e.message);
+      return null;
+    }
+  }
+  return _contratoItemsServidor;
+}
+
+/* ¿Existe la tabla? Se cachea: 5 min si existe, 1 min si no (para que una
+   tabla recién creada por el administrador se note enseguida). */
+const _infoTablaCache = new Map();
+async function infoTablaCadena(tipo) {
+  const c = contratoItemsServidor();
+  if (!c) return null;
+  const cache = _infoTablaCache.get(tipo);
+  const ttl = cache && cache.info && cache.info.exists ? 5 * 60 * 1000 : 60 * 1000;
+  if (cache && (Date.now() - cache.at) < ttl) return cache.info;
+  try {
+    const ts = await c.getTipoStats(tipo);
+    const info = {
+      totalQuantity:   Number(ts.totalQuantity   ?? ts[0] ?? 0),
+      limit:           Number(ts.limit           ?? ts[1] ?? 0),
+      perInvoiceLimit: Number(ts.perInvoiceLimit ?? ts[2] ?? 0),
+      invoiceCount:    Number(ts.invoiceCount    ?? ts[3] ?? 0),
+      totalBurned:     Number(ts.totalBurned     ?? ts[4] ?? 0),
+      exists:          Boolean(ts.exists !== undefined ? ts.exists : ts[5])
+    };
+    _infoTablaCache.set(tipo, { at: Date.now(), info });
+    return info;
+  } catch (e) {
+    console.warn(`⚠️  getTipoStats(${tipo}) falló:`, e.message);
+    return null;
+  }
+}
+
+async function tablaExiste(tipo) {
+  const info = await infoTablaCadena(tipo);
+  return !!(info && info.exists);
+}
+
+/* ¿El contrato desplegado es v3 (sabe guardar casillas)? */
+let _soporteCasillas = { at: 0, ok: false };
+async function contratoSoportaCasillas() {
+  // "Sí" se recuerda 10 min; "no" solo 2, por si fue el nodo el que no
+  // contestó y no el contrato el que no sabe.
+  const ttl = _soporteCasillas.ok ? 10 * 60 * 1000 : 2 * 60 * 1000;
+  if (Date.now() - _soporteCasillas.at < ttl) return _soporteCasillas.ok;
+  let ok = false;
+  try {
+    const c = contratoItemsServidor();
+    if (c) ok = Number(await c.CONTRACT_VERSION()) >= 3;
+  } catch (_) { ok = false; }
+  _soporteCasillas = { at: Date.now(), ok };
+  return ok;
+}
+
+/** Facturas ACTIVAS del jugador, ya en objetos planos. */
+async function facturasDeCadena(address) {
+  const c = contratoItemsServidor();
+  if (!c) throw new Error('sin_contrato');
+  const snap = await c.getUserInventorySnapshot(address);
+  const salida = [];
+  for (const inv of snap) {
+    if (!inv.active) continue;
+    salida.push({
+      id: Number(inv.id), manualId: String(inv.manualId), tipo: String(inv.tipo),
+      cantidad: Number(inv.cantidad), owner: String(inv.owner).toLowerCase()
+    });
+  }
+  return salida;
+}
+
+/** Las mismas, sin las que el jugador tiene guardadas en sus cofres de la
+ *  isla. Es lo que hay que usar para GASTAR o para comprobar que "lo tiene":
+ *  lo guardado sigue siendo suyo, pero no está en la mochila. */
+async function facturasLibresDeCadena(address) {
+  const [todas, guardadas] = await Promise.all([
+    facturasDeCadena(address), facturasGuardadasEnCofres(address)
+  ]);
+  return guardadas.size ? todas.filter(f => !guardadas.has(f.id)) : todas;
+}
+
+/** Envía una transacción del relayer y espera el recibo (nonce del gestor). */
+async function txRelayer(nombre, fn) {
+  const nonce = await relayerNonceManager.getNextNonce();
+  try {
+    const tx = await fn({ gasPrice: gatherGasPrice(), nonce });
+    return await tx.wait();
+  } catch (e) {
+    console.error(`❌ ${nombre}:`, e.shortMessage || e.message);
+    try { await relayerNonceManager.resetNonce(); } catch (_) {}
+    throw e;
+  }
+}
+
+function idDeFacturaCreada(c, receipt) {
+  try {
+    for (const log of receipt.logs) {
+      let p = null;
+      try { p = c.interface.parseLog(log); } catch (_) {}
+      if (p && p.name === 'InvoiceCreated') return Number(p.args.id);
+    }
+  } catch (_) {}
+  return null;
+}
+
+/* Un trabajo de cadena a la vez POR JUGADOR. Colocar dos parcelas con dos
+   clics rápidos no puede quemar dos veces la misma factura de parcela. */
+const _colaCadenaJugador = new Map();
+function enColaDelJugador(clave, trabajo) {
+  const anterior = _colaCadenaJugador.get(clave) || Promise.resolve();
+  const actual = anterior.catch(() => {}).then(trabajo);
+  const fin = actual.catch(() => {}).then(() => {
+    if (_colaCadenaJugador.get(clave) === fin) _colaCadenaJugador.delete(clave);
+  });
+  _colaCadenaJugador.set(clave, fin);
+  return actual;
+}
+
+// ── NIVEL Y NOMBRE EN LA CADENA ──────────────────────────────────────────────
+const _identidadFirma = new Map();      // playerName → lo último que quedó en cadena
+const _identidadTimer = new Map();      // playerName → timeout del antirrebote
+
+function manualIdNivel(address, quien) { return `nv:${quien}:${String(address).toLowerCase()}`; }
+function manualIdNombre(quien, nombre) { return `${quien}:${nombre}`; }
+
+/**
+ * Pone en la cadena el nivel y el nombre del personaje y de la mascota.
+ *
+ * Reglas:
+ *   · los niveles SOLO suben (nunca se baja una factura de nivel). Si la
+ *     cadena va POR DELANTE de Mongo en la mascota (Mongo perdió datos), se
+ *     adopta la de la cadena: la cadena es la copia de seguridad;
+ *   · los nombres son de una sola vez: se crea la factura si falta. Si Mongo
+ *     dice '---' pero la cadena tiene el nombre de ESTA cartera, se recupera;
+ *   · si una tabla no existe todavía, esa parte se salta sin error.
+ */
+async function sincronizarIdentidadEnCadena(playerName) {
+  const c = contratoItemsServidor();
+  if (!c || !playerName || playerName === '---') return { ok: false, motivo: 'sin_contrato' };
+
+  const gp = await GamePlayer.findOne({ playerName })
+    .select('address Username petName nivel_exp petExp petLevel').lean();
+  if (!gp || !gp.address) return { ok: false, motivo: 'sin_jugador' };
+  const address = String(gp.address).toLowerCase();
+
+  const objetivo = {
+    pj:  Math.max(0, Math.min(MAX_LEVEL_PERSONAJE, nivelPorExperiencia(gp.nivel_exp))),
+    pet: nivelMascotaEfectivo(gp),
+    nombrePj:  gp.Username && gp.Username !== '---' ? String(gp.Username) : null,
+    nombrePet: gp.petName  && gp.petName  !== '---' ? String(gp.petName)  : null
+  };
+  const firma = JSON.stringify([address, objetivo]);
+  if (_identidadFirma.get(playerName) === firma) return { ok: true, sinCambios: true };
+
+  const [hayNivel, hayNombre] = await Promise.all([tablaExiste(TABLA_NIVEL), tablaExiste(TABLA_NOMBRE)]);
+  if (!hayNivel && !hayNombre) return { ok: false, motivo: 'tablas_sin_crear' };
+
+  let facturas;
+  try { facturas = await facturasDeCadena(address); }
+  catch (e) { return { ok: false, motivo: 'snapshot: ' + e.message }; }
+
+  let completo = true;
+
+  // ── Niveles ───────────────────────────────────────────────────────────
+  if (hayNivel) {
+    for (const quien of ['pj', 'pet']) {
+      const manualId = manualIdNivel(address, quien);
+      const quiero = objetivo[quien];
+      const f = facturas.find(x => x.tipo === TABLA_NIVEL && x.manualId === manualId);
+      try {
+        if (!f) {
+          await txRelayer(`nivel ${quien} (crear)`, (o) => c.createInvoice(address, TABLA_NIVEL, quiero, manualId, o));
+          console.log(`🏷️  ${playerName}: nivel ${quien} = ${quiero} guardado en la cadena`);
+        } else if (f.cantidad < quiero) {
+          await txRelayer(`nivel ${quien} (subir)`, (o) => c.increaseInvoiceQuantity(f.id, quiero - f.cantidad, o));
+          console.log(`🏷️  ${playerName}: nivel ${quien} ${f.cantidad} → ${quiero} en la cadena`);
+        } else if (f.cantidad > quiero && quien === 'pet') {
+          // La cadena va por delante: Mongo perdió la experiencia de la
+          // mascota. Se recupera hasta ese nivel (nunca se baja).
+          const exp = expMascotaParaNivel(f.cantidad);
+          await GamePlayer.updateOne({ playerName, $or: [{ petExp: { $lt: exp } }, { petExp: { $exists: false } }] },
+            { $set: { petExp: exp, petLevel: f.cantidad } });
+          objetivo.pet = f.cantidad;
+          console.log(`♻️  ${playerName}: nivel de la mascota recuperado de la cadena (${f.cantidad})`);
+        }
+      } catch (e) { completo = false; }
+    }
+  }
+
+  // ── Nombres ───────────────────────────────────────────────────────────
+  if (hayNombre) {
+    for (const [quien, campo, clave] of [['pj', 'Username', 'nombrePj'], ['pet', 'petName', 'nombrePet']]) {
+      const prefijo = quien + ':';
+      const enCadena = facturas.find(x => x.tipo === TABLA_NOMBRE && x.manualId.startsWith(prefijo));
+      const nombre = objetivo[clave];
+      try {
+        if (nombre && !enCadena) {
+          const manualId = manualIdNombre(quien, nombre);
+          if (Buffer.byteLength(manualId, 'utf8') > 64) { console.warn(`⚠️  nombre demasiado largo para la cadena: ${manualId}`); continue; }
+          await txRelayer(`nombre ${quien}`, (o) => c.createInvoice(address, TABLA_NOMBRE, 1, manualId, o));
+          console.log(`🏷️  ${playerName}: nombre ${quien} '${nombre}' registrado en la cadena`);
+        } else if (!nombre && enCadena) {
+          // Mongo lo perdió: se recupera de la cadena si nadie más lo usa.
+          const recuperado = enCadena.manualId.slice(prefijo.length);
+          const esc = recuperado.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const otro = await GamePlayer.findOne({ [campo]: { $regex: '^' + esc + '$', $options: 'i' }, playerName: { $ne: playerName } })
+            .select('_id').lean();
+          if (!otro && recuperado) {
+            await GamePlayer.updateOne({ playerName, [campo]: '---' }, { $set: { [campo]: recuperado } });
+            objetivo[clave] = recuperado;
+            console.log(`♻️  ${playerName}: ${campo} '${recuperado}' recuperado de la cadena`);
+          }
+        }
+      } catch (e) {
+        // ManualIdAlreadyExists: otra cartera ya registró ese nombre en la
+        // cadena. No se reintenta en bucle: se apunta y se sigue.
+        console.warn(`⚠️  ${playerName}: no se pudo registrar el nombre ${quien}:`, e.shortMessage || e.message);
+      }
+    }
+  }
+
+  if (completo && hayNivel && hayNombre) {
+    _identidadFirma.set(playerName, JSON.stringify([address, objetivo]));
+  }
+  return { ok: completo, objetivo };
+}
+
+/** Antirrebote: la cadena se escribe 4 s después del ÚLTIMO cambio. */
+function programarIdentidadEnCadena(playerName) {
+  if (!playerName || playerName === '---' || !relayerWallet) return;
+  const t = _identidadTimer.get(playerName);
+  if (t) clearTimeout(t);
+  _identidadTimer.set(playerName, setTimeout(() => {
+    _identidadTimer.delete(playerName);
+    enColaDelJugador('id:' + playerName, () => sincronizarIdentidadEnCadena(playerName))
+      .catch(e => console.warn('⚠️  identidad en cadena:', e.message));
+  }, 4000));
+}
+
+/** Lo que hay en la cadena para un jugador (admin.html). */
+async function identidadEnCadena(address) {
+  const facturas = await facturasDeCadena(address);
+  const addr = String(address).toLowerCase();
+  const nivelDe = (quien) => {
+    const f = facturas.find(x => x.tipo === TABLA_NIVEL && x.manualId === manualIdNivel(addr, quien));
+    return f ? { valor: f.cantidad, factura: f.id } : null;
+  };
+  const nombreDe = (quien) => {
+    const f = facturas.find(x => x.tipo === TABLA_NOMBRE && x.manualId.startsWith(quien + ':'));
+    return f ? { valor: f.manualId.slice(quien.length + 1), factura: f.id } : null;
+  };
+  const parcelas = facturas.filter(x => x.tipo === TABLA_PARCELAS).reduce((n, f) => n + f.cantidad, 0);
+  const colocadas = facturas.filter(x => x.tipo === TABLA_CONS_PARCELAS).length;
+  return {
+    nivelPj: nivelDe('pj'), nivelPet: nivelDe('pet'),
+    nombrePj: nombreDe('pj'), nombrePet: nombreDe('pet'),
+    parcelasEnInventario: parcelas, parcelasColocadas: colocadas
+  };
+}
+
+// ── CASILLAS DEL INVENTARIO EN LA CADENA (contrato v3) ───────────────────────
+/* Convención (la misma que documenta el contrato):
+     0 = sin casilla · 1..9999 = inventario (n-1) · 10001..19999 = cofre (n-10001) */
+const CASILLA_COFRE_BASE = 10001;
+function codigoCasilla(contenedor, indice) {
+  const i = Math.max(0, Math.floor(Number(indice) || 0));
+  return contenedor === 'cofre' ? CASILLA_COFRE_BASE + i : 1 + i;
+}
+
+const _casillasTimer = new Map();       // playerName → timeout
+const _casillasUltimoEnvio = new Map(); // playerName → ms
+const CASILLAS_ESPERA_MS = 20 * 1000;   // tras el último guardado
+const CASILLAS_MIN_ENTRE_TX_MS = 60 * 1000;
+
+/**
+ * Lleva a la cadena en qué casilla está cada factura del jugador, según lo
+ * último que guardó /api/save. Solo manda lo que CAMBIÓ (un intercambio de dos
+ * casillas son dos entradas, ~58 000 de gas) y solo facturas que de verdad
+ * son suyas, del mismo tipo que el objeto de la casilla y con el mismo
+ * manualId: un IDX basura (el número de casilla que rellena addItem cuando no
+ * hay factura) no llega nunca al contrato.
+ */
+async function sincronizarCasillasEnCadena(playerName) {
+  if (!(await contratoSoportaCasillas())) return { ok: false, motivo: 'contrato_v2' };
+  const c = contratoItemsServidor();
+  const gp = await GamePlayer.findOne({ playerName }).select('address inventory chest').lean();
+  if (!c || !gp || !gp.address) return { ok: false, motivo: 'sin_jugador' };
+  const address = String(gp.address).toLowerCase();
+
+  const deseado = new Map();   // invoiceId → { codigo, manualId, tipo }
+  const anotar = (lista, contenedor, maximo) => {
+    if (!Array.isArray(lista)) return;
+    for (const s of lista) {
+      if (!s || typeof s.id !== 'number' || s.id < 0 || s.id >= maximo) continue;
+      const idx = Number(s.IDX);
+      const tipo = itemTipoOnChain(s.objeto);
+      if (!(idx > 0) || !tipo || deseado.has(idx)) continue;
+      deseado.set(idx, { codigo: codigoCasilla(contenedor, s.id), manualId: String(s.Manualid || ''), tipo });
+    }
+  };
+  anotar(gp.inventory, 'inventario', INV_SLOTS);
+  anotar(gp.chest, 'cofre', CHEST_SLOTS);
+
+  let result, slots;
+  try { [result, slots] = await c.getUserInventorySnapshotWithSlots(address); }
+  catch (e) { return { ok: false, motivo: 'snapshot: ' + e.message }; }
+
+  const tiposDeItem = tiposDeItemPermitidos();
+  const ids = [], codigos = [];
+  for (let i = 0; i < result.length; i++) {
+    const inv = result[i];
+    if (!inv.active) continue;
+    const id = Number(inv.id);
+    const actual = Number(slots[i]) || 0;
+    const quiero = deseado.get(id);
+    if (quiero) {
+      if (quiero.manualId !== String(inv.manualId) || quiero.tipo !== String(inv.tipo)) continue;
+      if (actual !== quiero.codigo) { ids.push(id); codigos.push(quiero.codigo); }
+    } else if (actual !== 0 && tiposDeItem.has(String(inv.tipo))) {
+      // Ya no está en ninguna casilla guardada: se suelta la que tenía, o al
+      // cargar le "quitaría" el hueco al objeto que ahora vive ahí.
+      ids.push(id); codigos.push(0);
+    }
+  }
+  if (!ids.length) return { ok: true, cambios: 0 };
+
+  for (let i = 0; i < ids.length; i += 200) {
+    const loteIds = ids.slice(i, i + 200);
+    const loteCod = codigos.slice(i, i + 200);
+    await txRelayer('setInvoiceSlotsBatch', (o) => c.setInvoiceSlotsBatch(address, loteIds, loteCod, o));
+  }
+  console.log(`🗂️  ${playerName}: ${ids.length} casilla(s) guardadas en la cadena`);
+  return { ok: true, cambios: ids.length };
+}
+
+/** Se llama tras cada /api/save con inventario: agrupa y respeta un mínimo. */
+function programarCasillasEnCadena(playerName) {
+  if (!playerName || playerName === '---' || !relayerWallet) return;
+  const t = _casillasTimer.get(playerName);
+  if (t) clearTimeout(t);
+  const desdeUltimo = Date.now() - (_casillasUltimoEnvio.get(playerName) || 0);
+  const espera = Math.max(CASILLAS_ESPERA_MS, CASILLAS_MIN_ENTRE_TX_MS - desdeUltimo);
+  _casillasTimer.set(playerName, setTimeout(() => {
+    _casillasTimer.delete(playerName);
+    _casillasUltimoEnvio.set(playerName, Date.now());
+    enColaDelJugador('cas:' + playerName, () => sincronizarCasillasEnCadena(playerName))
+      .catch(e => console.warn('⚠️  casillas en cadena:', e.message));
+  }, espera));
+}
+
+// ── CONSTRUCCIÓN EN LA ISLA ──────────────────────────────────────────────────
+/* Las coordenadas de una construcción son las de su casilla de ARRIBA A LA
+   IZQUIERDA, en una rejilla de 32 px.
+
+   LA ISLA AL DOBLE (2026-10-05). La isla se pinta ahora al doble
+   (Maps/mapa_lands_x2.json, casillas de 64 px: "la Land la quiero x2"), pero
+   lo construido sigue en la rejilla de 32 —la parcela mide lo que un cuadro
+   del huerto del pueblo—, así que la isla pasa de 64 × 48 a 128 × 96
+   casillas de construcción. Lo construido ANTES se lleva al doble una vez
+   (migrarIslaAlDoble), y la factura de la cadena no se toca: su manualId
+   viejo (`cp:x.y:...`) se lee al doble (ver `prefijoViejo`). */
+const ISLA_ANCHO_CASILLAS = 128;
+const ISLA_ALTO_CASILLAS  = 96;
+const MAX_CONSTRUCCIONES_POR_JUGADOR = 200;
+
+const TIPOS_DE_CONSTRUCCION = {
+  parcela: {
+    ancho: 2, alto: 2,                 // 64 × 64 px, como los cuadros del huerto
+    itemId: 'parcela',
+    tablaItem: TABLA_PARCELAS,
+    tablaConstruccion: TABLA_CONS_PARCELAS,
+    // 'cq': rejilla de la isla al doble. 'cp': la de antes, que se lee al doble.
+    prefijo: 'cq',
+    prefijoViejo: 'cp'
+  },
+  /* EL BOTE DE BASURA Y LOS COFRES (2026-10-05). Ocupan 2 × 2 casillas (el
+     dibujo va al doble, como el bote del pueblo) y viven SOLO EN MONGO
+     (`tablaConstruccion: null`): al colocarlos se quema el objeto de la
+     mochila en la cadena, y al recogerlos con la pala se acuña otra vez.
+     `capacidad`: cuántas casillas guarda el cofre (ver LOS COFRES DE LA ISLA). */
+  basura: { ancho: 2, alto: 2, itemId: 'basura', tablaItem: 'basura', tablaConstruccion: null },
+  cofre1: { ancho: 2, alto: 2, itemId: 'cofre1', tablaItem: 'cofre1', tablaConstruccion: null, capacidad: 5 },
+  cofre2: { ancho: 2, alto: 2, itemId: 'cofre2', tablaItem: 'cofre2', tablaConstruccion: null, capacidad: 7 },
+  cofre3: { ancho: 2, alto: 2, itemId: 'cofre3', tablaItem: 'cofre3', tablaConstruccion: null, capacidad: 13 },
+  cofre4: { ancho: 2, alto: 2, itemId: 'cofre4', tablaItem: 'cofre4', tablaConstruccion: null, capacidad: 20 }
+};
+
+const construccionSchema = new mongoose.Schema({
+  playerName: { type: String, required: true, index: true },
+  address:    { type: String, required: true, lowercase: true },
+  tipo:       { type: String, required: true },
+  gx:         { type: Number, required: true, min: 0 },
+  gy:         { type: Number, required: true, min: 0 },
+  ancho:      { type: Number, required: true, min: 1 },
+  alto:       { type: Number, required: true, min: 1 },
+  invoiceId:  { type: Number, default: null },
+  manualId:   { type: String, default: null },
+  // Quitada de la cadena pero sin devolver todavía la parcela al inventario
+  // (la acuñación falló). La siguiente lectura lo reintenta.
+  devolucionPendiente: { type: Boolean, default: false },
+  // 2 = coordenadas de la isla al doble. Sin él, es de antes y se migra
+  // (ver migrarIslaAlDoble).
+  escala: { type: Number },
+  // Los cofres: QUÉ FACTURAS guardan. La factura sigue en la cadena a nombre
+  // del jugador; aquí solo se apunta que está dentro (ver LOS COFRES).
+  contenido: {
+    type: [{
+      _id: false,
+      invoiceId: { type: Number, required: true },
+      itemId:    { type: String, required: true },
+      manualId:  { type: String, default: '' },
+      tipo:      { type: String, required: true }
+    }],
+    default: []
+  }
+}, { timestamps: true, versionKey: false });
+construccionSchema.index({ address: 1, tipo: 1, gx: 1, gy: 1 }, { unique: true });
+const Construccion = mongoose.model('Construccion', construccionSchema);
+
+/** Ids de las facturas que el jugador tiene guardadas en sus cofres. Nunca
+ *  lanza: sin Mongo devuelve un conjunto vacío. */
+async function facturasGuardadasEnCofres(address) {
+  const ids = new Set();
+  const addr = String(address || '').toLowerCase();
+  if (!addr) return ids;
+  try {
+    const docs = await Construccion.find({ address: addr }).select('contenido').lean();
+    for (const d of (docs || [])) {
+      for (const e of (d.contenido || [])) {
+        const id = Number(e && e.invoiceId);
+        if (id > 0) ids.add(id);
+      }
+    }
+  } catch (e) { console.warn('⚠️  cofres: no se pudo leer lo guardado:', e.message); }
+  return ids;
+}
+
+function manualIdConstruccion(def, gx, gy, address) {
+  return `${def.prefijo}:${gx}.${gy}:${String(address).toLowerCase()}`;
+}
+
+function leerManualIdConstruccion(manualId) {
+  const m = /^([a-z]+):(\d+)\.(\d+):(0x[0-9a-f]{40})$/.exec(String(manualId || ''));
+  if (!m) return null;
+  const tipo = Object.keys(TIPOS_DE_CONSTRUCCION).find(k =>
+    TIPOS_DE_CONSTRUCCION[k].prefijo === m[1] || TIPOS_DE_CONSTRUCCION[k].prefijoViejo === m[1]);
+  if (!tipo) return null;
+  // Una factura de antes de la isla al doble: sus coordenadas, al doble.
+  const k = TIPOS_DE_CONSTRUCCION[tipo].prefijoViejo === m[1] ? 2 : 1;
+  return { tipo, gx: Number(m[2]) * k, gy: Number(m[3]) * k, address: m[4] };
+}
+
+/* LA ISLA AL DOBLE: lo construido antes de 2026-10-05 se lleva a la rejilla
+   nueva UNA vez por jugador, en su cola 'lands:' (la misma de colocar y
+   recoger): la construcción, y si es una parcela, sus cultivos y su
+   espantapájaros, que van por el plotId `isla_<x>_<y>`. Se mueve de la
+   coordenada más grande a la más pequeña: así un sitio nuevo (el doble) no
+   pisa nunca a uno viejo que todavía no se ha movido. */
+const _islaMigrada = new Set();
+async function migrarIslaAlDoble(playerName, address) {
+  const addr = String(address || '').toLowerCase();
+  if (!addr || _islaMigrada.has(addr)) return;
+  const viejos = await Construccion.find({ address: addr, escala: { $ne: 2 } }).lean();
+  if (viejos.length) {
+    viejos.sort((a, b) => (b.gx - a.gx) || (b.gy - a.gy));
+    const quien = [playerName, addr].filter(Boolean)
+      .map(s => new RegExp('^' + String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i'));
+    for (const d of viejos) {
+      const gx = d.gx * 2, gy = d.gy * 2;
+      await Construccion.updateOne({ _id: d._id }, { $set: { gx, gy, escala: 2 } });
+      if (d.tipo !== 'parcela') continue;
+      const antes = plotIdDeIsla(d.gx, d.gy), ahora = plotIdDeIsla(gx, gy);
+      try { await UserCrop.updateMany({ userId: { $in: quien }, plotId: antes }, { $set: { plotId: ahora } }); }
+      catch (e) { console.warn('⚠️  isla al doble: cultivos de ' + antes + ':', e.message); }
+      try {
+        if (playerName && typeof Espantapajaros !== 'undefined') {
+          await Espantapajaros.updateMany({ playerName, plotId: antes }, { $set: { plotId: ahora } });
+        }
+      } catch (e) { console.warn('⚠️  isla al doble: espantapájaros de ' + antes + ':', e.message); }
+    }
+    console.log(`🏝️  ${playerName || addr}: ${viejos.length} construcción(es) llevadas a la isla al doble`);
+  }
+  _islaMigrada.add(addr);
+}
+
+function seSolapan(a, b) {
+  return a.gx < b.gx + b.ancho && a.gx + a.ancho > b.gx &&
+         a.gy < b.gy + b.alto  && a.gy + a.alto  > b.gy;
+}
+
+function plotIdDeIsla(gx, gy) { return `isla_${gx}_${gy}`; }
+
+/** ¿Ese plotId de la isla es una parcela COLOCADA de esta cartera? */
+async function parcelaIslaDeJugador(address, plotId) {
+  const m = /^isla_(\d+)_(\d+)$/.exec(String(plotId || ''));
+  if (!m || !address) return false;
+  const doc = await Construccion.findOne({
+    address: String(address).toLowerCase(), tipo: 'parcela',
+    gx: Number(m[1]), gy: Number(m[2]), devolucionPendiente: { $ne: true }
+  }).select('_id').lean();
+  return !!doc;
+}
+
+/* Pone `cantidad` unidades de una factura en las casillas GUARDADAS del
+   jugador: en la casilla que ya lleva esa factura, o en la primera libre del
+   inventario (y si no, del cofre). Es lo que hace el cliente al recibir el
+   objeto; hacerlo también aquí deja Mongo bien aunque el cliente no guarde. */
+function ponerFacturaEnSlots(inventory, chest, itemId, factura) {
+  const inv = Array.isArray(inventory) ? inventory.map(s => ({ ...s })) : [];
+  const cof = Array.isArray(chest) ? chest.map(s => ({ ...s })) : [];
+  for (const lista of [inv, cof]) {
+    const s = lista.find(x => x && Number(x.IDX) === Number(factura.id));
+    if (s) { s.cantidad = factura.cantidad; s.objeto = itemId; s.Manualid = factura.manualId; return { inventory: inv, chest: cof }; }
+  }
+  const libre = (lista, maximo) => {
+    const usados = new Set(lista.filter(x => x && typeof x.id === 'number').map(x => x.id));
+    for (let i = 0; i < maximo; i++) if (!usados.has(i)) return i;
+    return -1;
+  };
+  let n = libre(inv, INV_SLOTS);
+  if (n >= 0) {
+    inv.push({ id: n, objeto: itemId, cantidad: factura.cantidad, IDX: factura.id, Manualid: factura.manualId });
+  } else if ((n = libre(cof, CHEST_SLOTS)) >= 0) {
+    cof.push({ id: n, objeto: itemId, cantidad: factura.cantidad, IDX: factura.id, Manualid: factura.manualId });
+  }
+  return { inventory: inv, chest: cof };
+}
+
+/* Resta una unidad a la casilla guardada que lleva la factura `invoiceId`. */
+function quitarUnaDeFacturaEnSlots(inventory, chest, invoiceId, quedan) {
+  const tocar = (lista) => {
+    if (!Array.isArray(lista)) return [];
+    const salida = [];
+    for (const s of lista) {
+      if (s && Number(s.IDX) === Number(invoiceId)) {
+        if (quedan > 0) salida.push({ ...s, cantidad: quedan });
+        continue;
+      }
+      salida.push(s);
+    }
+    return salida;
+  };
+  return { inventory: tocar(inventory), chest: tocar(chest) };
+}
+
+/* Devuelve la parcela al inventario de la cadena (y de Mongo). */
+async function devolverItemDeConstruccion(doc) {
+  const def = TIPOS_DE_CONSTRUCCION[doc.tipo];
+  if (!def) return null;
+  const minted = await mintGatherReward(doc.address, def.tablaItem, 1);
+  if (!minted || !minted.id) return null;
+  try {
+    const gp = await GamePlayer.findOne({ playerName: doc.playerName });
+    if (gp) {
+      const r = ponerFacturaEnSlots(gp.inventory, gp.chest, def.itemId, minted);
+      gp.inventory = r.inventory; gp.chest = r.chest;
+      gp.markModified('inventory'); gp.markModified('chest');
+      await gp.save();
+    }
+  } catch (e) { console.warn('⚠️  devolver parcela (Mongo):', e.message); }
+  return minted;
+}
+
+/**
+ * Las construcciones del jugador, con la CADENA como verdad: lo que exista en
+ * `cons_parcelas` y no en Mongo se añade; lo que esté en Mongo y la cadena ya
+ * no tenga se quita. Si la cadena no se puede leer, se devuelve Mongo tal cual.
+ *
+ * Va en la MISMA cola que colocar y recoger. Sin eso, una lectura que cayera
+ * entre "quemar la construcción" y "apuntar la devolución" de un recoger vería
+ * la construcción en Mongo y no en la cadena, la borraría, y si la devolución
+ * fallaba no quedaría ningún apunte para reintentarla: parcela perdida.
+ */
+function construccionesDeJugador(playerName, address) {
+  const addr = String(address).toLowerCase();
+  return enColaDelJugador('lands:' + addr, () => _construccionesDeJugador(playerName, addr));
+}
+
+async function _construccionesDeJugador(playerName, addr) {
+  await migrarIslaAlDoble(playerName, addr);
+  // Devoluciones que se quedaron a medias: se reintentan aquí.
+  const pendientes = await Construccion.find({ address: addr, devolucionPendiente: true }).lean();
+  for (const p of pendientes) {
+    const ok = await devolverItemDeConstruccion(p).catch(() => null);
+    if (ok) await Construccion.deleteOne({ _id: p._id });
+  }
+
+  let docs = await Construccion.find({ address: addr, devolucionPendiente: { $ne: true } }).lean();
+  let cadenaLeida = false;
+  if (await tablaExiste(TABLA_CONS_PARCELAS)) {
+    try {
+      const facturas = await facturasDeCadena(addr);
+      cadenaLeida = true;
+      const enCadena = new Map();
+      for (const f of facturas) {
+        if (f.tipo !== TABLA_CONS_PARCELAS) continue;
+        const pos = leerManualIdConstruccion(f.manualId);
+        if (pos && pos.address === addr) enCadena.set(`${pos.tipo}:${pos.gx}:${pos.gy}`, { ...pos, factura: f });
+      }
+      const enMongo = new Set(docs.map(d => `${d.tipo}:${d.gx}:${d.gy}`));
+      for (const [clave, pos] of enCadena) {
+        if (enMongo.has(clave)) continue;
+        const def = TIPOS_DE_CONSTRUCCION[pos.tipo];
+        try {
+          await Construccion.updateOne(
+            { address: addr, tipo: pos.tipo, gx: pos.gx, gy: pos.gy },
+            { $setOnInsert: { playerName, ancho: def.ancho, alto: def.alto, invoiceId: pos.factura.id, manualId: pos.factura.manualId, escala: 2 } },
+            { upsert: true });
+          console.log(`♻️  ${playerName}: ${pos.tipo} en ${pos.gx},${pos.gy} recuperada de la cadena`);
+        } catch (_) {}
+      }
+      // Solo lo que tiene factura de construcción: el bote y los cofres viven
+      // en Mongo y no se pueden "perder" en la cadena.
+      const sobran = docs.filter(d => {
+        const def = TIPOS_DE_CONSTRUCCION[d.tipo];
+        return !!(def && def.tablaConstruccion) && !enCadena.has(`${d.tipo}:${d.gx}:${d.gy}`);
+      });
+      if (sobran.length) {
+        await Construccion.deleteMany({ _id: { $in: sobran.map(d => d._id) } });
+        console.log(`🧹 ${playerName}: ${sobran.length} construcción(es) sin factura en la cadena, quitadas`);
+      }
+      docs = await Construccion.find({ address: addr, devolucionPendiente: { $ne: true } }).lean();
+    } catch (e) {
+      console.warn('⚠️  construcciones: no se pudo leer la cadena:', e.message);
+    }
+  }
+  return {
+    cadenaLeida,
+    construcciones: docs.map(d => ({
+      tipo: d.tipo, gx: d.gx, gy: d.gy, ancho: d.ancho, alto: d.alto, invoiceId: d.invoiceId
+    }))
+  };
+}
+
+// ── RUTAS ────────────────────────────────────────────────────────────────────
+
+/* Jugador de la sesión (por la cartera del token). */
+async function gpDeLaSesion(req) {
+  const address = String((req.user && req.user.address) || '').toLowerCase();
+  if (!address) return null;
+  return GamePlayer.findOne({ address }).select('playerName address').lean();
+}
+
+// GET /api/inventory/casillas — casilla guardada en la cadena de cada factura.
+app.get('/api/inventory/casillas', apiLimiter, authMiddleware, async (req, res) => {
+  // Las facturas guardadas en los cofres de la isla: el cliente las quita de
+  // lo que repone desde la cadena (si no, volverían a la mochila al entrar).
+  let enCofres = [];
+  try { enCofres = [...(await facturasGuardadasEnCofres(String((req.user && req.user.address) || '')))]; } catch (_) {}
+  try {
+    const address = String(req.user.address || '').toLowerCase();
+    if (!(await contratoSoportaCasillas())) return res.json({ soportado: false, casillas: {}, enCofres });
+    const c = contratoItemsServidor();
+    const [result, slots] = await c.getUserInventorySnapshotWithSlots(address);
+    const casillas = {};
+    for (let i = 0; i < result.length; i++) {
+      if (!result[i].active) continue;
+      const codigo = Number(slots[i]) || 0;
+      if (codigo) casillas[Number(result[i].id)] = codigo;
+    }
+    return res.json({ soportado: true, casillas, enCofres });
+  } catch (e) {
+    console.warn('GET /api/inventory/casillas:', e.message);
+    return res.json({ soportado: false, casillas: {}, error: 'lectura_fallida', enCofres });
+  }
+});
+
+// GET /api/lands/construcciones — lo construido en la isla del jugador.
+app.get('/api/lands/construcciones', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await gpDeLaSesion(req);
+    if (!gp) return res.status(404).json({ error: 'player_not_found' });
+    const [r, hayItem, hayCons, hayPala] = await Promise.all([
+      construccionesDeJugador(gp.playerName, gp.address),
+      tablaExiste(TABLA_PARCELAS), tablaExiste(TABLA_CONS_PARCELAS), tablaExiste(TABLA_PALA)
+    ]);
+    return res.json({
+      ok: true,
+      isla: { ancho: ISLA_ANCHO_CASILLAS, alto: ISLA_ALTO_CASILLAS, casilla: 32 },
+      tipos: TIPOS_DE_CONSTRUCCION,
+      maximo: MAX_CONSTRUCCIONES_POR_JUGADOR,
+      tablas: { [TABLA_PARCELAS]: hayItem, [TABLA_CONS_PARCELAS]: hayCons, [TABLA_PALA]: hayPala },
+      // Lo construido se recoge con la pala (ver /api/lands/quitar).
+      requierePala: true,
+      construcciones: r.construcciones,
+      cadenaLeida: r.cadenaLeida
+    });
+  } catch (e) {
+    console.error('GET /api/lands/construcciones:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// GET /api/lands/visita?de=<playerName> — la isla de OTRO, solo para mirar.
+//
+// Se puede visitar a un amigo, o a quien esté conectado ahora mismo (es a
+// quien enseña la pestaña Online). Se lee Mongo tal cual, sin cuadrar con la
+// cadena: eso lo hace el dueño cada vez que entra en su isla, y una visita no
+// debe costar lecturas del contrato. Los cultivos van con lo justo para
+// pintarlos (sin plazos ocultos: `expiresAt` y `sedientaHasta` son select:false).
+app.get('/api/lands/visita', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const de = String(req.query.de || '').slice(0, 80);
+    if (!de) return res.status(400).json({ error: 'falta_de' });
+    const yo = await gpDeLaSesion(req);
+    if (!yo) return res.status(404).json({ error: 'player_not_found' });
+    if (de === yo.playerName) return res.status(400).json({ error: 'es_tu_isla' });
+
+    const dueno = await GamePlayer.findOne({ playerName: de }).select('playerName Username address').lean();
+    const addr = String((dueno && dueno.address) || '').toLowerCase();
+    if (!dueno || !/^0x[0-9a-f]{40}$/.test(addr)) return res.status(404).json({ error: 'no_existe' });
+
+    const conectado = socketsDeJugador(dueno.playerName).length > 0;
+    let amigo = false;
+    if (!conectado) {
+      const a = await Amistad.findOne({ playerName: yo.playerName }).select('amigos').lean();
+      amigo = enLista(a && a.amigos, dueno.playerName);
+    }
+    if (!conectado && !amigo) return res.status(403).json({ error: 'no_disponible' });
+
+    // Si el dueño no ha entrado desde la isla al doble, se migra ya: si no,
+    // el visitante vería lo construido en el sitio de antes.
+    try { await enColaDelJugador('lands:' + addr, () => migrarIslaAlDoble(dueno.playerName, addr)); }
+    catch (e) { console.warn('⚠️  visita: isla al doble:', e.message); }
+    const docs = await Construccion.find({ address: addr, devolucionPendiente: { $ne: true } }).lean();
+    const cultivos = await UserCrop.find({
+      $or: [{ userId: dueno.playerName }, { userId: { $regex: '^' + addr + '$', $options: 'i' } }],
+      isHarvested: false,
+      plotId: /^isla_/
+    }).select('plotId cropType growthStage growthDuration currentGrowthTime isWatered isCompleted isDead').lean();
+
+    return res.json({
+      ok: true,
+      dueno: {
+        playerName: dueno.playerName,
+        username: dueno.Username && dueno.Username !== '---' ? dueno.Username : dueno.playerName
+      },
+      tipos: TIPOS_DE_CONSTRUCCION,
+      construcciones: docs.map(d => ({ tipo: d.tipo, gx: d.gx, gy: d.gy, ancho: d.ancho, alto: d.alto })),
+      cultivos: cultivos.map(c => ({
+        plotId: c.plotId, cropType: c.cropType, growthStage: c.growthStage,
+        growthDuration: c.growthDuration, currentGrowthTime: c.currentGrowthTime,
+        isWatered: !!c.isWatered, isCompleted: !!c.isCompleted, isDead: !!c.isDead,
+        cropConfig: (cropController.cropTypes && cropController.cropTypes[c.cropType]) || null
+      }))
+    });
+  } catch (e) {
+    console.error('GET /api/lands/visita:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// POST /api/lands/colocar  { tipo:'parcela', gx, gy }
+app.post('/api/lands/colocar', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await gpDeLaSesion(req);
+    if (!gp) return res.status(404).json({ error: 'player_not_found' });
+    const tipo = String((req.body && req.body.tipo) || '');
+    const def = TIPOS_DE_CONSTRUCCION[tipo];
+    const gx = Number(req.body && req.body.gx);
+    const gy = Number(req.body && req.body.gy);
+    if (!def) return res.status(400).json({ error: 'tipo_invalido' });
+    if (!Number.isInteger(gx) || !Number.isInteger(gy) || gx < 0 || gy < 0 ||
+        gx + def.ancho > ISLA_ANCHO_CASILLAS || gy + def.alto > ISLA_ALTO_CASILLAS) {
+      return res.status(400).json({ error: 'fuera_de_la_isla' });
+    }
+    if (await esFantasma({ playerName: gp.playerName, address: gp.address })) {
+      return res.status(403).json({ error: 'fantasma', message: 'You are a ghost — revive first.' });
+    }
+    if (!relayerWallet) return res.status(503).json({ error: 'relayer_unavailable' });
+    if (!(await tablaExiste(def.tablaItem)) ||
+        (def.tablaConstruccion && !(await tablaExiste(def.tablaConstruccion)))) {
+      return res.status(503).json({ error: 'tablas_sin_crear', message: 'Construction is not enabled yet (missing contract tables).' });
+    }
+    const address = String(gp.address).toLowerCase();
+
+    const resultado = await enColaDelJugador('lands:' + address, async () => {
+      await migrarIslaAlDoble(gp.playerName, address);
+      // 1) Sitio libre (contra TODAS sus construcciones, de cualquier tipo).
+      const existentes = await Construccion.find({ address }).lean();
+      if (existentes.length >= MAX_CONSTRUCCIONES_POR_JUGADOR) return { status: 409, body: { error: 'maximo_alcanzado', maximo: MAX_CONSTRUCCIONES_POR_JUGADOR } };
+      const nueva = { gx, gy, ancho: def.ancho, alto: def.alto };
+      const choca = existentes.find(e => seSolapan(nueva, e));
+      if (choca) return { status: 409, body: { error: 'ocupado', con: { tipo: choca.tipo, gx: choca.gx, gy: choca.gy } } };
+
+      // 2) Que tenga el objeto EN LA CADENA (no basta con el inventario local).
+      const c = contratoItemsServidor();
+      const facturas = await facturasLibresDeCadena(address);
+      const manualId = def.tablaConstruccion ? manualIdConstruccion(def, gx, gy, address) : null;
+      if (def.tablaConstruccion && facturas.some(f => f.tipo === def.tablaConstruccion && f.manualId === manualId)) {
+        return { status: 409, body: { error: 'ocupado', recargar: true } };
+      }
+      const delItem = facturas.filter(f => f.tipo === def.tablaItem && f.cantidad > 0)
+        .sort((a, b) => a.cantidad - b.cantidad)[0];
+      if (!delItem) return { status: 400, body: { error: 'no_tienes', itemId: def.itemId } };
+
+      // 3) Primero se QUEMA la parcela del inventario...
+      await txRelayer('colocar: quemar ' + def.tablaItem, (o) => c.decreaseInvoiceQuantity(delItem.id, 1, o));
+      const quedan = delItem.cantidad - 1;
+
+      // 4) ...y después se acuña la construcción. Si esto falla, la parcela
+      //    se devuelve: el jugador no puede perderla por un fallo de red.
+      //    (El bote y los cofres no tienen factura de construcción: Mongo.)
+      const devolverQuemada = async () => {
+        try {
+          if (quedan > 0) await txRelayer('colocar: devolver', (o) => c.increaseInvoiceQuantity(delItem.id, 1, o));
+          else await mintGatherReward(address, def.tablaItem, 1);
+        } catch (e2) { console.error('❌ colocar: NO se pudo devolver el objeto quemado a ' + address + ':', e2.message); }
+      };
+      let receipt = null;
+      if (def.tablaConstruccion) {
+        try {
+          receipt = await txRelayer('colocar: crear ' + def.tablaConstruccion,
+            (o) => c.createInvoice(address, def.tablaConstruccion, 1, manualId, o));
+        } catch (e) {
+          await devolverQuemada();
+          return { status: 502, body: { error: 'cadena_fallo', message: 'Could not save the plot on-chain. Your plot was returned.' } };
+        }
+      }
+      const invoiceId = receipt ? idDeFacturaCreada(c, receipt) : null;
+
+      // 5) Mongo: la construcción y la casilla del inventario.
+      try {
+        await Construccion.updateOne(
+          { address, tipo, gx, gy },
+          { $set: { playerName: gp.playerName, ancho: def.ancho, alto: def.alto, invoiceId, manualId, devolucionPendiente: false, escala: 2 } },
+          { upsert: true });
+      } catch (e) {
+        // Lo que solo vive en Mongo, si Mongo falla, se pierde: se devuelve.
+        // (Una parcela se recupera de la cadena en la siguiente lectura.)
+        if (!def.tablaConstruccion) {
+          await devolverQuemada();
+          return { status: 500, body: { error: 'internal_error', message: 'Could not save it. Your item was returned.' } };
+        }
+        throw e;
+      }
+      try {
+        const doc = await GamePlayer.findOne({ playerName: gp.playerName });
+        if (doc) {
+          const r = quitarUnaDeFacturaEnSlots(doc.inventory, doc.chest, delItem.id, quedan);
+          doc.inventory = r.inventory; doc.chest = r.chest;
+          doc.markModified('inventory'); doc.markModified('chest');
+          await doc.save();
+        }
+      } catch (e) { console.warn('⚠️  colocar: casilla en Mongo:', e.message); }
+
+      console.log(`🏗️  ${gp.playerName} colocó ${tipo} en ${gx},${gy} (factura ${invoiceId})`);
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          construccion: { tipo, gx, gy, ancho: def.ancho, alto: def.alto, invoiceId },
+          gastado: { itemId: def.itemId, invoiceId: delItem.id, manualId: delItem.manualId, cantidadRestante: quedan }
+        }
+      };
+    });
+    return res.status(resultado.status).json(resultado.body);
+  } catch (e) {
+    console.error('POST /api/lands/colocar:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// POST /api/lands/quitar  { gx, gy } — recoge la construcción y la devuelve.
+app.post('/api/lands/quitar', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await gpDeLaSesion(req);
+    if (!gp) return res.status(404).json({ error: 'player_not_found' });
+    const gx = Number(req.body && req.body.gx);
+    const gy = Number(req.body && req.body.gy);
+    if (!Number.isInteger(gx) || !Number.isInteger(gy)) return res.status(400).json({ error: 'posicion_invalida' });
+    if (!relayerWallet) return res.status(503).json({ error: 'relayer_unavailable' });
+    const address = String(gp.address).toLowerCase();
+
+    const resultado = await enColaDelJugador('lands:' + address, async () => {
+      await migrarIslaAlDoble(gp.playerName, address);
+      const doc = await Construccion.findOne({ address, gx, gy, devolucionPendiente: { $ne: true } }).lean();
+      if (!doc) return { status: 404, body: { error: 'no_existe' } };
+      const def = TIPOS_DE_CONSTRUCCION[doc.tipo];
+      if (!def) return { status: 400, body: { error: 'tipo_invalido' } };
+
+      // Con un cultivo encima no se recoge: se perdería la cosecha.
+      if (doc.tipo === 'parcela') {
+        const plotId = plotIdDeIsla(gx, gy);
+        const quien = [gp.playerName, address].map(s => new RegExp('^' + String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i'));
+        const cultivo = await UserCrop.findOne({ userId: { $in: quien }, plotId, isHarvested: false }).select('_id').lean();
+        if (cultivo) return { status: 409, body: { error: 'tiene_cultivo', message: 'Harvest or clear the crop before picking up this plot.' } };
+      }
+
+      // 0) LA PALA (2026-10-04). Lo construido se recoge con la pala de
+      //    construcción, y se mira EN LA CADENA: el inventario de Mongo lo
+      //    guarda el cliente y no prueba nada. La pala no se gasta. Una pala
+      //    guardada en un cofre no vale: tiene que estar en la mochila.
+      const c = contratoItemsServidor();
+      const todas = await facturasDeCadena(address);
+      const guardadas = await facturasGuardadasEnCofres(address);
+      const facturas = todas.filter(x => !guardadas.has(x.id));
+      if (!facturas.some(x => x.tipo === TABLA_PALA && x.cantidad > 0)) {
+        return { status: 403, body: { error: 'sin_pala', message: 'You need a Construction Shovel to dig it up. Buy one in the shop → Construction.' } };
+      }
+
+      // Un cofre con cosas dentro no se recoge (lo que ya no exista en la
+      // cadena —vendido en el mercado, por ejemplo— no cuenta).
+      if (def.capacidad && contenidoVivoDeCofre(doc, todas).length) {
+        return { status: 409, body: { error: 'cofre_con_cosas', message: 'Empty the chest before picking it up.' } };
+      }
+
+      // 1) Se quita la construcción de la cadena (comprobando que es SUYA).
+      //    El bote y los cofres no tienen: viven en Mongo.
+      if (def.tablaConstruccion) {
+        const f = facturas.find(x => x.tipo === def.tablaConstruccion && x.manualId === doc.manualId) ||
+                  facturas.find(x => x.tipo === def.tablaConstruccion && x.id === doc.invoiceId);
+        if (f) await txRelayer('quitar: ' + def.tablaConstruccion, (o) => c.decreaseInvoiceQuantity(f.id, 1, o));
+      }
+
+      // 2) Se devuelve el objeto. Si falla, queda apuntado y se reintenta.
+      await Construccion.updateOne({ _id: doc._id }, { $set: { devolucionPendiente: true } });
+      const devuelto = await devolverItemDeConstruccion(doc);
+      if (!devuelto) {
+        return { status: 202, body: { ok: true, pendiente: true, message: 'Plot removed. It will return to your inventory shortly.' } };
+      }
+      await Construccion.deleteOne({ _id: doc._id });
+      console.log(`🏗️  ${gp.playerName} recogió ${doc.tipo} de ${gx},${gy}`);
+      return {
+        status: 200,
+        body: { ok: true, quitada: { tipo: doc.tipo, gx, gy }, devuelto: { itemId: def.itemId, invoiceId: devuelto.id, manualId: devuelto.manualId, cantidad: devuelto.cantidad } }
+      };
+    });
+    return res.status(resultado.status).json(resultado.body);
+  } catch (e) {
+    console.error('POST /api/lands/quitar:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── LOS COFRES DE LA ISLA (2026-10-05) ──────────────────────────────────────
+/* Guardar algo en un cofre NO lo saca de la cadena ni le cambia el dueño: la
+   factura sigue siendo del jugador. El cofre solo APUNTA qué facturas guarda
+   (`contenido`) y la casilla de la mochila se vacía. Por eso:
+
+     · todo lo que elige facturas "por tipo" en este servidor —acuñar,
+       quemar en el mercado, la caña, la pala, el espantapájaros— se salta las
+       guardadas (facturasGuardadasEnCofres / facturasLibresDeCadena);
+     · el cliente las quita de lo que repone desde la cadena al entrar
+       (`enCofres` en /api/inventory/casillas);
+     · la cantidad de cada cosa guardada se lee SIEMPRE de la cadena, y lo
+       que ya no exista en ella se borra del cofre al mirarlo.
+
+   Todo va en la cola 'lands:' del jugador, la misma de colocar y recoger:
+   no se puede recoger un cofre mientras se guarda algo en él. */
+
+/** Lo guardado en el cofre que sigue existiendo en la cadena, con su cantidad. */
+function contenidoVivoDeCofre(doc, facturas) {
+  const porId = new Map((facturas || []).map(f => [f.id, f]));
+  const vivos = [];
+  for (const e of ((doc && doc.contenido) || [])) {
+    const f = porId.get(Number(e && e.invoiceId));
+    if (!f || f.cantidad <= 0 || f.tipo !== e.tipo) continue;
+    vivos.push({ invoiceId: f.id, itemId: e.itemId, manualId: f.manualId, tipo: f.tipo, cantidad: f.cantidad });
+  }
+  return vivos;
+}
+
+function itemIdDeTablaDeObjeto(tipo, pedido) {
+  if (pedido && ITEM_TIPO_MAP[pedido] === tipo) return pedido;
+  for (const [itemId, t] of Object.entries(ITEM_TIPO_MAP)) if (t === tipo) return itemId;
+  return null;
+}
+
+async function cofreDelJugador(address, gx, gy) {
+  const doc = await Construccion.findOne({ address, gx, gy, devolucionPendiente: { $ne: true } }).lean();
+  const def = doc && TIPOS_DE_CONSTRUCCION[doc.tipo];
+  return (doc && def && def.capacidad) ? { doc, def } : null;
+}
+
+async function apuntarContenidoDeCofre(doc, vivos) {
+  await Construccion.updateOne({ _id: doc._id }, {
+    $set: { contenido: vivos.map(v => ({ invoiceId: v.invoiceId, itemId: v.itemId, manualId: v.manualId, tipo: v.tipo })) }
+  });
+}
+
+function respuestaDeCofre(doc, def, vivos, extra) {
+  return Object.assign({
+    ok: true, tipo: doc.tipo, gx: doc.gx, gy: doc.gy, capacidad: def.capacidad,
+    contenido: vivos.map(v => ({ invoiceId: v.invoiceId, itemId: v.itemId, manualId: v.manualId, cantidad: v.cantidad }))
+  }, extra || {});
+}
+
+/* El trabajo común de las tres rutas: el cofre, la cadena y lo vivo. */
+async function conCofre(req, res, nombre, trabajo) {
+  try {
+    const gp = await gpDeLaSesion(req);
+    if (!gp) return res.status(404).json({ error: 'player_not_found' });
+    // gx/gy: en la consulta (GET) o en el cuerpo (POST).
+    const fuente = (req.query && req.query.gx !== undefined) ? req.query : (req.body || {});
+    const gx = Number(fuente.gx), gy = Number(fuente.gy);
+    if (!Number.isInteger(gx) || !Number.isInteger(gy)) return res.status(400).json({ error: 'posicion_invalida' });
+    const address = String(gp.address).toLowerCase();
+    const r = await enColaDelJugador('lands:' + address, async () => {
+      await migrarIslaAlDoble(gp.playerName, address);
+      const k = await cofreDelJugador(address, gx, gy);
+      if (!k) return { status: 404, body: { error: 'no_existe', message: 'That chest is no longer there.' } };
+      let facturas;
+      try { facturas = await facturasDeCadena(address); }
+      catch (e) { return { status: 503, body: { error: 'cadena', message: 'The chain is not answering. Try again.' } }; }
+      const vivos = contenidoVivoDeCofre(k.doc, facturas);
+      if (vivos.length !== (k.doc.contenido || []).length) await apuntarContenidoDeCofre(k.doc, vivos);
+      return trabajo({ gp, address, doc: k.doc, def: k.def, facturas, vivos });
+    });
+    return res.status(r.status).json(r.body);
+  } catch (e) {
+    console.error(nombre + ':', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+}
+
+// GET /api/lands/cofre?gx=&gy= — lo que hay dentro.
+app.get('/api/lands/cofre', apiLimiter, authMiddleware, (req, res) =>
+  conCofre(req, res, 'GET /api/lands/cofre', async ({ doc, def, vivos }) =>
+    ({ status: 200, body: respuestaDeCofre(doc, def, vivos) })));
+
+// POST /api/lands/cofre/guardar { gx, gy, invoiceId, itemId } — una casilla
+// entera de la mochila adentro.
+app.post('/api/lands/cofre/guardar', apiLimiter, authMiddleware, csrfProtection, (req, res) =>
+  conCofre(req, res, 'POST /api/lands/cofre/guardar', async ({ gp, address, doc, def, facturas, vivos }) => {
+    const id = Number(req.body && req.body.invoiceId);
+    if (!Number.isInteger(id) || id <= 0) return { status: 400, body: { error: 'factura_invalida' } };
+    const guardadas = await facturasGuardadasEnCofres(address);
+    if (guardadas.has(id)) return { status: 409, body: { error: 'ya_guardada', message: 'That is already in a chest.' } };
+    const f = facturas.find(x => x.id === id);
+    if (!f || f.cantidad <= 0 || (f.owner && f.owner !== address)) {
+      return { status: 404, body: { error: 'no_tienes', message: 'That item is not in your bag any more.' } };
+    }
+    if (!tiposDeItemPermitidos().has(f.tipo)) return { status: 400, body: { error: 'no_se_guarda', message: 'That cannot be stored.' } };
+    if (vivos.length >= def.capacidad) {
+      return { status: 409, body: { error: 'cofre_lleno', message: 'This chest is full (' + def.capacidad + ' slots).' } };
+    }
+    const itemId = itemIdDeTablaDeObjeto(f.tipo, String((req.body && req.body.itemId) || ''));
+    if (!itemId) return { status: 400, body: { error: 'no_se_guarda', message: 'That cannot be stored.' } };
+    vivos.push({ invoiceId: f.id, itemId, manualId: f.manualId, tipo: f.tipo, cantidad: f.cantidad });
+    await apuntarContenidoDeCofre(doc, vivos);
+    // La casilla de la mochila que la llevaba, vacía (Mongo).
+    try {
+      const g = await GamePlayer.findOne({ playerName: gp.playerName });
+      if (g) {
+        const r = quitarUnaDeFacturaEnSlots(g.inventory, g.chest, f.id, 0);
+        g.inventory = r.inventory; g.chest = r.chest;
+        g.markModified('inventory'); g.markModified('chest');
+        await g.save();
+      }
+    } catch (e) { console.warn('⚠️  cofre/guardar: casilla en Mongo:', e.message); }
+    console.log(`📦 ${gp.playerName} guardó ${f.cantidad}× ${itemId} en su ${doc.tipo} (${doc.gx},${doc.gy})`);
+    return { status: 200, body: respuestaDeCofre(doc, def, vivos, { guardado: { invoiceId: f.id, itemId, cantidad: f.cantidad } }) };
+  }));
+
+// POST /api/lands/cofre/sacar { gx, gy, invoiceId } — una casilla del cofre
+// a la mochila.
+app.post('/api/lands/cofre/sacar', apiLimiter, authMiddleware, csrfProtection, (req, res) =>
+  conCofre(req, res, 'POST /api/lands/cofre/sacar', async ({ gp, doc, def, vivos }) => {
+    const id = Number(req.body && req.body.invoiceId);
+    const i = vivos.findIndex(v => v.invoiceId === id);
+    if (i < 0) return { status: 404, body: Object.assign(respuestaDeCofre(doc, def, vivos), { ok: false, error: 'no_esta', message: 'That is no longer in the chest.' }) };
+    const g = await GamePlayer.findOne({ playerName: gp.playerName });
+    if (g) {
+      const hueco = (lista, maximo) => {
+        const usados = new Set((Array.isArray(lista) ? lista : []).filter(x => x && typeof x.id === 'number').map(x => x.id));
+        for (let n = 0; n < maximo; n++) if (!usados.has(n)) return true;
+        return false;
+      };
+      const yaEsta = [].concat(g.inventory || [], g.chest || []).some(x => x && Number(x.IDX) === id);
+      if (!yaEsta && !hueco(g.inventory, INV_SLOTS) && !hueco(g.chest, CHEST_SLOTS)) {
+        return { status: 409, body: Object.assign(respuestaDeCofre(doc, def, vivos), { ok: false, error: 'mochila_llena', message: 'Your bag is full.' }) };
+      }
+    }
+    const v = vivos.splice(i, 1)[0];
+    await apuntarContenidoDeCofre(doc, vivos);
+    if (g) {
+      try {
+        const r = ponerFacturaEnSlots(g.inventory, g.chest, v.itemId, { id: v.invoiceId, cantidad: v.cantidad, manualId: v.manualId });
+        g.inventory = r.inventory; g.chest = r.chest;
+        g.markModified('inventory'); g.markModified('chest');
+        await g.save();
+      } catch (e) { console.warn('⚠️  cofre/sacar: casilla en Mongo:', e.message); }
+    }
+    console.log(`📦 ${gp.playerName} sacó ${v.cantidad}× ${v.itemId} de su ${doc.tipo} (${doc.gx},${doc.gy})`);
+    return { status: 200, body: respuestaDeCofre(doc, def, vivos, { sacado: { invoiceId: v.invoiceId, itemId: v.itemId, manualId: v.manualId, cantidad: v.cantidad } }) };
+  }));
+
+// GET /api/admin/tablas — estado de las tablas del contrato (admin.html).
+app.get('/api/admin/tablas', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    _infoTablaCache.clear();
+    _soporteCasillas.at = 0;
+    const filas = [];
+    for (const t of TABLAS_RECOMENDADAS) {
+      const info = await infoTablaCadena(t.tipo);
+      const avisos = [];
+      if (info && info.exists) {
+        if (info.perInvoiceLimit !== t.perInvoiceLimit) avisos.push(`perInvoiceLimit ${info.perInvoiceLimit} (recomendado ${t.perInvoiceLimit})`);
+        if (info.limit - info.totalQuantity < 1000) avisos.push('casi sin cupo');
+      }
+      filas.push({ ...t, cadena: info, existe: !!(info && info.exists), avisos });
+    }
+    return res.json({
+      ok: true,
+      contrato: CONTRACTS.ITEMS_CONTRACT.address,
+      version: (await contratoSoportaCasillas()) ? 3 : 2,
+      casillasEnCadena: await contratoSoportaCasillas(),
+      tablas: filas
+    });
+  } catch (e) {
+    console.error('GET /api/admin/tablas:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// GET /api/admin/players/:playerName/cadena — nivel, nombre y parcelas en la cadena.
+app.get('/api/admin/players/:playerName/cadena', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const playerName = await resolvePlayerName(req.params.playerName);
+    const gp = await GamePlayer.findOne({ playerName }).select('address petExp petLevel nivel_exp').lean();
+    if (!gp || !gp.address) return res.status(404).json({ error: 'player_not_found' });
+    const [cadena, construcciones] = await Promise.all([
+      identidadEnCadena(gp.address),
+      Construccion.countDocuments({ address: String(gp.address).toLowerCase() })
+    ]);
+    return res.json({
+      ok: true, cadena, construcciones,
+      mascota: progresoMascota(gp.petExp != null ? gp.petExp : expMascotaParaNivel(gp.petLevel || 1)),
+      nivelPj: nivelPorExperiencia(gp.nivel_exp)
+    });
+  } catch (e) {
+    console.warn('GET /api/admin/players/:playerName/cadena:', e.message);
+    return res.status(502).json({ error: 'lectura_fallida', message: e.message });
+  }
+});
+
+// POST /api/admin/players/:playerName/cadena — fuerza la escritura ya.
+app.post('/api/admin/players/:playerName/cadena', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const playerName = await resolvePlayerName(req.params.playerName);
+    _identidadFirma.delete(playerName);
+    const r = await enColaDelJugador('id:' + playerName, () => sincronizarIdentidadEnCadena(playerName));
+    let casillas = null;
+    try { casillas = await enColaDelJugador('cas:' + playerName, () => sincronizarCasillasEnCadena(playerName)); }
+    catch (e) { casillas = { ok: false, motivo: e.message }; }
+    return res.json({ ok: true, identidad: r, casillas });
+  } catch (e) {
+    console.error('POST /api/admin/players/:playerName/cadena:', e);
+    return res.status(500).json({ error: 'internal_error', message: e.message });
+  }
+});
 
 // POST /api/marketplace/onchain/settle
 // body: { op: 'escrow'|'deliver'|'refund', listingId, itemId, qty }
@@ -16751,8 +18941,26 @@ function nivelMascotaEfectivo(gp) {
      sigue haciendo subir —la arena da EXP (ver expDeArena)— y lo que se gana
      ahí lo nota el personaje y, con él, el perro. petWins/petBattles se siguen
      contando (estadísticas) pero ya no deciden el nivel. */
+
+  /* TERCER CAMBIO (2026-10-03) — "siempre la mascota me sale en nivel 5 y
+     nunca subo; no sé si ese nivel es falso".
+
+     Lo era, en el sentido que importa: no era el nivel de la MASCOTA, era el
+     del personaje copiado. Las peleas de la mascota no lo movían (solo
+     sumaban experiencia al personaje, y del 5 al 6 hacen falta 1.200), así
+     que el jugador veía a su perro clavado mientras ganaba combates.
+
+     Ahora la mascota tiene SU experiencia (`petExp`), que se gana peleando
+     (ver expMascotaDeArena) con una curva propia más corta, y su nivel sale de
+     ahí. Arranca en el nivel que el jugador veía (sembrarExpMascota), así que
+     nadie baja. Y queda escrito en la cadena, en la tabla `nivel`. */
   if (!gp) return 1;
-  return Math.min(MAX_LEVEL_PERSONAJE, Math.max(1, nivelPorExperiencia(gp.nivel_exp)));
+  const exp = Number(gp.petExp);
+  if (gp.petExp !== undefined && gp.petExp !== null && Number.isFinite(exp)) {
+    return nivelMascotaPorExp(exp);
+  }
+  // Sin sembrar todavía: lo que verá en cuanto se siembre (el del personaje).
+  return Math.min(MAX_LEVEL_MASCOTA, Math.max(1, nivelPorExperiencia(gp.nivel_exp)));
 }
 
 const battleScoreSchema = new mongoose.Schema({
@@ -17528,7 +19736,7 @@ async function construirJugadorDeSocket(socket) {
   let nivel = 1, petName = 'Pet', petHealth = 100;
   try {
     const gp = await GamePlayer.findOne({ playerName })
-      .select('nivel_exp petName petHealth petLevel petWins petBattles').lean();
+      .select('nivel_exp petName petHealth petLevel petWins petBattles petExp').lean();
     if (gp) {
       /* EL NIVEL LO CALCULA EL SERVIDOR, Y ES EL MISMO QUE SE VE EN EL MAPA.
          Sale de nivelMascotaEfectivo(): el del personaje, de la experiencia
@@ -20064,10 +22272,15 @@ async function guardarResultadoBrawl(match, resumen) {
       // factura de exp (PlayerStats.exp, que es la que manda al cargar si
       // existe). La cadena la escribe el liquidador, como las vitales.
       const exp = expDeArena(match, fila);
+      // Y la de la MASCOTA, que es la que decide su nivel (2026-10-03). Se
+      // siembra antes: un $inc sobre un campo que no existe empezaría en 0 y
+      // el perro caería al nivel 1.
+      const expPet = expMascotaDeArena(match, fila);
+      await sembrarExpMascota(playerName);
       const gp = await GamePlayer.findOneAndUpdate(
         { playerName },
-        { $inc: { petWins: gano ? 1 : 0, petBattles: 1, nivel_exp: exp } },
-        { new: true, projection: { petWins: 1, petBattles: 1, petLevel: 1, nivel_exp: 1 } }
+        { $inc: { petWins: gano ? 1 : 0, petBattles: 1, nivel_exp: exp, petExp: expPet } },
+        { new: true, projection: { petWins: 1, petBattles: 1, petLevel: 1, nivel_exp: 1, petExp: 1 } }
       ).lean();
       let expTotal = gp ? Math.max(0, Number(gp.nivel_exp) || 0) : null;
       if (exp > 0) {
@@ -20084,19 +22297,26 @@ async function guardarResultadoBrawl(match, resumen) {
         }
       }
       if (gp) {
-        const nivelPet = nivelMascotaEfectivo({ nivel_exp: expTotal });
-        if (nivelPet !== (Number(gp.petLevel) || 1)) {
+        const prog = progresoMascota(gp.petExp);
+        const nivelPet = prog.petLevel;
+        const nivelAntes = Number(gp.petLevel) || 1;
+        if (nivelPet !== nivelAntes) {
           await GamePlayer.updateOne({ playerName }, { $set: { petLevel: nivelPet } });
         }
         niveles[fila.clave] = nivelPet;
-        exps[fila.clave] = { exp, expTotal };
+        exps[fila.clave] = { exp, expTotal, expPet, prog, nivelAntes };
+        programarIdentidadEnCadena(playerName);
         /* Se avisa SIEMPRE, también a quien ya se fue de la arena: si cayó y
            volvió al mapa antes de que acabara la partida, el mapa se tiene que
            poner al día igual (GameScene y la tienda escuchan esto y adoptan
            expTotal si va por delante de la suya). */
         try {
           if (reg.socket && reg.socket.connected !== false) {
-            reg.socket.emit('petLevelUpdate', { petLevel: nivelPet, exp, expTotal });
+            reg.socket.emit('petLevelUpdate', {
+              petLevel: nivelPet, exp, expTotal,
+              petExpGanada: expPet, petExp: prog.petExp,
+              petExpBase: prog.petExpBase, petExpSiguiente: prog.petExpSiguiente
+            });
           }
         } catch (_) {}
       }
@@ -20189,6 +22409,12 @@ async function brawlAlTerminar(match, resumen) {
           daily: dailyInfo, petLevel: niveles[reg.clave] || null,
           exp: exps[reg.clave] ? exps[reg.clave].exp : 0,
           expTotal: exps[reg.clave] ? exps[reg.clave].expTotal : null,
+          // La mascota: lo que ganó, su nivel de antes y su barra.
+          petExpGanada: exps[reg.clave] ? exps[reg.clave].expPet : 0,
+          petLevelAntes: exps[reg.clave] ? exps[reg.clave].nivelAntes : null,
+          petExp: exps[reg.clave] ? exps[reg.clave].prog.petExp : null,
+          petExpBase: exps[reg.clave] ? exps[reg.clave].prog.petExpBase : null,
+          petExpSiguiente: exps[reg.clave] ? exps[reg.clave].prog.petExpSiguiente : null,
           tabla
         });
       }
@@ -21024,18 +23250,23 @@ io.on('connection', (socket) => {
       if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
 
       const canal = (socket.playerData && socket.playerData.canal) || 1;
-      const vistos = new Map();          // playerName -> {sala}
+      const vistos = new Map();          // playerName -> {sala, islaDe}
       for (const [, s] of io.of('/').sockets) {
         if (!s.authenticatedPlayer) continue;
         const c = s.playerData && s.playerData.canal;
         if (c !== canal) continue;
         if (s.authenticatedPlayer === yo) continue;
-        const sala = s.playerData && s.playerData.room ? salaBase(s.playerData.room) : null;
-        if (!vistos.has(s.authenticatedPlayer)) vistos.set(s.authenticatedPlayer, sala);
+        const sala = s.playerData && s.playerData.room ? s.playerData.room : null;
+        const previo = vistos.get(s.authenticatedPlayer);
+        // Con dos pestañas manda la que está en algún sitio de verdad.
+        if (!previo || (!previo.sala && sala)) {
+          vistos.set(s.authenticatedPlayer, { sala, islaDe: sala ? islaDeSala(sala) : null });
+        }
       }
 
       const nombres = [...vistos.keys()];
-      const fichas  = await fichasDe(nombres);
+      const duenos  = [...vistos.values()].map(v => v.islaDe).filter(Boolean);
+      const fichas  = await fichasDe(nombres.concat(duenos));
       const d       = await amistadDoc(yo);
 
       const jugadores = nombres.map(n => {
@@ -21053,7 +23284,12 @@ io.on('connection', (socket) => {
              en la pestaña que se llama, precisamente, "Online". */
           online: true,
           canal:  canal,
-          zona: vistos.get(n) === 'tienda' ? 'shop' : 'world',
+          // world | shop | mine | island | battle | travel
+          zona: vistos.get(n).sala ? zonaDeSala(vistos.get(n).sala) : 'world',
+          // En una isla: de quién es (la suya o la de otro al que visita).
+          islaDe: vistos.get(n).islaDe || null,
+          islaDeNombre: vistos.get(n).islaDe
+            ? ((fichas.get(vistos.get(n).islaDe) || {}).username || vistos.get(n).islaDe) : null,
           esAmigo:    enLista(d.amigos, n),
           pendiente:  enLista(d.salientes, n),
           tePidio:    enLista(d.entrantes, n)
@@ -21063,6 +23299,64 @@ io.on('connection', (socket) => {
       socket.emit('friends:online', { ok: true, canal, jugadores });
     } catch (e) {
       console.error('friends:online', e);
+      socket.emit('friends:error', { motivo: 'error' });
+    }
+  });
+
+  /**
+   * ¿Dónde está ahora mismo? Para el botón de ir con él del panel de amigos.
+   *
+   * Solo dentro del MISMO canal: cada canal es un mundo paralelo y en otro no
+   * le verías aunque llegaras a su sitio. La posición sale de `rooms`, que es
+   * lo mismo que ven los demás jugadores de su sala: no se cuenta nada que no
+   * sea ya visible estando allí. Con dos pestañas manda la que se movió la
+   * última.
+   */
+  socket.on('friends:ir', async (data) => {
+    try {
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return socket.emit('friends:error', { motivo: 'sin_sesion' });
+      if (frenado(socket, 'ir', 1500)) return socket.emit('friends:error', { motivo: 'demasiado_rapido' });
+
+      const otro = String((data && data.playerName) || '').slice(0, 80);
+      if (!otro) return socket.emit('friends:ir', { ok: false, motivo: 'no_conectado' });
+      if (otro === yo) return socket.emit('friends:error', { motivo: 'eres_tu' });
+
+      let mejor = null, mejorT = -1;
+      for (const s of socketsDeJugador(otro)) {
+        const sala = s.playerData && s.playerData.room;
+        if (!sala || !rooms[sala] || !rooms[sala][s.id]) continue;
+        const t = Number(rooms[sala][s.id].lastUpdate) || 0;
+        if (t > mejorT) { mejor = s; mejorT = t; }
+      }
+      const ficha  = (await fichasDe([otro])).get(otro);
+      const nombre = ficha ? ficha.username : otro;
+      const base   = { playerName: otro, nombre };
+      if (!mejor) return socket.emit('friends:ir', { ok: false, motivo: 'no_conectado', ...base });
+
+      const miCanal = (socket.playerData && socket.playerData.canal) || 1;
+      const suCanal = mejor.playerData.canal || 1;
+      if (suCanal !== miCanal) {
+        return socket.emit('friends:ir', { ok: false, motivo: 'otro_canal', canal: suCanal, ...base });
+      }
+
+      const sala = mejor.playerData.room;
+      const zona = zonaDeSala(sala);
+      if (zona === 'battle' || zona === 'travel') {
+        return socket.emit('friends:ir', { ok: false, motivo: 'ocupado', zona, ...base });
+      }
+      const p = rooms[sala][mejor.id];
+      const resp = { ok: true, zona, ...base,
+        x: Math.round(Number(p.x) || 0), y: Math.round(Number(p.y) || 0) };
+      if (zona === 'island') {
+        const dueno = islaDeSala(sala) || otro;
+        resp.islaDe = dueno;
+        resp.islaDeNombre = dueno === otro ? nombre
+          : (((await fichasDe([dueno])).get(dueno)) || {}).username || dueno;
+      }
+      socket.emit('friends:ir', resp);
+    } catch (e) {
+      console.error('friends:ir', e);
       socket.emit('friends:error', { motivo: 'error' });
     }
   });
