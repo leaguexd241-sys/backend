@@ -5798,7 +5798,10 @@ io.on("connection", (socket) => {
       // entra vea a los demas ya con su color, sin esperar a que se muevan.
       nameColor: socket._nameColor || null,
       petNameColor: socket._petNameColor || null,
-      lastUpdate: Date.now()
+      lastUpdate: Date.now(),
+      /* MODO REPOSO (2026-10-05): cuándo se movió por última vez. Re-entrar
+         en la MISMA sala tras una reconexión no es moverse: se hereda. */
+      ultimoPaso: (previo && previo.ultimoPaso) || Date.now()
     };
 
     // socket.join es idempotente, pero hay que rehacerlo SIEMPRE: tras una
@@ -5813,7 +5816,16 @@ io.on("connection", (socket) => {
 
     console.log('✅ ' + socket.id + (mismoSitio ? ' re-entra en ' : ' unido a ') + room + ' como ' + username);
 
-    const otherPlayers = Object.values(rooms[room]).filter(p => p.id !== socket.id);
+    /* `quietoMs`: cuánto lleva cada uno sin moverse. El cliente oculta a
+       los que lleven 5 minutos (gf-reposo.js); sin este dato, quien entra los
+       veía otros 5 minutos. Va en milisegundos y no como hora para que no
+       dependa de que el reloj del cliente esté en hora. */
+    const ahoraFoto = Date.now();
+    const otherPlayers = Object.values(rooms[room])
+      .filter(p => p.id !== socket.id)
+      .map(p => Object.assign({}, p, {
+        quietoMs: Math.max(0, ahoraFoto - (p.ultimoPaso || p.lastUpdate || ahoraFoto))
+      }));
     socket.emit("currentPlayers", otherPlayers);
 
     // "Jugador nuevo" solo si de verdad lo es. Al re-sincronizar no se molesta
@@ -5839,6 +5851,16 @@ io.on("connection", (socket) => {
       return;
     }
     
+    /* ¿Se movió de verdad? (modo reposo). Cambiar de sitio, andar o un
+       cambio en la pesca; un paquete que solo repite la posición no cuenta. */
+    const antesMov = rooms[room][socket.id];
+    const firmaPescaMov = (pz) => (pz && typeof pz === 'object') ? [pz.n, pz.dir, pz.fase].join('|') : '';
+    const seMovio = !!(data && (
+      Math.abs(Number(data.x) - Number(antesMov.x)) > 1 ||
+      Math.abs(Number(data.y) - Number(antesMov.y)) > 1 ||
+      (data.isMoving && data.direction !== 'stop') ||
+      firmaPescaMov(data.pesca) !== firmaPescaMov(antesMov.pesca)));
+
     rooms[room][socket.id] = {
       ...rooms[room][socket.id],
       ...data,
@@ -5852,7 +5874,9 @@ io.on("connection", (socket) => {
       // Mismo motivo que address/playerName: los colores los pone el servidor.
       nameColor:    socket._nameColor || null,
       petNameColor: socket._petNameColor || null,
-      lastUpdate: Date.now()
+      lastUpdate: Date.now(),
+      // Lo pone el servidor, nunca el paquete (`...data` no puede fijarlo).
+      ultimoPaso: seMovio ? Date.now() : (antesMov.ultimoPaso || Date.now())
     };
 
     socket.to(room).emit("playerMoved", rooms[room][socket.id]);
@@ -10423,6 +10447,10 @@ app.post('/api/crops/crow', apiLimiter, authMiddleware, csrfProtection, async (r
     if (await espantapajarosActivo(gp.playerName, plotId)) {
       return res.json({ ok: true, resultado: 'espantapajaros', plotId });
     }
+    // Y en la isla, si uno CONSTRUIDO la tiene dentro de su radio.
+    if (plotId.startsWith('isla_') && await parcelaGuardadaEnIsla(gp.address, plotId)) {
+      return res.json({ ok: true, resultado: 'espantapajaros', plotId });
+    }
 
     /* Se incluyen también las MUERTAS: una planta seca en la parcela es
        comida para un cuervo igual que una buena, y el jugador se quejó de que
@@ -10793,6 +10821,121 @@ app.post('/api/espantapajaros/colocar', apiLimiter, authMiddleware, csrfProtecti
     return res.status(r.status).json(r.body);
   } catch (e) {
     console.error('POST /api/espantapajaros/colocar:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// =============================================================================
+// EL TRADUCTOR DEL CHAT                                            (2026-10-05)
+// -----------------------------------------------------------------------------
+// "En el chat general y en el privado quiero poder traducir los mensajes, de
+// inglés a español y de español a inglés." El cliente (gf-traductor.js) manda
+// LOTES de textos y el idioma al que quiere verlos; aquí se traducen con el
+// traductor público de Google (sin clave) y, si falla, con MyMemory. Lo ya
+// traducido se guarda en memoria, así que el mismo "hello" de cien jugadores
+// sale una sola vez a la red. Tope por jugador para que nadie lo use de
+// traductor gratis: TRAD_POR_MINUTO textos NUEVOS (lo que ya está guardado no
+// cuenta).
+//
+// Responde { ok, a, traducciones: [ { t, de } | { error } | null ] } en el
+// mismo orden; `de` es el idioma que se detectó (si es el mismo que `a`, el
+// cliente no enseña nada). null = texto vacío; { error } = ese no salió.
+// =============================================================================
+const TRAD_IDIOMAS     = new Set(['es', 'en']);
+const TRAD_MAX_TEXTOS  = 25;
+const TRAD_MAX_LARGO   = 400;
+const TRAD_POR_MINUTO  = 150;
+const TRAD_CACHE_MAX   = 4000;
+const TRAD_TIMEOUT_MS  = 5000;
+const _tradCache = new Map();          // 'a\u0001texto' -> { t, de }
+const _tradUso   = new Map();          // quien -> { desde, n }
+
+function tradPedirJson(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (GrasslandForest chat)' }, timeout: TRAD_TIMEOUT_MS }, (r) => {
+      let datos = '';
+      r.setEncoding('utf8');
+      r.on('data', (c) => { datos += c; if (datos.length > 200000) req.destroy(new Error('respuesta_enorme')); });
+      r.on('end', () => {
+        if (r.statusCode !== 200) return reject(new Error('http_' + r.statusCode));
+        try { resolve(JSON.parse(datos)); } catch (e) { reject(new Error('json')); }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+}
+
+async function tradGoogle(texto, a) {
+  const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=' + a +
+              '&dt=t&q=' + encodeURIComponent(texto);
+  const d = await tradPedirJson(url);
+  if (!Array.isArray(d) || !Array.isArray(d[0])) throw new Error('formato');
+  const t = d[0].map(p => (Array.isArray(p) && typeof p[0] === 'string') ? p[0] : '').join('');
+  if (!t) throw new Error('vacio');
+  return { t, de: typeof d[2] === 'string' ? d[2].slice(0, 8) : null };
+}
+
+async function tradMyMemory(texto, a) {
+  const de = a === 'es' ? 'en' : 'es';
+  const url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(texto) + '&langpair=' + de + '|' + a;
+  const d = await tradPedirJson(url);
+  const t = d && d.responseData && d.responseData.translatedText;
+  if (Number(d && d.responseStatus) !== 200 || typeof t !== 'string' || !t) throw new Error('mymemory');
+  return { t, de: null };
+}
+
+async function traducirTexto(texto, a) {
+  const k = a + '\u0001' + texto;
+  if (_tradCache.has(k)) return _tradCache.get(k);
+  let r;
+  try { r = await tradGoogle(texto, a); }
+  catch (e) { r = await tradMyMemory(texto, a); }
+  r = { t: String(r.t).slice(0, TRAD_MAX_LARGO * 2), de: r.de };
+  _tradCache.set(k, r);
+  if (_tradCache.size > TRAD_CACHE_MAX) _tradCache.delete(_tradCache.keys().next().value);
+  return r;
+}
+
+app.post('/api/chat/traducir', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const a = String((req.body && req.body.a) || '');
+    if (!TRAD_IDIOMAS.has(a)) return res.status(400).json({ error: 'idioma_invalido' });
+    const lista = Array.isArray(req.body && req.body.textos) ? req.body.textos : null;
+    if (!lista) return res.status(400).json({ error: 'faltan_textos' });
+    const textos = lista.slice(0, TRAD_MAX_TEXTOS).map(t => String(t == null ? '' : t).trim().slice(0, TRAD_MAX_LARGO));
+
+    // El tope cuenta solo lo que hay que pedir de verdad.
+    const quien = String((req.user && (req.user.address || req.user.playerName)) || req.ip || '?').toLowerCase();
+    const nuevos = textos.filter(t => t && !_tradCache.has(a + '\u0001' + t)).length;
+    const ahora = Date.now();
+    let uso = _tradUso.get(quien);
+    if (!uso || ahora - uso.desde > 60000) { uso = { desde: ahora, n: 0 }; _tradUso.set(quien, uso); }
+    if (uso.n + nuevos > TRAD_POR_MINUTO) {
+      return res.status(429).json({ error: 'demasiadas', message: 'Too many translations. Try again in a minute.' });
+    }
+    uso.n += nuevos;
+    if (_tradUso.size > 5000) {
+      for (const [k2, u2] of _tradUso) if (ahora - u2.desde > 60000) _tradUso.delete(k2);
+    }
+
+    // De cinco en cinco: un lote de 25 no abre 25 conexiones a la vez.
+    const traducciones = new Array(textos.length).fill(null);
+    for (let i = 0; i < textos.length; i += 5) {
+      await Promise.all(textos.slice(i, i + 5).map(async (t, j) => {
+        if (!t) return;
+        try { traducciones[i + j] = await traducirTexto(t, a); }
+        catch (e) { traducciones[i + j] = { error: 'no_disponible' }; }
+      }));
+    }
+    // Si no salió NINGUNO, es que el traductor no contesta: que el cliente espere.
+    const pedidos = textos.filter(Boolean).length;
+    if (pedidos && traducciones.filter(x => x && x.error).length === pedidos) {
+      return res.status(503).json({ error: 'no_disponible', message: 'Translation is not available right now.' });
+    }
+    return res.json({ ok: true, a, traducciones });
+  } catch (e) {
+    console.error('POST /api/chat/traducir:', e);
     return res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -16123,7 +16266,25 @@ const TABLAS_RECOMENDADAS = [
   { tipo: TABLA_NOMBRE,        limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Nombre del personaje y de la mascota (2 facturas por jugador)' },
   { tipo: TABLA_PARCELAS,      limit: 1_000_000_000, perInvoiceLimit: 20,  para: 'Objeto Parcela del inventario (20 por casilla)' },
   { tipo: TABLA_CONS_PARCELAS, limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Parcelas colocadas en la isla (1 por parcela)' },
-  { tipo: TABLA_PALA,          limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Pala de construcción: la herramienta para recoger lo construido (1 por casilla)' }
+  { tipo: TABLA_PALA,          limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Pala de construcción: la herramienta para recoger lo construido (1 por casilla)' },
+  /* Las de 2026-10-05 (pesca, espadas, espantapájaros, bote y cofres). Estas
+     NO hace falta crearlas a mano: ensureItemTipoOnChain las da de alta con la
+     primera compra, crafteo o acuñación (límite = lo que haya + 10.000.000 y
+     50 por factura). Si el administrador prefiere crearlas antes, estos son
+     los valores; con un perInvoiceLimit menor de 50 el servidor lo subiría. */
+  { tipo: 'caña_pescar',    limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Caña de pescar (objeto cana_pescar; se apila de 1 en 1)' },
+  { tipo: 'espantapajaros', limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espantapájaros: se usa en una parcela del pueblo (2 h) o se construye en la isla (10 por casilla)' },
+  { tipo: 'pes1',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: trucha marrón (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes2',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: carpa común (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes3',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: trucha dorada (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'madera',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de madera (objeto espada_madera; 1 por casilla)' },
+  { tipo: 'cobre',          limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de cobre (objeto espada_cobre; 1 por casilla)' },
+  { tipo: 'hierro',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de hierro (objeto espada_hierro; 1 por casilla)' },
+  { tipo: 'basura',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Bote de basura de la isla (10 por casilla)' },
+  { tipo: 'cofre1',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Cofre de madera, 5 huecos (5 por casilla)' },
+  { tipo: 'cofre2',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Cofre reforzado, 7 huecos (solo crafteo; 5 por casilla)' },
+  { tipo: 'cofre3',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Cofre mágico, 13 huecos (solo crafteo; 5 por casilla)' },
+  { tipo: 'cofre4',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Cofre legendario, 20 huecos (solo crafteo; 5 por casilla)' }
 ];
 
 // ── EL NIVEL PROPIO DE LA MASCOTA ────────────────────────────────────────────
@@ -16608,8 +16769,38 @@ const TIPOS_DE_CONSTRUCCION = {
   cofre1: { ancho: 2, alto: 2, itemId: 'cofre1', tablaItem: 'cofre1', tablaConstruccion: null, capacidad: 5 },
   cofre2: { ancho: 2, alto: 2, itemId: 'cofre2', tablaItem: 'cofre2', tablaConstruccion: null, capacidad: 7 },
   cofre3: { ancho: 2, alto: 2, itemId: 'cofre3', tablaItem: 'cofre3', tablaConstruccion: null, capacidad: 13 },
-  cofre4: { ancho: 2, alto: 2, itemId: 'cofre4', tablaItem: 'cofre4', tablaConstruccion: null, capacidad: 20 }
+  cofre4: { ancho: 2, alto: 2, itemId: 'cofre4', tablaItem: 'cofre4', tablaConstruccion: null, capacidad: 20 },
+  /* EL ESPANTAPÁJAROS CONSTRUIDO (2026-10-05): "quiero que esté en la tienda
+     para construcción sobre la Lands". Como el bote: solo en Mongo, se quema 1
+     de `espantapajaros` al ponerlo y se acuña al recogerlo con la pala. No
+     caduca: guarda las parcelas de la isla que tenga a su alrededor (ver
+     ESPANTAPAJAROS_GUARDA_CASILLAS y /api/crops/crow). */
+  espantapajaros: { ancho: 2, alto: 2, itemId: 'espantapajaros', tablaItem: 'espantapajaros', tablaConstruccion: null }
 };
+
+/* Cuántas casillas (32 px) guarda un espantapájaros de la isla, del centro de
+   su sitio al centro de la parcela. El cliente usa el mismo número
+   (GUARDA_CASILLAS en gf-espantapajaros.js). */
+const ESPANTAPAJAROS_GUARDA_CASILLAS = 4;
+
+/** ¿Guarda esa parcela de la isla algún espantapájaros CONSTRUIDO? Nunca lanza. */
+async function parcelaGuardadaEnIsla(address, plotId) {
+  const m = /^isla_(\d+)_(\d+)$/.exec(String(plotId || ''));
+  const addr = String(address || '').toLowerCase();
+  if (!m || !addr) return false;
+  try {
+    const px = Number(m[1]) + 1, py = Number(m[2]) + 1;          // centro de la parcela (2 × 2)
+    const r = ESPANTAPAJAROS_GUARDA_CASILLAS;
+    const cerca = await Construccion.find({
+      address: addr, tipo: 'espantapajaros', devolucionPendiente: { $ne: true },
+      gx: { $gte: px - r - 2, $lte: px + r }, gy: { $gte: py - r - 2, $lte: py + r }
+    }).select('gx gy ancho alto').lean();
+    return (cerca || []).some(e => {
+      const ex = e.gx + (e.ancho || 2) / 2, ey = e.gy + (e.alto || 2) / 2;
+      return Math.hypot(ex - px, ey - py) <= r + 0.01;
+    });
+  } catch (e) { return false; }
+}
 
 const construccionSchema = new mongoose.Schema({
   playerName: { type: String, required: true, index: true },
