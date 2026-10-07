@@ -11968,18 +11968,20 @@ const ITEM_MAX_STACK = {
   cofre1: 5, cofre2: 5, cofre3: 5, cofre4: 5,
 };
 
-// ── TABLAS QUE CREA EL ADMINISTRADOR A MANO (2026-10-03) ────────────────────
-// Ver "IDENTIDAD, CASILLAS Y CONSTRUCCIÓN EN LA CADENA" más abajo.
+// ── TABLAS CON LÍMITES DE DISEÑO (2026-10-03) ─────────────────────────────────
+// Ver "IDENTIDAD, CASILLAS Y CONSTRUCCIÓN EN LA CADENA" más abajo. Desde
+// 2026-10-05 ya no las crea nadie a mano: si faltan, el servidor las crea con
+// los límites de TABLAS_RECOMENDADAS (ver crearTablaSiFalta).
 const TABLA_NIVEL         = 'nivel';
 const TABLA_NOMBRE        = 'nombre';
 const TABLA_PARCELAS      = 'parcelas';
 const TABLA_CONS_PARCELAS = 'cons_parcelas';
 const TABLA_PALA          = 'pala_contrucion';
 
-/* Lo que el servidor NO toca con setLimit (ver ensureItemTipoOnChain): los
-   límites los pone el administrador. Sin esto, la primera compra de una
-   parcela "ampliaba" su perInvoiceLimit de 20 a 50 y una casilla dejaba de
-   corresponder con una factura. */
+/* Lo que ensureItemTipoOnChain NO AMPLÍA: sus límites son de diseño (se
+   crean con los de TABLAS_RECOMENDADAS y ya no se tocan). Sin esto, la
+   primera compra de una parcela "ampliaba" su perInvoiceLimit de 20 a 50 y
+   una casilla dejaba de corresponder con una factura. */
 const TABLAS_MANUALES = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_PARCELAS, TABLA_CONS_PARCELAS, TABLA_PALA]);
 /* Tablas que SOLO escribe el servidor. Con el cliente pudiendo escribirlas,
    bastaría una llamada al relay para ponerse nivel 150 en la cadena o
@@ -16259,19 +16261,18 @@ async function burnItemOnChain(address, tipo, quantity) {
 // ensureItemTipoOnChain, que vive allí.
 // =============================================================================
 
-/* Límites que se RECOMIENDAN al administrador (los enseña admin.html). El
-   servidor no los aplica: solo compara y avisa si una tabla se queda corta. */
+/* Las tablas del juego y sus límites (los enseña admin.html). Si una falta,
+   el servidor la CREA con estos valores (crearTablaSiFalta); si ya existe, no
+   la cambia: solo compara y avisa si se queda corta. */
 const TABLAS_RECOMENDADAS = [
   { tipo: TABLA_NIVEL,         limit: 1_000_000_000, perInvoiceLimit: 150, para: 'Nivel del personaje y de la mascota (2 facturas por jugador)' },
   { tipo: TABLA_NOMBRE,        limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Nombre del personaje y de la mascota (2 facturas por jugador)' },
   { tipo: TABLA_PARCELAS,      limit: 1_000_000_000, perInvoiceLimit: 20,  para: 'Objeto Parcela del inventario (20 por casilla)' },
   { tipo: TABLA_CONS_PARCELAS, limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Parcelas colocadas en la isla (1 por parcela)' },
   { tipo: TABLA_PALA,          limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Pala de construcción: la herramienta para recoger lo construido (1 por casilla)' },
-  /* Las de 2026-10-05 (pesca, espadas, espantapájaros, bote y cofres). Estas
-     NO hace falta crearlas a mano: ensureItemTipoOnChain las da de alta con la
-     primera compra, crafteo o acuñación (límite = lo que haya + 10.000.000 y
-     50 por factura). Si el administrador prefiere crearlas antes, estos son
-     los valores; con un perInvoiceLimit menor de 50 el servidor lo subiría. */
+  /* Las de 2026-10-05 (pesca, espadas, espantapájaros, bote y cofres). Como
+     TODAS las de esta lista, si faltan las crea el servidor con estos valores
+     (crearTablaSiFalta, al arrancar y cuando algo las necesita). */
   { tipo: 'caña_pescar',    limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Caña de pescar (objeto cana_pescar; se apila de 1 en 1)' },
   { tipo: 'espantapajaros', limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espantapájaros: se usa en una parcela del pueblo (2 h) o se construye en la isla (10 por casilla)' },
   { tipo: 'pes1',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: trucha marrón (solo lo acuña el servidor al pescar; 20 por casilla)' },
@@ -16421,7 +16422,81 @@ async function infoTablaCadena(tipo) {
 
 async function tablaExiste(tipo) {
   const info = await infoTablaCadena(tipo);
-  return !!(info && info.exists);
+  if (info && info.exists) return true;
+  // null = el nodo no contestó: no se crea nada a ciegas.
+  if (!info) return false;
+  return crearTablaSiFalta(tipo);
+}
+
+/* LAS TABLAS SE CREAN SOLAS (2026-10-05). "Las tablas se deben crear
+   automáticamente si no existen; nada debe quedar manual."
+
+   Antes cinco tablas (nivel, nombre, parcelas, cons_parcelas y la pala) las
+   tenía que crear el administrador, y mientras no existían la construcción,
+   el nivel y el nombre en la cadena se quedaban apagados. Ahora cualquier
+   tabla de TABLAS_RECOMENDADAS que falte se crea con SUS límites:
+     · al arrancar el servidor y cada 15 minutos (asegurarTablasDelJuego), y
+     · en el momento en que algo la necesita (tablaExiste).
+   Una tabla que YA existe no se toca nunca desde aquí: sus límites siguen
+   siendo los que tenga (y las de TABLAS_MANUALES tampoco las amplía
+   ensureItemTipoOnChain). setLimit es onlyAdmin: el relayer tiene que ser
+   admin del contrato, igual que para todo lo demás que escribe. */
+const _creandoTabla = new Map();        // tipo -> promesa en curso
+const _falloTabla = new Map();          // tipo -> hora del último intento fallido
+const TABLA_REINTENTO_MS = 2 * 60 * 1000;
+
+function crearTablaSiFalta(tipo) {
+  const rec = TABLAS_RECOMENDADAS.find(t => t.tipo === tipo);
+  if (!rec) return Promise.resolve(false);              // solo las del juego
+  if (_creandoTabla.has(tipo)) return _creandoTabla.get(tipo);
+  const fallo = _falloTabla.get(tipo);
+  if (fallo && Date.now() - fallo < TABLA_REINTENTO_MS) return Promise.resolve(false);
+  const p = (async () => {
+    const c = contratoItemsServidor();
+    if (!c || typeof c.setLimit !== 'function' || !relayerWallet) return false;
+    // Otra mirada sin caché: puede que ya la haya creado otra petición.
+    _infoTablaCache.delete(tipo);
+    const antes = await infoTablaCadena(tipo);
+    if (!antes) return false;
+    if (antes.exists) return true;
+    try {
+      console.log(`🧾 La tabla [${tipo}] no existe: se crea (límite ${rec.limit}, ${rec.perInvoiceLimit} por factura)`);
+      const nonce = await relayerNonceManager.getNextNonce();
+      const tx = await c.setLimit(tipo, rec.limit, rec.perInvoiceLimit, { gasPrice: gatherGasPrice(), nonce });
+      await tx.wait();
+      _infoTablaCache.delete(tipo);
+      try { if (typeof _itemTipoCache !== 'undefined') _itemTipoCache.delete(tipo); } catch (_) {}
+      const despues = await infoTablaCadena(tipo);
+      const ok = !!(despues && despues.exists);
+      if (ok) { _falloTabla.delete(tipo); console.log(`✅ Tabla [${tipo}] creada`); }
+      else _falloTabla.set(tipo, Date.now());
+      return ok;
+    } catch (e) {
+      _falloTabla.set(tipo, Date.now());
+      console.error(`❌ No se pudo crear la tabla [${tipo}] (¿el relayer es admin del ItemContract?):`, e.message);
+      try { await relayerNonceManager.resetNonce(); } catch (_) {}
+      return false;
+    }
+  })();
+  const conLimpieza = p.finally(() => _creandoTabla.delete(tipo));
+  _creandoTabla.set(tipo, conLimpieza);
+  return conLimpieza;
+}
+
+/** Repasa TODAS las tablas del juego y crea las que falten. Una a una (el
+ *  nonce del relayer es uno). Devuelve { creadas, faltan }. */
+async function asegurarTablasDelJuego() {
+  const out = { creadas: [], faltan: [] };
+  if (!relayerWallet || !contratoItemsServidor()) return out;
+  for (const t of TABLAS_RECOMENDADAS) {
+    const antes = await infoTablaCadena(t.tipo);
+    if (antes && antes.exists) continue;
+    const ok = await tablaExiste(t.tipo);
+    (ok ? out.creadas : out.faltan).push(t.tipo);
+  }
+  if (out.creadas.length) console.log('🧾 Tablas creadas al repasar:', out.creadas.join(', '));
+  if (out.faltan.length) console.warn('⚠️  Tablas que no se pudieron crear (se reintenta):', out.faltan.join(', '));
+  return out;
 }
 
 /* ¿El contrato desplegado es v3 (sabe guardar casillas)? */
@@ -17510,13 +17585,19 @@ app.get('/api/admin/tablas', adminAuth, apiLimiter, async (req, res) => {
     _soporteCasillas.at = 0;
     const filas = [];
     for (const t of TABLAS_RECOMENDADAS) {
-      const info = await infoTablaCadena(t.tipo);
+      let info = await infoTablaCadena(t.tipo);
+      // La que falte se crea aquí mismo (ver crearTablaSiFalta).
+      let creada = false;
+      if (info && !info.exists && await crearTablaSiFalta(t.tipo)) {
+        creada = true;
+        info = await infoTablaCadena(t.tipo);
+      }
       const avisos = [];
       if (info && info.exists) {
         if (info.perInvoiceLimit !== t.perInvoiceLimit) avisos.push(`perInvoiceLimit ${info.perInvoiceLimit} (recomendado ${t.perInvoiceLimit})`);
         if (info.limit - info.totalQuantity < 1000) avisos.push('casi sin cupo');
       }
-      filas.push({ ...t, cadena: info, existe: !!(info && info.exists), avisos });
+      filas.push({ ...t, cadena: info, existe: !!(info && info.exists), creadaAhora: creada, avisos });
     }
     return res.json({
       ok: true,
@@ -24237,6 +24318,11 @@ server.listen(PORT, HOST, () => {
   // consumo ya cobrado.
   setTimeout(() => { rondaDeLiquidacion({ inmediato: true }).catch(() => {}); }, 8000);
   setInterval(() => { rondaDeLiquidacion().catch(() => {}); }, CHAIN_SETTLE_TICK_MS);
+
+  // LAS TABLAS DEL CONTRATO SE CREAN SOLAS (ver crearTablaSiFalta): un repaso
+  // al arrancar y otro cada 15 minutos por si alguna falló.
+  setTimeout(() => { asegurarTablasDelJuego().catch(() => {}); }, 12000);
+  setInterval(() => { asegurarTablasDelJuego().catch(() => {}); }, 15 * 60 * 1000);
 });
 
 // --- GRACEFUL SHUTDOWN ---
