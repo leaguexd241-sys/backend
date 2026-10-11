@@ -10003,7 +10003,7 @@ app.post('/api/save/:playerName',
         console.warn('⚠️  No se pudo aplicar la regla de progreso monótono:', monoErr.message);
       }
 
-      await saveGamePlayerWithTutorial(playerName, update);
+      inventarioObsoleto = (await guardarInventarioProtegido(playerName, address, update, req.body.inventoryLoadedAt)) || inventarioObsoleto;
 
       // A LA CADENA, sin hacer esperar al jugador: nivel y nombre (tablas
       // `nivel` y `nombre`) y, si cambió el inventario, en qué casilla está
@@ -10146,6 +10146,7 @@ app.get('/api/load/:playerName',
       }
 
       const response = Object.assign({}, p, { 
+        inventoryLoadedAt: p.marketWriteAt || new Date(0).toISOString(),
         hora: a.hora, 
         dia_noche: a.dia_noche, 
         missionsData 
@@ -17330,6 +17331,100 @@ async function parcelaIslaDeJugador(address, plotId) {
    jugador: en la casilla que ya lleva esa factura, o en la primera libre del
    inventario (y si no, del cofre). Es lo que hace el cliente al recibir el
    objeto; hacerlo también aquí deja Mongo bien aunque el cliente no guarde. */
+// <<SHOP-PVP-SYNC>>
+// Se incrusta en server2.js mediante repair-shop-pvp.cjs.
+// La cadena confirma la propiedad y cantidad; ningún precio/cantidad del
+// cliente se usa para entregar objetos.
+function reconciliarSlotsDeCadena(gp, facturas) {
+  const porTipo = new Map(Object.entries(ITEM_TIPO_MAP).map(([id, tipo]) => [tipo, id]));
+  const porId = new Map(facturas.filter(f => f.cantidad > 0 && porTipo.has(f.tipo)).map(f => [f.id, f]));
+  const usados = new Set();
+  const limpiar = (lista, max) => {
+    const posiciones = new Set();
+    return (lista || []).flatMap(s => {
+      if (!s || !s.objeto || !Number.isInteger(s.id) || s.id < 0 || s.id >= max || posiciones.has(s.id)) return [];
+      const f = porId.get(Number(s.IDX));
+      if (!f || usados.has(f.id) || itemTipoOnChain(s.objeto) !== f.tipo || String(s.Manualid) !== f.manualId) return [];
+      usados.add(f.id); posiciones.add(s.id);
+      return [{ ...s, IDX: f.id, Manualid: f.manualId, cantidad: f.cantidad }];
+    });
+  };
+  let inventory = limpiar(gp.inventory, INV_SLOTS);
+  let chest = limpiar(gp.chest, CHEST_SLOTS);
+  const pendientes = [];
+  for (const f of porId.values()) {
+    if (usados.has(f.id)) continue;
+    const r = ponerFacturaEnSlots(inventory, chest, porTipo.get(f.tipo), f);
+    inventory = r.inventory; chest = r.chest;
+    if (!inventory.concat(chest).some(s => Number(s.IDX) === f.id)) pendientes.push(f.id);
+  }
+  return { inventory, chest, pendientes };
+}
+
+async function guardarInventarioProtegido(playerName, address, fields, loadedAt) {
+  return enColaDelJugador('inventory:' + address, async () => {
+    const gp = await GamePlayer.findOne({ playerName }).select('marketWriteAt').lean();
+    const writtenAt = gp?.marketWriteAt ? new Date(gp.marketWriteAt).getTime() : 0;
+    const readAt = Date.parse(loadedAt);
+    const stale = writtenAt > 0 && (Number.isFinite(readAt)
+      ? writtenAt > readAt : Date.now() - writtenAt < 600000);
+    if (stale) { delete fields.inventory; delete fields.chest; }
+    await saveGamePlayerWithTutorial(playerName, fields);
+    return stale;
+  });
+}
+
+app.post('/api/inventory/reconcile', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  const address = String(req.user.address).toLowerCase();
+  const itemId = String(req.body?.itemId || '');
+  if (!itemTipoOnChain(itemId)) return res.status(400).json({ error: 'invalid_item' });
+  const expected = req.body?.expectedInvoices;
+  if (expected != null && (!Array.isArray(expected) || expected.length > INV_SLOTS + CHEST_SLOTS ||
+      expected.some(f => !f || typeof f.manualId !== 'string' || !f.manualId || f.manualId.length > 256 ||
+        !Number.isSafeInteger(f.cantidad) || f.cantidad < 1 ||
+        (f.id != null && (!Number.isSafeInteger(f.id) || f.id < 1))))) {
+    return res.status(400).json({ error: 'invalid_purchase_reference' });
+  }
+  try {
+    const result = await enColaDelJugador('inventory:' + address, async () => {
+      const auth = await PlayerAuth.findOne({ address }).lean();
+      if (!auth?.playerName) throw new Error('user_not_found');
+      // CAS: un guardado o entrega del mercado durante la lectura de la
+      // cadena obliga a releer Mongo antes de escribir; no pierde la entrega.
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const gp = await GamePlayer.findOne({ playerName: auth.playerName }).lean();
+        if (!gp || String(gp.address).toLowerCase() !== address) throw new Error('user_not_found');
+        const facturas = (await facturasLibresDeCadena(address)).filter(f => f.owner === address);
+        const entregadas = facturas.filter(f => f.tipo === itemTipoOnChain(itemId));
+        // Estas referencias solo exigen que la lectura alcance la compra
+        // confirmada. Nunca crean objetos ni fijan cantidades en Mongo.
+        if (!entregadas.length || (expected || []).some(ref => !entregadas.some(f =>
+          f.manualId === ref.manualId && (ref.id == null || f.id === ref.id) && f.cantidad >= ref.cantidad))) {
+          throw new Error('purchase_not_visible_on_chain');
+        }
+        const slots = reconciliarSlotsDeCadena(gp, facturas);
+        const inventoryLoadedAt = new Date(Math.max(Date.now(), new Date(gp.marketWriteAt || 0).getTime() + 1));
+        const saved = await GamePlayer.findOneAndUpdate({
+          playerName: auth.playerName, address,
+          inventory: gp.inventory ?? null, chest: gp.chest ?? null, marketWriteAt: gp.marketWriteAt || null
+        }, { $set: { inventory: slots.inventory, chest: slots.chest, marketWriteAt: inventoryLoadedAt } }, { new: true });
+        if (!saved) continue;
+        const ids = new Set(slots.inventory.concat(slots.chest).map(s => Number(s.IDX)));
+        const pendiente = entregadas.some(f => !ids.has(f.id));
+        programarCasillasEnCadena(auth.playerName);
+        return { success: !pendiente, error: pendiente ? 'inventory_full' : undefined,
+          inventory: slots.inventory, chest: slots.chest, inventoryLoadedAt: inventoryLoadedAt.toISOString() };
+      }
+      throw new Error('inventory_changed_retry');
+    });
+    return res.status(result.success ? 200 : 409).json(result);
+  } catch (e) {
+    console.warn('inventory/reconcile:', e.message);
+    return res.status(503).json({ success: false, error: 'inventory_sync_pending' });
+  }
+});
+
+// <<SHOP-PVP-SYNC-FIN>>
 function ponerFacturaEnSlots(inventory, chest, itemId, factura) {
   const inv = Array.isArray(inventory) ? inventory.map(s => ({ ...s })) : [];
   const cof = Array.isArray(chest) ? chest.map(s => ({ ...s })) : [];
@@ -19866,6 +19961,7 @@ function isBattleAdmissionCurrent(socket, ticket) {
 
 function releaseBattleAdmission(socket, ticket = socket && socket._battleTicket) {
   if (!socket || !ticket) return;
+  if (ticket._battleQueueDeadline) { clearTimeout(ticket._battleQueueDeadline); ticket._battleQueueDeadline = null; }
   if (battleAdmissions.get(ticket.account) === ticket) battleAdmissions.delete(ticket.account);
   if (socket._battleTicket === ticket) socket._battleTicket = null;
 }
@@ -20655,9 +20751,9 @@ const GFBrawlMotor = (function () {
    *    movía al principio: con la cámara siguiendo al perro y partidas de 1
    *    contra 1 que acababan en un minuto, no se llegaba a ver nunca ("la zona
    *    que se cierra no está"). Ahora el anillo de la PRÓXIMA zona segura se
-   *    ve desde el primer segundo, la niebla entra a los 15 s, cada fase
+   *    ve desde el primer segundo, la niebla entra a los 45 s, cada fase
    *    mueve el centro a un sitio al azar (hay que moverse, no basta con
-   *    quedarse en medio) y pega más que la anterior. Todo cerrado a los 80 s.
+   *    quedarse en medio) y pega más que la anterior. Todo cerrado a los 195 s.
    *  · La VIDA se REGENERA sola a los 3 s sin pegar ni recibir: premia saber
    *    retirarse, y castiga quedarse a pegar con poca vida.
    *  · BARRILES ('x'): aguantan dos golpes y al romperse EXPLOTAN — quitan
@@ -20682,15 +20778,19 @@ const GFBrawlMotor = (function () {
        final); `dano` = vida máxima que quita por segundo a quien está fuera,
        desde que empieza esa fase hasta que empieza la siguiente. */
     ZONA_FASES: [
-      { desde: 15000, hasta: 30000, frac: 0.72, dano: 0.05 },
-      { desde: 42000, hasta: 57000, frac: 0.40, dano: 0.08 },
-      { desde: 67000, hasta: 80000, frac: 0,    dano: 0.12 }
+      { desde: 45000, hasta: 75000, frac: 0.72, dano: 0.04 },
+      { desde: 105000, hasta: 135000, frac: 0.40, dano: 0.06 },
+      { desde: 160000, hasta: 195000, frac: 0,    dano: 0.10 }
     ],
-    ZONA_INICIO_MS: 15000,       // = la primera fase (el reloj del cliente lo usa)
-    ZONA_FIN_MS: 80000,          // cerrada del todo
-    DURACION_MAX_MS: 115000,
-    ZONA_RADIO_FINAL: 80,
-    ZONA_DANO_FINAL_S: 0.16,     // cuando ya se ha cerrado del todo
+    ZONA_INICIO_MS: 45000,
+    ZONA_FIN_MS: 195000,
+    DURACION_MAX_MS: 240000,
+    ZONA_RADIO_FINAL: 100,
+    ZONA_DANO_FINAL_S: 0.12,
+    CAJAS_EXTRA: 10,
+    PODER_DURACION_MS: 8000,
+    PODER_VELOCIDAD_MULT: 1.20,
+    ESCUDO_VIDA: 0.25,
     BARRIL_VIDA: 2,
     BARRIL_RADIO: 76,
     BARRIL_DANO: 0.32,           // de la vida máxima, en el centro (0,14 en el borde)
@@ -20993,6 +21093,7 @@ const GFBrawlMotor = (function () {
       P.luchadores.push(crearLuchador(P, spec, i + 1, (ap[0] + 0.5) * R.celda, (ap[1] + 0.5) * R.celda));
     }
     P.luchadores.forEach(function (l) { P.porId[l.id] = l; });
+    agregarCajas(P);
 
     /* `x`/`y` además de `cx`/`cy`: dist2() lee x e y. Sin ellos la distancia a
        la zona salía NaN, "fuera de la niebla" no era nunca verdad y la niebla
@@ -21016,6 +21117,33 @@ const GFBrawlMotor = (function () {
 
     P.luchadores.forEach(function (l) { enviarInicio(P, l); });
     return P;
+  }
+
+  function agregarCajas(P) {
+    if (!ARENAS[P.arenaId]) return;
+    var R = P.R, candidatos = [];
+    for (var y = 2; y < R.alto - 2; y++) for (var x = 2; x < R.ancho - 2; x++) {
+      var idx = y * R.ancho + x;
+      if (R.celdas[idx] !== '.') continue;
+      var p = celdaCentro(R, x, y);
+      if (P.luchadores.some(function (l) { return dist2(l, p) < Math.pow(R.celda * 2.5, 2); })) continue;
+      var libres = [idx - 1, idx + 1, idx - R.ancho, idx + R.ancho].filter(function (i) { return R.celdas[i] === '.' || R.celdas[i] === '*'; });
+      // Solo espacios abiertos: no se tapan puentes ni pasillos.
+      if (libres.length === 4) candidatos.push(idx);
+    }
+    for (var i = candidatos.length - 1; i > 0; i--) {
+      var j = Math.floor(P.azar() * (i + 1)), tmp = candidatos[i]; candidatos[i] = candidatos[j]; candidatos[j] = tmp;
+    }
+    var puestos = [];
+    for (var k = 0; k < candidatos.length && puestos.length < REGLAS.CAJAS_EXTRA; k++) {
+      var at = candidatos[k], pt = celdaCentro(R, at % R.ancho, Math.floor(at / R.ancho));
+      if (puestos.some(function (p) { return dist2(p, pt) < Math.pow(R.celda * 3, 2); })) continue;
+      var oro = puestos.length % 3 === 0;
+      R.celdas[at] = oro ? 'o' : 'c';
+      var vida = oro ? REGLAS.CAJA_ORO_VIDA : REGLAS.CAJA_VIDA;
+      R.cajas[at] = { vida: vida, max: vida, oro: oro };
+      puestos.push(pt);
+    }
   }
 
   /**
@@ -21104,6 +21232,12 @@ const GFBrawlMotor = (function () {
       ataque: Math.max(1, Number(s.ataque) || 12),
       x: x, y: y, r: REGLAS.RADIO,
       vel: REGLAS.VEL * esp.vel,
+      velBase: REGLAS.VEL * esp.vel,
+      rapidezHasta: 0,
+      escudoHasta: 0,
+      escudo: 0,
+      fraccionNiebla: 0,
+      fraccionRegen: 0,
       arma: ARMAS[esp.arma],
       armaId: esp.arma,
       superArma: ARMAS[esp.super],
@@ -21455,6 +21589,8 @@ const GFBrawlMotor = (function () {
     for (var i = 0; i < P.luchadores.length; i++) {
       var l = P.luchadores[i];
       if (!l.vivo) continue;
+      l.vel = l.velBase * (t < l.rapidezHasta ? REGLAS.PODER_VELOCIDAD_MULT : 1);
+      if (t >= l.escudoHasta) l.escudo = 0;
       // munición
       if (l.municion < REGLAS.MUNICION) {
         l.municion = Math.min(REGLAS.MUNICION, l.municion + REGLAS.TICK_MS / l.arma.recarga);
@@ -21474,13 +21610,16 @@ const GFBrawlMotor = (function () {
       var z = P.zona;
       var fuera = z.activa && Math.sqrt(dist2(l, z)) > z.r;
       if (fuera) {
-        var d = Math.max(1, Math.round(l.maxHp * z.dano * dt));
+        l.fraccionNiebla += l.maxHp * z.dano * dt;
+        var d = Math.floor(l.fraccionNiebla); l.fraccionNiebla -= d;
         l.hp -= d;
         l.regenDesde = t + REGLAS.REGEN_ESPERA_MS;
         if (l.hp <= 0) { l.hp = 0; caer(P, l, null); continue; }
       } else if (t >= l.regenDesde && l.hp < l.maxHp) {
         // regeneración
-        l.hp = Math.min(l.maxHp, l.hp + Math.max(1, Math.round(l.maxHp * REGLAS.REGEN_POR_S * dt)));
+        l.fraccionRegen += l.maxHp * REGLAS.REGEN_POR_S * dt;
+        var curaRegen = Math.floor(l.fraccionRegen); l.fraccionRegen -= curaRegen;
+        l.hp = Math.min(l.maxHp, l.hp + curaRegen);
       }
     }
 
@@ -21584,6 +21723,9 @@ const GFBrawlMotor = (function () {
   function golpear(P, b, duenio, l, t) {
     b.golpeados[l.id] = true;
     var d = b.dano;
+    if (l.escudo > 0 && t < l.escudoHasta) {
+      var absorbido = Math.min(l.escudo, d); l.escudo -= absorbido; d -= absorbido;
+    }
     l.hp = Math.max(0, l.hp - d);
     l.regenDesde = t + REGLAS.REGEN_ESPERA_MS;
     l.reveladoHasta = t + REGLAS.REVELA_MS;
@@ -21620,6 +21762,7 @@ const GFBrawlMotor = (function () {
     if (rota) romperCaja(P.R, idx);
     difundir(P, 'brawl:caja', { i: idx, vida: Math.max(0, c.vida), max: c.max, rota: rota ? 1 : 0, oro: c.oro ? 1 : 0, barril: c.barril ? 1 : 0 });
     if (rota && c.oro) soltarHuesos(P, x, y, 1);
+    if (rota && !c.barril) soltarSuministro(P, x, y, c.oro);
     if (rota && c.barril) explotar(P, x, y, b.duenio, t);
   }
 
@@ -21644,6 +21787,9 @@ const GFBrawlMotor = (function () {
       if (d > rad + l.r || !lineaDeTiro(R, x, y, l.x, l.y)) continue;
       var k = 1 - 0.55 * Math.min(1, d / rad);
       var dano = Math.max(1, Math.round(l.maxHp * REGLAS.BARRIL_DANO * k));
+      if (l.escudo > 0 && t < l.escudoHasta) {
+        var absorbido = Math.min(l.escudo, dano); l.escudo -= absorbido; dano -= absorbido;
+      }
       l.hp = Math.max(0, l.hp - dano);
       l.regenDesde = t + REGLAS.REGEN_ESPERA_MS;
       l.reveladoHasta = t + REGLAS.REVELA_MS;
@@ -21707,6 +21853,9 @@ const GFBrawlMotor = (function () {
         // La carne solo la coge quien está herido: pasar por encima con la
         // vida llena no la gasta (si no, se "robaría" para que no cure a otro).
         if (esCarne && l.hp >= l.maxHp) continue;
+        if (o.tipo === 'municion' && l.municion >= REGLAS.MUNICION) continue;
+        if (o.tipo === 'super' && l.superCarga >= 1) continue;
+        if (o.tipo === 'hueso' && l.potencia >= REGLAS.HUESO_MAX) continue;
         var rr = l.r + REGLAS.HUESO_RADIO * 0.5;
         if (dist2(l, o) <= rr * rr) { quien = l; break; }
       }
@@ -21717,6 +21866,15 @@ const GFBrawlMotor = (function () {
         var cu = P.curas[o.cura];
         if (cu) { cu.objeto = 0; cu.proxima = (t - P.tCombate) + REGLAS.CURA_CADA_MS; }
         difundir(P, 'brawl:recoger', { id: o.id, por: quien.id, tipo: 'carne', cura: cura, potencia: quien.potencia, maxHp: quien.maxHp, hp: quien.hp });
+        continue;
+      }
+      if (o.tipo !== 'hueso') {
+        if (o.tipo === 'escudo') { quien.escudo = Math.round(quien.maxHp * REGLAS.ESCUDO_VIDA); quien.escudoHasta = t + REGLAS.PODER_DURACION_MS; }
+        if (o.tipo === 'rapidez') { quien.rapidezHasta = t + REGLAS.PODER_DURACION_MS; quien.vel = quien.velBase * REGLAS.PODER_VELOCIDAD_MULT; }
+        if (o.tipo === 'municion') quien.municion = Math.min(REGLAS.MUNICION, quien.municion + 1.5);
+        if (o.tipo === 'super') quien.superCarga = Math.min(1, quien.superCarga + 0.35);
+        difundir(P, 'brawl:recoger', { id: o.id, por: quien.id, tipo: o.tipo, potencia: quien.potencia,
+          maxHp: quien.maxHp, hp: quien.hp, vel: quien.vel, m: quien.municion, s: quien.superCarga });
         continue;
       }
       if (quien.potencia < REGLAS.HUESO_MAX) {
@@ -21730,6 +21888,15 @@ const GFBrawlMotor = (function () {
       difundir(P, 'brawl:recoger', { id: o.id, por: quien.id, tipo: 'hueso', potencia: quien.potencia, maxHp: quien.maxHp, hp: quien.hp });
     }
     P.objetos = quedan;
+  }
+
+  function soltarSuministro(P, x, y, oro) {
+    var tipos = ['carne', 'escudo', 'rapidez', 'municion', 'super'];
+    var tipo = tipos[Math.floor(P.azar() * tipos.length)];
+    var p = moverCirculo(P.R, x, y, oro ? 18 : 0, 0, 8);
+    var o = { id: P.sigObjeto++, x: p[0], y: p[1], tipo: tipo };
+    P.objetos.push(o);
+    difundir(P, 'brawl:objeto', { id: o.id, x: o.x, y: o.y, tipo: tipo });
   }
 
   function caer(P, l, asesino) {
@@ -21829,6 +21996,10 @@ const GFBrawlMotor = (function () {
         c: yo.correccion,
         hp: yo.hp
       };
+      y.v = redondea(yo.vel, 2);
+      y.e = yo.escudo;
+      y.r = Math.max(0, yo.rapidezHasta - ahora);
+      y.ed = Math.max(0, yo.escudoHasta - ahora);
       /* La posición buena va en TODAS las instantáneas hasta que el cliente
          confirme (con la `c` de sus entradas) que ya la ha aplicado. Mandarla
          una sola vez bastaría con una red perfecta; con una pestaña que se
@@ -22066,11 +22237,14 @@ const GFBrawlMotor = (function () {
     var R = P.R, mejor = null, md = Infinity;
     Object.keys(R.cajas).forEach(function (k) {
       var c = R.cajas[k];
-      if (!c.oro) return;
+      if (c.barril) return;
       var i = Number(k);
       var pt = celdaCentro(R, i % R.ancho, Math.floor(i / R.ancho));
       var d = dist2(l, pt);
-      if (d < md && d <= l.arma.alcance * l.arma.alcance * 0.8 && lineaDeTiro(R, l.x, l.y, pt.x, pt.y)) {
+      var distancia = Math.sqrt(d) || 1;
+      var bordeX = pt.x - (pt.x - l.x) / distancia * (R.celda * 0.72);
+      var bordeY = pt.y - (pt.y - l.y) / distancia * (R.celda * 0.72);
+      if (d < md && d <= l.arma.alcance * l.arma.alcance * 0.8 && dentroDeZona(P, pt, l.r) && lineaDeTiro(R, l.x, l.y, bordeX, bordeY)) {
         md = d; mejor = pt;
       }
     });
@@ -22207,6 +22381,12 @@ const GFBrawlMotor = (function () {
     for (var h = 0; h < P.objetos.length; h++) {
       var o = P.objetos[h];
       if (tipo && o.tipo !== tipo) continue;
+      if (o.tipo === 'carne' && l.hp >= l.maxHp) continue;
+      if (o.tipo === 'hueso' && l.potencia >= REGLAS.HUESO_MAX) continue;
+      if (o.tipo === 'municion' && l.municion >= REGLAS.MUNICION) continue;
+      if (o.tipo === 'super' && l.superCarga >= 1) continue;
+      if (o.tipo === 'escudo' && l.escudo > 0) continue;
+      if (o.tipo === 'rapidez' && l.rapidezHasta > P.tUltimo) continue;
       var d = dist2(l, o);
       if (d < md) { md = d; mejor = o; }
     }
@@ -22422,8 +22602,10 @@ const GFBrawlMotor = (function () {
       irHacia(P, l, ia.recuerdo.x, ia.recuerdo.y, t);
       return;
     }
-    var hueso = objetoCerca(P, l, 'hueso', R.celda * 7);
+    var hueso = objetoCerca(P, l, null, R.celda * 7);
     if (hueso && dentroDeZona(P, hueso, l.r)) { ia.modo = 'recurso'; irHacia(P, l, hueso.x, hueso.y, t); return; }
+    var suministro = cajaOroCerca(P, l);
+    if (suministro && l.municion >= 2) { ia.modo = 'recurso'; irHacia(P, l, suministro.x, suministro.y, t); return; }
 
     // Explorar: a un sitio libre dentro de la zona buena (los listos, por la
     // hierba). Al llegar, a veces se para a mirar un momento.
@@ -22507,7 +22689,7 @@ const GFBrawlMotor = (function () {
   function dentroDeZona(P, p, margen) {
     var z = P.zona;
     if (Math.sqrt(dist2(p, z)) > z.r - margen) return false;
-    if (z.sig) {
+    if (z.sig && (z.estado === 1 || z.cambioEn - (P.tUltimo - P.tCombate) <= 8000)) {
       var dx = p.x - z.sig.x, dy = p.y - z.sig.y;
       if (Math.sqrt(dx * dx + dy * dy) > z.sig.r - margen) return false;
     }
@@ -22570,7 +22752,8 @@ const GFBrawlMotor = (function () {
 // ---------------------------------------------------------------------------
 const BRAWL_ARENAS = Object.keys(GFBrawlMotor.ARENAS);
 const BRAWL_MAX_JUGADORES = 6;
-const BRAWL_SALA_MS = 8000;            // juntados dos, se espera esto a que entren más
+const BRAWL_BUSQUEDA_MS = 150000;
+const BRAWL_SALA_MS = BRAWL_BUSQUEDA_MS;            // juntados dos, se espera esto a que entren más
 const BRAWL_ESPERA_LIBRE_MS = 20000;   // tras esto en cola, se empareja con cualquier nivel
 
 /** La arena sale del id de la partida: todos los de una partida ven la misma. */
@@ -22640,6 +22823,7 @@ function brawlNuevaPartida(modo, humanos, bots, extra) {
                   luchadorId: null, sinConexion: 0, graciaReloj: null };
     match.porClave.set(h.socket.id, reg);
     match.humanos.push(reg);
+    if (h.ticket._battleQueueDeadline) { clearTimeout(h.ticket._battleQueueDeadline); h.ticket._battleQueueDeadline = null; }
     specs.push({
       clave: h.socket.id, humano: true,
       playerName: h.player.playerName, petName: h.player.petName, address: h.player.address,
@@ -23103,7 +23287,7 @@ function brawlAvisarSala() {
 }
 
 function brawlAvisarCola() {
-  battleQueue.forEach((s, i) => emitBattle(s, 'brawl:enCola', { posicion: i + 1, enCola: battleQueue.length }));
+  battleQueue.forEach((s, i) => emitBattle(s, 'brawl:enCola', { posicion: i + 1, enCola: battleQueue.length, empiezaEnMs: Math.max(0, s._battleTicket.createdAt + BRAWL_BUSQUEDA_MS - Date.now()) }));
 }
 
 function brawlDeshacerSala() {
@@ -23127,18 +23311,31 @@ function brawlQuitarDeSala(socket) {
   else brawlAvisarSala();
 }
 
+function brawlBotsDeRelleno(humanos, cuantos) {
+  const levels = humanos.map(h => h.player.level).sort((a, b) => a - b);
+  const level = levels[Math.floor(levels.length / 2)] || 1;
+  const stats = battleStatsForLevel(level);
+  const fichas = BATTLE_BOTS.concat(BATTLE_BOTS_EXTRA).slice().sort(() => Math.random() - 0.5);
+  return Array.from({ length: Math.max(0, cuantos) }, (_, i) => {
+    const f = fichas[i % fichas.length];
+    return { species: f.species, petName: f.petName, playerName: f.playerName + ' · Bot',
+      level, maxHp: stats.maxHp, attack: stats.attack, astucia: 0.62 + (i % 3) * 0.08, salud: 1 };
+  });
+}
+
 function brawlLanzarSala() {
   const sala = brawlSala;
   if (!sala) return;
   clearTimeout(sala.reloj);
   brawlSala = null;
   const validos = sala.regs.filter((r) => isBattleAdmissionCurrent(r.socket, r.ticket));
-  if (validos.length < 2) {
+  if (validos.length < 1) {
     for (let i = validos.length - 1; i >= 0; i--) battleQueue.unshift(validos[i].socket);
     brawlEmparejar();
     return;
   }
-  const match = brawlNuevaPartida('pvp', validos, [], {});
+  const bots = brawlBotsDeRelleno(validos, BRAWL_MAX_JUGADORES - validos.length);
+  const match = brawlNuevaPartida('pvp', validos, bots, { extraInicio: { botsRelleno: bots.length } });
   console.log(`⚔️  Batalla ${match.id}: ${validos.map((r) => r.player.playerName).join(' vs ')} en ${match.P.arenaId}`);
   brawlEmparejar();
 }
@@ -23177,9 +23374,10 @@ function brawlEmparejar() {
       const b = brawlRegDeSocket(battleQueue[j]);
       if (brawlCompatibles(a, b, ahora)) grupo.push(b);
     }
-    if (grupo.length < 2) continue;
+    if (grupo.length < 2 && ahora < a.ticket.createdAt + BRAWL_BUSQUEDA_MS) continue;
     for (const g of grupo) removeBattleQueueSocket(g.socket);
-    brawlSala = { regs: grupo, empiezaEn: ahora + BRAWL_SALA_MS, reloj: setTimeout(brawlLanzarSala, BRAWL_SALA_MS) };
+    const empiezaEn = Math.min(...grupo.map(r => r.ticket.createdAt)) + BRAWL_BUSQUEDA_MS;
+    brawlSala = { regs: grupo, empiezaEn, reloj: setTimeout(brawlLanzarSala, Math.max(0, empiezaEn - ahora)) };
     if (grupo.length >= BRAWL_MAX_JUGADORES) { brawlLanzarSala(); return; }
     brawlAvisarSala();
     break;
@@ -23191,7 +23389,7 @@ function brawlEmparejar() {
    pasa a valer cualquier nivel, pero nadie llamaría a brawlEmparejar si no
    entra nadie nuevo. Un repaso cada 5 s mientras haya cola. */
 setInterval(() => {
-  if (battleQueue.length >= 2 || brawlSala) {
+  if (battleQueue.length >= 1 || brawlSala) {
     try { brawlEmparejar(); } catch (e) { console.error('❌ brawlEmparejar', e); }
   }
 }, 5000).unref();
@@ -23275,7 +23473,7 @@ function brawlRecuperarSolicitud(socket, modo) {
   if (caido) { brawlVolver(socket, { matchId: caido.matchId }); return true; }
   if (socket._battleTicket && socket._battleTicket.mode === modo && !id) {
     if (modo === 'pvp' && socket._battleTicket.player) {
-      emitBattle(socket, 'brawl:enCola', { enCola: battleQueue.length });
+      emitBattle(socket, 'brawl:enCola', { enCola: battleQueue.length, empiezaEnMs: Math.max(0, socket._battleTicket.createdAt + BRAWL_BUSQUEDA_MS - Date.now()) });
       if (brawlSala && brawlSala.regs.some(r => r.socket === socket)) brawlAvisarSala();
     }
     return true;
@@ -23347,6 +23545,10 @@ io.on('connection', (socket) => {
       }
       ticket.player = player;
       battleQueue.push(socket);
+      ticket._battleQueueDeadline = setTimeout(() => {
+        ticket._battleQueueDeadline = null;
+        if (isBattleAdmissionCurrent(socket, ticket)) brawlEmparejar();
+      }, Math.max(0, ticket.createdAt + BRAWL_BUSQUEDA_MS - Date.now()));
       emitBattle(socket, 'brawl:enCola', {
         posicion: battleQueue.length, enCola: battleQueue.length, nivel: player.level
       });
