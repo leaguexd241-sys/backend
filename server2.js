@@ -4998,6 +4998,7 @@ function zonaDeSala(sala) {
   if (b === 'game') return 'world';
   if (b === 'tienda') return 'shop';
   if (b === 'mina') return 'mine';
+  if (b === 'salvaje') return 'wild';
   if (b === 'isla' || b.startsWith('isla@')) return 'island';
   if (b.startsWith('batalla') || b.startsWith('battle') || b.startsWith('arena')) return 'battle';
   return 'travel';
@@ -7899,7 +7900,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 // GF_NATIVE_PAIRING_BEGIN
 // Autorización PKCE de un solo uso: sesión nueva para el cliente nativo,
 // sin copiar cookies del navegador, refresh tokens, claves ni frases semilla.
-const gfCreateNativePairing = function createNativePairing({ crypto, now = Date.now, limit = 1000, issueSession, checkAccess }) {
+const gfCreateNativePairing = function createNativePairing({ crypto, now = Date.now, limit = 1000, issueSession, checkAccess, getPlayer = async () => ({}) }) {
   const pending = new Map();
   const ttl = 10 * 60 * 1000;
   const idPattern = /^[a-f0-9]{32}$/;
@@ -7907,7 +7908,7 @@ const gfCreateNativePairing = function createNativePairing({ crypto, now = Date.
   function find(id) { prune(); return typeof id === 'string' && idPattern.test(id) ? pending.get(id) : null; }
   function start({ challenge, platform }) {
     prune();
-    if (typeof challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(challenge) || !['win32','linux','darwin'].includes(platform)) return { status: 400, error: 'invalid_request' };
+    if (typeof challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(challenge) || !['win32','linux','darwin','android'].includes(platform)) return { status: 400, error: 'invalid_request' };
     if (pending.size >= limit) return { status: 503, error: 'pairing_capacity' };
     const id = crypto.randomBytes(16).toString('hex');
     const code = String(crypto.randomInt(100000, 1000000));
@@ -7939,12 +7940,16 @@ const gfCreateNativePairing = function createNativePairing({ crypto, now = Date.
     pending.delete(id);
     const access = await checkAccess(entry.address);
     if (!access.allowed) return { status: 403, error: access.error || 'access_denied' };
-    const player = await issueSession(entry.address, req, res);
+    // Android ejecuta el juego en el mismo Custom Tab/TWA que autorizó.
+    // Conserva la cookie de ese navegador; no emite una cookie sin destino
+    // hacia el cliente HTTP de Java ni copia credenciales al lanzador.
+    const player = entry.platform === 'android' ? await getPlayer(entry.address) : await issueSession(entry.address, req, res);
     return { status: 200, authenticated: true, address: entry.address, playerName: player.playerName || entry.address, walletKind: entry.walletKind };
   }
   return { start, info, approve, poll, clear: () => pending.clear(), size: () => { prune(); return pending.size; } };
 };
 const gfNativePairing = gfCreateNativePairing({ crypto, checkAccess: checkGameAccess,
+  getPlayer: async address => (await GamePlayer.findOne({ address }).lean().exec()) || {},
   issueSession: async (address, req, res) => {
     const accessToken = jwt.sign({ address, type: 'access', jti: uuidv4() }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRES });
     const refresh = jwt.sign({ address, type: 'refresh', jti: uuidv4() }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_TTL_DAYS + 'd' });
@@ -7977,6 +7982,7 @@ app.post('/api/native/poll', gfNativePollLimiter, async (req, res) => {
   catch { return gfNativeResult(res, { status: 503, error: 'pairing_service_unavailable' }); }
 });
 // GF_NATIVE_PAIRING_END
+
 
 // Logout
 app.post('/api/auth/logout', csrfProtection, async (req, res) => {
@@ -10277,6 +10283,15 @@ const DANO_MORDISCO_ANIMAL = 6;
 // (su salto, sus piedras). Ver costesDeAccion.
 const DANO_ZOMBI_MINA = 5;
 const DANO_JEFE_MINA = 12;
+/* Los monstruos con poderes (2026-10-11): cuánto quita cada golpe. El
+   cliente solo dice CUÁL le ha dado (gf-mina-serpiente.js, gf-salvaje.js). */
+const DANO_MONSTRUOS = {
+  serpiente_fuego: 9,          // bola de fuego de la serpiente de la mina
+  serpiente_terremoto: 7,      // piedra que cae en su terremoto
+  serpiente_mordisco: 14,      // su mordisco al salir del suelo
+  monstruo_golpe: 8,           // golpe de un monstruo del mapa salvaje
+  monstruo_poder: 11           // su poder (rayo, onda, espinas…)
+};
 
 const REVIVIR_BASE_PLATA   = 30;
 const REVIVIR_TOPE_PLATA   = 480;
@@ -10991,6 +11006,452 @@ app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, async
     console.error('POST /api/pesca/recoger:', e);
     return res.status(500).json({ error: 'internal_error' });
   }
+});
+
+// =============================================================================
+// EL BOTÍN DE LOS MONSTRUOS                                        (2026-10-11)
+// -----------------------------------------------------------------------------
+// "Que al matarla me dé nivel y objetos en el suelo." Los monstruos viven en
+// el navegador de cada jugador (como los zombis), así que el servidor no ve
+// la pelea; lo que sí controla es lo que se GANA:
+//   POST /api/monstruos/derrotado { tipo }
+//     · el tipo tiene que existir (MONSTRUOS_BOTIN) y el jugador tiene que
+//       estar, según su socket, en la sala de ese monstruo (la mina…);
+//     · un enfriamiento por jugador y monstruo (no se puede "matar" en bucle);
+//     · da la EXPERIENCIA en los dos sitios donde vive (como la arena):
+//       GamePlayer.nivel_exp y la factura de exp (PlayerStats.exp, que la
+//       escribe el liquidador en la cadena);
+//     · y prepara el BOTÍN: unos montones con id que el cliente pinta en el
+//       suelo. NO se acuña nada todavía.
+//   POST /api/monstruos/botin/recoger { id }
+//     · al pisar un montón: se acuña EN ESE MOMENTO (mintGatherReward, como
+//       la pesca) y se apunta en su casilla de Mongo. Cada montón, una vez.
+//     · lo que no se recoge caduca a los 10 minutos.
+// =============================================================================
+const MONSTRUOS_BOTIN = {
+  serpiente_mina: {
+    nombre: 'Magma Serpent', salas: ['mina'], enfriaMs: 20 * 60 * 1000, exp: 450, montones: [3, 4], instancias: 1,
+    botin: [['mineral_piedra_cobre', 2, 4], ['mineral_piedra_hierro', 2, 4], ['carbon', 3, 5], ['mineral_piedra', 3, 6]]
+  },
+  // Los del mapa salvaje (gf-salvaje.js, zona 5): más flojos y más a menudo.
+  golem_salvaje: {
+    nombre: 'Stone Golem', salas: ['salvaje'], enfriaMs: 6 * 60 * 1000, exp: 140, montones: [2, 2], instancias: 4,
+    botin: [['mineral_piedra', 2, 4], ['mineral_piedra_cobre', 1, 2]]
+  },
+  lobo_salvaje: {
+    nombre: 'Shadow Wolf', salas: ['salvaje'], enfriaMs: 4 * 60 * 1000, exp: 90, montones: [1, 2], instancias: 5,
+    botin: [['madera_pinos', 2, 4], ['carbon', 1, 2]]
+  },
+  arana_salvaje: {
+    nombre: 'Thorn Spider', salas: ['salvaje'], enfriaMs: 5 * 60 * 1000, exp: 110, montones: [1, 2], instancias: 5,
+    botin: [['madera_con_hojas', 2, 3], ['mineral_piedra', 1, 3]]
+  },
+  brujo_salvaje: {
+    nombre: 'Storm Wraith', salas: ['salvaje'], enfriaMs: 12 * 60 * 1000, exp: 260, montones: [2, 3], instancias: 2,
+    botin: [['mineral_piedra_hierro', 1, 3], ['carbon', 2, 4], ['mineral_piedra_cobre', 1, 3]]
+  }
+};
+const BOTIN_CADUCA_MS = 10 * 60 * 1000;
+const _monstruoUltimo = new Map();     // 'jugador|tipo' -> hora de la última victoria
+const _botinPendiente = new Map();     // id -> { playerName, address, itemId, cantidad, hasta }
+
+function _salaDeJugadorVista(playerName) {
+  for (const s of socketsDeJugador(playerName)) {
+    const sala = s.playerData && s.playerData.room;
+    if (sala) return salaBase(sala);
+  }
+  return null;
+}
+
+setInterval(() => {
+  const ahora = Date.now();
+  for (const [id, b] of _botinPendiente) if (ahora > b.hasta) _botinPendiente.delete(id);
+  for (const [k, t] of _monstruoUltimo) if (ahora - t > 60 * 60 * 1000) _monstruoUltimo.delete(k);
+}, 5 * 60 * 1000).unref();
+
+app.post('/api/monstruos/derrotado', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    const tipo = String((req.body && req.body.tipo) || '');
+    const def = Object.prototype.hasOwnProperty.call(MONSTRUOS_BOTIN, tipo) ? MONSTRUOS_BOTIN[tipo] : null;
+    if (!def) return res.status(400).json({ error: 'tipo_desconocido' });
+    const sala = _salaDeJugadorVista(gp.playerName);
+    if (!sala || !def.salas.includes(sala)) return res.status(403).json({ error: 'fuera_de_zona' });
+    /* CUÁL de ellos (2026-10-11): en el mapa salvaje hay varios de cada
+       especie (Maps/salvaje.json, capa `monstruos`) y el enfriamiento es de
+       cada uno. `n` no puede pasar de los que hay: matar al mismo dos veces
+       seguidas sigue sin dar nada. */
+    const n = Math.floor(Number(req.body && req.body.n) || 0);
+    if (!(n >= 0 && n < (def.instancias || 1))) return res.status(400).json({ error: 'monstruo_desconocido' });
+    const clave = gp.playerName + '|' + tipo + '|' + n;
+    const ahora = Date.now();
+    const ultimo = _monstruoUltimo.get(clave) || 0;
+    if (ahora - ultimo < def.enfriaMs) {
+      return res.status(429).json({ error: 'demasiado_pronto', esperaMs: def.enfriaMs - (ahora - ultimo) });
+    }
+    _monstruoUltimo.set(clave, ahora);
+
+    // La experiencia, como la de la arena (ver expDeArena más abajo).
+    let expTotal = null;
+    try {
+      const g2 = await GamePlayer.findOneAndUpdate({ playerName: gp.playerName }, { $inc: { nivel_exp: def.exp } },
+        { new: true, projection: { nivel_exp: 1 } }).lean();
+      expTotal = g2 ? Math.max(0, Number(g2.nivel_exp) || 0) : null;
+      const st = await PlayerStats.findOne({ playerName: gp.playerName });
+      if (st) {
+        st.exp = clampStat('exp', (Number(st.exp) || 0) + def.exp);
+        marcarPendienteDeCadena(st, ['exp']);
+        await st.save();
+        expTotal = Math.max(expTotal || 0, st.exp);
+      }
+      programarIdentidadEnCadena(gp.playerName);
+    } catch (e) { console.warn('⚠️  monstruo: exp de ' + gp.playerName + ':', e.message); }
+
+    // Los montones del suelo.
+    const cuantos = def.montones[0] + Math.floor(Math.random() * (def.montones[1] - def.montones[0] + 1));
+    const botin = [];
+    for (let i = 0; i < cuantos; i++) {
+      const [itemId, min, max] = def.botin[Math.floor(Math.random() * def.botin.length)];
+      const cantidad = min + Math.floor(Math.random() * (max - min + 1));
+      const id = crypto.randomBytes(8).toString('hex');
+      _botinPendiente.set(id, { playerName: gp.playerName, address: String(gp.address || '').toLowerCase(),
+                                itemId, cantidad, hasta: ahora + BOTIN_CADUCA_MS });
+      botin.push({ id, itemId, cantidad });
+    }
+    console.log(`🐉 ${gp.playerName} venció a ${def.nombre}: +${def.exp} exp, ${botin.length} montones`);
+    return res.json({ ok: true, tipo, exp: def.exp, expTotal, botin, caducaMs: BOTIN_CADUCA_MS });
+  } catch (e) {
+    console.error('POST /api/monstruos/derrotado:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/monstruos/botin/recoger', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const id = String((req.body && req.body.id) || '');
+    const b = _botinPendiente.get(id);
+    if (!b || b.playerName !== gp.playerName) return res.json({ ok: false, motivo: 'no_existe' });
+    if (Date.now() > b.hasta) { _botinPendiente.delete(id); return res.json({ ok: false, motivo: 'caducado' }); }
+    if (b.recogiendo) return res.json({ ok: false, motivo: 'en_curso' });
+    b.recogiendo = true;
+    const tipo = ITEM_TIPO_MAP[b.itemId];
+    let factura = null;
+    try { factura = tipo ? await mintGatherReward(b.address, tipo, b.cantidad) : null; } catch (e) { factura = null; }
+    if (!factura || !factura.id) {
+      b.recogiendo = false;                        // se puede volver a intentar
+      return res.status(502).json({ ok: false, motivo: 'cadena', message: 'The chain is busy. Try picking it up again.' });
+    }
+    _botinPendiente.delete(id);
+    try {
+      const doc = await GamePlayer.findOne({ playerName: gp.playerName });
+      if (doc) {
+        const r2 = ponerFacturaEnSlots(doc.inventory, doc.chest, b.itemId, factura);
+        doc.inventory = r2.inventory; doc.chest = r2.chest;
+        doc.markModified('inventory'); doc.markModified('chest');
+        await doc.save();
+      }
+    } catch (e) { console.warn('⚠️  botín: casilla en Mongo:', e.message); }
+    return res.json({ ok: true, itemId: b.itemId, cantidad: b.cantidad,
+      factura: { invoiceId: factura.id, manualId: factura.manualId, cantidad: factura.cantidad } });
+  } catch (e) {
+    console.error('POST /api/monstruos/botin/recoger:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// =============================================================================
+// EL MAPA SALVAJE: ESPADAZOS ENTRE JUGADORES Y LO QUE SE SUELTA EN EL SUELO
+//                                                                  (2026-10-11)
+// -----------------------------------------------------------------------------
+// "Una zona PvP donde los usuarios se puedan dar espadazos o, si arrastran un
+// recurso hacia afuera, puedan soltarlo libremente" (Scenes/SalvajeScene.js y
+// gf-salvaje.js). Las dos cosas las decide el SERVIDOR:
+//
+//   · EL ESPADAZO ('pvp:golpe' por socket). El cliente solo dice A QUIÉN (el
+//     id de su socket) y CON QUÉ espada. Aquí se mira que los dos estén en la
+//     misma sala 'salvaje' (con su canal), los dos al oeste del río (la zona
+//     PvP), cerca el uno del otro según las posiciones que tiene el SERVIDOR,
+//     que el que pega tenga esa espada en su inventario guardado y que ninguno
+//     sea fantasma. El daño sale de PVP_DANO y se quita como el del veneno: en
+//     Mongo, con la deuda apuntada para la cadena. Al herido se le avisa por
+//     su socket ('pvp:herido') y a la sala ('pvp:impacto') para el destello.
+//     El tajo en sí ('pvp:tajo') solo se reenvía a la sala: es lo que hace
+//     que los demás vean la espada moverse.
+//
+//   · EL SUELO. Soltar QUEMA en la cadena lo soltado (de la factura que se
+//     arrastró) y deja un montón en el suelo de esa sala, a la vista de todos;
+//     recogerlo lo ACUÑA al primero que llega. Lo que nadie recoge en diez
+//     minutos se pierde. Solo recursos (SUELO_SOLTABLES): herramientas,
+//     espadas, parcelas o cofres no, que llevan usos o se construyen.
+// =============================================================================
+const SALVAJE_SALA = 'salvaje';
+// Maps/salvaje.json, capa `zonas`: todo lo que queda al oeste del río.
+const PVP_ZONA = { x0: 0, y0: 0, x1: 2240, y1: 5024 };
+// Vida que quita cada espada a otro jugador (la vida va de 0 a 100).
+const PVP_DANO = { espada_madera: 4, espada_cobre: 6, espada_hierro: 9 };
+// Generoso: las dos posiciones llegan con el retraso de la red.
+const PVP_ALCANCE = 150;
+const PVP_ENFRIA_MS = 300;
+const _pvpEspadas = new Map();          // playerName -> { hasta, espadas: Set }
+
+function _enZonaPvp(p) {
+  const x = Number(p && p.x), y = Number(p && p.y);
+  return Number.isFinite(x) && Number.isFinite(y) &&
+         x >= PVP_ZONA.x0 && x < PVP_ZONA.x1 && y >= PVP_ZONA.y0 && y < PVP_ZONA.y1;
+}
+
+/** Las espadas que tiene de verdad (inventario y barra guardados), un minuto en caché. */
+async function _espadasDe(playerName) {
+  const c = _pvpEspadas.get(playerName);
+  if (c && c.hasta > Date.now()) return c.espadas;
+  const espadas = new Set();
+  try {
+    const gp = await GamePlayer.findOne({ playerName }).select('inventory chest').lean();
+    const casillas = [].concat(gp && Array.isArray(gp.inventory) ? gp.inventory : [],
+                               gp && Array.isArray(gp.chest) ? gp.chest : []);
+    for (const s of casillas) {
+      if (s && PVP_DANO[s.objeto] && Number(s.cantidad) > 0) espadas.add(s.objeto);
+    }
+  } catch (_) {}
+  _pvpEspadas.set(playerName, { hasta: Date.now() + 60 * 1000, espadas });
+  return espadas;
+}
+
+/** La sala (con canal), el socket y la posición desde la que juega ahora. */
+function _salaYPosicion(playerName) {
+  let mejor = null, mejorT = -1;
+  for (const s of socketsDeJugador(playerName)) {
+    const sala = s.playerData && s.playerData.room;
+    const fila = sala && rooms[sala] && rooms[sala][s.id];
+    if (!fila) continue;
+    const t = Number(fila.lastUpdate) || 0;
+    if (t > mejorT) { mejorT = t; mejor = { sala, socket: s, x: Number(fila.x) || 0, y: Number(fila.y) || 0 }; }
+  }
+  return mejor;
+}
+
+/** Quita `dano` de vida al jugador, en su cola (dos golpes a la vez no se pisan). */
+function _herirJugador(playerName, dano) {
+  return enColaDelJugador('vida:' + playerName, async () => {
+    const doc = await PlayerStats.findOne({ playerName });
+    if (!doc) return null;
+    applyGhostVitalRegen(doc);
+    const actual = clampStat('vida', doc.vida);
+    const quita = Math.min(dano, actual);
+    if (quita > 0) {
+      doc.vida = clampStat('vida', actual - quita);
+      marcarPendienteDeCadena(doc, ['vida']);
+      await doc.save();
+    }
+    return { quita, stats: buildStatsResponse(doc), muerto: clampStat('vida', doc.vida) <= 0 };
+  });
+}
+
+// ── EL SUELO ──────────────────────────────────────────────────────────────────
+const SUELO_SOLTABLES = new Set([
+  'Semillax', 'Semillax1', 'Semillax2', 'Semillax3', 'Semillax4',
+  'mineral_piedra', 'mineral_cobre', 'mineral_hierro', 'carbon',
+  'mineral_piedra_cobre', 'mineral_piedra_hierro', 'mineral_carbon',
+  'palo', 'tablon_de_madera', 'madera_pinos', 'madera_con_hojas', 'madera_seca',
+  'zanahoria_buena', 'zanahoria_corta', 'zanahoria_mala',
+  'tomate_buena', 'tomate_corta', 'tomate_mala',
+  'trigo_buena', 'trigo_corta', 'trigo_mala',
+  'calabaza_buena', 'calabaza_corta', 'calabaza_mala',
+  'fresa_buena', 'fresa_corta', 'fresa_mala',
+  'pes1', 'pes2', 'pes3', 'pes4', 'pes5', 'pes6', 'pes7', 'pes8',
+  'pocion_mascota', 'pocion_mascota_grande', 'elixir_revivir'
+]);
+const SUELO_CADUCA_MS = 10 * 60 * 1000;
+const SUELO_MAX_POR_SALA = 150;
+const SUELO_ALCANCE = 260;              // px desde el jugador a donde suelta o recoge
+const _sueloSalvaje = new Map();        // id -> montón
+
+function _montonPublico(m) {
+  return { id: m.id, itemId: m.itemId, cantidad: m.cantidad, x: m.x, y: m.y,
+           deNombre: m.deNombre, caducaEn: m.hasta };
+}
+
+setInterval(() => {
+  const ahora = Date.now();
+  for (const [id, m] of _sueloSalvaje) {
+    if (ahora <= m.hasta || m.recogiendo) continue;
+    _sueloSalvaje.delete(id);
+    try { io.to(m.sala).emit('suelo:fuera', { id, caducado: true }); } catch (_) {}
+  }
+  for (const [n, c] of _pvpEspadas) if (c.hasta < ahora) _pvpEspadas.delete(n);
+}, 30 * 1000).unref();
+
+app.get('/api/salvaje/suelo', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const yo = _salaYPosicion(gp.playerName);
+    if (!yo || salaBase(yo.sala) !== SALVAJE_SALA) return res.json({ ok: true, lista: [] });
+    const lista = [];
+    for (const m of _sueloSalvaje.values()) if (m.sala === yo.sala && !m.recogiendo) lista.push(_montonPublico(m));
+    return res.json({ ok: true, lista, ahora: Date.now() });
+  } catch (e) {
+    console.error('GET /api/salvaje/suelo:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/salvaje/soltar', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    if (!relayerWallet) return res.status(503).json({ error: 'relayer_unavailable' });
+    const yo = _salaYPosicion(gp.playerName);
+    if (!yo || salaBase(yo.sala) !== SALVAJE_SALA) {
+      return res.status(403).json({ error: 'fuera_de_zona', message: 'You can only drop items in the wild lands.' });
+    }
+    const itemId = String((req.body && req.body.itemId) || '');
+    const tipo = itemTipoOnChain(itemId);
+    if (!tipo || !SUELO_SOLTABLES.has(itemId)) {
+      return res.status(400).json({ error: 'no_se_suelta', message: 'Only resources can be dropped on the ground.' });
+    }
+    let x = Number(req.body && req.body.x), y = Number(req.body && req.body.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || Math.hypot(x - yo.x, y - yo.y) > SUELO_ALCANCE) {
+      x = yo.x; y = yo.y + 40;            // demasiado lejos: a sus pies
+    }
+    let enSala = 0;
+    for (const m of _sueloSalvaje.values()) if (m.sala === yo.sala) enSala++;
+    if (enSala >= SUELO_MAX_POR_SALA) {
+      return res.status(429).json({ error: 'suelo_lleno', message: 'There are too many things on the ground here. Try again later.' });
+    }
+    const invoiceId = Number(req.body && req.body.invoiceId);
+    const pedida = Math.max(1, Math.floor(Number(req.body && req.body.cantidad) || 1));
+    const address = String(gp.address || '').toLowerCase();
+
+    const r = await enColaDelJugador('suelo:' + address, async () => {
+      const c = contratoItemsServidor();
+      if (!c) return { status: 503, body: { error: 'relayer_unavailable' } };
+      const facturas = (await facturasLibresDeCadena(address)).filter(f => f.tipo === tipo && f.cantidad > 0);
+      // La que se arrastró, si es suya y es de ese objeto; si no, la más pequeña.
+      const f = facturas.find(v => v.id === invoiceId) || facturas.sort((a, b) => a.cantidad - b.cantidad)[0];
+      if (!f) return { status: 400, body: { error: 'no_tienes', message: 'You do not have that item anymore.' } };
+      const cantidad = Math.min(pedida, f.cantidad);
+      await txRelayer('suelo: soltar ' + tipo, (o) => cantidad >= f.cantidad
+        ? c.deleteInvoice(f.id, o) : c.decreaseInvoiceQuantity(f.id, cantidad, o));
+      const quedan = f.cantidad - cantidad;
+      try {
+        const doc = await GamePlayer.findOne({ playerName: gp.playerName });
+        if (doc) {
+          const r2 = quitarUnaDeFacturaEnSlots(doc.inventory, doc.chest, f.id, quedan);
+          doc.inventory = r2.inventory; doc.chest = r2.chest;
+          doc.markModified('inventory'); doc.markModified('chest');
+          await doc.save();
+        }
+      } catch (e) { console.warn('⚠️  suelo: casilla en Mongo:', e.message); }
+      const m = {
+        id: crypto.randomBytes(8).toString('hex'), sala: yo.sala, itemId, cantidad,
+        x: Math.round(x), y: Math.round(y), de: gp.playerName,
+        deNombre: String(gp.Username || gp.playerName).slice(0, 40), hasta: Date.now() + SUELO_CADUCA_MS
+      };
+      _sueloSalvaje.set(m.id, m);
+      try { io.to(yo.sala).emit('suelo:nuevo', _montonPublico(m)); } catch (_) {}
+      console.log(`🌲 ${gp.playerName} soltó ${cantidad} ${itemId} en ${yo.sala}`);
+      return { status: 200, body: { ok: true, monton: _montonPublico(m),
+        gastado: { itemId, invoiceId: f.id, manualId: f.manualId, cantidadRestante: quedan } } };
+    });
+    return res.status(r.status).json(r.body);
+  } catch (e) {
+    console.error('POST /api/salvaje/soltar:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/salvaje/recoger', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    const id = String((req.body && req.body.id) || '');
+    const m = _sueloSalvaje.get(id);
+    if (!m) return res.json({ ok: false, motivo: 'no_existe' });
+    const yo = _salaYPosicion(gp.playerName);
+    if (!yo || yo.sala !== m.sala) return res.json({ ok: false, motivo: 'otra_sala' });
+    if (Math.hypot(m.x - yo.x, m.y - yo.y) > SUELO_ALCANCE) return res.json({ ok: false, motivo: 'lejos' });
+    if (m.recogiendo) return res.json({ ok: false, motivo: 'en_curso' });
+    m.recogiendo = gp.playerName;
+    let factura = null;
+    try { factura = await mintGatherReward(String(gp.address || '').toLowerCase(), itemTipoOnChain(m.itemId), m.cantidad); }
+    catch (e) { factura = null; }
+    if (!factura || !factura.id) {
+      m.recogiendo = null;                      // se puede volver a intentar
+      return res.status(502).json({ ok: false, motivo: 'cadena', message: 'The chain is busy. Try picking it up again.' });
+    }
+    _sueloSalvaje.delete(id);
+    try {
+      const doc = await GamePlayer.findOne({ playerName: gp.playerName });
+      if (doc) {
+        const r2 = ponerFacturaEnSlots(doc.inventory, doc.chest, m.itemId, factura);
+        doc.inventory = r2.inventory; doc.chest = r2.chest;
+        doc.markModified('inventory'); doc.markModified('chest');
+        await doc.save();
+      }
+    } catch (e) { console.warn('⚠️  suelo: recoger en Mongo:', e.message); }
+    try { io.to(m.sala).emit('suelo:fuera', { id, por: String(gp.Username || gp.playerName).slice(0, 40) }); } catch (_) {}
+    return res.json({ ok: true, itemId: m.itemId, cantidad: m.cantidad, deNombre: m.deNombre,
+      factura: { invoiceId: factura.id, manualId: factura.manualId, cantidad: factura.cantidad } });
+  } catch (e) {
+    console.error('POST /api/salvaje/recoger:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ── LOS ESPADAZOS ─────────────────────────────────────────────────────────────
+io.on('connection', (socket) => {
+  /* El tajo: solo para que los demás vean la espada. No quita nada. */
+  socket.on('pvp:tajo', (d) => {
+    const sala = socket.playerData && socket.playerData.room;
+    if (!sala || salaBase(sala) !== SALVAJE_SALA) return;
+    if (frenado(socket, 'pvp_tajo', 200)) return;
+    const dir = ['left', 'right', 'up', 'down'].includes(d && d.dir) ? d.dir : 'right';
+    const arma = PVP_DANO[d && d.arma] ? d.arma : 'espada_madera';
+    socket.to(sala).emit('pvp:tajo', { id: socket.id, dir, arma });
+  });
+
+  socket.on('pvp:golpe', async (d) => {
+    try {
+      const sala = socket.playerData && socket.playerData.room;
+      if (!sala || salaBase(sala) !== SALVAJE_SALA) return;
+      if (frenado(socket, 'pvp_golpe', PVP_ENFRIA_MS)) return;
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return;
+      const arma = String((d && d.arma) || '');
+      if (!PVP_DANO[arma]) return;
+      const victimaId = String((d && d.victima) || '');
+      if (!victimaId || victimaId === socket.id) return;
+      const filas = rooms[sala] || {};
+      const pa = filas[socket.id], pv = filas[victimaId];
+      if (!pa || !pv) return;
+      if (!_enZonaPvp(pa) || !_enZonaPvp(pv)) return socket.emit('pvp:rechazado', { motivo: 'zona' });
+      if (Math.hypot(Number(pa.x) - Number(pv.x), Number(pa.y) - Number(pv.y)) > PVP_ALCANCE) return;
+      const sv = io.sockets.sockets.get(victimaId);
+      if (!sv) return;
+      const ella = await cuentaDelSocket(sv);
+      if (!ella || ella === yo) return;
+      if (!(await _espadasDe(yo)).has(arma)) return socket.emit('pvp:rechazado', { motivo: 'sin_espada' });
+      if (await esFantasma({ playerName: yo }) || await esFantasma({ playerName: ella })) return;
+      const r = await _herirJugador(ella, PVP_DANO[arma]);
+      if (!r || !r.quita) return;
+      const deNombre = String(pa.username || yo).slice(0, 40);
+      for (const s of socketsDeJugador(ella)) {
+        try { s.emit('pvp:herido', { de: socket.id, deNombre, dano: r.quita, stats: r.stats, muerto: r.muerto,
+                                     x: Math.round(Number(pa.x) || 0), y: Math.round(Number(pa.y) || 0) }); } catch (_) {}
+      }
+      io.to(sala).emit('pvp:impacto', { id: victimaId, de: socket.id, muerto: r.muerto });
+      if (r.muerto) console.log(`⚔️  ${yo} derribó a ${ella} en ${sala}`);
+    } catch (e) {
+      console.warn('⚠️  pvp:golpe:', e.message);
+    }
+  });
 });
 
 // =============================================================================
@@ -19204,6 +19665,9 @@ function costesDeAccion(reason, seedType, units) {
   // que el mordisco: el cliente dice QUÉ le ha pasado y el daño lo pone esto.
   if (reason === 'zombi_mina') return { vida: DANO_ZOMBI_MINA };
   if (reason === 'jefe_mina') return { vida: DANO_JEFE_MINA };
+  // Los monstruos con poderes (2026-10-11): la serpiente de la mina y los del
+  // mapa salvaje. Ver DANO_MONSTRUOS.
+  if (Object.prototype.hasOwnProperty.call(DANO_MONSTRUOS, reason)) return { vida: DANO_MONSTRUOS[reason] };
 
   return null;   // acción no reconocida
 }
@@ -19307,7 +19771,8 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
        sigan mordiendo": con la regla de todo o nada, en cuanto la vida bajaba
        del coste del mordisco el servidor devolvía 409 y NO descontaba nada. Los
        últimos puntos eran ininvulnerables y el personaje no podía morir jamás. */
-    const esDano = (reason === 'animal_bite' || reason === 'zombi_mina' || reason === 'jefe_mina');
+    const esDano = (reason === 'animal_bite' || reason === 'zombi_mina' || reason === 'jefe_mina' ||
+                    Object.prototype.hasOwnProperty.call(DANO_MONSTRUOS, reason));
     if (esDano) {
       for (const stat of Object.keys(costs)) {
         costs[stat] = Math.min(costs[stat], clampStat(stat, doc[stat]));
@@ -20442,9 +20907,10 @@ async function construirJugadorDeSocket(socket) {
   if (!playerName) playerName = '---';
 
   let nivel = 1, petName = 'Pet', petHealth = 100;
+  let username = '', record = { wins: 0, battles: 0 };
   try {
     const gp = await GamePlayer.findOne({ playerName })
-      .select('nivel_exp petName petHealth petLevel petWins petBattles petExp').lean();
+      .select('nivel_exp petName petHealth petLevel petWins petBattles petExp Username').lean();
     if (gp) {
       /* EL NIVEL LO CALCULA EL SERVIDOR, Y ES EL MISMO QUE SE VE EN EL MAPA.
          Sale de nivelMascotaEfectivo(): el del personaje, de la experiencia
@@ -20458,6 +20924,10 @@ async function construirJugadorDeSocket(socket) {
       nivel = nivelMascotaEfectivo(gp);
       petName = gp.petName && gp.petName !== '---' ? gp.petName : 'Pet';
       petHealth = gp.petHealth == null ? 100 : gp.petHealth;
+      // Para la sala de espera (el nombre que ven los demás) y para ajustar
+      // los bots de relleno a cómo le va (brawlBotsDeRelleno).
+      username = gp.Username && gp.Username !== '---' ? String(gp.Username).slice(0, 20) : '';
+      record = { wins: Math.max(0, Number(gp.petWins) || 0), battles: Math.max(0, Number(gp.petBattles) || 0) };
     }
   } catch (e) { /* valores por defecto */ }
 
@@ -20476,7 +20946,9 @@ async function construirJugadorDeSocket(socket) {
     level: nivel,
     petHealthPct: saludPet,
     maxHp: stats.maxHp,
-    attack: stats.attack
+    attack: stats.attack,
+    username,
+    record
   };
 }
 
@@ -23277,13 +23749,40 @@ function brawlCompatibles(a, b, ahora) {
          (ahora - b.ticket.createdAt > BRAWL_ESPERA_LIBRE_MS);
 }
 
+/* LA SALA SE VE Y SE PUEDE DECIR "LISTO" (2026-10-10). "En el PvP no puedo
+   ver a los otros jugadores que entraron conmigo; al esperar los 2:30 quiero
+   un botón de listo para que, si todos los unidos le dan y están todos
+   confirmados, podamos jugar, y el resto de plazas sean bots."
+   Cada uno recibe la lista (con `yo` en la suya). En cuanto TODOS los de la
+   sala están listos, empieza (brawlComprobarListos); si no, a los 2:30. */
 function brawlAvisarSala() {
   if (!brawlSala) return;
-  const datos = {
+  const lista = brawlSala.regs.map((r) => ({
+    id: r.socket.id,
+    nombre: (r.player && (r.player.username || r.player.playerName)) || 'Player',
+    mascota: (r.player && r.player.petName) || 'Pet',
+    nivel: (r.player && r.player.level) || 1,
+    listo: !!(r.ticket && r.ticket.listo)
+  }));
+  const base = {
     jugadores: brawlSala.regs.length, max: BRAWL_MAX_JUGADORES,
+    listos: lista.filter((x) => x.listo).length,
     empiezaEnMs: Math.max(0, brawlSala.empiezaEn - Date.now())
   };
-  for (const r of brawlSala.regs) emitBattle(r.socket, 'brawl:sala', datos);
+  for (const r of brawlSala.regs) {
+    emitBattle(r.socket, 'brawl:sala', Object.assign({}, base, {
+      lista: lista.map((x) => ({ nombre: x.nombre, mascota: x.mascota, nivel: x.nivel, listo: x.listo, yo: x.id === r.socket.id }))
+    }));
+  }
+}
+
+/** Todos los de la sala listos: se empieza ya, con bots en lo que falte. */
+function brawlComprobarListos() {
+  if (!brawlSala || !brawlSala.regs.length) return false;
+  const vivos = brawlSala.regs.filter((r) => isBattleAdmissionCurrent(r.socket, r.ticket));
+  if (!vivos.length || !vivos.every((r) => r.ticket && r.ticket.listo)) return false;
+  brawlLanzarSala();
+  return true;
 }
 
 function brawlAvisarCola() {
@@ -23307,19 +23806,47 @@ function brawlQuitarDeSala(socket) {
   const antes = brawlSala.regs.length;
   brawlSala.regs = brawlSala.regs.filter((r) => r.socket.id !== socket.id);
   if (brawlSala.regs.length === antes) return;
-  if (brawlSala.regs.length < 2) { brawlDeshacerSala(); brawlAvisarCola(); brawlEmparejar(); }
-  else brawlAvisarSala();
+  // (Una sala de uno vale: se ve en la lista y puede empezar con bots.)
+  if (brawlSala.regs.length < 1) { brawlDeshacerSala(); brawlAvisarCola(); brawlEmparejar(); }
+  else if (!brawlComprobarListos()) brawlAvisarSala();
+}
+
+/* LOS BOTS DE RELLENO, A LA MEDIDA (2026-10-10). "Los bots están difíciles;
+   quiero que se adapten: ni buenos ni malos." Antes salían con astucia de
+   0,62 a 0,78 (puntería y reflejos casi de experto) y la vida y el ataque de
+   un jugador de tu nivel. Ahora:
+     · la ASTUCIA sale de cómo le va a la sala: con el historial de victorias
+       de sus mascotas (con un "a priori" de 1 de 2, para que dos partidas no
+       manden), del 0,30 al 0,58. Al que gana mucho le tocan bots más listos;
+       al que pierde, más torpes. Uno de cada tres un poco por debajo y otro
+       un poco por encima: hay a quién ganar y alguno que cuesta.
+     · la VIDA y el ATAQUE, un 8 % y un 12 % por debajo de los de un jugador de
+       su nivel: un bot no debe pegar como una persona. */
+function brawlRatioDeVictorias(humanos) {
+  if (!humanos.length) return 0.5;
+  let suma = 0;
+  for (const h of humanos) {
+    const r = (h.player && h.player.record) || { wins: 0, battles: 0 };
+    const jugadas = Math.max(r.battles, r.wins);
+    suma += (r.wins + 1) / (jugadas + 2);
+  }
+  return suma / humanos.length;
 }
 
 function brawlBotsDeRelleno(humanos, cuantos) {
   const levels = humanos.map(h => h.player.level).sort((a, b) => a - b);
   const level = levels[Math.floor(levels.length / 2)] || 1;
   const stats = battleStatsForLevel(level);
+  const ratio = brawlRatioDeVictorias(humanos);
+  const base = Math.max(0.30, Math.min(0.52, 0.26 + 0.40 * ratio));
+  const reparto = [-0.06, 0, 0.06];
   const fichas = BATTLE_BOTS.concat(BATTLE_BOTS_EXTRA).slice().sort(() => Math.random() - 0.5);
   return Array.from({ length: Math.max(0, cuantos) }, (_, i) => {
     const f = fichas[i % fichas.length];
+    const astucia = Math.max(0.28, Math.min(0.58, base + reparto[i % 3]));
     return { species: f.species, petName: f.petName, playerName: f.playerName + ' · Bot',
-      level, maxHp: stats.maxHp, attack: stats.attack, astucia: 0.62 + (i % 3) * 0.08, salud: 1 };
+      level, maxHp: Math.max(1, Math.round(stats.maxHp * 0.92)),
+      attack: Math.max(1, Math.round(stats.attack * 0.88)), astucia, salud: 1 };
   });
 }
 
@@ -23348,7 +23875,7 @@ function brawlEmparejar() {
   }
   if (brawlSala) {
     brawlSala.regs = brawlSala.regs.filter((r) => isBattleAdmissionCurrent(r.socket, r.ticket));
-    if (brawlSala.regs.length < 2) brawlDeshacerSala();
+    if (brawlSala.regs.length < 1) brawlDeshacerSala();
   }
 
   if (brawlSala) {
@@ -23374,7 +23901,8 @@ function brawlEmparejar() {
       const b = brawlRegDeSocket(battleQueue[j]);
       if (brawlCompatibles(a, b, ahora)) grupo.push(b);
     }
-    if (grupo.length < 2 && ahora < a.ticket.createdAt + BRAWL_BUSQUEDA_MS) continue;
+    // Se abre la sala aunque sea de uno (2026-10-10): así se ve en la lista,
+    // los que lleguen entran en ella y puede darle a "Ready".
     for (const g of grupo) removeBattleQueueSocket(g.socket);
     const empiezaEn = Math.min(...grupo.map(r => r.ticket.createdAt)) + BRAWL_BUSQUEDA_MS;
     brawlSala = { regs: grupo, empiezaEn, reloj: setTimeout(brawlLanzarSala, Math.max(0, empiezaEn - ahora)) };
@@ -23559,6 +24087,18 @@ io.on('connection', (socket) => {
       console.error('❌ brawl:cola', e);
       emitBattle(socket, 'brawl:error', { error: 'queue_failed' });
     }
+  });
+
+  // "Ready" en la sala de espera (2026-10-10): ver brawlAvisarSala.
+  socket.on('brawl:listo', (d) => {
+    try {
+      const t = socket._battleTicket;
+      if (!t || !isBattleAdmissionCurrent(socket, t)) return;
+      t.listo = !!(d && d.listo);
+      if (brawlSala && brawlSala.regs.some((r) => r.socket.id === socket.id)) {
+        if (!brawlComprobarListos()) brawlAvisarSala();
+      }
+    } catch (e) { console.error('❌ brawl:listo', e); }
   });
 
   socket.on('brawl:salirCola', () => {
