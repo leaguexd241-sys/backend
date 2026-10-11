@@ -3077,10 +3077,23 @@ class RelayManager {
       sessionId
     } = transactionData;
     
-    const transactionId = `relay_${uuidv4()}`;
+    /* EL ID DE LO ENCOLADO ES FIJO (2026-10-10). Cuando el envío se caía por
+       algo transitorio, la ruta lo mandaba a la cola y contestaba 202 SIN
+       transactionId: el cliente esperaba "undefined" dos minutos, daba la
+       compra por fallida (y la tienda REEMBOLSABA), y luego la cola la hacía:
+       objeto y dinero a la vez. Ahora la ruta le pone un id antes de
+       encolarla, se lo da al cliente, y cada reintento de la cola escribe en
+       ESE mismo documento. */
+    const transactionId = (typeof transactionData.idFijo === 'string' && transactionData.idFijo)
+      ? transactionData.idFijo : `relay_${uuidv4()}`;
     const internalId = crypto.createHash('sha256').update(transactionId).digest('hex');
-    
-    const relayTx = new RelayedTransaction({
+
+    let relayTx = transactionData.idFijo
+      ? await RelayedTransaction.findOne({ transactionId }).catch(() => null) : null;
+    if (relayTx) {
+      relayTx.status = 'processing';
+      relayTx.error = undefined;
+    } else relayTx = new RelayedTransaction({
       transactionId,
       internalId,
       playerAddress,
@@ -3319,8 +3332,13 @@ class RelayManager {
       
     } catch (error) {
       console.error(`❌ Error en processTransaction:`, error);
-      
-      relayTx.status = 'failed';
+
+      // Lo encolado que la cola va a reintentar queda 'pending' (no es final):
+      // si se marcaba 'failed', el cliente lo daba por perdido y reembolsaba
+      // mientras la cola lo hacía de todos modos.
+      const seReintentara = !!transactionData.idFijo && transactionData.__enCola === true &&
+                            this.shouldRetry(error) && (transactionData.retryCount || 0) < 3;
+      relayTx.status = seReintentara ? 'pending' : 'failed';
       relayTx.error = error.message;
       await relayTx.save();
       
@@ -3920,6 +3938,15 @@ class RelayManager {
 
 // Inicializar Relay Manager
 const relayManager = new RelayManager();
+
+// Claves `idem` de /api/relay/transaction (ver "LA MISMA PETICIÓN NO SE HACE
+// DOS VECES" en esa ruta): clave -> { at, promesa de la respuesta }.
+const _relayIdem = new Map();
+const RELAY_IDEM_MS = 15 * 60 * 1000;
+setInterval(() => {
+  const limite = Date.now() - RELAY_IDEM_MS;
+  for (const [k, v] of _relayIdem) if (v.at < limite) _relayIdem.delete(k);
+}, 5 * 60 * 1000).unref();
 
 // Verificar balance al inicio
 setTimeout(async () => {
@@ -4821,7 +4848,7 @@ const io = new Server(server, {
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "X-Requested-With", "Accept"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "X-Requested-With", "Accept", "X-GF-Sesion"],
     exposedHeaders: ["Set-Cookie", "X-CSRF-Token"]
   },
   transports: ['websocket', 'polling'],
@@ -5119,6 +5146,125 @@ io.use((socket, next) => {
     next();
   }
 });
+
+// =============================================================================
+// UNA SOLA PARTIDA POR CUENTA (2026-10-10)
+// -----------------------------------------------------------------------------
+// "No permitas que un usuario abra dos pestañas e inicie sesión en el mismo o
+// en otros navegadores con la misma cuenta, ni en PC ni en teléfonos, ni por
+// MetaMask ni por Google."
+//
+// Cada pestaña del juego manda en el saludo del socket un identificador de
+// partida (`auth.sesion`, lo inventa gf-sesion-unica.js al cargar la página).
+// Aquí se apunta cuál es la partida de cada CARTERA (la cuenta, se entre como
+// se entre). Si llega otra distinta, LA NUEVA MANDA: a la vieja se le dice
+// `sesion:reemplazada` y se la desconecta; su cliente se para y deja de
+// reconectar. Una partida reemplazada que vuelva a llamar no recupera el
+// sitio (si no, las dos pestañas se echarían una a otra sin fin): para jugar
+// en ella hay que recargarla, y eso es una partida nueva.
+//
+// Las peticiones que cambian algo y traen `X-GF-Sesion` (el cliente la manda
+// solo cuando aquí se le anuncia con `sesion:aceptada`) se rechazan con 409
+// si son de una partida reemplazada: una pestaña vieja no puede guardar
+// encima de la buena. Sin la cabecera (clientes viejos, market.html, admin)
+// todo sigue como antes.
+// =============================================================================
+const _partidaActiva = new Map();        // cartera -> { sesion, sockets:Set, desde, soltadaEn }
+const _sesionesReemplazadas = new Map(); // sesion -> hasta cuándo se recuerda
+const SESION_RECUERDO_MS = 6 * 60 * 60 * 1000;
+const SESION_RX = /^[A-Za-z0-9_-]{8,64}$/;
+
+function _sesionFueReemplazada(sesion) {
+  const hasta = _sesionesReemplazadas.get(sesion);
+  if (!hasta) return false;
+  if (Date.now() > hasta) { _sesionesReemplazadas.delete(sesion); return false; }
+  return true;
+}
+
+function _resumenDispositivo(ua) {
+  ua = String(ua || '');
+  const movil = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+  const nav = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Firefox\//.test(ua) ? 'Firefox'
+            : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'browser';
+  return (movil ? 'phone' : 'computer') + ' · ' + nav;
+}
+
+io.on('connection', (socket) => {
+  try {
+    const address = String(socket.authenticatedAddress || '').toLowerCase();
+    const sesion = String((socket.handshake && socket.handshake.auth && socket.handshake.auth.sesion) || '');
+    // Sin cuenta o sin identificador (un cliente viejo, market.html): como antes.
+    if (!address || !SESION_RX.test(sesion)) return;
+
+    if (_sesionFueReemplazada(sesion)) {
+      socket.emit('sesion:reemplazada', { motivo: 'otra_partida' });
+      setTimeout(() => { try { socket.disconnect(true); } catch (_) {} }, 300);
+      return;
+    }
+
+    let p = _partidaActiva.get(address);
+    if (p && p.sesion !== sesion) {
+      const dispositivo = _resumenDispositivo(socket.handshake && socket.handshake.headers && socket.handshake.headers['user-agent']);
+      _sesionesReemplazadas.set(p.sesion, Date.now() + SESION_RECUERDO_MS);
+      for (const id of p.sockets) {
+        const viejo = io.sockets.sockets.get(id);
+        if (!viejo) continue;
+        try { viejo.emit('sesion:reemplazada', { motivo: 'otra_partida', dispositivo }); } catch (_) {}
+        setTimeout(() => { try { viejo.disconnect(true); } catch (_) {} }, 300);
+      }
+      console.log(`🔁 Partida de ${address.slice(0, 10)}… reemplazada por otra (${dispositivo})`);
+      p = null;
+    }
+    if (!p) {
+      p = { sesion, sockets: new Set(), desde: Date.now(), soltadaEn: 0 };
+      _partidaActiva.set(address, p);
+    }
+    p.sockets.add(socket.id);
+    p.soltadaEn = 0;
+    socket.emit('sesion:aceptada', { cabecera: true });
+
+    socket.on('disconnect', () => {
+      const q = _partidaActiva.get(address);
+      if (!q || q.sesion !== sesion) return;
+      q.sockets.delete(socket.id);
+      if (!q.sockets.size) q.soltadaEn = Date.now();
+    });
+  } catch (e) {
+    console.warn('sesion única:', e && e.message);
+  }
+});
+
+// Limpieza: partidas sin socket desde hace media hora y recuerdos caducados.
+setInterval(() => {
+  const ahora = Date.now();
+  for (const [dir, p] of _partidaActiva) {
+    if (!p.sockets.size && p.soltadaEn && ahora - p.soltadaEn > 30 * 60 * 1000) _partidaActiva.delete(dir);
+  }
+  for (const [s, hasta] of _sesionesReemplazadas) if (ahora > hasta) _sesionesReemplazadas.delete(s);
+}, 10 * 60 * 1000).unref();
+
+/** Middleware HTTP: rechaza lo que cambia algo desde una partida reemplazada. */
+function exigirPartidaActiva(req, res, next) {
+  try {
+    const s = req.headers['x-gf-sesion'];
+    if (!s || req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+    const ruta = String(req.path || '');
+    if (ruta.indexOf('/api/') !== 0 || ruta.indexOf('/api/auth/') === 0) return next();
+    const token = req.cookies && req.cookies.session;
+    if (!token) return next();
+    let payload = null;
+    try { payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }); } catch (_) { return next(); }
+    const address = String((payload && payload.address) || '').toLowerCase();
+    const sesion = String(s).slice(0, 64);
+    if (!address || !SESION_RX.test(sesion)) return next();
+    const p = _partidaActiva.get(address);
+    if (_sesionFueReemplazada(sesion) || (p && p.sesion !== sesion && p.sockets.size > 0)) {
+      return res.status(409).json({ error: 'sesion_reemplazada',
+                                    message: 'This account is playing in another tab or device.' });
+    }
+  } catch (_) {}
+  return next();
+}
 
 // ============================================================================
 // ANTI-SPAM DE SIEMBRA: penalización progresiva por sembrar semillas UNA POR
@@ -6353,7 +6499,7 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH', 'HEAD'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Cache-Control', 'Origin', 'X-CSRF-Token', 'x-csrf-token', 'X-Requested-With', 'Access-Control-Request-Method', 'Access-Control-Request-Headers'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Cache-Control', 'Origin', 'X-CSRF-Token', 'x-csrf-token', 'X-Requested-With', 'Access-Control-Request-Method', 'Access-Control-Request-Headers', 'X-GF-Sesion'],
   exposedHeaders: ['Set-Cookie', 'X-CSRF-Token', 'X-Token-Expires-Soon'],
   maxAge: 86400,
   preflightContinue: false,
@@ -6407,6 +6553,8 @@ app.use((req, res, next) => {
 app.use(useragent.express());
 // Use Express's configured trusted proxies, not arbitrary client IP headers.
 app.use((req, res, next) => { req.clientIp = req.ip; next(); });
+// Una sola partida por cuenta (ver "UNA SOLA PARTIDA POR CUENTA").
+app.use(exigirPartidaActiva);
 
 // Middleware de análisis de seguridad
 app.use(async (req, res, next) => {
@@ -8741,7 +8889,39 @@ app.post('/api/relay/transaction',
       
       const { contractAddress, functionName, parameters, priority } = req.body;
       const playerAddress = req.user.address.toLowerCase();
-      
+
+      /* LA MISMA PETICIÓN NO SE HACE DOS VECES (2026-10-10). Si el cliente no
+         sabe si su envío llegó (se le agotó la espera, se cortó la red), lo
+         repite con la MISMA clave `idem` (phaser-relay-library.js). Si esa
+         clave ya se está haciendo o se hizo bien hace poco, se contesta lo
+         mismo que entonces en vez de mandar otra transacción: antes eso era
+         un objeto duplicado, o un cobro doble. */
+      const claveIdem = (typeof req.body.idem === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(req.body.idem))
+        ? playerAddress + ':' + req.body.idem : null;
+      if (claveIdem) {
+        const previa = _relayIdem.get(claveIdem);
+        if (previa && Date.now() - previa.at < RELAY_IDEM_MS) {
+          const r = await Promise.race([previa.promesa, new Promise(ok => setTimeout(() => ok(null), 90000))]);
+          if (r) return res.status(r.status).json(r.cuerpo);
+          return res.status(503).json({ error: 'idem_pending', message: 'The same transaction is still being processed.' });
+        }
+        let resolver = null;
+        const promesa = new Promise(ok => { resolver = ok; });
+        _relayIdem.set(claveIdem, { at: Date.now(), promesa });
+        if (_relayIdem.size > 5000) {
+          const limite = Date.now() - RELAY_IDEM_MS;
+          for (const [k, v] of _relayIdem) if (v.at < limite) _relayIdem.delete(k);
+        }
+        const jsonOriginal = res.json.bind(res);
+        res.json = (cuerpo) => {
+          const st = res.statusCode || 200;
+          // Lo que salió mal se puede volver a intentar con la misma clave.
+          if (st < 200 || st >= 300) _relayIdem.delete(claveIdem);
+          try { resolver({ status: st, cuerpo }); } catch (_) {}
+          return jsonOriginal(cuerpo);
+        };
+      }
+
       // Verificar que el relay esté configurado
       if (!relayerWallet) {
         return res.status(503).json({
@@ -8828,6 +9008,9 @@ app.post('/api/relay/transaction',
         result = await relayManager.processTransaction(transactionData);
       } catch (envioError) {
         if (relayManager.shouldRetry(envioError)) {
+          // Un id fijo que el cliente pueda esperar (ver processTransaction).
+          transactionData.idFijo = `relay_${uuidv4()}`;
+          transactionData.__enCola = true;
           const queueId = await relayManager.addToQueue(transactionData);
           console.warn(`🕓 Envío fallido por causa transitoria — encolado para reintento: ${envioError.message}`);
 
@@ -8835,6 +9018,7 @@ app.post('/api/relay/transaction',
             success: true,
             queued: true,
             queueId,
+            transactionId: transactionData.idFijo,
             message: 'Transaction queued for retry',
             reason: envioError.message
           });
@@ -10088,6 +10272,10 @@ const PET_DANO_INTERVALO_MS  = 700;
 
 // Lo que le quita al JUGADOR un mordisco (lo cobra /api/stats/consume).
 const DANO_MORDISCO_ANIMAL = 6;
+// Los de la mina (2026-10-10): el mordisco de un zombi y el golpe del guardián
+// (su salto, sus piedras). Ver costesDeAccion.
+const DANO_ZOMBI_MINA = 5;
+const DANO_JEFE_MINA = 12;
 
 const REVIVIR_BASE_PLATA   = 30;
 const REVIVIR_TOPE_PLATA   = 480;
@@ -10562,9 +10750,17 @@ const PESCA_VENTANA_MS = 1700;
 const PESCA_MARGEN_MS = 900;           // la red: lo que tarda el clic en llegar
 const PESCA_SESION_MS = 90 * 1000;
 const PESCA_ESPECIES = [               // [itemId, probabilidad acumulada, exp]
-  ['pes1', 0.58, 15],
-  ['pes2', 0.90, 25],
-  ['pes3', 1.00, 60]
+  // Cinco nuevas el 2026-10-10: tres buenas (perca y brema, fáciles; el
+  // esturión, difícil) y dos VENENOSAS (anguila, media; pez león, difícil),
+  // que al sacarlas te pican y quitan vida poco a poco (PESCA_VENENO).
+  ['pes1', 0.30, 15],                  // trucha marrón      fácil
+  ['pes4', 0.48, 12],                  // perca de río       muy fácil
+  ['pes5', 0.63, 18],                  // brema              fácil
+  ['pes2', 0.78, 25],                  // carpa común        media
+  ['pes7', 0.86, 35],                  // anguila venenosa   media  · veneno
+  ['pes3', 0.92, 60],                  // trucha dorada      difícil
+  ['pes8', 0.96, 70],                  // pez león venenoso  difícil · veneno
+  ['pes6', 1.00, 80]                   // esturión           muy difícil
 ];
 const PESCA_ESCAPA = 0.12;             // a veces se suelta igual (solo sin lucha)
 /* Cómo pelea cada pez. `tam`: el alto de su cuadro (fracción de la pista);
@@ -10576,8 +10772,71 @@ const PESCA_DIFICULTAD = {
   // siempre, la carpa unos 7 s de pelea, la dorada la mitad de las veces.
   pes1: { tam: 0.42, vel: 0.32, nervio: 0.70, mengua: 0.00, rafaga: 0.00 },
   pes2: { tam: 0.32, vel: 0.54, nervio: 1.20, mengua: 0.12, rafaga: 0.16 },
-  pes3: { tam: 0.29, vel: 0.60, nervio: 1.35, mengua: 0.22, rafaga: 0.22 }
+  pes3: { tam: 0.29, vel: 0.60, nervio: 1.35, mengua: 0.22, rafaga: 0.22 },
+  // Las de 2026-10-10, puestas entre las de arriba: la perca y la brema más
+  // mansas que la trucha marrón; la anguila se retuerce (mucho nervio) pero
+  // no corre tanto; el pez león y el esturión, de lo más duro.
+  pes4: { tam: 0.45, vel: 0.28, nervio: 0.60, mengua: 0.00, rafaga: 0.00 },
+  pes5: { tam: 0.40, vel: 0.36, nervio: 0.80, mengua: 0.04, rafaga: 0.04 },
+  pes7: { tam: 0.33, vel: 0.48, nervio: 1.70, mengua: 0.10, rafaga: 0.18 },
+  pes8: { tam: 0.28, vel: 0.62, nervio: 1.40, mengua: 0.20, rafaga: 0.24 },
+  pes6: { tam: 0.26, vel: 0.66, nervio: 1.50, mengua: 0.25, rafaga: 0.26 }
 };
+
+/* LOS VENENOSOS (2026-10-10). "Quiero venenosos que quiten un porcentaje de
+   vida poco a poco." Al sacar uno del agua te pica: el SERVIDOR te quita
+   `porTic` de vida cada `cadaMs` hasta sumar `total`, y se lo dice al
+   jugador por su socket (`vitales:veneno`) para que la barra baje a la vez.
+   Lo hace el servidor y no el cliente: un cliente que no mandara los tics
+   sería inmune. Un segundo pez venenoso suma al veneno que quede (con tope). */
+const PESCA_VENENO = {
+  pes7: { total: 12, porTic: 1, cadaMs: 2000 },    // 12 % en 24 s
+  pes8: { total: 20, porTic: 1, cadaMs: 1500 }     // 20 % en 30 s
+};
+const VENENO_TOPE = 40;
+const _venenos = new Map();            // playerName -> { restante, porTic, cadaMs, reloj }
+
+async function _ticDeVeneno(playerName) {
+  const v = _venenos.get(playerName);
+  if (!v) return;
+  try {
+    if (await esFantasma({ playerName })) { _venenos.delete(playerName); return; }
+    const doc = await PlayerStats.findOne({ playerName });
+    if (!doc) { _venenos.delete(playerName); return; }
+    applyGhostVitalRegen(doc);
+    const actual = clampStat('vida', doc.vida);
+    const dano = Math.min(v.porTic, v.restante, actual);
+    if (dano > 0) {
+      doc.vida = clampStat('vida', actual - dano);
+      marcarPendienteDeCadena(doc, ['vida']);
+      await doc.save();
+    }
+    v.restante -= Math.max(dano, v.porTic);
+    const stats = buildStatsResponse(doc);
+    for (const s of socketsDeJugador(playerName)) {
+      try { s.emit('vitales:veneno', { stats, restante: Math.max(0, v.restante), dano }); } catch (_) {}
+    }
+    if (v.restante <= 0 || clampStat('vida', doc.vida) <= 0) { _venenos.delete(playerName); return; }
+  } catch (e) {
+    console.warn('⚠️  veneno:', e.message);
+  }
+  const sigue = _venenos.get(playerName);
+  if (sigue) sigue.reloj = setTimeout(() => _ticDeVeneno(playerName), sigue.cadaMs);
+}
+
+function envenenar(playerName, cfg) {
+  const v = _venenos.get(playerName);
+  if (v) {
+    v.restante = Math.min(VENENO_TOPE, v.restante + cfg.total);
+    v.porTic = Math.max(v.porTic, cfg.porTic);
+    v.cadaMs = Math.min(v.cadaMs, cfg.cadaMs);
+    return;
+  }
+  const nuevo = { restante: Math.min(VENENO_TOPE, cfg.total), porTic: cfg.porTic, cadaMs: cfg.cadaMs, reloj: null };
+  _venenos.set(playerName, nuevo);
+  // El primer pinchazo, al momento: que se note de dónde viene.
+  nuevo.reloj = setTimeout(() => _ticDeVeneno(playerName), 600);
+}
 const PESCA_LUCHA_MIN_MS = 1900;       // de 35 % a 100 % al ritmo máximo
 const PESCA_LUCHA_MAX_MS = 45000;
 
@@ -10722,7 +10981,10 @@ app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, async
       }
     } catch (e) { console.warn('⚠️  pesca: casilla en Mongo:', e.message); }
     console.log(`🎣 ${gp.playerName} pescó ${itemId} (factura ${factura.id})`);
+    const veneno = PESCA_VENENO[itemId] || null;
+    if (veneno) envenenar(gp.playerName, veneno);
     return res.json({ ok: true, itemId, exp,
+      veneno: veneno ? { total: veneno.total, duracionMs: Math.ceil(veneno.total / veneno.porTic) * veneno.cadaMs } : null,
       factura: { invoiceId: factura.id, manualId: factura.manualId, cantidad: factura.cantidad } });
   } catch (e) {
     console.error('POST /api/pesca/recoger:', e);
@@ -10876,12 +11138,28 @@ async function tradGoogle(texto, a) {
   return { t, de: typeof d[2] === 'string' ? d[2].slice(0, 8) : null };
 }
 
+/* La de la extensión de Chrome (2026-10-10): otra puerta de Google que
+   suele seguir abierta cuando la de gtx devuelve 429 a una IP de servidor.
+   Contesta [["texto","idioma"]]. */
+async function tradGoogleClients5(texto, a) {
+  const url = 'https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=' + a +
+              '&q=' + encodeURIComponent(texto);
+  const d = await tradPedirJson(url);
+  const x = Array.isArray(d) ? d[0] : null;
+  const t = Array.isArray(x) ? x[0] : x;
+  if (typeof t !== 'string' || !t) throw new Error('formato');
+  return { t, de: (Array.isArray(x) && typeof x[1] === 'string') ? x[1].slice(0, 8) : null };
+}
+
 async function tradMyMemory(texto, a) {
   const de = a === 'es' ? 'en' : 'es';
   const url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(texto) + '&langpair=' + de + '|' + a;
   const d = await tradPedirJson(url);
   const t = d && d.responseData && d.responseData.translatedText;
   if (Number(d && d.responseStatus) !== 200 || typeof t !== 'string' || !t) throw new Error('mymemory');
+  // Cuando se le acaba el cupo, MyMemory contesta 200 con un aviso EN LUGAR
+  // de la traducción ("MYMEMORY WARNING…"): eso no es una traducción.
+  if (/MYMEMORY WARNING|QUERY LENGTH LIMIT|INVALID LANGUAGE PAIR|^testvalue$/i.test(t)) throw new Error('mymemory_aviso');
   return { t, de: null };
 }
 
@@ -10890,7 +11168,10 @@ async function traducirTexto(texto, a) {
   if (_tradCache.has(k)) return _tradCache.get(k);
   let r;
   try { r = await tradGoogle(texto, a); }
-  catch (e) { r = await tradMyMemory(texto, a); }
+  catch (e) {
+    try { r = await tradGoogleClients5(texto, a); }
+    catch (e2) { r = await tradMyMemory(texto, a); }
+  }
   r = { t: String(r.t).slice(0, TRAD_MAX_LARGO * 2), de: r.de };
   _tradCache.set(k, r);
   if (_tradCache.size > TRAD_CACHE_MAX) _tradCache.delete(_tradCache.keys().next().value);
@@ -11927,6 +12208,7 @@ const ITEM_TIPO_MAP = {
   espantapajaros: 'espantapajaros',
   // Los peces: SOLO los acuña el servidor (ver TABLAS_SOLO_ACUNA_SERVIDOR).
   pes1: 'pes1', pes2: 'pes2', pes3: 'pes3',
+  pes4: 'pes4', pes5: 'pes5', pes6: 'pes6', pes7: 'pes7', pes8: 'pes8',
 
   // EL BOTE DE BASURA Y LOS COFRES DE LA ISLA (2026-10-05). Se compran (el
   // bote y el cofre1) o se craftean (cofre2..4) y se COLOCAN en Lands: ver
@@ -11964,6 +12246,7 @@ const ITEM_MAX_STACK = {
   espada_madera: 1, espada_cobre: 1, espada_hierro: 1,
   cana_pescar: 1, espantapajaros: 10,
   pes1: 20, pes2: 20, pes3: 20,
+  pes4: 20, pes5: 20, pes6: 20, pes7: 20, pes8: 20,
   basura: 10,
   cofre1: 5, cofre2: 5, cofre3: 5, cofre4: 5,
 };
@@ -11993,7 +12276,7 @@ const TABLAS_SOLO_SERVIDOR = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_CONS_PARC
    relay). Lo que el cliente no puede es crearlos ni aumentarlos: si pudiera,
    bastaría una llamada al relay para llenarse el inventario de truchas
    doradas. Siempre activo, sin bandera, como TABLAS_SOLO_SERVIDOR. */
-const TABLAS_SOLO_ACUNA_SERVIDOR = new Set(['pes1', 'pes2', 'pes3']);
+const TABLAS_SOLO_ACUNA_SERVIDOR = new Set(['pes1', 'pes2', 'pes3', 'pes4', 'pes5', 'pes6', 'pes7', 'pes8']);
 
 // =============================================================================
 // CUPO DE LAS TABLAS DE ÍTEM EN EL CONTRATO
@@ -16278,6 +16561,11 @@ const TABLAS_RECOMENDADAS = [
   { tipo: 'pes1',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: trucha marrón (solo lo acuña el servidor al pescar; 20 por casilla)' },
   { tipo: 'pes2',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: carpa común (solo lo acuña el servidor al pescar; 20 por casilla)' },
   { tipo: 'pes3',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: trucha dorada (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes4',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: perca de río (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes5',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: brema (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes6',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: esturión (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes7',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez venenoso: anguila (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes8',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez venenoso: pez león (solo lo acuña el servidor al pescar; 20 por casilla)' },
   { tipo: 'madera',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de madera (objeto espada_madera; 1 por casilla)' },
   { tipo: 'cobre',          limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de cobre (objeto espada_cobre; 1 por casilla)' },
   { tipo: 'hierro',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de hierro (objeto espada_hierro; 1 por casilla)' },
@@ -16361,7 +16649,14 @@ const ABI_ITEMS_V3_EXTRA = [
   'function CONTRACT_VERSION() view returns (uint256)',
   'function setInvoiceSlotsBatch(address _owner, uint256[] _ids, uint32[] _slots) returns (uint256 applied)',
   'function getInvoiceSlot(uint256 _id) view returns (uint32)',
-  'function getUserInventorySnapshotWithSlots(address user) view returns (tuple(uint256 id, string manualId, address owner, string tipo, uint256 cantidad, bool active, uint256 createdAt)[] result, uint32[] slots)'
+  'function getUserInventorySnapshotWithSlots(address user) view returns (tuple(uint256 id, string manualId, address owner, string tipo, uint256 cantidad, bool active, uint256 createdAt)[] result, uint32[] slots)',
+  /* Las que usa la creación automática de tablas (2026-10-09). Están en el
+     contrato desde la v2, pero si el abis/ItemContract.json desplegado es uno
+     viejo sin ellas, `c.setLimit` no existía y las tablas no se creaban NUNCA,
+     sin un solo aviso. Solo se añaden si al ABI le faltan. */
+  'function setLimit(string _tipo, uint256 _limit, uint256 _perInvoiceLimit)',
+  'function getTipoStats(string _tipo) view returns (uint256 totalQuantity, uint256 limit, uint256 perInvoiceLimit, uint256 invoiceCount, uint256 totalBurned, bool exists)',
+  'function isAdmin(address _who) view returns (bool)'
 ];
 let _abiItemsCompleto = null;
 let _contratoItemsServidor = null;
@@ -16443,6 +16738,7 @@ async function tablaExiste(tipo) {
    admin del contrato, igual que para todo lo demás que escribe. */
 const _creandoTabla = new Map();        // tipo -> promesa en curso
 const _falloTabla = new Map();          // tipo -> hora del último intento fallido
+const _motivoTabla = new Map();         // tipo -> por qué no se pudo crear (para admin.html)
 const TABLA_REINTENTO_MS = 2 * 60 * 1000;
 
 function crearTablaSiFalta(tipo) {
@@ -16453,12 +16749,17 @@ function crearTablaSiFalta(tipo) {
   if (fallo && Date.now() - fallo < TABLA_REINTENTO_MS) return Promise.resolve(false);
   const p = (async () => {
     const c = contratoItemsServidor();
-    if (!c || typeof c.setLimit !== 'function' || !relayerWallet) return false;
+    if (!relayerWallet) { _motivoTabla.set(tipo, 'sin relayer en el servidor'); return false; }
+    if (!c || typeof c.setLimit !== 'function') {
+      _motivoTabla.set(tipo, 'el contrato no expone setLimit');
+      console.error(`❌ Tabla [${tipo}]: el contrato del servidor no expone setLimit`);
+      return false;
+    }
     // Otra mirada sin caché: puede que ya la haya creado otra petición.
     _infoTablaCache.delete(tipo);
     const antes = await infoTablaCadena(tipo);
-    if (!antes) return false;
-    if (antes.exists) return true;
+    if (!antes) { _motivoTabla.set(tipo, 'el nodo no contestó (se reintenta)'); return false; }
+    if (antes.exists) { _motivoTabla.delete(tipo); return true; }
     try {
       console.log(`🧾 La tabla [${tipo}] no existe: se crea (límite ${rec.limit}, ${rec.perInvoiceLimit} por factura)`);
       const nonce = await relayerNonceManager.getNextNonce();
@@ -16468,11 +16769,12 @@ function crearTablaSiFalta(tipo) {
       try { if (typeof _itemTipoCache !== 'undefined') _itemTipoCache.delete(tipo); } catch (_) {}
       const despues = await infoTablaCadena(tipo);
       const ok = !!(despues && despues.exists);
-      if (ok) { _falloTabla.delete(tipo); console.log(`✅ Tabla [${tipo}] creada`); }
-      else _falloTabla.set(tipo, Date.now());
+      if (ok) { _falloTabla.delete(tipo); _motivoTabla.delete(tipo); console.log(`✅ Tabla [${tipo}] creada`); }
+      else { _falloTabla.set(tipo, Date.now()); _motivoTabla.set(tipo, 'setLimit se confirmó pero la tabla no aparece'); }
       return ok;
     } catch (e) {
       _falloTabla.set(tipo, Date.now());
+      _motivoTabla.set(tipo, /admin|unauthor|notadmin/i.test(String(e && e.message)) ? 'el relayer no es admin del contrato' : String(e && e.message || e).slice(0, 140));
       console.error(`❌ No se pudo crear la tabla [${tipo}] (¿el relayer es admin del ItemContract?):`, e.message);
       try { await relayerNonceManager.resetNonce(); } catch (_) {}
       return false;
@@ -16483,11 +16785,27 @@ function crearTablaSiFalta(tipo) {
   return conLimpieza;
 }
 
+let _relayerEsAdmin = null;            // null = aún no se sabe
+
 /** Repasa TODAS las tablas del juego y crea las que falten. Una a una (el
- *  nonce del relayer es uno). Devuelve { creadas, faltan }. */
+ *  nonce del relayer es uno). Devuelve { creadas, faltan }.
+ *
+ *  "Eso es UNA vez, y si ya están creadas que no haga nada" (2026-10-09): se
+ *  lanza al arrancar el servidor; si falta alguna se vuelve a intentar al rato
+ *  y, en cuanto están todas, deja de mirar (ver repasarTablasHastaQueEsten).
+ *  Las que ya existen no se tocan nunca. */
 async function asegurarTablasDelJuego() {
   const out = { creadas: [], faltan: [] };
   if (!relayerWallet || !contratoItemsServidor()) return out;
+  // ¿El relayer es admin? Sin eso setLimit revierte: se dice UNA vez, claro.
+  if (_relayerEsAdmin === null) {
+    try { _relayerEsAdmin = !!(await contratoItemsServidor().isAdmin(relayerWallet.address)); }
+    catch (_) { _relayerEsAdmin = null; }
+    if (_relayerEsAdmin === false) {
+      console.error('❌ El relayer ' + relayerWallet.address + ' NO es admin del ItemContract: ' +
+                    'las tablas no se pueden crear. El dueño tiene que llamar addAdmin(relayer) una vez.');
+    }
+  }
   for (const t of TABLAS_RECOMENDADAS) {
     const antes = await infoTablaCadena(t.tipo);
     if (antes && antes.exists) continue;
@@ -16497,6 +16815,21 @@ async function asegurarTablasDelJuego() {
   if (out.creadas.length) console.log('🧾 Tablas creadas al repasar:', out.creadas.join(', '));
   if (out.faltan.length) console.warn('⚠️  Tablas que no se pudieron crear (se reintenta):', out.faltan.join(', '));
   return out;
+}
+
+/** Repasa y, si falta alguna, vuelve a intentarlo con espera creciente (2,
+ *  4, 8… hasta 30 min). Cuando están todas, para: no vuelve a mirar. */
+function repasarTablasHastaQueEsten(intento) {
+  asegurarTablasDelJuego().then((r) => {
+    if (!r || !r.faltan || !r.faltan.length) {
+      console.log('✅ Tablas del contrato: todas creadas (no se vuelve a mirar)');
+      return;
+    }
+    const espera = Math.min(30 * 60 * 1000, 2 * 60 * 1000 * Math.pow(2, Math.max(0, intento - 1)));
+    setTimeout(() => repasarTablasHastaQueEsten(intento + 1), espera);
+  }).catch(() => {
+    setTimeout(() => repasarTablasHastaQueEsten(intento + 1), 5 * 60 * 1000);
+  });
 }
 
 /* ¿El contrato desplegado es v3 (sabe guardar casillas)? */
@@ -17597,13 +17930,15 @@ app.get('/api/admin/tablas', adminAuth, apiLimiter, async (req, res) => {
         if (info.perInvoiceLimit !== t.perInvoiceLimit) avisos.push(`perInvoiceLimit ${info.perInvoiceLimit} (recomendado ${t.perInvoiceLimit})`);
         if (info.limit - info.totalQuantity < 1000) avisos.push('casi sin cupo');
       }
-      filas.push({ ...t, cadena: info, existe: !!(info && info.exists), creadaAhora: creada, avisos });
+      filas.push({ ...t, cadena: info, existe: !!(info && info.exists), creadaAhora: creada,
+                   motivo: _motivoTabla.get(t.tipo) || null, avisos });
     }
     return res.json({
       ok: true,
       contrato: CONTRACTS.ITEMS_CONTRACT.address,
       version: (await contratoSoportaCasillas()) ? 3 : 2,
       casillasEnCadena: await contratoSoportaCasillas(),
+      relayerEsAdmin: _relayerEsAdmin,
       tablas: filas
     });
   } catch (e) {
@@ -18770,6 +19105,11 @@ function costesDeAccion(reason, seedType, units) {
     return { vida: DANO_MORDISCO_ANIMAL };
   }
 
+  // LOS ZOMBIS DE LA MINA Y SU GUARDIÁN (gf-mina-zombis.js, 2026-10-10). Igual
+  // que el mordisco: el cliente dice QUÉ le ha pasado y el daño lo pone esto.
+  if (reason === 'zombi_mina') return { vida: DANO_ZOMBI_MINA };
+  if (reason === 'jefe_mina') return { vida: DANO_JEFE_MINA };
+
   return null;   // acción no reconocida
 }
 
@@ -18872,7 +19212,7 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
        sigan mordiendo": con la regla de todo o nada, en cuanto la vida bajaba
        del coste del mordisco el servidor devolvía 409 y NO descontaba nada. Los
        últimos puntos eran ininvulnerables y el personaje no podía morir jamás. */
-    const esDano = (reason === 'animal_bite');
+    const esDano = (reason === 'animal_bite' || reason === 'zombi_mina' || reason === 'jefe_mina');
     if (esDano) {
       for (const stat of Object.keys(costs)) {
         costs[stat] = Math.min(costs[stat], clampStat(stat, doc[stat]));
@@ -24321,8 +24661,7 @@ server.listen(PORT, HOST, () => {
 
   // LAS TABLAS DEL CONTRATO SE CREAN SOLAS (ver crearTablaSiFalta): un repaso
   // al arrancar y otro cada 15 minutos por si alguna falló.
-  setTimeout(() => { asegurarTablasDelJuego().catch(() => {}); }, 12000);
-  setInterval(() => { asegurarTablasDelJuego().catch(() => {}); }, 15 * 60 * 1000);
+  setTimeout(() => { repasarTablasHastaQueEsten(1); }, 12000);
 });
 
 // --- GRACEFUL SHUTDOWN ---
