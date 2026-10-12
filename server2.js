@@ -1268,6 +1268,27 @@ const activitySchema = new mongoose.Schema({
      se lleve la sesion entera por delante.
      Lleva indice porque la clasificacion del panel ordena por el. */
   tiempoJugadoMs: { type: Number, default: 0, index: true },
+  /* LO QUE HACE MIENTRAS JUEGA (2026-10-11), para el panel de administración
+     (detectar bots): cuándo jugó por primera y por última vez, el tiempo en
+     cada sitio (lo cuenta el servidor por las salas del socket, no lo dice el
+     cliente), lo que pesca y los monstruos que vence. Ver "LAS INVITACIONES Y
+     LA ACTIVIDAD DE CADA JUGADOR". */
+  primeraPartida: { type: Date },
+  ultimaPartida: { type: Date, index: true },
+  tiempoPescaMs: { type: Number, default: 0 },
+  capturas: { type: Number, default: 0 },
+  tiempoMinaMs: { type: Number, default: 0 },
+  tiempoTiendaMs: { type: Number, default: 0 },          // dentro de la tienda
+  tiempoTiendaAbiertaMs: { type: Number, default: 0 },   // con el panel de la tienda abierto
+  tiempoSalvajeMs: { type: Number, default: 0 },
+  monstruos: { type: Number, default: 0 },
+  /* LAS INVITACIONES: su código (único), quién le invitó y cuándo, y si
+     entró desde la misma IP que quien le invitó (una pista, no una prueba). */
+  codigoInvitacion: { type: String, index: { unique: true, sparse: true } },
+  invitadoPor: { type: String, index: true },
+  invitadoEn: { type: Date },
+  invitaMismaIp: { type: Boolean, default: false },
+  discord: { type: String, maxlength: 40 },
   lastLogin: { type: Date },
   ip: { type: String },
   geo: {
@@ -5049,6 +5070,8 @@ function purgarFantasmas(room) {
  * por el registro no deberia aparecer en la clasificacion.
  */
 function anotarTiempoJugado(socket) {
+  // Y el de la sala en la que está (mina, tienda, mapa salvaje).
+  anotarTiempoDeSala(socket);
   try {
     if (!socket || !socket._jugandoDesde) return;
     const quien = socket.authenticatedPlayer;
@@ -5773,6 +5796,7 @@ io.on("connection", (socket) => {
     let baseSala = salaBase(salaPedida).slice(0, 120);
     if (baseSala.startsWith('isla@') && !islaDeSala(baseSala)) baseSala = 'isla';
     const room  = salaConCanal(baseSala, canal);
+    anotarCambioDeSala(socket, baseSala);
 
     console.log(`🔵 joinRoom: ${socket.id} -> ${room}, último escena: ${lastScene}`);
 
@@ -10286,6 +10310,7 @@ const DANO_JEFE_MINA = 12;
 /* Los monstruos con poderes (2026-10-11): cuánto quita cada golpe. El
    cliente solo dice CUÁL le ha dado (gf-mina-serpiente.js, gf-salvaje.js). */
 const DANO_MONSTRUOS = {
+  fantasma_mina: 6, mago_mina: 10,
   serpiente_fuego: 9,          // bola de fuego de la serpiente de la mina
   serpiente_terremoto: 7,      // piedra que cae en su terremoto
   serpiente_mordisco: 14,      // su mordisco al salir del suelo
@@ -10769,14 +10794,24 @@ const PESCA_ESPECIES = [               // [itemId, probabilidad acumulada, exp]
   // Cinco nuevas el 2026-10-10: tres buenas (perca y brema, fáciles; el
   // esturión, difícil) y dos VENENOSAS (anguila, media; pez león, difícil),
   // que al sacarlas te pican y quitan vida poco a poco (PESCA_VENENO).
-  ['pes1', 0.30, 15],                  // trucha marrón      fácil
-  ['pes4', 0.48, 12],                  // perca de río       muy fácil
-  ['pes5', 0.63, 18],                  // brema              fácil
-  ['pes2', 0.78, 25],                  // carpa común        media
-  ['pes7', 0.86, 35],                  // anguila venenosa   media  · veneno
-  ['pes3', 0.92, 60],                  // trucha dorada      difícil
+  // Seis más el 2026-10-11 (pes9 … pes14): la trucha de hielo y la
+  // lucioperca, fáciles; el lucio y el salmón real, duros; el pez arcoíris,
+  // casi una leyenda; y el pez globo, VENENOSO. Las probabilidades de los de
+  // antes se reparten para hacerles sitio (la suma sigue siendo 1).
+  ['pes1', 0.20, 15],                  // trucha marrón      fácil
+  ['pes4', 0.33, 12],                  // perca de río       muy fácil
+  ['pes5', 0.44, 18],                  // brema              fácil
+  ['pes11', 0.54, 20],                 // trucha de hielo    fácil
+  ['pes2', 0.64, 25],                  // carpa común        media
+  ['pes10', 0.72, 28],                 // lucioperca         media
+  ['pes7', 0.78, 35],                  // anguila venenosa   media  · veneno
+  ['pes9', 0.84, 40],                  // lucio plateado     difícil
+  ['pes13', 0.89, 45],                 // salmón real        difícil
+  ['pes3', 0.93, 60],                  // trucha dorada      difícil
   ['pes8', 0.96, 70],                  // pez león venenoso  difícil · veneno
-  ['pes6', 1.00, 80]                   // esturión           muy difícil
+  ['pes14', 0.98, 75],                 // pez globo          difícil · veneno
+  ['pes6', 0.995, 80],                 // esturión           muy difícil
+  ['pes12', 1.00, 90]                  // pez arcoíris       muy difícil, rarísimo
 ];
 const PESCA_ESCAPA = 0.12;             // a veces se suelta igual (solo sin lucha)
 /* Cómo pelea cada pez. `tam`: el alto de su cuadro (fracción de la pista);
@@ -10796,7 +10831,16 @@ const PESCA_DIFICULTAD = {
   pes5: { tam: 0.40, vel: 0.36, nervio: 0.80, mengua: 0.04, rafaga: 0.04 },
   pes7: { tam: 0.33, vel: 0.48, nervio: 1.70, mengua: 0.10, rafaga: 0.18 },
   pes8: { tam: 0.28, vel: 0.62, nervio: 1.40, mengua: 0.20, rafaga: 0.24 },
-  pes6: { tam: 0.26, vel: 0.66, nervio: 1.50, mengua: 0.25, rafaga: 0.26 }
+  pes6: { tam: 0.26, vel: 0.66, nervio: 1.50, mengua: 0.25, rafaga: 0.26 },
+  // Las de 2026-10-11: la trucha de hielo y la lucioperca, mansas; el lucio
+  // da tirones; el salmón aguanta; el pez globo se retuerce; el arcoíris,
+  // el más difícil de todos junto al esturión.
+  pes9:  { tam: 0.31, vel: 0.56, nervio: 1.25, mengua: 0.16, rafaga: 0.22 },
+  pes10: { tam: 0.36, vel: 0.42, nervio: 0.75, mengua: 0.08, rafaga: 0.12 },
+  pes11: { tam: 0.38, vel: 0.40, nervio: 0.90, mengua: 0.06, rafaga: 0.06 },
+  pes12: { tam: 0.27, vel: 0.64, nervio: 1.45, mengua: 0.24, rafaga: 0.22 },
+  pes13: { tam: 0.30, vel: 0.58, nervio: 1.10, mengua: 0.18, rafaga: 0.20 },
+  pes14: { tam: 0.29, vel: 0.50, nervio: 1.60, mengua: 0.18, rafaga: 0.16 }
 };
 
 /* LOS VENENOSOS (2026-10-10). "Quiero venenosos que quiten un porcentaje de
@@ -10807,7 +10851,8 @@ const PESCA_DIFICULTAD = {
    sería inmune. Un segundo pez venenoso suma al veneno que quede (con tope). */
 const PESCA_VENENO = {
   pes7: { total: 12, porTic: 1, cadaMs: 2000 },    // 12 % en 24 s
-  pes8: { total: 20, porTic: 1, cadaMs: 1500 }     // 20 % en 30 s
+  pes8: { total: 20, porTic: 1, cadaMs: 1500 },    // 20 % en 30 s
+  pes14: { total: 16, porTic: 1, cadaMs: 2000 }    // 16 % en 32 s (pez globo)
 };
 const VENENO_TOPE = 40;
 const _venenos = new Map();            // playerName -> { restante, porTic, cadaMs, reloj }
@@ -10818,6 +10863,7 @@ async function _ticDeVeneno(playerName) {
   try {
     if (await esFantasma({ playerName })) { _venenos.delete(playerName); return; }
     const doc = await PlayerStats.findOne({ playerName });
+    if (_venenos.get(playerName) !== v) return;
     if (!doc) { _venenos.delete(playerName); return; }
     applyGhostVitalRegen(doc);
     const actual = clampStat('vida', doc.vida);
@@ -10870,6 +10916,11 @@ const _pescaAgua = (() => {
 })();
 
 /** ¿Hay agua del río a `radio` casillas de (px, py)? */
+const GF_LANDS_WATER = {"width":64,"height":48,"tile":64,"rle":"0-63;0-63;0-63;0-63;0-63;0-22,40-63;0-18,44-63;0-16,46-63;0-14,48-63;0-12,50-63;0-11,51-63;0-9,53-63;0-8,54-63;0-7,55-63;0-6,56-63;0-5,57-63;0-5,57-63;0-4,58-63;0-4,58-63;0-3,59-63;0-3,59-63;0-3,59-63;0-3,59-63;0-3,59-63;0-3,59-63;0-3,59-63;0-3,59-63;0-3,59-63;0-3,59-63;0-3,59-63;0-4,58-63;0-4,58-63;0-5,57-63;0-5,57-63;0-6,56-63;0-7,55-63;0-8,54-63;0-9,53-63;0-11,51-63;0-12,50-63;0-14,48-63;0-16,46-63;0-18,44-63;0-22,40-63;0-63;0-63;0-63;0-63"};
+function gfLandsNearWater(x,y) {
+ const cx=Math.floor(x/GF_LANDS_WATER.tile), cy=Math.floor(y/GF_LANDS_WATER.tile);
+ for(let row=Math.max(0,cy-2);row<=Math.min(GF_LANDS_WATER.height-1,cy+2);row++) for(const run of GF_LANDS_WATER.rle.split(';')[row].split(',')) { if(!run)continue; const [a,b]=run.split('-').map(Number); if(cx+2>=a && cx-2<=b)return true; } return false;
+}
 function pescaCercaDelAgua(px, py, radio = 3) {
   const cx = Math.floor(px / PESCA_CASILLA), cy = Math.floor(py / PESCA_CASILLA);
   for (let y = cy - radio; y <= cy + radio; y++) {
@@ -10886,9 +10937,10 @@ function pescaCercaDelAgua(px, py, radio = 3) {
 function pescaPosicionVista(playerName) {
   for (const s of socketsDeJugador(playerName)) {
     const sala = s.playerData && s.playerData.room;
-    if (!sala || salaBase(sala) !== 'game' || !rooms[sala] || !rooms[sala][s.id]) continue;
+    const basePesca = zonaDeSala(sala) === 'island' ? 'isla' : salaBase(sala);
+    if (!sala || !['game','isla'].includes(basePesca) || !rooms[sala] || !rooms[sala][s.id]) continue;
     const p = rooms[sala][s.id];
-    if (Number.isFinite(p.x) && Number.isFinite(p.y) && (p.x || p.y)) return { x: p.x, y: p.y };
+    if (Number.isFinite(p.x) && Number.isFinite(p.y) && (p.x || p.y)) return { x: p.x, y: p.y, sala: basePesca };
   }
   return null;
 }
@@ -10907,8 +10959,8 @@ app.post('/api/pesca/lanzar', apiLimiter, authMiddleware, csrfProtection, async 
     }
     const x = Number(req.body && req.body.x), y = Number(req.body && req.body.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'posicion' });
-    if (!pescaCercaDelAgua(x, y)) return res.status(400).json({ error: 'lejos_del_agua' });
     const vista = pescaPosicionVista(gp.playerName);
+    if (!vista || !(vista.sala === 'isla' ? gfLandsNearWater(x,y) : pescaCercaDelAgua(x,y))) return res.status(400).json({ error: 'lejos_del_agua' });
     if (vista && Math.hypot(vista.x - x, vista.y + 40 - y) > 260) {
       return res.status(400).json({ error: 'lejos_del_agua' });
     }
@@ -10964,6 +11016,7 @@ app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, async
     if (!s || s.id !== pedida) return res.json({ ok: false, motivo: 'sin_sesion' });
     _pescaSesiones.delete(gp.playerName);
     const ahora = Date.now();
+    anotarPesca(gp.playerName, ahora - s.t0, false);
     if (ahora - s.t0 > PESCA_SESION_MS) return res.json({ ok: false, motivo: 'tarde' });
     let itemId, exp;
     if (s.enganchadoEn) {
@@ -10997,6 +11050,7 @@ app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, async
       }
     } catch (e) { console.warn('⚠️  pesca: casilla en Mongo:', e.message); }
     console.log(`🎣 ${gp.playerName} pescó ${itemId} (factura ${factura.id})`);
+    anotarPesca(gp.playerName, 0, true);
     const veneno = PESCA_VENENO[itemId] || null;
     if (veneno) envenenar(gp.playerName, veneno);
     return res.json({ ok: true, itemId, exp,
@@ -11029,6 +11083,8 @@ app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, async
 //     · lo que no se recoge caduca a los 10 minutos.
 // =============================================================================
 const MONSTRUOS_BOTIN = {
+  fantasma_mina: { nombre: 'Mine Wraith', salas: ['mina'], enfriaMs: 5*60*1000, exp: 80, montones: [1,2], instancias: 2, botin: [['carbon',1,2],['Semillax',1,2]] },
+  mago_mina: { nombre: 'Ash Sorcerer', salas: ['mina'], enfriaMs: 8*60*1000, exp: 140, montones: [2,2], instancias: 2, botin: [['mineral_piedra_cobre',1,2],['Semillax2',1,2]] },
   serpiente_mina: {
     nombre: 'Magma Serpent', salas: ['mina'], enfriaMs: 20 * 60 * 1000, exp: 450, montones: [3, 4], instancias: 1,
     botin: [['mineral_piedra_cobre', 2, 4], ['mineral_piedra_hierro', 2, 4], ['carbon', 3, 5], ['mineral_piedra', 3, 6]]
@@ -11121,6 +11177,7 @@ app.post('/api/monstruos/derrotado', apiLimiter, authMiddleware, csrfProtection,
       botin.push({ id, itemId, cantidad });
     }
     console.log(`🐉 ${gp.playerName} venció a ${def.nombre}: +${def.exp} exp, ${botin.length} montones`);
+    UserActivity.updateOne({ playerName: gp.playerName }, { $inc: { monstruos: 1 } }).catch(() => {});
     return res.json({ ok: true, tipo, exp: def.exp, expTotal, botin, caducaMs: BOTIN_CADUCA_MS });
   } catch (e) {
     console.error('POST /api/monstruos/derrotado:', e);
@@ -11240,6 +11297,11 @@ function _herirJugador(playerName, dano) {
     const doc = await PlayerStats.findOne({ playerName });
     if (!doc) return null;
     applyGhostVitalRegen(doc);
+    // La defensa y la guardia de la espada (N) también cuentan contra otros
+    // jugadores: el mismo cálculo que el de los monstruos.
+    if (typeof gfCharacterCosts === 'function') {
+      try { const c = await gfCharacterCosts(playerName, 'pvp', { vida: dano }, doc); dano = Math.max(1, Math.round(c.vida || 0)); } catch (_) {}
+    }
     const actual = clampStat('vida', doc.vida);
     const quita = Math.min(dano, actual);
     if (quita > 0) {
@@ -11263,6 +11325,7 @@ const SUELO_SOLTABLES = new Set([
   'calabaza_buena', 'calabaza_corta', 'calabaza_mala',
   'fresa_buena', 'fresa_corta', 'fresa_mala',
   'pes1', 'pes2', 'pes3', 'pes4', 'pes5', 'pes6', 'pes7', 'pes8',
+  'pes9', 'pes10', 'pes11', 'pes12', 'pes13', 'pes14',
   'pocion_mascota', 'pocion_mascota_grande', 'elixir_revivir'
 ]);
 const SUELO_CADUCA_MS = 10 * 60 * 1000;
@@ -11421,13 +11484,15 @@ io.on('connection', (socket) => {
     try {
       const sala = socket.playerData && socket.playerData.room;
       if (!sala || salaBase(sala) !== SALVAJE_SALA) return;
-      if (frenado(socket, 'pvp_golpe', PVP_ENFRIA_MS)) return;
+      const victimaId = String((d && d.victima) || '').slice(0, 64);
+      if (!victimaId || victimaId === socket.id) return;
+      // El freno es POR VÍCTIMA (un remolino puede dar a dos a la vez) y, aparte,
+      // uno general corto para que nadie mande cientos por segundo.
+      if (frenado(socket, 'pvp_golpe', 60) || frenado(socket, 'pvp_golpe:' + victimaId, PVP_ENFRIA_MS)) return;
       const yo = await cuentaDelSocket(socket);
       if (!yo) return;
       const arma = String((d && d.arma) || '');
       if (!PVP_DANO[arma]) return;
-      const victimaId = String((d && d.victima) || '');
-      if (!victimaId || victimaId === socket.id) return;
       const filas = rooms[sala] || {};
       const pa = filas[socket.id], pv = filas[victimaId];
       if (!pa || !pv) return;
@@ -11450,6 +11515,131 @@ io.on('connection', (socket) => {
       if (r.muerto) console.log(`⚔️  ${yo} derribó a ${ella} en ${sala}`);
     } catch (e) {
       console.warn('⚠️  pvp:golpe:', e.message);
+    }
+  });
+});
+
+// =============================================================================
+// LOS MONSTRUOS COMPARTIDOS (la mina y el mapa salvaje)            (2026-10-11)
+// -----------------------------------------------------------------------------
+// "Los enemigos en la mina o el mapa nuevo deben estar vinculados para que a
+// los otros usuarios conectados les salgan en la misma ubicación, con el
+// enemigo que yo, y los vean como yo. Y si ataco, quiero que él me vea
+// atacarlo."
+//
+// Los monstruos no viven aquí: su cabeza (rodear paredes, elegir ataque) va en
+// el navegador, que es quien tiene el mapa de colisiones de cada escena. Lo
+// que hace el servidor es que en cada sala (con su canal) UNO de los jugadores
+// sea el ANFITRIÓN: el suyo es el único navegador que mueve a los monstruos y
+// manda su foto unas seis veces por segundo ('mobs:estado'); los demás los
+// dibujan donde él dice. Los ataques los anuncia el anfitrión ('mobs:evento')
+// y CADA jugador mira si le alcanzan a él (el daño, como siempre, lo pone
+// /api/stats/:p/consume). Los espadazos de los demás le llegan al anfitrión
+// ('mobs:golpe'), que resta la vida y dice quién lo mató: solo ése cobra
+// (/api/monstruos/derrotado, con su freno de siempre).
+//
+// El anfitrión es el que lleva más tiempo en la sala con monstruos; si se va,
+// cierra la pestaña o cambia de sala, se elige otro en menos de 2 s.
+// El tajo de cada uno se reenvía a la sala ('combate:tajo'): así se ve.
+// =============================================================================
+const MOBS_SALAS = new Set(['mina', 'salvaje']);
+const MOBS_GRUPOS = new Set(['salvaje', 'zombis', 'espectros', 'serpiente']);
+const _mobsSalas = new Map();     // sala -> { host: socketId|null, miembros: Map<socketId, desde> }
+
+function _mobsSocketEnSala(id, sala) {
+  const s = io.sockets.sockets.get(id);
+  return !!(s && s.connected && s.playerData && s.playerData.room === sala);
+}
+
+/** Repasa los miembros y el anfitrión de una sala; si cambia, lo dice a todos. */
+function _mobsRevisar(sala) {
+  const reg = _mobsSalas.get(sala);
+  if (!reg) return null;
+  for (const id of [...reg.miembros.keys()]) if (!_mobsSocketEnSala(id, sala)) reg.miembros.delete(id);
+  if (!reg.miembros.size) { _mobsSalas.delete(sala); return null; }
+  if (reg.host && reg.miembros.has(reg.host)) return reg.host;
+  let elegido = null, desde = Infinity;
+  for (const [id, t] of reg.miembros) if (t < desde) { desde = t; elegido = id; }
+  reg.host = elegido;
+  try { io.to(sala).emit('mobs:host', { host: elegido }); } catch (_) {}
+  return elegido;
+}
+
+setInterval(() => { for (const sala of [..._mobsSalas.keys()]) _mobsRevisar(sala); }, 2000).unref();
+
+function _mobsSalaDe(socket) {
+  const sala = socket.playerData && socket.playerData.room;
+  return sala && MOBS_SALAS.has(salaBase(sala)) ? sala : null;
+}
+
+io.on('connection', (socket) => {
+  /* "Tengo monstruos en esta sala": entra en la lista y sabe quién manda. */
+  socket.on('mobs:hola', () => {
+    const sala = _mobsSalaDe(socket);
+    if (!sala || frenado(socket, 'mobs_hola', 400)) return;
+    let reg = _mobsSalas.get(sala);
+    if (!reg) { reg = { host: null, miembros: new Map() }; _mobsSalas.set(sala, reg); }
+    if (!reg.miembros.has(socket.id)) reg.miembros.set(socket.id, Date.now());
+    const host = _mobsRevisar(sala);
+    socket.emit('mobs:host', { host });
+    // El anfitrión manda su foto ya: el que llega no espera.
+    if (host && host !== socket.id) io.to(host).emit('mobs:pideFoto', { para: socket.id });
+  });
+
+  /* La foto de los monstruos: solo la del anfitrión pasa. */
+  socket.on('mobs:estado', (d) => {
+    const sala = _mobsSalaDe(socket);
+    if (!sala || !d || !MOBS_GRUPOS.has(d.g) || !Array.isArray(d.l) || d.l.length > 80) return;
+    const reg = _mobsSalas.get(sala);
+    if (!reg || reg.host !== socket.id) {
+      // No es el anfitrión (o el servidor se reinició): que sepa quién lo es.
+      if (!frenado(socket, 'mobs_nohost', 2000)) socket.emit('mobs:host', { host: reg ? reg.host : null });
+      return;
+    }
+    if (frenado(socket, 'mobs_estado:' + d.g, 90)) return;
+    socket.to(sala).emit('mobs:estado', { g: d.g, l: d.l, de: socket.id });
+  });
+
+  /* Un ataque, una muerte, un salto: lo anuncia el anfitrión. */
+  socket.on('mobs:evento', (d) => {
+    const sala = _mobsSalaDe(socket);
+    if (!sala || !d || !MOBS_GRUPOS.has(d.g)) return;
+    const reg = _mobsSalas.get(sala);
+    if (!reg || reg.host !== socket.id) return;
+    if (frenado(socket, 'mobs_evento', 20)) return;
+    let texto;
+    try { texto = JSON.stringify(d); } catch (_) { return; }
+    if (texto.length > 2048) return;
+    socket.to(sala).emit('mobs:evento', Object.assign({}, d, { de: socket.id }));
+  });
+
+  /* Un espadazo de otro jugador a un monstruo: al anfitrión, que resta. */
+  socket.on('mobs:golpe', (d) => {
+    const sala = _mobsSalaDe(socket);
+    if (!sala || !d || !MOBS_GRUPOS.has(d.g)) return;
+    const reg = _mobsSalas.get(sala);
+    if (!reg || !reg.host || reg.host === socket.id) return;
+    if (frenado(socket, 'mobs_golpe', 30)) return;
+    const dano = Math.max(0, Math.min(250, Number(d.dano) || 0));
+    const id = Math.floor(Number(d.id));
+    if (!Number.isFinite(id) || id < 0 || id > 200 || !(dano > 0)) return;
+    io.to(reg.host).emit('mobs:golpe', { g: d.g, id, dano, ux: Number(d.ux) || 0, uy: Number(d.uy) || 0,
+                                        k: d.k ? String(d.k).slice(0, 12) : null, de: socket.id });
+  });
+
+  /* El tajo de la espada, para que los demás lo vean (no quita nada). */
+  socket.on('combate:tajo', (d) => {
+    const sala = _mobsSalaDe(socket);
+    if (!sala || frenado(socket, 'combate_tajo', 110)) return;
+    const dir = ['left', 'right', 'up', 'down'].includes(d && d.dir) ? d.dir : 'right';
+    const arma = PVP_DANO[d && d.arma] ? d.arma : 'espada_madera';
+    const poder = ['v', 'b'].includes(d && d.poder) ? d.poder : null;
+    socket.to(sala).emit('combate:tajo', { id: socket.id, dir, arma, poder });
+  });
+
+  socket.on('disconnect', () => {
+    for (const [sala, reg] of _mobsSalas) {
+      if (reg.miembros.delete(socket.id) && reg.host === socket.id) { reg.host = null; _mobsRevisar(sala); }
     }
   });
 });
@@ -11545,6 +11735,130 @@ app.post('/api/espantapajaros/colocar', apiLimiter, authMiddleware, csrfProtecti
     return res.status(r.status).json(r.body);
   } catch (e) {
     console.error('POST /api/espantapajaros/colocar:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// =============================================================================
+// LAS ANTORCHAS                                                    (2026-10-11)
+// -----------------------------------------------------------------------------
+// "Quiero que en la tienda se puedan comprar y vender antorchas que podría
+// poner en la mina, en el mapa nuevo o en GameScene, que tengan duración y que,
+// cuando se acaben, se desvanezcan poco a poco."
+//
+// Como el espantapájaros: ponerla QUEMA 1 de la tabla `antorcha` en la cadena
+// y queda apuntada en Mongo hasta que se consume (índice TTL sobre `hasta`).
+// Son del MUNDO y no del canal: una antorcha en la mina la ven todos los que
+// estén en la mina, en cualquier canal (se avisa a las diez salas). El
+// desvanecido lo dibuja el cliente con `hasta` (gf-antorchas.js).
+//
+// Lo que se comprueba aquí: que no seas fantasma, que estés EN esa zona (la
+// sala y la posición que tiene el servidor, no las que diga el cliente), que
+// la pongas cerca de ti, y los topes: ANTORCHA_MAX_JUGADOR encendidas a la vez
+// por jugador y ANTORCHA_MAX_ZONA por zona.
+// =============================================================================
+const ANTORCHA_MS = 30 * 60 * 1000;
+const ANTORCHA_ZONAS = new Set(['game', 'mina', 'salvaje']);
+const ANTORCHA_MAX_ZONA = 120;
+const ANTORCHA_MAX_JUGADOR = 6;
+const ANTORCHA_ALCANCE = 260;
+const antorchaSchema = new mongoose.Schema({
+  zona:       { type: String, required: true, index: true },
+  playerName: { type: String, required: true, index: true },
+  deNombre:   { type: String, default: '' },
+  x:          { type: Number, required: true },
+  y:          { type: Number, required: true },
+  hasta:      { type: Date, required: true }
+}, { timestamps: true, versionKey: false });
+antorchaSchema.index({ hasta: 1 }, { expireAfterSeconds: 0 });
+const Antorcha = mongoose.model('Antorcha', antorchaSchema);
+
+function _antorchaPublica(a) {
+  return { id: String(a._id), zona: a.zona, x: Math.round(a.x), y: Math.round(a.y),
+           hasta: new Date(a.hasta).getTime(), deNombre: String(a.deNombre || '').slice(0, 40) };
+}
+
+/** A todas las salas de una zona: la del nombre a secas y la de cada canal. */
+function _avisarZona(zona, evento, datos) {
+  try { io.to(zona).emit(evento, datos); } catch (_) {}
+  for (let c = 1; c <= CANALES_TOTAL; c++) {
+    try { io.to(salaConCanal(zona, c)).emit(evento, datos); } catch (_) {}
+  }
+}
+
+app.get('/api/antorchas', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const zona = String((req.query && req.query.zona) || '');
+    if (!ANTORCHA_ZONAS.has(zona)) return res.json({ ok: true, lista: [], ahora: Date.now() });
+    const lista = await Antorcha.find({ zona, hasta: { $gt: new Date() } })
+      .sort({ hasta: 1 }).limit(ANTORCHA_MAX_ZONA).lean();
+    return res.json({ ok: true, ahora: Date.now(), duracionMs: ANTORCHA_MS, lista: lista.map(_antorchaPublica) });
+  } catch (e) {
+    console.error('GET /api/antorchas:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/antorchas/poner', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    if (!relayerWallet) return res.status(503).json({ error: 'relayer_unavailable' });
+    const zona = String((req.body && req.body.zona) || '');
+    if (!ANTORCHA_ZONAS.has(zona)) return res.status(400).json({ error: 'zona_invalida' });
+    const yo = _salaYPosicion(gp.playerName);
+    if (!yo || salaBase(yo.sala) !== zona) {
+      return res.status(403).json({ error: 'fuera_de_zona', message: 'Walk a little first: you are not in this place yet.' });
+    }
+    let x = Number(req.body && req.body.x), y = Number(req.body && req.body.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || Math.hypot(x - yo.x, y - yo.y) > ANTORCHA_ALCANCE) {
+      x = yo.x + 30; y = yo.y + 46;           // demasiado lejos: a su lado
+    }
+    const address = String(gp.address || '').toLowerCase();
+
+    const r = await enColaDelJugador('antorcha:' + address, async () => {
+      const ahora = new Date();
+      const mias = await Antorcha.countDocuments({ playerName: gp.playerName, hasta: { $gt: ahora } });
+      if (mias >= ANTORCHA_MAX_JUGADOR) {
+        return { status: 429, body: { error: 'muchas', message: 'You already have ' + ANTORCHA_MAX_JUGADOR + ' torches burning.' } };
+      }
+      const enZona = await Antorcha.countDocuments({ zona, hasta: { $gt: ahora } });
+      if (enZona >= ANTORCHA_MAX_ZONA) {
+        return { status: 429, body: { error: 'zona_llena', message: 'There are too many torches here. Try later.' } };
+      }
+      const c = contratoItemsServidor();
+      if (!c) return { status: 503, body: { error: 'relayer_unavailable' } };
+      const facturas = await facturasLibresDeCadena(address);
+      const del = facturas.filter(f => f.tipo === 'antorcha' && f.cantidad > 0)
+        .sort((a, b) => a.cantidad - b.cantidad)[0];
+      if (!del) return { status: 400, body: { error: 'no_tienes', message: 'You have no torch.' } };
+      await txRelayer('antorcha: quemar', (o) => c.decreaseInvoiceQuantity(del.id, 1, o));
+      const quedan = del.cantidad - 1;
+      const doc = await Antorcha.create({
+        zona, playerName: gp.playerName, deNombre: String(gp.Username || gp.playerName).slice(0, 40),
+        x: Math.round(x), y: Math.round(y), hasta: new Date(Date.now() + ANTORCHA_MS)
+      });
+      try {
+        const g = await GamePlayer.findOne({ playerName: gp.playerName });
+        if (g) {
+          const r2 = quitarUnaDeFacturaEnSlots(g.inventory, g.chest, del.id, quedan);
+          g.inventory = r2.inventory; g.chest = r2.chest;
+          g.markModified('inventory'); g.markModified('chest');
+          await g.save();
+        }
+      } catch (e) { console.warn('⚠️  antorcha: casilla en Mongo:', e.message); }
+      const pub = _antorchaPublica(doc);
+      _avisarZona(zona, 'antorcha:nueva', pub);
+      console.log(`🔥 ${gp.playerName} encendió una antorcha en ${zona} (${pub.x}, ${pub.y})`);
+      return { status: 200, body: { ok: true, antorcha: pub, duracionMs: ANTORCHA_MS,
+        gastado: { itemId: 'antorcha', invoiceId: del.id, manualId: del.manualId, cantidadRestante: quedan } } };
+    });
+    return res.status(r.status).json(r.body);
+  } catch (e) {
+    console.error('POST /api/antorchas/poner:', e);
     return res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -11699,6 +12013,8 @@ app.post('/api/chat/traducir', apiLimiter, authMiddleware, csrfProtection, async
 const ALQUIMISTA_CATALOGO = {
   pocion_mascota:        { plata: 45,  cura: 40,  nombre: 'Pet Potion' },
   pocion_mascota_grande: { plata: 110, cura: 100, nombre: 'Great Pet Potion' },
+  pocion_vida: { plata: 65, cura: 50, target: 'player', nombre: 'Health Potion' },
+  pocion_antidoto: { plata: 45, target: 'player', antidote: true, nombre: 'Antidote' },
   elixir_revivir:        { plata: 260, revive: true, nombre: 'Revival Elixir' }
 };
 const ALQUIMISTA_MAX_POR_COMPRA = 5;
@@ -11713,14 +12029,14 @@ app.get('/api/alchemist/catalog', apiLimiter, authMiddleware, async (req, res) =
       const c = ALQUIMISTA_CATALOGO[id];
       return {
         id, name: c.nombre, price: c.plata,
-        heals: c.cura || 0, revives: !!c.revive,
+        heals: c.cura || 0, revives: !!c.revive, target: c.target || 'pet', curesPoison: !!c.antidote,
         owned: contarEnSlots(gp.inventory, id) + contarEnSlots(gp.chest, id)
       };
     });
     return res.json({
       ok: true, items,
       silver: stats ? Math.max(0, Math.round(Number(stats.plata) || 0)) : 0,
-      pet: estadoVivo(gp).pet
+      pet: estadoVivo(gp).pet, player: { health: stats ? stats.vida : 100, poisoned: _venenos.has(gp.playerName), alive: !gp.isGhost }
     });
   } catch (err) {
     console.error('GET /api/alchemist/catalog:', err);
@@ -11730,71 +12046,7 @@ app.get('/api/alchemist/catalog', apiLimiter, authMiddleware, async (req, res) =
 
 // ── POST /api/alchemist/buy ─────────────────────────────────────────────────
 // body: { itemId, qty }
-app.post('/api/alchemist/buy', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
-  try {
-    const itemId = String((req.body && req.body.itemId) || '');
-    const cfg = ALQUIMISTA_CATALOGO[itemId];
-    if (!cfg) return res.status(400).json({ error: 'item_desconocido' });
-
-    const qty = Math.max(1, Math.min(ALQUIMISTA_MAX_POR_COMPRA,
-                                     Math.floor(Number(req.body && req.body.qty) || 1)));
-
-    const gp = await jugadorDeLaSesion(req);
-    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
-
-    const stats = await PlayerStats.findOne({ playerName: gp.playerName }).exec();
-    if (!stats) return res.status(409).json({ error: 'sin_stats' });
-
-    // EL PRECIO LO PONE EL SERVIDOR. El cliente solo dice qué y cuántos.
-    const coste = cfg.plata * qty;
-    const plata = Math.max(0, Math.round(Number(stats.plata) || 0));
-    if (plata < coste) {
-      return res.status(409).json({ error: 'plata_insuficiente', precio: coste, plata });
-    }
-
-    // 1) Acuñar el ítem. Si esto falla NO se cobra: primero se entrega.
-    const address = String(gp.address || '').toLowerCase();
-    let acunado = null;
-    const tipo = itemTipoOnChain(itemId);
-    if (address && tipo) {
-      try { acunado = await mintGatherReward(address, tipo, qty); }
-      catch (e) { console.error('❌ alquimista: acuñado falló:', e.message); }
-      if (!acunado) {
-        return res.status(502).json({ error: 'acunado_fallido', itemId });
-      }
-    }
-
-    // 2) Meterlo en el inventario guardado.
-    const puesto = agregarASlots(gp.inventory, itemId, qty, {
-      invoiceId: acunado ? acunado.id : null,
-      manualId:  acunado ? acunado.manualId : null
-    });
-    if (puesto.metidas <= 0) {
-      return res.status(409).json({ error: 'inventario_lleno', itemId });
-    }
-    gp.inventory = puesto.inventory;
-    gp.markModified('inventory');
-    await gp.save();
-
-    // 3) Cobrar, por el mismo camino que el resto del juego.
-    const entregadas = puesto.metidas;
-    const cobro = cfg.plata * entregadas;
-    stats.plata = clampStat('plata', plata - cobro);
-    marcarPendienteDeCadena(stats, ['plata']);
-    await stats.save();
-
-    console.log(`⚗️  ${gp.playerName} compró ${entregadas}x ${itemId} por ${cobro} de plata`);
-    return res.json({
-      ok: true, itemId, qty: entregadas, paid: cobro,
-      silver: stats.plata,
-      partial: entregadas < qty ? qty - entregadas : 0,
-      stats: buildStatsResponse(stats)
-    });
-  } catch (err) {
-    console.error('POST /api/alchemist/buy:', err);
-    return res.status(500).json({ error: 'internal_server_error' });
-  }
-});
+app.post('/api/alchemist/buy', apiLimiter, authMiddleware, csrfProtection, gfAlchemistBuy);
 
 
 // =============================================================================
@@ -12648,6 +12900,7 @@ const ITEM_TIPO_MAP = {
   // Alquimista: pociones para la mascota y elixir para revivirla. Al estar
   // aqui, sus tablas on-chain se aprovisionan solas como las de cualquier
   // otro item del juego.
+  pocion_vida: 'pocion_vida', pocion_antidoto: 'pocion_antidoto',
   pocion_mascota:        'pocion_mascota',
   pocion_mascota_grande: 'pocion_mascota_grande',
   elixir_revivir:        'elixir_revivir',
@@ -12668,9 +12921,14 @@ const ITEM_TIPO_MAP = {
   espada_hierro:  'hierro',
   cana_pescar:    'caña_pescar',
   espantapajaros: 'espantapajaros',
+  // La antorcha (2026-10-11): se compra en la tienda y se pone en el pueblo,
+  // la mina o el mapa salvaje (ver "LAS ANTORCHAS"). Tabla `antorcha`, que se
+  // da de alta sola.
+  antorcha:       'antorcha',
   // Los peces: SOLO los acuña el servidor (ver TABLAS_SOLO_ACUNA_SERVIDOR).
   pes1: 'pes1', pes2: 'pes2', pes3: 'pes3',
   pes4: 'pes4', pes5: 'pes5', pes6: 'pes6', pes7: 'pes7', pes8: 'pes8',
+  pes9: 'pes9', pes10: 'pes10', pes11: 'pes11', pes12: 'pes12', pes13: 'pes13', pes14: 'pes14',
 
   // EL BOTE DE BASURA Y LOS COFRES DE LA ISLA (2026-10-05). Se compran (el
   // bote y el cofre1) o se craftean (cofre2..4) y se COLOCAN en Lands: ver
@@ -12689,6 +12947,7 @@ const ITEM_MAX_STACK = {
   Semillax: 50, Semillax1: 50, Semillax2: 50, Semillax3: 50, Semillax4: 50,
 
   // Pociones del alquimista: se apilan poco, son consumibles caros.
+  pocion_vida: 20, pocion_antidoto: 20,
   pocion_mascota: 20, pocion_mascota_grande: 10, elixir_revivir: 5,
   Regaderax: 1, Tijerasx: 1,
   mineral_piedra: 20, mineral_cobre: 20, mineral_hierro: 20, carbon: 20,
@@ -12706,9 +12965,10 @@ const ITEM_MAX_STACK = {
   parcela: 20,
   pala_construccion: 1,
   espada_madera: 1, espada_cobre: 1, espada_hierro: 1,
-  cana_pescar: 1, espantapajaros: 10,
+  cana_pescar: 1, espantapajaros: 10, antorcha: 20,
   pes1: 20, pes2: 20, pes3: 20,
   pes4: 20, pes5: 20, pes6: 20, pes7: 20, pes8: 20,
+  pes9: 20, pes10: 20, pes11: 20, pes12: 20, pes13: 20, pes14: 20,
   basura: 10,
   cofre1: 5, cofre2: 5, cofre3: 5, cofre4: 5,
 };
@@ -12731,14 +12991,16 @@ const TABLAS_MANUALES = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_PARCELAS, TABL
 /* Tablas que SOLO escribe el servidor. Con el cliente pudiendo escribirlas,
    bastaría una llamada al relay para ponerse nivel 150 en la cadena o
    "colocar" parcelas sin haberlas comprado. */
-const TABLAS_SOLO_SERVIDOR = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_CONS_PARCELAS]);
+const GF_ALLOC_KEYS = ['strength','defense','wisdom','patience','farming','woodcutting','fishing','combat'];
+const TABLAS_SOLO_SERVIDOR = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_CONS_PARCELAS, ...GF_ALLOC_KEYS.map(k => 'player_' + k)]);
 /* Tablas que SOLO ACUÑA el servidor, pero que el cliente sí puede GASTAR
    (2026-10-05): los peces. Se pescan (POST /api/pesca/recoger, que acuña con
    el relayer) y se comen o se venden (el cliente baja la factura por el
    relay). Lo que el cliente no puede es crearlos ni aumentarlos: si pudiera,
    bastaría una llamada al relay para llenarse el inventario de truchas
    doradas. Siempre activo, sin bandera, como TABLAS_SOLO_SERVIDOR. */
-const TABLAS_SOLO_ACUNA_SERVIDOR = new Set(['pes1', 'pes2', 'pes3', 'pes4', 'pes5', 'pes6', 'pes7', 'pes8']);
+const TABLAS_SOLO_ACUNA_SERVIDOR = new Set(['pes1', 'pes2', 'pes3', 'pes4', 'pes5', 'pes6', 'pes7', 'pes8',
+  'pes9', 'pes10', 'pes11', 'pes12', 'pes13', 'pes14']);
 
 // =============================================================================
 // CUPO DE LAS TABLAS DE ÍTEM EN EL CONTRATO
@@ -14035,6 +14297,267 @@ app.get('/api/admin/top-jugadores', adminAuth, apiLimiter, async (req, res) => {
   } catch (e) {
     console.error('top-jugadores:', e);
     res.status(500).json({ ok: false, error: 'No se pudo leer la clasificacion' });
+  }
+});
+
+// =============================================================================
+// LAS INVITACIONES Y LA ACTIVIDAD DE CADA JUGADOR                   (2026-10-11)
+// -----------------------------------------------------------------------------
+// "Un sistema de invitación por el dashboard: enlace y código, la wallet de
+// quien invita, los totales y un campo para el usuario de Discord; y en el
+// admin, por usuario: tiempo jugado, wallet, nombre, primera y última vez que
+// jugó, tiempo pescando, minando y con la tienda abierta (para ver bots)."
+//
+// EL CÓDIGO: 8 letras y números sin los que se confunden (sin 0/O ni 1/I),
+// uno por cuenta, se crea la primera vez que se pide. El enlace es el juego
+// con `?ref=CÓDIGO`; el cliente lo guarda y lo reclama al entrar
+// (gf-invitaciones.js). También se puede escribir a mano en el dashboard.
+//
+// LAS REGLAS: una cuenta se apunta a UN invitador, una sola vez, y solo en
+// sus primeros INVITA_DIAS días; no vale el propio código ni devolver la
+// invitación a quien te invitó. Si entra desde la misma IP que su invitador
+// se apunta (`invitaMismaIp`): el admin lo ve como pista de cuentas dobles.
+//
+// LA ACTIVIDAD la cuenta el SERVIDOR: el tiempo en cada sala sale de los
+// joinRoom del socket (anotarCambioDeSala), la pesca de sus rutas, los
+// monstruos de /api/monstruos/derrotado. Lo único que dice el cliente es si
+// tiene el panel de la tienda abierto ('actividad:tienda', como mucho uno
+// cada 25 s y 30 s cada uno).
+// =============================================================================
+const INVITA_DIAS = 14;
+const INVITA_ACTIVO_MS = 30 * 60 * 1000;      // "activo": media hora jugada
+const INVITA_LETRAS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const INVITA_CODIGO_RE = /^[A-HJ-NP-Z2-9]{8}$/;
+const DISCORD_RE = /^(?:[a-z0-9_.]{2,32}|[^\s#@:]{2,32}#\d{4})$/i;
+const TIEMPO_POR_SALA = { mina: 'tiempoMinaMs', tienda: 'tiempoTiendaMs', salvaje: 'tiempoSalvajeMs' };
+
+/** Cierra el tramo de la sala en la que estaba el socket y lo suma a su campo. */
+function anotarTiempoDeSala(socket) {
+  try {
+    if (!socket || !socket._salaDesde) return;
+    const quien = socket.authenticatedPlayer;
+    const ahora = Date.now();
+    const rato = ahora - socket._salaDesde;
+    socket._salaDesde = ahora;
+    if (!quien || rato < 1000 || rato > 86400000) return;
+    const upd = { $max: { ultimaPartida: new Date(ahora) }, $min: { primeraPartida: new Date(ahora - rato) } };
+    const campo = TIEMPO_POR_SALA[socket._salaBase];
+    if (campo) upd.$inc = { [campo]: rato };
+    UserActivity.updateOne({ playerName: quien }, upd, { upsert: false }).catch(() => {});
+  } catch (_) {}
+}
+
+function anotarCambioDeSala(socket, base) {
+  anotarTiempoDeSala(socket);
+  socket._salaBase = String(base || '').split('@')[0];
+  socket._salaDesde = Date.now();
+}
+
+/** El rato con la caña (con tope: una sesión de pesca dura como mucho 90 s) y la captura. */
+function anotarPesca(playerName, ms, capturado) {
+  const inc = {};
+  const rato = Math.max(0, Math.min(Number(ms) || 0, 2 * 60 * 1000));
+  if (rato) inc.tiempoPescaMs = rato;
+  if (capturado) inc.capturas = 1;
+  if (!Object.keys(inc).length) return;
+  UserActivity.updateOne({ playerName }, { $inc: inc }, { upsert: false }).catch(() => {});
+}
+
+function codigoNuevoDeInvitacion() {
+  const b = crypto.randomBytes(8);
+  let s = '';
+  for (const x of b) s += INVITA_LETRAS[x % INVITA_LETRAS.length];
+  return s;
+}
+
+/** El código de la cuenta; si no tiene, se le crea uno (único). */
+async function codigoDeInvitacion(playerName) {
+  let a = await UserActivity.findOne({ playerName }).select('codigoInvitacion').lean();
+  if (!a) {
+    await UserActivity.updateOne({ playerName }, { $setOnInsert: { registeredAt: new Date() } }, { upsert: true });
+    a = {};
+  }
+  if (a.codigoInvitacion) return a.codigoInvitacion;
+  for (let i = 0; i < 8; i++) {
+    const c = codigoNuevoDeInvitacion();
+    if (await UserActivity.exists({ codigoInvitacion: c })) continue;
+    try {
+      const r = await UserActivity.findOneAndUpdate({ playerName, codigoInvitacion: null },
+        { $set: { codigoInvitacion: c } }, { new: true }).lean();
+      if (r && r.codigoInvitacion) return r.codigoInvitacion;
+    } catch (_) { /* otro se llevó ese código a la vez: se prueba otro */ }
+    const ya = await UserActivity.findOne({ playerName }).select('codigoInvitacion').lean();
+    if (ya && ya.codigoInvitacion) return ya.codigoInvitacion;
+  }
+  throw new Error('sin_codigo');
+}
+
+app.get('/api/invitaciones/mia', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const codigo = await codigoDeInvitacion(gp.playerName);
+    const a = await UserActivity.findOne({ playerName: gp.playerName }).lean() || {};
+    let invitadoPor = null;
+    if (a.invitadoPor) {
+      const q = await GamePlayer.findOne({ playerName: a.invitadoPor }).select('Username address').lean();
+      invitadoPor = { nombre: (q && q.Username && q.Username !== '---') ? q.Username : 'A player',
+                      wallet: q ? String(q.address || '').toLowerCase() : null, desde: a.invitadoEn || null };
+    }
+    const mios = await UserActivity.find({ invitadoPor: gp.playerName })
+      .select('playerName tiempoJugadoMs invitadoEn').limit(500).lean();
+    const fichas = mios.length
+      ? await GamePlayer.find({ playerName: { $in: mios.map(m => m.playerName) } }).select('playerName Username nivel').lean()
+      : [];
+    const porNombre = new Map(fichas.map(f => [f.playerName, f]));
+    const invitados = mios.map(m => {
+      const f = porNombre.get(m.playerName) || {};
+      return { nombre: (f.Username && f.Username !== '---') ? f.Username : 'New player', nivel: Number(f.nivel) || 0,
+               desde: m.invitadoEn || null, horas: Math.round((m.tiempoJugadoMs || 0) / 36000) / 100,
+               activo: (m.tiempoJugadoMs || 0) >= INVITA_ACTIVO_MS };
+    }).sort((x, y) => new Date(y.desde || 0) - new Date(x.desde || 0));
+    const registrado = a.registeredAt || a.createdAt || null;
+    const nuevo = !registrado || Date.now() - new Date(registrado).getTime() < INVITA_DIAS * 86400000;
+    return res.json({
+      ok: true, codigo, wallet: String(gp.address || '').toLowerCase(), invitadoPor,
+      invitados: invitados.slice(0, 200), total: invitados.length, activos: invitados.filter(i => i.activo).length,
+      discord: a.discord || '', puedeReclamar: !a.invitadoPor && nuevo, diasParaReclamar: INVITA_DIAS
+    });
+  } catch (e) {
+    console.error('GET /api/invitaciones/mia:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/invitaciones/reclamar', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const codigo = String((req.body && req.body.codigo) || '').trim().toUpperCase();
+    if (!INVITA_CODIGO_RE.test(codigo)) return res.status(400).json({ error: 'codigo_invalido', message: 'That invite code is not valid.' });
+    const quien = await UserActivity.findOne({ codigoInvitacion: codigo }).select('playerName invitadoPor ip').lean();
+    if (!quien) return res.status(404).json({ error: 'codigo_desconocido', message: 'No player has that invite code.' });
+    if (quien.playerName === gp.playerName) return res.status(400).json({ error: 'propio', message: 'You cannot use your own invite code.' });
+    if (quien.invitadoPor === gp.playerName) return res.status(400).json({ error: 'circular', message: 'That player joined with your invite.' });
+    await codigoDeInvitacion(gp.playerName);          // que exista su documento
+    const yo = await UserActivity.findOne({ playerName: gp.playerName }).select('invitadoPor registeredAt createdAt ip').lean() || {};
+    if (yo.invitadoPor) return res.status(409).json({ error: 'ya_invitado', message: 'You already joined with an invite.' });
+    const registrado = yo.registeredAt || yo.createdAt || null;
+    if (registrado && Date.now() - new Date(registrado).getTime() > INVITA_DIAS * 86400000) {
+      return res.status(409).json({ error: 'tarde', message: 'Invite codes can only be used in your first ' + INVITA_DIAS + ' days.' });
+    }
+    const mismaIp = !!(yo.ip && quien.ip && String(yo.ip) === String(quien.ip));
+    const r = await UserActivity.findOneAndUpdate({ playerName: gp.playerName, invitadoPor: null },
+      { $set: { invitadoPor: quien.playerName, invitadoEn: new Date(), invitaMismaIp: mismaIp } }, { new: true }).lean();
+    if (!r) return res.status(409).json({ error: 'ya_invitado', message: 'You already joined with an invite.' });
+    const ficha = await GamePlayer.findOne({ playerName: quien.playerName }).select('Username address').lean();
+    console.log(`🎟️  ${gp.playerName} entró con la invitación de ${quien.playerName}${mismaIp ? ' (misma IP)' : ''}`);
+    return res.json({ ok: true, invitadoPor: { nombre: (ficha && ficha.Username && ficha.Username !== '---') ? ficha.Username : 'A player',
+                                               wallet: ficha ? String(ficha.address || '').toLowerCase() : null, desde: r.invitadoEn } });
+  } catch (e) {
+    console.error('POST /api/invitaciones/reclamar:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/invitaciones/discord', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const discord = String((req.body && req.body.discord) || '').trim().replace(/^@/, '');
+    if (discord && !DISCORD_RE.test(discord)) {
+      return res.status(400).json({ error: 'discord_invalido', message: 'Use your Discord username: 2-32 letters, numbers, dots or underscores.' });
+    }
+    await codigoDeInvitacion(gp.playerName);
+    await UserActivity.updateOne({ playerName: gp.playerName }, discord ? { $set: { discord } } : { $unset: { discord: '' } });
+    return res.json({ ok: true, discord });
+  } catch (e) {
+    console.error('POST /api/invitaciones/discord:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+/* El panel de la tienda abierto (el cliente avisa cada 30 s mientras lo está). */
+io.on('connection', (socket) => {
+  socket.on('actividad:tienda', () => {
+    const quien = socket.authenticatedPlayer;
+    if (!quien || frenado(socket, 'actividad_tienda', 25000)) return;
+    UserActivity.updateOne({ playerName: quien }, { $inc: { tiempoTiendaAbiertaMs: 30000 } }, { upsert: false }).catch(() => {});
+  });
+});
+
+/**
+ * LA ACTIVIDAD DE CADA JUGADOR, para el admin (admin.html).
+ *
+ *   GET /api/admin/actividad?page=1&q=texto&orden=tiempo|ultima|primera|pesca|mina|tienda|salvaje|invitados
+ *
+ * 50 por página. Cada fila lleva sus PISTAS de bot: muchas horas al día,
+ * casi todo el tiempo pescando o minando, la misma IP que su invitador.
+ */
+const ORDEN_ACTIVIDAD = {
+  tiempo: 'tiempoJugadoMs', ultima: 'ultimaPartida', primera: 'primeraPartida', pesca: 'tiempoPescaMs',
+  mina: 'tiempoMinaMs', tienda: 'tiempoTiendaMs', salvaje: 'tiempoSalvajeMs', capturas: 'capturas', monstruos: 'monstruos'
+};
+function pistasDeBot(a) {
+  const pistas = [];
+  const jugado = a.tiempoJugadoMs || 0;
+  const desde = a.primeraPartida || a.registeredAt || a.createdAt;
+  const dias = desde ? Math.max(1, (Date.now() - new Date(desde).getTime()) / 86400000) : 1;
+  if (jugado / dias > 14 * 3600000) pistas.push('14h+ per day');
+  if (jugado > 2 * 3600000 && (a.tiempoPescaMs || 0) / jugado > 0.6) pistas.push('fishing 60%+ of the time');
+  if (jugado > 2 * 3600000 && (a.tiempoMinaMs || 0) / jugado > 0.7) pistas.push('mining 70%+ of the time');
+  if ((a.tiempoPescaMs || 0) > 30 * 60000 && (a.capturas || 0) / ((a.tiempoPescaMs || 1) / 3600000) > 150) pistas.push('catches too fast');
+  if (a.invitaMismaIp) pistas.push('same IP as inviter');
+  return pistas;
+}
+app.get('/api/admin/actividad', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const POR_PAGINA = 50;
+    const campo = ORDEN_ACTIVIDAD[String(req.query.orden || 'tiempo')] || 'tiempoJugadoMs';
+    const q = String(req.query.q || '').trim().slice(0, 60);
+    const filtro = {};
+    if (q) {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      const gps = await GamePlayer.find({ $or: [{ playerName: re }, { Username: re }, { address: re }] }).select('playerName').limit(500).lean();
+      filtro.$or = [{ playerName: { $in: gps.map(g => g.playerName) } }, { playerName: re }, { discord: re }];
+    }
+    const [total, filas] = await Promise.all([
+      UserActivity.countDocuments(filtro),
+      UserActivity.find(filtro).sort({ [campo]: -1, _id: 1 }).skip((page - 1) * POR_PAGINA).limit(POR_PAGINA)
+        .select('-headers -geo').lean()
+    ]);
+    const nombres = filas.map(f => f.playerName);
+    const invitadores = filas.map(f => f.invitadoPor).filter(Boolean);
+    const [fichas, cuentas] = await Promise.all([
+      GamePlayer.find({ playerName: { $in: nombres.concat(invitadores) } }).select('playerName Username address nivel').lean(),
+      UserActivity.aggregate([{ $match: { invitadoPor: { $in: nombres } } }, { $group: { _id: '$invitadoPor', n: { $sum: 1 } } }])
+    ]);
+    const ficha = new Map(fichas.map(f => [f.playerName, f]));
+    const invitadosDe = new Map(cuentas.map(c => [c._id, c.n]));
+    const jugando = new Set();
+    try { for (const s of io.of('/').sockets.values()) if (s.authenticatedPlayer) jugando.add(s.authenticatedPlayer); } catch (_) {}
+    const nombreDe = (p) => { const f = ficha.get(p); return f && f.Username && f.Username !== '---' ? f.Username : p; };
+    return res.json({
+      ok: true, page, porPagina: POR_PAGINA, total, orden: campo,
+      jugadores: filas.map(a => {
+        const f = ficha.get(a.playerName) || {};
+        return {
+          playerName: a.playerName, username: f.Username || '', wallet: String(f.address || '').toLowerCase(),
+          nivel: Number(f.nivel) || 0, discord: a.discord || '',
+          tiempoJugadoMs: a.tiempoJugadoMs || 0,
+          primeraPartida: a.primeraPartida || a.registeredAt || null, ultimaPartida: a.ultimaPartida || a.lastLogin || null,
+          tiempoPescaMs: a.tiempoPescaMs || 0, capturas: a.capturas || 0, tiempoMinaMs: a.tiempoMinaMs || 0,
+          tiempoTiendaMs: (a.tiempoTiendaMs || 0) + (a.tiempoTiendaAbiertaMs || 0), tiempoSalvajeMs: a.tiempoSalvajeMs || 0,
+          monstruos: a.monstruos || 0, loginCount: a.loginCount || 0,
+          invitadoPor: a.invitadoPor ? nombreDe(a.invitadoPor) : '', invitados: invitadosDe.get(a.playerName) || 0,
+          codigo: a.codigoInvitacion || '', conectado: jugando.has(a.playerName), pistas: pistasDeBot(a)
+        };
+      })
+    });
+  } catch (e) {
+    console.error('GET /api/admin/actividad:', e);
+    return res.status(500).json({ ok: false, error: 'No se pudo leer la actividad' });
   }
 });
 
@@ -16313,6 +16836,10 @@ const playerStatsSchema = new mongoose.Schema({
   // La regeneración se calcula por diferencia de tiempo (ver
   // applyGhostVitalRegen), así que también cuenta el rato que el jugador estuvo
   // DESCONECTADO sin necesidad de ningún temporizador por jugador.
+  lastFullVitalHeal: { type: Date, default: null },
+  lastDamageAt: { type: Date, default: null },
+  swordGuardReady: { type: Date, default: null },
+  swordGuardUntil: { type: Date, default: null },
   lastVitalRegen: { type: Date, default: null },
   // DEUDA CON LA CADENA (liquidación agrupada, 2026-08-05).
   // Lista de stats cuyo valor en Mongo ya está cobrado pero todavía no se ha
@@ -16426,23 +16953,24 @@ const VITAL_REGEN_MAX_TICKS = Math.ceil(VITAL_MAX / VITAL_REGEN_PER_TICK);
 function applyGhostVitalRegen(doc, now = new Date()) {
   if (!doc) return { changed: false, minutes: 0, gain: 0 };
 
+  const healed = gfFullVitalHealing(doc, now);
   const ahora = now.getTime();
   if (!doc.lastVitalRegen) {
     // Primera vez que se ve a este jugador: se arranca el reloj, sin regalar nada.
     doc.lastVitalRegen = now;
-    return { changed: false, minutes: 0, gain: 0 };
+    return { changed: healed, minutes: healed ? 1 : 0, gain: healed ? 1 : 0 };
   }
 
   const desde = new Date(doc.lastVitalRegen).getTime();
   const tics  = Math.floor((ahora - desde) / VITAL_REGEN_TICK_MS);
-  if (tics <= 0) return { changed: false, minutes: 0, gain: 0 };
+  if (tics <= 0) return { changed: healed, minutes: healed ? 1 : 0, gain: healed ? 1 : 0 };
 
   // El resto NO se pierde: el reloj avanza solo los tics enteros consumidos,
   // así que los segundos sobrantes cuentan para el próximo tic.
   doc.lastVitalRegen = new Date(desde + tics * VITAL_REGEN_TICK_MS);
 
   const ganancia = Math.min(tics, VITAL_REGEN_MAX_TICKS) * VITAL_REGEN_PER_TICK;
-  let changed = false;
+  let changed = healed;
   for (const stat of VITAL_STATS) {
     /* MUERTO NO SE CURA SOLO.
 
@@ -17010,6 +17538,8 @@ async function burnItemOnChain(address, tipo, quantity) {
    el servidor la CREA con estos valores (crearTablaSiFalta); si ya existe, no
    la cambia: solo compara y avisa si se queda corta. */
 const TABLAS_RECOMENDADAS = [
+  ...GF_ALLOC_KEYS.map(k => ({ tipo: 'player_' + k, limit: 1_000_000_000, perInvoiceLimit: 150, para: 'Character allocation: ' + k })),
+  ...['pocion_vida','pocion_antidoto'].map(tipo => ({ tipo, limit: 1_000_000_000, perInvoiceLimit: 20, para: 'Player potion' })),
   { tipo: TABLA_NIVEL,         limit: 1_000_000_000, perInvoiceLimit: 150, para: 'Nivel del personaje y de la mascota (2 facturas por jugador)' },
   { tipo: TABLA_NOMBRE,        limit: 1_000_000_000, perInvoiceLimit: 1,   para: 'Nombre del personaje y de la mascota (2 facturas por jugador)' },
   { tipo: TABLA_PARCELAS,      limit: 1_000_000_000, perInvoiceLimit: 20,  para: 'Objeto Parcela del inventario (20 por casilla)' },
@@ -17020,6 +17550,7 @@ const TABLAS_RECOMENDADAS = [
      (crearTablaSiFalta, al arrancar y cuando algo las necesita). */
   { tipo: 'caña_pescar',    limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Caña de pescar (objeto cana_pescar; se apila de 1 en 1)' },
   { tipo: 'espantapajaros', limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espantapájaros: se usa en una parcela del pueblo (2 h) o se construye en la isla (10 por casilla)' },
+  { tipo: 'antorcha',       limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Antorcha: se pone en el pueblo, la mina o el mapa salvaje y arde 30 min (20 por casilla)' },
   { tipo: 'pes1',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: trucha marrón (solo lo acuña el servidor al pescar; 20 por casilla)' },
   { tipo: 'pes2',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: carpa común (solo lo acuña el servidor al pescar; 20 por casilla)' },
   { tipo: 'pes3',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: trucha dorada (solo lo acuña el servidor al pescar; 20 por casilla)' },
@@ -17028,6 +17559,12 @@ const TABLAS_RECOMENDADAS = [
   { tipo: 'pes6',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: esturión (solo lo acuña el servidor al pescar; 20 por casilla)' },
   { tipo: 'pes7',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez venenoso: anguila (solo lo acuña el servidor al pescar; 20 por casilla)' },
   { tipo: 'pes8',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez venenoso: pez león (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes9',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: lucio plateado (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes10',          limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: lucioperca (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes11',          limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: trucha de hielo (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes12',          limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: pez arcoíris (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes13',          limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez: salmón real (solo lo acuña el servidor al pescar; 20 por casilla)' },
+  { tipo: 'pes14',          limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Pez venenoso: pez globo (solo lo acuña el servidor al pescar; 20 por casilla)' },
   { tipo: 'madera',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de madera (objeto espada_madera; 1 por casilla)' },
   { tipo: 'cobre',          limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de cobre (objeto espada_cobre; 1 por casilla)' },
   { tipo: 'hierro',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de hierro (objeto espada_hierro; 1 por casilla)' },
@@ -18865,6 +19402,8 @@ async function requireOwner(req, res, playerName) {
 // =============================================================================
 const skillsSchema = new mongoose.Schema({
   playerName:  { type: String, required: true, unique: true, index: true },
+  allocations: { type: Object, default: {} },
+  allocationSyncAt: { type: Date, default: null },
   skills:      { type: Object, default: {} },
   skillPoints: { type: Number, default: 0 },
   updatedAt:   { type: Date, default: Date.now }
@@ -18945,6 +19484,169 @@ app.post('/api/skills/:playerName', authMiddleware, csrfProtection, async (req, 
   } catch (err) { return res.status(500).json({ error: 'Internal server error' }); }
 });
 console.log('✅ Skills routes loaded');
+// CHARACTER-WORLD BEGIN
+// Embedded in server2.js after PlayerSkills. Chain tables contain only character allocations.
+async function gfCharacterSnapshot(gp, invoices) {
+  const address = String(gp.address).toLowerCase();
+  const rows = invoices || await facturasDeCadena(address);
+  const allocations = Object.fromEntries(GF_ALLOC_KEYS.map(k => [k, 0]));
+  for (const f of rows) {
+    const k = f.tipo.startsWith('player_') ? f.tipo.slice(7) : '';
+    if (GF_ALLOC_KEYS.includes(k) && f.owner === address && Number.isSafeInteger(f.cantidad) && f.cantidad > 0) allocations[k] += f.cantidad;
+  }
+  const level = Math.max(0, nivelPorExperiencia(gp.nivel_exp));
+  const spent = Object.values(allocations).reduce((a, b) => a + b, 0);
+  await PlayerSkills.updateOne({ playerName: gp.playerName }, { $set: { allocations, allocationSyncAt: new Date() } }, { upsert: true });
+  return { ok: true, level, available: Math.max(0, level - spent), allocations };
+}
+app.get('/api/player/skills', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    return res.json(await gfCharacterSnapshot(gp));
+  } catch (_) { return res.status(503).json({ error: 'chain_unavailable' }); }
+});
+app.post('/api/player/skills/allocate', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const key = String(req.body && req.body.skill || '');
+    if (!GF_ALLOC_KEYS.includes(key)) return res.status(400).json({ error: 'unknown_skill' });
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    return await enColaDelJugador(String(gp.address).toLowerCase(), async () => {
+      const fresh = await GamePlayer.findOne({ playerName: gp.playerName });
+      const rows = await facturasDeCadena(gp.address);
+      const state = await gfCharacterSnapshot(fresh, rows);
+      if (!state.available) return res.status(409).json({ error: 'no_points', ...state });
+      const tipo = 'player_' + key;
+      const ready = await crearTablaSiFalta(tipo);
+      const c = contratoItemsServidor();
+      if (!c || !ready) return res.status(503).json({ error: 'chain_unavailable' });
+      const invoice = rows.find(f => f.tipo === tipo && f.owner === String(gp.address).toLowerCase());
+      const receipt = await txRelayer('character skill ' + key, o => invoice
+        ? c.increaseInvoiceQuantity(invoice.id, 1, o)
+        : c.createInvoice(gp.address, tipo, 1, 'skill:' + key + ':' + String(gp.address).toLowerCase(), o));
+      if (receipt.status !== 1 && receipt.status !== 1n) throw new Error('unconfirmed');
+      // Return the confirmed result even if the subsequent RPC/mirror read is unavailable.
+      state.allocations[key]++; state.available--;
+      try { await PlayerSkills.updateOne({ playerName: gp.playerName }, { $set: { allocations: state.allocations, allocationSyncAt: new Date() } }); } catch (_) {}
+      return res.json({ ...state, transactionHash: receipt.hash || receipt.transactionHash });
+    });
+  } catch (_) { return res.status(503).json({ error: 'chain_unavailable' }); }
+});
+async function gfCharacterCosts(playerName, reason, costs, doc) {
+  const result = { ...costs };
+  const mirror = await PlayerSkills.findOne({ playerName }).select('allocations').lean();
+  const a = mirror && mirror.allocations || {};
+  if (result.vida > 0) {
+    result.vida *= 1 - Math.min(0.4, Math.max(0, Number(a.defense) || 0) * 0.02);
+    if (doc.swordGuardUntil && Date.now() < new Date(doc.swordGuardUntil).getTime()) result.vida *= 0.35;
+    doc.lastDamageAt = new Date(); doc.lastFullVitalHeal = new Date();
+  }
+  const skill = /plant|water|harvest|farm|siembr|regar/.test(reason) ? 'farming' : /wood|chop|talar/.test(reason) ? 'woodcutting' : /fish|pesca/.test(reason) ? 'fishing' : null;
+  if (skill) for (const k of ['agua', 'comida']) if (result[k]) result[k] *= 1 - Math.min(0.35, (Number(a[skill]) || 0) * 0.02);
+  return result;
+}
+app.post('/api/player/sword-power', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    if (!req.body || req.body.ability !== 'guard') return res.status(400).json({ error: 'unknown_ability' });
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    return await enColaDelJugador(String(gp.address).toLowerCase(), async () => {
+      const rows = await facturasLibresDeCadena(gp.address);
+      if (!rows.some(f => ['madera', 'cobre', 'hierro'].includes(f.tipo) && f.cantidad > 0)) return res.status(409).json({ error: 'sword_required' });
+      const now = Date.now();
+      const st = await PlayerStats.findOneAndUpdate({ playerName: gp.playerName,
+        $or: [{ swordGuardReady: { $lte: new Date(now) } }, { swordGuardReady: null }] },
+      { $set: { swordGuardReady: new Date(now + 12000), swordGuardUntil: new Date(now + 3000) } }, { new: true });
+      return st ? res.json({ ok: true, duration: 3000 }) : res.status(429).json({ error: 'cooldown' });
+    });
+  } catch (_) { return res.status(503).json({ error: 'chain_unavailable' }); }
+});
+// Called on authenticated reads; no timer or transaction per healing tick.
+function gfFullVitalHealing(doc, now) {
+  const t = now.getTime(), previous = doc.lastFullVitalHeal && new Date(doc.lastFullVitalHeal).getTime();
+  const eligible = !doc.vidaCongelada && Number(doc.vida) > 0 && Number(doc.vida) < 100 && Number(doc.agua) >= 100 && Number(doc.comida) >= 100 && !_venenos.has(doc.playerName);
+  const combat = doc.lastDamageAt && t - new Date(doc.lastDamageAt).getTime() < 5000;
+  if (!eligible || combat || !previous || t - previous > 30000 || t < previous) { doc.lastFullVitalHeal = now; return false; }
+  const ticks = Math.floor((t - previous) / 5000);
+  if (!ticks) return false;
+  doc.lastFullVitalHeal = new Date(previous + ticks * 5000);
+  doc.vida = clampStat('vida', Number(doc.vida) + ticks);
+  marcarPendienteDeCadena(doc, ['vida']);
+  return true;
+}
+app.get('/api/player/vitals', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const doc = await PlayerStats.findOne({ playerName: gp.playerName });
+    if (!doc) return res.status(404).json({ error: 'sin_stats' });
+    const before = { vida: doc.vida, agua: doc.agua, comida: doc.comida, lastFullVitalHeal: doc.lastFullVitalHeal || null, lastDamageAt: doc.lastDamageAt || null, vidaCongelada: !!doc.vidaCongelada };
+    gfFullVitalHealing(doc, new Date());
+    // Compare-and-swap: a delayed healing read must never undo a concurrent hit or death.
+    const saved = await PlayerStats.findOneAndUpdate({ _id: doc._id, ...before }, { $set: { vida: doc.vida, lastFullVitalHeal: doc.lastFullVitalHeal }, ...(doc.vida > before.vida ? { $addToSet: { chainPending: 'vida' } } : {}) }, { new: true });
+    const result = saved || await PlayerStats.findOne({ playerName: gp.playerName });
+    return res.json({ ok: true, stats: buildStatsResponse(result), poisoned: _venenos.has(gp.playerName) });
+  } catch (_) { return res.status(503).json({ error: 'stats_unavailable' }); }
+});
+app.post('/api/alchemist/use', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const itemId = String(req.body && req.body.itemId || '');
+    if (!['pocion_vida', 'pocion_antidoto'].includes(itemId)) return res.status(400).json({ error: 'unknown_item' });
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    return await enColaDelJugador(String(gp.address).toLowerCase(), async () => {
+      const doc = await PlayerStats.findOne({ playerName: gp.playerName });
+      if (!doc) return res.status(409).json({ error: 'sin_stats' });
+      if (itemId === 'pocion_vida' && doc.vida >= 100 || itemId === 'pocion_antidoto' && !_venenos.has(gp.playerName)) return res.status(409).json({ error: 'not_needed' });
+      const rows = await facturasLibresDeCadena(gp.address);
+      const f = rows.find(f => f.tipo === ITEM_TIPO_MAP[itemId] && f.cantidad > 0);
+      if (!f) return res.status(409).json({ error: 'missing_potion' });
+      const c = contratoItemsServidor();
+      await txRelayer('use player potion', o => f.cantidad === 1 ? c.deleteInvoice(f.id, o) : c.decreaseInvoiceQuantity(f.id, 1, o));
+      if (itemId === 'pocion_vida') { doc.vida = clampStat('vida', Number(doc.vida) + 50); marcarPendienteDeCadena(doc, ['vida']); }
+      else { const v = _venenos.get(gp.playerName); if (v) clearTimeout(v.reloj); _venenos.delete(gp.playerName); }
+      await doc.save();
+      // Preserve the invoice IDs and all other items, rather than replacing the bag with a partial snapshot.
+      const fresh = await GamePlayer.findOne({ playerName: gp.playerName });
+      for (const arr of [fresh.inventory, fresh.chest]) if (Array.isArray(arr)) for (let i = 0; i < arr.length; i++) {
+        const s = arr[i]; if (!s || s.objeto !== itemId || Number(s.IDX) !== f.id) continue;
+        const n = Math.max(0, f.cantidad - 1);
+        s.cantidad = n; if (!n) { s.objeto = ''; s.IDX = null; s.Manualid = null; }
+        break;
+      }
+      fresh.marketWriteAt = new Date(); fresh.markModified('inventory'); fresh.markModified('chest'); await fresh.save();
+      return res.json({ ok: true, stats: buildStatsResponse(doc), poisoned: _venenos.has(gp.playerName) });
+    });
+  } catch (_) { return res.status(503).json({ error: 'use_failed' }); }
+});
+async function gfAlchemistBuy(req,res) {
+  try {
+    const itemId=String(req.body&&req.body.itemId||''),cfg=ALQUIMISTA_CATALOGO[itemId];
+    if(!cfg)return res.status(400).json({error:'item_desconocido'});
+    const owner=await jugadorDeLaSesion(req);if(!owner)return res.status(403).json({error:'no_autorizado'});
+    return await enColaDelJugador(String(owner.address).toLowerCase(),async()=>{
+      const gp=await GamePlayer.findOne({playerName:owner.playerName});
+      const qty=Math.max(1,Math.min(ALQUIMISTA_MAX_POR_COMPRA,Math.floor(Number(req.body&&req.body.qty)||1)));
+      const preview=agregarASlots(gp.inventory,itemId,qty);
+      if(preview.metidas<qty)return res.status(409).json({error:'inventario_lleno'});
+      const cost=cfg.plata*qty;
+      const stats=await PlayerStats.findOneAndUpdate({playerName:gp.playerName,plata:{$gte:cost}},{$inc:{plata:-cost},$addToSet:{chainPending:'plata'}},{new:true});
+      if(!stats)return res.status(409).json({error:'plata_insuficiente',precio:cost});
+      let invoice;
+      try { invoice=await mintGatherReward(String(gp.address).toLowerCase(),itemTipoOnChain(itemId),qty);if(!invoice||!invoice.id)throw Error('mint'); }
+      catch(e){await PlayerStats.updateOne({playerName:gp.playerName},{$inc:{plata:cost},$addToSet:{chainPending:'plata'}});return res.status(502).json({error:'acunado_fallido'});}
+      const placed=ponerFacturaEnSlots(gp.inventory,gp.chest,itemId,invoice);
+      gp.inventory=placed.inventory;gp.chest=placed.chest;gp.marketWriteAt=new Date();gp.markModified('inventory');gp.markModified('chest');
+      let mirrorPending=false;try{await gp.save();}catch(e){mirrorPending=true;}
+      return res.json({ok:true,itemId,qty,paid:cost,silver:stats.plata,stats:buildStatsResponse(stats),mirrorPending});
+    });
+  }catch(e){return res.status(503).json({error:'purchase_failed'});}
+}
+
+// CHARACTER-WORLD END
 
 // =============================================================================
 // PET ROUTES
@@ -19717,7 +20419,7 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
     const seedType = String((req.body && req.body.seedType) || '').slice(0, 40);
     const units    = Math.max(1, Math.min(100, Math.floor(Number(req.body && req.body.units) || 1)));
 
-    const costesPedidos = costesDeAccion(reason, seedType, units);
+    let costesPedidos = costesDeAccion(reason, seedType, units);
     if (costesPedidos === null) {
       return res.status(400).json({ error: 'unknown_action', reason });
     }
@@ -19739,6 +20441,7 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
     // cobran 0 y acumulan (0,2 → 0,4 → 0,6 → 0,8); la quinta llega a 1,0 y
     // cobra 1 de comida. En cinco siembras se paga exactamente 1, que es lo
     // que dice la tabla.
+    costesPedidos = await gfCharacterCosts(playerName, reason, costesPedidos, doc);
     if (!doc.vitalFractions) doc.vitalFractions = { vida: 0, agua: 0, comida: 0 };
 
     const costs         = {};   // lo que se cobra AHORA (entero)
