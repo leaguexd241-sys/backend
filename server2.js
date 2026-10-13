@@ -22,6 +22,28 @@ const { Server } = require("socket.io");
 const https = require('https');
 const compression = require('compression');
 
+// Express 4 no propaga rechazos de handlers async al middleware de errores.
+function asyncRoute(handler) {
+  return function (req, res, next) {
+    Promise.resolve().then(() => handler(req, res, next)).catch(next);
+  };
+}
+
+// Una pasada lenta de Mongo/RPC no debe acumular nuevas pasadas del mismo reloj.
+const _intervalosAsync = new Set();
+function setIntervalAsync(trabajo, ms) {
+  let ocupado = false;
+  const timer = setInterval(async () => {
+    if (ocupado) return;
+    ocupado = true;
+    try { await trabajo(); }
+    catch (error) { console.error('❌ Error en tarea periódica:', error?.message || error); }
+    finally { ocupado = false; }
+  }, ms);
+  _intervalosAsync.add(timer);
+  return timer;
+}
+
 // --- Módulo de gestión de keystore (cifrado) ---
 const keystore = require('./keystore');
 
@@ -352,16 +374,17 @@ class RelayerNonceManager {
   async init() {
     if (!relayerWallet) return;
     try {
-      this.currentNonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+      const networkNonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+      this.currentNonce = Math.max(this.currentNonce ?? 0, networkNonce);
       console.log(`🔢 Initial relayer nonce: ${this.currentNonce}`);
     } catch (error) {
       console.error('❌ Error obteniendo nonce inicial:', error);
-      this.currentNonce = 0;
+      // Una lectura fallida no significa nonce cero. El siguiente envío relee.
     }
   }
   async getNextNonce() {
     if (!relayerWallet) return 0;
-    return new Promise(async (resolve) => {
+    return new Promise((resolve, reject) => {
       const requestId = uuidv4();
       const processQueue = async () => {
         if (this.lock) {
@@ -379,7 +402,7 @@ class RelayerNonceManager {
           resolve(nonceToUse);
         } catch (error) {
           console.error('❌ Error obteniendo nonce:', error);
-          if (this.currentNonce === null) this.currentNonce = 0;
+          if (this.currentNonce === null) { reject(error); return; }
           const nonceToUse = this.currentNonce;
           this.currentNonce++;
           resolve(nonceToUse);
@@ -404,6 +427,45 @@ class RelayerNonceManager {
   }
 }
 const relayerNonceManager = new RelayerNonceManager();
+
+// Un fallo HTTP después de enviar NO prueba que el nodo rechazó la transacción.
+// Se persiste su hash antes del envío y se reintentan exactamente los mismos
+// bytes: cambiar el nonce aquí puede ejecutar dos veces una compra/acuñación.
+async function broadcastRelayTransaction(tx, relayTx, intentos = 5) {
+  const signedTx = await relayerWallet.signTransaction(tx);
+  const hash = ethers.keccak256(signedTx);
+  relayTx.txHash = hash;
+  relayTx.status = 'signed';
+  await relayTx.save();
+  let espera = 800;
+  let ambiguoPrevio = false;
+  for (let intento = 0; intento < intentos; intento++) {
+    relayTx.broadcastedAt = new Date();
+    try {
+      return await provider.broadcastTransaction(signedTx);
+    } catch (error) {
+      const mensaje = String(error?.shortMessage || error?.message || '').toLowerCase();
+      const ambiguo = RelayManager.esErrorTransitorioRPC(error) ||
+        ['NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(error?.code) ||
+        /already known|known transaction|nonce too low|nonce has already been used|replacement transaction underpriced/.test(mensaje);
+      if (!ambiguo && !ambiguoPrevio) {
+        // Rechazo definitivo antes de entrar al mempool (p. ej. saldo insuficiente).
+        relayTx.txHash = undefined;
+        relayTx.broadcastedAt = undefined;
+        throw error;
+      }
+      ambiguoPrevio = true;
+      if (RelayManager.esErrorTransitorioRPC(error) && intento + 1 < intentos) {
+        await new Promise(resolve => { setTimeout(resolve, espera); });
+        espera = Math.min(espera * 2, 6000);
+        continue;
+      }
+      // La confirmación/reconciliación por ESTE hash decide el resultado final.
+      relayTx.error = 'broadcast_pending: ' + (error.shortMessage || error.message);
+      return { hash, broadcastUncertain: true };
+    }
+  }
+}
 
 // --- Configuración de Seguridad Avanzada ---
 const SECURITY_CONFIG = {
@@ -2325,7 +2387,7 @@ class SecurityController {
   }
 
   async startCleanupTimer() {
-    setInterval(async () => {
+    setIntervalAsync(async () => {
       try {
         const result = await BlockedIP.deleteMany({
           isPermanent: false,
@@ -2368,7 +2430,7 @@ class SecurityController {
   }
 
   async startMonitoring() {
-    setInterval(async () => {
+    setIntervalAsync(async () => {
       try {
         const suspiciousIPs = await IPActivity.find({
           threatScore: { $gte: 60 },
@@ -2730,10 +2792,11 @@ class RelayManager {
                 }
                 await tx.save();
               } else {
-                // Transacción no minada, reenviar
-                if (tx.status === 'broadcasted' && tx.createdAt < new Date(Date.now() - 5 * 60 * 1000)) {
-                  console.log(`🔄 Reenviando transacción ${tx.transactionId}`);
-                  await this.processTransactionFromQueue(tx);
+                // Una ausencia de receipt no autoriza repetir la operación con
+                // otro nonce: la original aún puede minarse. Se consulta su hash.
+                if (tx.status !== 'broadcasted') {
+                  tx.status = 'broadcasted';
+                  await tx.save();
                 }
               }
             }
@@ -2748,6 +2811,14 @@ class RelayManager {
   }
   
   async addToQueue(transactionData) {
+    // Cada petición HTTP puede ocupar hasta 1 MB. Durante una caída del RPC,
+    // limitar tanto trabajos como tamaño evita retener cuerpos sin techo.
+    if (this.transactionQueue.length >= 250 ||
+        Buffer.byteLength(JSON.stringify(transactionData), 'utf8') > 65536) {
+      const error = new Error('relay_queue_capacity');
+      error.code = 'RELAY_QUEUE_CAPACITY';
+      throw error;
+    }
     const queueItem = {
       id: uuidv4(),
       data: transactionData,
@@ -2769,7 +2840,7 @@ class RelayManager {
   startQueueProcessor() {
     if (!relayerWallet) return;
     
-    setInterval(async () => {
+    setIntervalAsync(async () => {
       if (this.processingLock || this.transactionQueue.length === 0) return;
       
       this.processingLock = true;
@@ -2885,7 +2956,19 @@ class RelayManager {
   // Funciones que NO tocan una factura existente (createInvoice, setLimit,
   // vistas, logMessage…) se omiten.
   // ---------------------------------------------------------------------------
+  async verifyRelayPrivileges(functionName, playerAddress) {
+    // Métodos administrativos presentes en el ABI ItemContract. Permitir el
+    // contrato no permite que cualquier jugador use los poderes del relayer.
+    const nombre = String(functionName).split('(')[0];
+    const administrativas = ['setLimit', 'deprecateTipo', 'addAdmin', 'removeAdmin',
+      'transferOwnership', 'renounceOwnership', 'migrateInvoicesBatch', 'sealMigration'];
+    if (administrativas.includes(nombre) && !await isAdminAddressCached(playerAddress)) {
+      throw new Error('relay_admin_required: ' + nombre);
+    }
+  }
+
   async verifyInvoiceOwnership(contract, functionName, parameters, playerAddress) {
+    functionName = String(functionName).split('(')[0];
     // función → posición del id de factura, cantidad y (opcional) dueño de origen.
     const OWNED_INVOICE_FNS = {
       decreaseInvoiceQuantity:         { idArg: 0, amountArg: 1 },
@@ -2960,6 +3043,7 @@ class RelayManager {
   // relay: esos ítems solo puede acuñarlos el servidor (/api/gather/claim), que
   // llama al contrato directamente (sin pasar por aquí). Inerte con el flag off.
   async blockClientGatherMint(contract, functionName, parameters) {
+    functionName = String(functionName).split('(')[0];
     if (!GATHER_ENFORCE) return;
     const args = Array.isArray(parameters) ? parameters : Object.values(parameters || {});
     let tipo = null;
@@ -2967,7 +3051,7 @@ class RelayManager {
       tipo = String(args[1] || '');                 // createInvoice(owner, tipo, cantidad, manualId)
     } else if (functionName === 'increaseInvoiceQuantity') {
       const id = Number(args[0]);
-      if (id > 0) { try { const inv = await contract.getInvoice(id); tipo = String(inv.tipo || ''); } catch (_) {} }
+      if (id > 0) { const inv = await contract.getInvoice(id); tipo = String(inv.tipo || ''); }
     } else {
       return;
     }
@@ -2981,6 +3065,7 @@ class RelayManager {
   // llamada al relay bastaría si no para ponerse nivel 150 en la cadena,
   // quedarse el nombre de otro o "colocar" parcelas sin comprarlas.
   async blockClientServerTables(contract, functionName, parameters) {
+    functionName = String(functionName).split('(')[0];
     const ESCRITURAS = ['createInvoice', 'increaseInvoiceQuantity', 'decreaseInvoiceQuantity',
                         'deleteInvoice', 'transferInvoice', 'transferQuantityBetweenInvoices'];
     if (!ESCRITURAS.includes(functionName)) return;
@@ -2988,7 +3073,8 @@ class RelayManager {
     const tipoDe = async (id) => {
       const n = Number(id);
       if (!(n > 0)) return null;
-      try { const inv = await contract.getInvoice(n); return String(inv.tipo || ''); } catch (_) { return null; }
+      const inv = await contract.getInvoice(n);
+      return String(inv.tipo || '');
     };
     const tipos = [];
     if (functionName === 'createInvoice') tipos.push(String(args[1] || ''));        // (owner, tipo, cantidad, manualId)
@@ -3162,6 +3248,8 @@ class RelayManager {
         throw new Error(`Function ${functionName} not found in contract ABI`);
       }
 
+      await this.verifyRelayPrivileges(functionName, playerAddress);
+
       // 3.5. VERIFICACIÓN DE PROPIEDAD (anti-trampa). Antes de manipular una
       // factura EXISTENTE (decrease/increase/delete/transfer), confirmar on-chain
       // que pertenece al jugador que la solicita y que tiene cantidad suficiente.
@@ -3222,7 +3310,7 @@ class RelayManager {
         const feeData = await RelayManager.conReintentoRPC(
           () => provider.getFeeData(), 'getFeeData'
         );
-        gasPrice = feeData.gasPrice || await provider.getGasPrice();
+        gasPrice = feeData.gasPrice ?? ethers.parseUnits(FALLBACK_GAS_PRICE_GWEI, 'gwei');
         console.log(`   - Gas price base: ${ethers.formatUnits(gasPrice, 'gwei')} gwei`);
 
         // Aplicar multiplicador de seguridad
@@ -3274,60 +3362,8 @@ class RelayManager {
       relayTx.signedAt = new Date();
       await relayTx.save();
 
-      // 11. Firmar y enviar — CON AUTO-RECUPERACIÓN de nonce desincronizado.
-      // Antes, si el broadcast fallaba con "nonce too low"/"nonce has already
-      // been used" (NONCE_EXPIRED), la transacción se marcaba como fallida y se
-      // reembolsaba (síntoma: "Compra parcial 0/N — reembolso"). Ahora, ante ese
-      // error, se resetea el nonce del relayer desde la cadena y se REINTENTA
-      // con un nonce fresco, así el sistema se auto-corrige solo.
-      // Además del nonce, ahora se reintenta cuando el NODO no responde: era el
-      // caso más doloroso, porque el jugador ya había gastado el ítem o el
-      // recurso y la transacción se perdía por una caída de 10 segundos del RPC.
-      let txResponse;
-      let currentTxNonce = nonce;
-      const MAX_SEND_RETRIES = 5;
-      let esperaRPC = 800;
-      for (let attempt = 0; attempt < MAX_SEND_RETRIES; attempt++) {
-        try {
-          tx.nonce = currentTxNonce;
-          const signedTx = await relayerWallet.signTransaction(tx);
-          txResponse = await provider.broadcastTransaction(signedTx);
-          break; // enviado con éxito
-        } catch (sendErr) {
-          const msg = String(sendErr?.shortMessage || sendErr?.message || '').toLowerCase();
-          const isNonceError =
-            sendErr?.code === 'NONCE_EXPIRED' ||
-            msg.includes('nonce too low') ||
-            msg.includes('nonce has already been used') ||
-            msg.includes('replacement transaction underpriced');
-
-          const quedanIntentos = attempt < MAX_SEND_RETRIES - 1;
-
-          if (isNonceError && quedanIntentos) {
-            console.warn(`⚠️  Nonce desincronizado (usado ${currentTxNonce}): reseteando desde la cadena y reintentando (intento ${attempt + 1}/${MAX_SEND_RETRIES})…`);
-            await relayerNonceManager.resetNonce();
-            currentTxNonce = await relayerNonceManager.getNextNonce();
-            relayTx.nonce = currentTxNonce;
-            continue;
-          }
-
-          if (RelayManager.esErrorTransitorioRPC(sendErr) && quedanIntentos) {
-            console.warn(`⚠️  [RPC] Nodo no disponible al enviar (${sendErr.shortMessage || sendErr.message}). Reintento ${attempt + 1}/${MAX_SEND_RETRIES} en ${esperaRPC}ms…`);
-            await new Promise(r => setTimeout(r, esperaRPC));
-            esperaRPC = Math.min(esperaRPC * 2, 6000);
-            // El nonce se relee: mientras el nodo estaba caído puede haber
-            // avanzado por otra vía.
-            try {
-              await relayerNonceManager.resetNonce();
-              currentTxNonce = await relayerNonceManager.getNextNonce();
-              relayTx.nonce = currentTxNonce;
-            } catch (_) { /* se reintenta con el mismo nonce */ }
-            continue;
-          }
-
-          throw sendErr; // revert real del contrato, o se agotaron los reintentos
-        }
-      }
+      // Se conserva el mismo nonce y hash ante una respuesta RPC ambigua.
+      const txResponse = await broadcastRelayTransaction(tx, relayTx);
 
       relayTx.status = 'broadcasted';
       relayTx.txHash = txResponse.hash;
@@ -3340,7 +3376,7 @@ class RelayManager {
       await this.updateContractStats(contractAddress, true);
       
       // 13. Esperar confirmación (no bloqueante)
-      this.waitForConfirmation(txResponse.hash, relayTx);
+      this.waitForConfirmation(txResponse.hash, relayTx).catch(() => {});
       
       return {
         success: true,
@@ -3353,6 +3389,17 @@ class RelayManager {
       
     } catch (error) {
       console.error(`❌ Error en processTransaction:`, error);
+
+      // Si ya se intentó publicar, un fallo posterior de Mongo/estadísticas
+      // tampoco autoriza ejecutar otra operación. El hash queda reconciliable.
+      if (relayTx.txHash && relayTx.broadcastedAt) {
+        relayTx.status = 'broadcasted';
+        try { await relayTx.save(); } catch (_) {}
+        this.waitForConfirmation(relayTx.txHash, relayTx).catch(() => {});
+        return { success: true, transactionId, txHash: relayTx.txHash,
+          nonce: relayTx.nonce, estimatedCost: relayTx.estimatedCost,
+          message: 'Transaction confirmation pending' };
+      }
 
       // Lo encolado que la cola va a reintentar queda 'pending' (no es final):
       // si se marcaba 'failed', el cliente lo daba por perdido y reembolsaba
@@ -3514,10 +3561,11 @@ class RelayManager {
         relayTx.transactionIndex = receipt.index;
         relayTx.gasUsed = receipt.gasUsed.toString();
         
-        const effectiveGasPriceStr = receipt.effectiveGasPrice?.toString();
+        const receiptGasPrice = receipt.gasPrice ?? receipt.effectiveGasPrice;
+        const effectiveGasPriceStr = receiptGasPrice?.toString();
         relayTx.effectiveGasPrice = effectiveGasPriceStr;
         
-        if (receipt.gasUsed && receipt.effectiveGasPrice) {
+        if (receipt.gasUsed != null && receiptGasPrice != null) {
           const gasUsedBigInt = BigInt(receipt.gasUsed.toString());
           const effectiveGasPriceBigInt = BigInt(effectiveGasPriceStr);
           const actualCost = gasUsedBigInt * effectiveGasPriceBigInt;
@@ -3553,14 +3601,32 @@ class RelayManager {
     } catch (error) {
       console.error(`❌ Error esperando confirmación para ${txHash}:`, error);
       
-      relayTx.status = 'failed';
-      relayTx.error = `Confirmation timeout: ${error.message}`;
-      await relayTx.save();
+      // Timeout/red: sigue pendiente; solo un receipt prueba confirmación/revert.
+      // No sobrescribir una confirmación que ganó la carrera desde status/recovery.
+      if (!['confirmed', 'reverted'].includes(relayTx.status)) {
+        relayTx.status = 'broadcasted';
+        relayTx.error = `Confirmation pending: ${error.message}`;
+        try {
+          // Otra lectura puede haber confirmado en Mongo con un documento
+          // distinto: proteger también ese estado terminal de forma atómica.
+          await RelayedTransaction.updateOne({ transactionId: relayTx.transactionId,
+            txHash, status: { $nin: ['confirmed', 'reverted'] } },
+          { $set: { status: 'broadcasted', error: relayTx.error } });
+        } catch (saveError) {
+          console.error('❌ Error guardando confirmación pendiente:', saveError.message);
+        }
+      }
     }
   }
 
   async processTransactionFromQueue(relayTx) {
     if (!relayerWallet) return null;
+    // Una transacción con hash ya firmado/publicado se reconcilia, nunca se
+    // reconstruye con otro nonce como si hubiera fallado antes del envío.
+    if (relayTx.txHash) {
+      await this.getTransactionStatus(relayTx.transactionId);
+      return relayTx.txHash;
+    }
     
     try {
       console.log(`🔄 Reprocesando transacción desde cola: ${relayTx.transactionId}`);
@@ -3595,6 +3661,8 @@ class RelayManager {
         console.error(`❌ Función no encontrada en ABI: ${relayTx.functionName}`);
         throw new Error(`Function ${relayTx.functionName} not found in contract ABI`);
       }
+
+      await this.verifyRelayPrivileges(relayTx.functionName, relayTx.playerAddress);
       
       // SIEMPRE obtener un nonce FRESCO al reprocesar. Antes se REUTILIZABA
       // relayTx.nonce, pero si la tx original falló por "nonce too low" /
@@ -3650,7 +3718,7 @@ class RelayManager {
             console.log(`   - ⚙️ Gas price fijo (FIXED_GAS_PRICE_GWEI): ${FIXED_GAS_PRICE_GWEI} gwei`);
           } else {
             const feeData = await provider.getFeeData();
-            gasPrice = feeData.gasPrice || await provider.getGasPrice();
+            gasPrice = feeData.gasPrice ?? ethers.parseUnits(FALLBACK_GAS_PRICE_GWEI, 'gwei');
             console.log(`   - Gas price base: ${ethers.formatUnits(gasPrice, 'gwei')} gwei`);
 
             const multiplier = Number(process.env.GAS_PRICE_MULTIPLIER || "1.0");
@@ -3726,32 +3794,8 @@ class RelayManager {
       console.log(`   - Chain ID: ${CHAIN_ID}`);
       console.log(`   - To: ${relayTx.contractAddress}`);
       
-      // 7-8. Firmar y enviar CON auto-recuperación de nonce desincronizado.
-      console.log(`✍️ Firmando y enviando transacción...`);
-      let txResponse;
-      const MAX_NONCE_RETRIES = 3;
-      for (let attempt = 0; attempt < MAX_NONCE_RETRIES; attempt++) {
-        try {
-          tx.nonce = nonce;
-          const signedTx = await relayerWallet.signTransaction(tx);
-          txResponse = await provider.broadcastTransaction(signedTx);
-          break; // enviado con éxito
-        } catch (sendErr) {
-          const msg = String(sendErr?.shortMessage || sendErr?.message || '').toLowerCase();
-          const isNonceError =
-            sendErr?.code === 'NONCE_EXPIRED' ||
-            msg.includes('nonce too low') ||
-            msg.includes('nonce has already been used') ||
-            msg.includes('replacement transaction underpriced');
-          if (isNonceError && attempt < MAX_NONCE_RETRIES - 1) {
-            console.warn(`⚠️  Nonce desincronizado (usado ${nonce}) al reprocesar: reseteando desde la cadena y reintentando (${attempt + 1}/${MAX_NONCE_RETRIES})…`);
-            await relayerNonceManager.resetNonce();
-            nonce = await relayerNonceManager.getNextNonce();
-            continue;
-          }
-          throw sendErr; // error no recuperable o reintentos agotados
-        }
-      }
+      // Un reintento de transporte transmite los mismos bytes firmados.
+      const txResponse = await broadcastRelayTransaction(tx, relayTx, 3);
 
       console.log(`🎉 Transacción enviada exitosamente!`);
       console.log(`📝 Hash: ${txResponse.hash}`);
@@ -3805,7 +3849,7 @@ class RelayManager {
       }
       
       console.log(`⏳ Iniciando seguimiento de confirmación...`);
-      this.waitForConfirmation(txResponse.hash, relayTx);
+      this.waitForConfirmation(txResponse.hash, relayTx).catch(() => {});
       
       return txResponse.hash;
       
@@ -3820,6 +3864,12 @@ class RelayManager {
         errorCode: error.code
       });
       
+      if (relayTx?.txHash && relayTx.broadcastedAt) {
+        relayTx.status = 'broadcasted';
+        try { await relayTx.save(); } catch (_) {}
+        this.waitForConfirmation(relayTx.txHash, relayTx).catch(() => {});
+        return relayTx.txHash;
+      }
       if (relayTx) {
         relayTx.status = 'failed';
         relayTx.error = error.message;
@@ -3856,7 +3906,7 @@ class RelayManager {
 
   startCleanupInterval() {
     // Limpiar transacciones viejas cada hora
-    setInterval(async () => {
+    setIntervalAsync(async () => {
       try {
         const oneMonthAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
         
@@ -3925,7 +3975,7 @@ class RelayManager {
       }
       
       // Si está pendiente, verificar en blockchain
-      if (tx.txHash && ['broadcasted', 'processing'].includes(tx.status)) {
+      if (tx.txHash && ['broadcasted', 'processing', 'signed', 'failed'].includes(tx.status)) {
         try {
           const receipt = await provider.getTransactionReceipt(tx.txHash);
           if (receipt) {
@@ -3982,7 +4032,7 @@ class WaterCollectionController {
   }
 
   startDailyResetTimer() {
-    setInterval(async () => {
+    setIntervalAsync(async () => {
       /* CON try/catch, y no es cosmetico.
 
          Este callback es `async` y no lo capturaba nadie: si Mongo estaba
@@ -4661,7 +4711,7 @@ class CropController {
    * consulta indexada por minuto.
    */
   async startExpiryTimer() {
-    setInterval(async () => {
+    setIntervalAsync(async () => {
       try {
         const ahora = new Date();
 
@@ -4721,7 +4771,7 @@ class CropController {
    * juego.
    */
   async startThirstTimer() {
-    setInterval(async () => {
+    setIntervalAsync(async () => {
       try {
         const ahora = new Date();
 
@@ -4766,7 +4816,7 @@ class CropController {
   }
 
   async startGrowthTimers() {
-    setInterval(async () => {
+    setIntervalAsync(async () => {
       try {
         const activeCrops = await UserCrop.find({ 
           isWatered: true, 
@@ -5773,7 +5823,15 @@ io.on("connection", (socket) => {
 
   // Eventos de salas y personajes COMPLETOS
   socket.on("joinRoom", async (data) => {
-    const { room: salaPedida, username, lastScene, nivel, petLevel, dogName, soulbound } = data;
+    try {
+    if (!data || typeof data !== 'object' || typeof data.room !== 'string' || typeof data.username !== 'string') {
+      return socket.emit('error', { message: 'Datos de sala inválidos' });
+    }
+    const versionJoin = (socket._versionJoin || 0) + 1;
+    socket._versionJoin = versionJoin;
+    const { room: salaPedida, lastScene, nivel, petLevel, soulbound } = data;
+    const username = data.username.slice(0, 40);
+    const dogName = typeof data.dogName === 'string' ? data.dogName.slice(0, 40) : '';
 
     if (!salaPedida || !username) {
       socket.emit("error", { message: "Datos de sala inválidos" });
@@ -5865,6 +5923,8 @@ io.on("connection", (socket) => {
        ya tenías (para no teletransportarte al 0,0 a ojos de los demás) y se
        reenvía la foto de la sala. Lo único que se calla es el aviso de "jugador
        nuevo" a los demás, porque nuevo no eres. */
+    // Otra petición o una desconexión durante las lecturas invalida este join.
+    if (socket.connected === false || socket._versionJoin !== versionJoin) return;
     const yaEstaba = !!(rooms[room] && rooms[room][socket.id]);
     const mismoSitio = socket.playerData.room === room && socket.playerData.lastScene === lastScene;
 
@@ -6006,6 +6066,11 @@ io.on("connection", (socket) => {
     }
 
     io.to(room).emit("playerCount", Object.keys(rooms[room]).length);
+  
+    } catch (error) {
+      console.error('joinRoom error:', error?.message || error);
+      if (socket.connected !== false) socket.emit('error', { message: 'No se pudo entrar en la sala' });
+    }
   });
 
   socket.on("playerMove", (data) => {
@@ -6408,23 +6473,25 @@ app.use(cookieParser());
 // cual, así que nada del juego cambia — ninguna petición legítima del cliente
 // usa claves con '$' o '.'.
 //
-// El límite de profundidad evita que un JSON muy anidado consuma CPU aquí.
+// Recorrido iterativo: cubre objetos profundos sin desbordar la pila.
 function sanearClavesMongo(obj, profundidad) {
-  if (!obj || typeof obj !== 'object' || profundidad > 8) return 0;
+  if (!obj || typeof obj !== 'object') return 0;
   let quitadas = 0;
-
-  if (Array.isArray(obj)) {
-    for (let i = 0; i < obj.length; i++) quitadas += sanearClavesMongo(obj[i], profundidad + 1);
-    return quitadas;
-  }
-
-  for (const clave of Object.keys(obj)) {
-    if (clave.charCodeAt(0) === 36 /* $ */ || clave.indexOf('.') !== -1) {
-      delete obj[clave];
-      quitadas++;
-      continue;
+  const pendientes = [obj];
+  const vistos = new WeakSet();
+  while (pendientes.length) {
+    const actual = pendientes.pop();
+    if (!actual || typeof actual !== 'object' || vistos.has(actual)) continue;
+    vistos.add(actual);
+    for (const clave of Object.keys(actual)) {
+      if (clave.charCodeAt(0) === 36 /* $ */ || clave.indexOf('.') !== -1 ||
+          clave === '__proto__' || clave === 'prototype' || clave === 'constructor') {
+        delete actual[clave];
+        quitadas++;
+      } else if (actual[clave] && typeof actual[clave] === 'object') {
+        pendientes.push(actual[clave]);
+      }
     }
-    quitadas += sanearClavesMongo(obj[clave], profundidad + 1);
   }
   return quitadas;
 }
@@ -6582,9 +6649,9 @@ app.use((req, res, next) => { req.clientIp = req.ip; next(); });
 app.use(exigirPartidaActiva);
 
 // Middleware de análisis de seguridad
-app.use(async (req, res, next) => {
+app.use(asyncRoute(async (req, res, next) => {
   await securityController.analyzeRequest(req, res, next);
-});
+}));
 
 // --- RATE LIMITERS CORREGIDOS (con validate: false para evitar error IPv6) ---
 const createCustomRateLimiter = (windowMs, max, message, skipDevelopment = false) => {
@@ -9083,7 +9150,7 @@ app.post('/api/relay/transaction',
     } catch (error) {
       console.error('❌ Error en relay transaction:', error);
       
-      res.status(500).json({
+      res.status(error.code === 'RELAY_QUEUE_CAPACITY' ? 503 : 500).json({
         success: false,
         error: error.message || 'Failed to relay transaction',
         code: 'RELAY_ERROR'
@@ -11291,6 +11358,21 @@ function _salaYPosicion(playerName) {
   return mejor;
 }
 
+/** La vida (0-100) de un jugador, con 2 s de caché: la barra de la zona PvP. */
+const _vidasPvp = new Map();
+async function _vidaPvp(playerName) {
+  const c = _vidasPvp.get(playerName);
+  if (c && Date.now() - c.t < 2000) return c.v;
+  let v = null;
+  try {
+    const doc = await PlayerStats.findOne({ playerName }).select('vida').lean();
+    if (doc) v = clampStat('vida', doc.vida);
+  } catch (_) {}
+  _vidasPvp.set(playerName, { t: Date.now(), v });
+  if (_vidasPvp.size > 500) { for (const k of _vidasPvp.keys()) { _vidasPvp.delete(k); if (_vidasPvp.size <= 250) break; } }
+  return v;
+}
+
 /** Quita `dano` de vida al jugador, en su cola (dos golpes a la vez no se pisan). */
 function _herirJugador(playerName, dano) {
   return enColaDelJugador('vida:' + playerName, async () => {
@@ -11309,6 +11391,7 @@ function _herirJugador(playerName, dano) {
       marcarPendienteDeCadena(doc, ['vida']);
       await doc.save();
     }
+    _vidasPvp.delete(playerName);
     return { quita, stats: buildStatsResponse(doc), muerto: clampStat('vida', doc.vida) <= 0 };
   });
 }
@@ -11480,6 +11563,27 @@ io.on('connection', (socket) => {
     socket.to(sala).emit('pvp:tajo', { id: socket.id, dir, arma });
   });
 
+  /* LA VIDA DE LOS DEMÁS EN LA ZONA PVP (2026-10-11): "no dice la vida del
+     otro usuario". El cliente la pide cada pocos segundos mientras hay
+     alguien en la zona; se responde con la vida (0-100) de cada socket de la
+     sala que esté al oeste del río. Con una caché corta por jugador. */
+  socket.on('pvp:vidas', async () => {
+    try {
+      const sala = socket.playerData && socket.playerData.room;
+      if (!sala || salaBase(sala) !== SALVAJE_SALA || frenado(socket, 'pvp_vidas', 1500)) return;
+      const filas = rooms[sala] || {};
+      const lista = {};
+      const ids = Object.keys(filas).filter(id => id !== socket.id && _enZonaPvp(filas[id])).slice(0, 30);
+      for (const id of ids) {
+        const n = filas[id] && filas[id].playerName;
+        if (!n) continue;
+        const v = await _vidaPvp(n);
+        if (v !== null) lista[id] = v;
+      }
+      socket.emit('pvp:vidas', { lista });
+    } catch (_) {}
+  });
+
   socket.on('pvp:golpe', async (d) => {
     try {
       const sala = socket.playerData && socket.playerData.room;
@@ -11511,7 +11615,8 @@ io.on('connection', (socket) => {
         try { s.emit('pvp:herido', { de: socket.id, deNombre, dano: r.quita, stats: r.stats, muerto: r.muerto,
                                      x: Math.round(Number(pa.x) || 0), y: Math.round(Number(pa.y) || 0) }); } catch (_) {}
       }
-      io.to(sala).emit('pvp:impacto', { id: victimaId, de: socket.id, muerto: r.muerto });
+      io.to(sala).emit('pvp:impacto', { id: victimaId, de: socket.id, muerto: r.muerto,
+                                        dano: r.quita, vida: r.stats && Number(r.stats.vida) });
       if (r.muerto) console.log(`⚔️  ${yo} derribó a ${ella} en ${sala}`);
     } catch (e) {
       console.warn('⚠️  pvp:golpe:', e.message);
@@ -11540,11 +11645,16 @@ io.on('connection', (socket) => {
 //
 // El anfitrión es el que lleva más tiempo en la sala con monstruos; si se va,
 // cierra la pestaña o cambia de sala, se elige otro en menos de 2 s.
+// EL ANFITRIÓN DORMIDO (2026-10-11): "en la mina los monstruos no hacen daño".
+// Con la pestaña oculta el juego del anfitrión se para (Phaser duerme su
+// bucle) pero su socket sigue vivo: nadie movía a los monstruos de los demás.
+// El cliente avisa con 'mobs:dormido' y aquí el mando pasa al más antiguo de
+// los que están DESPIERTOS (si todos duermen, se queda como estaba).
 // El tajo de cada uno se reenvía a la sala ('combate:tajo'): así se ve.
 // =============================================================================
 const MOBS_SALAS = new Set(['mina', 'salvaje']);
 const MOBS_GRUPOS = new Set(['salvaje', 'zombis', 'espectros', 'serpiente']);
-const _mobsSalas = new Map();     // sala -> { host: socketId|null, miembros: Map<socketId, desde> }
+const _mobsSalas = new Map();     // sala -> { host, miembros: Map<socketId, desde>, dormidos: Set<socketId> }
 
 function _mobsSocketEnSala(id, sala) {
   const s = io.sockets.sockets.get(id);
@@ -11555,11 +11665,20 @@ function _mobsSocketEnSala(id, sala) {
 function _mobsRevisar(sala) {
   const reg = _mobsSalas.get(sala);
   if (!reg) return null;
-  for (const id of [...reg.miembros.keys()]) if (!_mobsSocketEnSala(id, sala)) reg.miembros.delete(id);
+  for (const id of [...reg.miembros.keys()]) {
+    if (!_mobsSocketEnSala(id, sala)) { reg.miembros.delete(id); reg.dormidos.delete(id); }
+  }
   if (!reg.miembros.size) { _mobsSalas.delete(sala); return null; }
-  if (reg.host && reg.miembros.has(reg.host)) return reg.host;
+  const despierto = (id) => !reg.dormidos.has(id);
+  const hayDespiertos = [...reg.miembros.keys()].some(despierto);
+  // Se queda el que hay si sigue en la sala y está despierto (o todos duermen).
+  if (reg.host && reg.miembros.has(reg.host) && (despierto(reg.host) || !hayDespiertos)) return reg.host;
   let elegido = null, desde = Infinity;
-  for (const [id, t] of reg.miembros) if (t < desde) { desde = t; elegido = id; }
+  for (const [id, t] of reg.miembros) {
+    if (hayDespiertos && !despierto(id)) continue;
+    if (t < desde) { desde = t; elegido = id; }
+  }
+  if (elegido === reg.host) return elegido;
   reg.host = elegido;
   try { io.to(sala).emit('mobs:host', { host: elegido }); } catch (_) {}
   return elegido;
@@ -11574,16 +11693,28 @@ function _mobsSalaDe(socket) {
 
 io.on('connection', (socket) => {
   /* "Tengo monstruos en esta sala": entra en la lista y sabe quién manda. */
-  socket.on('mobs:hola', () => {
+  socket.on('mobs:hola', (d) => {
     const sala = _mobsSalaDe(socket);
     if (!sala || frenado(socket, 'mobs_hola', 400)) return;
     let reg = _mobsSalas.get(sala);
-    if (!reg) { reg = { host: null, miembros: new Map() }; _mobsSalas.set(sala, reg); }
+    if (!reg) { reg = { host: null, miembros: new Map(), dormidos: new Set() }; _mobsSalas.set(sala, reg); }
     if (!reg.miembros.has(socket.id)) reg.miembros.set(socket.id, Date.now());
+    if (d && d.dormido === true) reg.dormidos.add(socket.id); else reg.dormidos.delete(socket.id);
     const host = _mobsRevisar(sala);
     socket.emit('mobs:host', { host });
     // El anfitrión manda su foto ya: el que llega no espera.
     if (host && host !== socket.id) io.to(host).emit('mobs:pideFoto', { para: socket.id });
+  });
+
+  /* La pestaña de este jugador se ocultó (o volvió): si era el anfitrión y
+     hay alguien despierto, el mando pasa a ése. */
+  socket.on('mobs:dormido', (d) => {
+    const sala = _mobsSalaDe(socket);
+    if (!sala || frenado(socket, 'mobs_dormido', 150)) return;
+    const reg = _mobsSalas.get(sala);
+    if (!reg || !reg.miembros.has(socket.id)) return;
+    if (d && d.si === true) reg.dormidos.add(socket.id); else reg.dormidos.delete(socket.id);
+    _mobsRevisar(sala);
   });
 
   /* La foto de los monstruos: solo la del anfitrión pasa. */
@@ -11639,6 +11770,7 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     for (const [sala, reg] of _mobsSalas) {
+      reg.dormidos.delete(socket.id);
       if (reg.miembros.delete(socket.id) && reg.host === socket.id) { reg.host = null; _mobsRevisar(sala); }
     }
   });
@@ -11893,6 +12025,13 @@ function tradPedirJson(url) {
     const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (GrasslandForest chat)' }, timeout: TRAD_TIMEOUT_MS }, (r) => {
       let datos = '';
       r.setEncoding('utf8');
+      // IncomingMessage puede fallar después de recibir las cabeceras;
+      // ClientRequest no captura por sí solo los errores de ese stream.
+      r.once('error', reject);
+      r.once('aborted', () => reject(new Error('respuesta_interrumpida')));
+      r.once('close', () => {
+        if (!r.complete) reject(new Error('respuesta_interrumpida'));
+      });
       r.on('data', (c) => { datos += c; if (datos.length > 200000) req.destroy(new Error('respuesta_enorme')); });
       r.on('end', () => {
         if (r.statusCode !== 200) return reject(new Error('http_' + r.statusCode));
@@ -12449,10 +12588,10 @@ function desfaseParaMinuto(min, ahoraMs) {
 }
 
 // GET /api/admin/world-time — la hora y cómo está puesto el reloj.
-app.get('/api/admin/world-time', adminAuth, async (req, res) => {
+app.get('/api/admin/world-time', adminAuth, asyncRoute(async (req, res) => {
   await cargarRelojMundo();
   return res.json({ ok: true, reloj: { ..._relojMundo }, estado: estadoDelMundo(Date.now()) });
-});
+}));
 
 // POST /api/admin/world-time  { accion, hora?, minuto?, horas? }
 //   dia | noche      ahora son las 08:00 / 21:00 (en auto, adelantando; en manual, fijando)
@@ -12938,7 +13077,8 @@ const ITEM_TIPO_MAP = {
 };
 
 function itemTipoOnChain(itemId) {
-  return ITEM_TIPO_MAP[String(itemId || '')] || null;
+  const clave = String(itemId || '');
+  return Object.prototype.hasOwnProperty.call(ITEM_TIPO_MAP, clave) ? ITEM_TIPO_MAP[clave] : null;
 }
 
 // Tope de stack por ítem (mismo criterio que ItemDefinitions.maxStack). Se usa
@@ -14311,7 +14451,8 @@ app.get('/api/admin/top-jugadores', adminAuth, apiLimiter, async (req, res) => {
 // EL CÓDIGO: 8 letras y números sin los que se confunden (sin 0/O ni 1/I),
 // uno por cuenta, se crea la primera vez que se pide. El enlace es el juego
 // con `?ref=CÓDIGO`; el cliente lo guarda y lo reclama al entrar
-// (gf-invitaciones.js). También se puede escribir a mano en el dashboard.
+// (gf-invitaciones.js). No se escribe a mano (2026-10-12): lo detecta el
+// sistema por el código del enlace.
 //
 // LAS REGLAS: una cuenta se apunta a UN invitador, una sola vez, y solo en
 // sus primeros INVITA_DIAS días; no vale el propio código ni devolver la
@@ -14326,6 +14467,21 @@ app.get('/api/admin/top-jugadores', adminAuth, apiLimiter, async (req, res) => {
 // =============================================================================
 const INVITA_DIAS = 14;
 const INVITA_ACTIVO_MS = 30 * 60 * 1000;      // "activo": media hora jugada
+/* LAS DOS FORMAS DE ENTRAR CON UNA INVITACIÓN (2026-10-11). "El login es
+   https://app.grasslandforest.com/; si alguien ya está logueado y usa un
+   enlace de invitación no le debe servir, pero si es un usuario nuevo
+   iniciando sesión sí. Y el código que me invitó lo quiero poder poner una
+   vez (y el mío no)."
+     · EL ENLACE (`origen: 'enlace'`): el login con ?ref=CÓDIGO. Solo vale para
+       una cuenta NUEVA: creada hace menos de INVITA_ENLACE_MS.
+     · EL CÓDIGO A MANO (`origen: 'codigo'`, dashboard → Invites): una vez,
+       cuando sea, salvo el propio y el de quien entró con tu invitación.
+   (2026-10-12) "En invitaciones no quiero que la persona ponga en un input
+   quién la invitó: que el sistema lo detecte solo según su código." El código
+   a mano YA NO EXISTE: todo reclamo es el del enlace (`origen` se ignora) y
+   solo vale en una cuenta nueva. */
+const INVITA_ENLACE_MS = 6 * 60 * 60 * 1000;
+const LOGIN_URL = String(process.env.LOGIN_URL || 'https://app.grasslandforest.com/').replace(/\/?$/, '/');
 const INVITA_LETRAS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const INVITA_CODIGO_RE = /^[A-HJ-NP-Z2-9]{8}$/;
 const DISCORD_RE = /^(?:[a-z0-9_.]{2,32}|[^\s#@:]{2,32}#\d{4})$/i;
@@ -14416,12 +14572,10 @@ app.get('/api/invitaciones/mia', apiLimiter, authMiddleware, async (req, res) =>
                desde: m.invitadoEn || null, horas: Math.round((m.tiempoJugadoMs || 0) / 36000) / 100,
                activo: (m.tiempoJugadoMs || 0) >= INVITA_ACTIVO_MS };
     }).sort((x, y) => new Date(y.desde || 0) - new Date(x.desde || 0));
-    const registrado = a.registeredAt || a.createdAt || null;
-    const nuevo = !registrado || Date.now() - new Date(registrado).getTime() < INVITA_DIAS * 86400000;
     return res.json({
-      ok: true, codigo, wallet: String(gp.address || '').toLowerCase(), invitadoPor,
+      ok: true, codigo, enlace: LOGIN_URL + '?ref=' + codigo, wallet: String(gp.address || '').toLowerCase(), invitadoPor,
       invitados: invitados.slice(0, 200), total: invitados.length, activos: invitados.filter(i => i.activo).length,
-      discord: a.discord || '', puedeReclamar: !a.invitadoPor && nuevo, diasParaReclamar: INVITA_DIAS
+      discord: a.discord || '', puedeReclamar: !a.invitadoPor, diasParaReclamar: INVITA_DIAS
     });
   } catch (e) {
     console.error('GET /api/invitaciones/mia:', e);
@@ -14433,18 +14587,23 @@ app.post('/api/invitaciones/reclamar', apiLimiter, authMiddleware, csrfProtectio
   try {
     const gp = await jugadorDeLaSesion(req);
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
-    const codigo = String((req.body && req.body.codigo) || '').trim().toUpperCase();
+    const codigo = String((req.body && req.body.codigo) || '').replace(/[\s-]/g, '').toUpperCase();
     if (!INVITA_CODIGO_RE.test(codigo)) return res.status(400).json({ error: 'codigo_invalido', message: 'That invite code is not valid.' });
     const quien = await UserActivity.findOne({ codigoInvitacion: codigo }).select('playerName invitadoPor ip').lean();
     if (!quien) return res.status(404).json({ error: 'codigo_desconocido', message: 'No player has that invite code.' });
-    if (quien.playerName === gp.playerName) return res.status(400).json({ error: 'propio', message: 'You cannot use your own invite code.' });
+    if (quien.playerName === gp.playerName) return res.status(400).json({ error: 'propio', message: 'That is your own invite link.' });
     if (quien.invitadoPor === gp.playerName) return res.status(400).json({ error: 'circular', message: 'That player joined with your invite.' });
     await codigoDeInvitacion(gp.playerName);          // que exista su documento
     const yo = await UserActivity.findOne({ playerName: gp.playerName }).select('invitadoPor registeredAt createdAt ip').lean() || {};
     if (yo.invitadoPor) return res.status(409).json({ error: 'ya_invitado', message: 'You already joined with an invite.' });
-    const registrado = yo.registeredAt || yo.createdAt || null;
-    if (registrado && Date.now() - new Date(registrado).getTime() > INVITA_DIAS * 86400000) {
-      return res.status(409).json({ error: 'tarde', message: 'Invite codes can only be used in your first ' + INVITA_DIAS + ' days.' });
+    // El enlace solo vale para una cuenta recién creada (quien ya jugaba y
+    // abre un enlace de otro no queda "invitado"). Ya no hay código a mano.
+    {
+      const ficha0 = await GamePlayer.findOne({ playerName: gp.playerName }).select('createdAt').lean();
+      const creada = (ficha0 && ficha0.createdAt) || yo.registeredAt || null;
+      if (!creada || Date.now() - new Date(creada).getTime() > INVITA_ENLACE_MS) {
+        return res.status(409).json({ error: 'no_nuevo', message: 'Invite links only count for new accounts.' });
+      }
     }
     const mismaIp = !!(yo.ip && quien.ip && String(yo.ip) === String(quien.ip));
     const r = await UserActivity.findOneAndUpdate({ playerName: gp.playerName, invitadoPor: null },
@@ -16183,11 +16342,17 @@ async function configColeccionNft() {
 function proveedorNft(cfg) {
   const rpc = String((cfg && cfg.rpc) || '').trim();
   if (!rpc) return provider;                       // la red del juego
-  if (!_nftProveedores.has(rpc)) {
-    if (_nftProveedores.size > 8) _nftProveedores.clear();
-    _nftProveedores.set(rpc, new ethers.JsonRpcProvider(rpc, Number(cfg.chainId) || undefined, { staticNetwork: true }));
+  const clave = String(Number(cfg.chainId) || '') + ':' + rpc;
+  if (!_nftProveedores.has(clave)) {
+    if (_nftProveedores.size >= 8) {
+      const vieja = _nftProveedores.keys().next().value;
+      const anterior = _nftProveedores.get(vieja);
+      _nftProveedores.delete(vieja);
+      try { anterior.destroy(); } catch (_) {}
+    }
+    _nftProveedores.set(clave, new ethers.JsonRpcProvider(rpc, Number(cfg.chainId) || undefined, { staticNetwork: true }));
   }
-  return _nftProveedores.get(rpc);
+  return _nftProveedores.get(clave);
 }
 
 /** ipfs://… → pasarela https. El resto se deja como está. */
@@ -16263,7 +16428,8 @@ app.get('/api/nft/mios', apiLimiter, authMiddleware, async (req, res) => {
 
     const cache = _nftCacheJugador.get(address);
     const refrescar = req.query && req.query.refrescar === '1';
-    if (cache && !refrescar && Date.now() - cache.at < 2 * 60 * 1000 && cache.contrato === cfg.contrato) {
+    if (cache && !refrescar && Date.now() - cache.at < 2 * 60 * 1000 &&
+        cache.contrato === cfg.contrato && cache.chainId === cfg.chainId && cache.rpc === cfg.rpc) {
       return res.json(cache.datos);
     }
     const c = new ethers.Contract(cfg.contrato, NFT_ABI, proveedorNft(cfg));
@@ -16276,7 +16442,8 @@ app.get('/api/nft/mios', apiLimiter, authMiddleware, async (req, res) => {
     }
     const datos = { ok: true, configurada: true, coleccion, address, total, truncado: total > tokens.length, tokens };
     if (_nftCacheJugador.size > 1000) _nftCacheJugador.clear();
-    _nftCacheJugador.set(address, { at: Date.now(), contrato: cfg.contrato, datos });
+    _nftCacheJugador.set(address, { at: Date.now(), contrato: cfg.contrato,
+      chainId: cfg.chainId, rpc: cfg.rpc, datos });
     return res.json(datos);
   } catch (e) {
     console.warn('GET /api/nft/mios:', e.shortMessage || e.message);
@@ -16534,7 +16701,7 @@ app.get('/pingxxx', (req, res) => {
 });
 
 // --- LIMPIEZA PERIÓDICA ---
-setInterval(async () => {
+setIntervalAsync(async () => {
   try {
     const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
     const result = await PlayerAuth.updateMany(
@@ -16557,7 +16724,7 @@ setInterval(async () => {
   }
 }, 5 * 60 * 1000); // Cada 5 minutos
 
-setInterval(async () => {
+setIntervalAsync(async () => {
   try {
     const result = await RateLimit.deleteMany({ firstAttempt: { $lt: new Date(Date.now() - 24 * 60 * 60 * 1000) } });
     if (result.deletedCount > 0) console.log(`🧹 Limpiados ${result.deletedCount} rate limits expirados`);
@@ -16567,7 +16734,7 @@ setInterval(async () => {
 }, 30 * 60 * 1000);
 
 // Limpieza diaria de progresos antiguos
-setInterval(async () => {
+setIntervalAsync(async () => {
   try {
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
@@ -16584,7 +16751,7 @@ setInterval(async () => {
 }, 24 * 60 * 60 * 1000);
 
 // Limpieza de tokens expirados
-setInterval(async () => {
+setIntervalAsync(async () => {
   try {
     const result = await RefreshToken.deleteMany({ expiresAt: { $lt: new Date() } });
     if (result.deletedCount > 0) console.log(`🧹 Limpiados ${result.deletedCount} refresh tokens expirados`);
@@ -16771,7 +16938,7 @@ app.post('/api/merge/cooldown/set',
 );
 
 // Limpieza periódica de merge cooldowns expirados (cada hora)
-setInterval(async () => {
+setIntervalAsync(async () => {
   try {
     const result = await MergeCooldown.deleteMany({ cooldownUntil: { $lt: new Date() } });
     if (result.deletedCount > 0) {
@@ -18014,6 +18181,9 @@ async function sincronizarIdentidadEnCadena(playerName) {
   }
 
   if (completo && hayNivel && hayNombre) {
+    if (_identidadFirma.size >= 5000 && !_identidadFirma.has(playerName)) {
+      _identidadFirma.delete(_identidadFirma.keys().next().value);
+    }
     _identidadFirma.set(playerName, JSON.stringify([address, objetivo]));
   }
   return { ok: completo, objetivo };
@@ -18304,6 +18474,7 @@ async function migrarIslaAlDoble(playerName, address) {
     }
     console.log(`🏝️  ${playerName || addr}: ${viejos.length} construcción(es) llevadas a la isla al doble`);
   }
+  if (_islaMigrada.size >= 10000) _islaMigrada.delete(_islaMigrada.values().next().value);
   _islaMigrada.add(addr);
 }
 
@@ -19774,48 +19945,48 @@ console.log('✅ Soulbound routes loaded: /api/soulbound/:playerName');
 //
 //   Ahora toda ruta exige ser el dueño (requireOwner), así que solo se crean
 //   buzones de jugadores reales, y el remitente lo pone el SERVIDOR.
-if (!global._mailStore) global._mailStore = {};
+if (!global._mailStore) global._mailStore = Object.create(null);
 
 // Tope de mensajes guardados por jugador: el buzón es un array en memoria, sin
 // límite crecía para siempre en cuentas muy activas.
 const MAIL_MAX_POR_JUGADOR = 100;
 
 function getPlayerMail(player) {
-  if (!global._mailStore[player]) global._mailStore[player] = [];
+  if (!Object.prototype.hasOwnProperty.call(global._mailStore, player)) global._mailStore[player] = [];
   return global._mailStore[player];
 }
 
 // GET /api/mail/:playerName — list mails
-app.get('/api/mail/:playerName', authMiddleware, async (req, res) => {
+app.get('/api/mail/:playerName', authMiddleware, asyncRoute(async (req, res) => {
   if (!await requireOwner(req, res, req.params.playerName)) return;
   res.json({ mails: getPlayerMail(req.params.playerName) });
-});
+}));
 
 // POST /api/mail/:playerName/read-all — mark all read
-app.post('/api/mail/:playerName/read-all', authMiddleware, csrfProtection, async (req, res) => {
+app.post('/api/mail/:playerName/read-all', authMiddleware, csrfProtection, asyncRoute(async (req, res) => {
   if (!await requireOwner(req, res, req.params.playerName)) return;
   getPlayerMail(req.params.playerName).forEach(m => { m.read = true; });
   res.json({ ok: true });
-});
+}));
 
 // DELETE /api/mail/:playerName/clear — delete all
-app.delete('/api/mail/:playerName/clear', authMiddleware, csrfProtection, async (req, res) => {
+app.delete('/api/mail/:playerName/clear', authMiddleware, csrfProtection, asyncRoute(async (req, res) => {
   if (!await requireOwner(req, res, req.params.playerName)) return;
   global._mailStore[req.params.playerName] = [];
   res.json({ ok: true });
-});
+}));
 
 // DELETE /api/mail/:playerName/:mailId — delete one
-app.delete('/api/mail/:playerName/:mailId', authMiddleware, csrfProtection, async (req, res) => {
+app.delete('/api/mail/:playerName/:mailId', authMiddleware, csrfProtection, asyncRoute(async (req, res) => {
   if (!await requireOwner(req, res, req.params.playerName)) return;
   const store = getPlayerMail(req.params.playerName);
   const idx = store.findIndex(m => String(m.id) === String(req.params.mailId));
   if (idx !== -1) store.splice(idx, 1);
   res.json({ ok: true });
-});
+}));
 
 // POST /api/mail/:playerName — send a mail (internal use or admin)
-app.post('/api/mail/:playerName', authMiddleware, csrfProtection, async (req, res) => {
+app.post('/api/mail/:playerName', authMiddleware, csrfProtection, asyncRoute(async (req, res) => {
   if (!await requireOwner(req, res, req.params.playerName)) return;
 
   const { subject, body } = req.body || {};
@@ -19838,7 +20009,7 @@ app.post('/api/mail/:playerName', authMiddleware, csrfProtection, async (req, re
   if (store.length > MAIL_MAX_POR_JUGADOR) store.length = MAIL_MAX_POR_JUGADOR;
 
   res.json({ ok: true, mail });
-});
+}));
 
 // =============================================================================
 // BADGES ROUTES  — /api/badges/:playerName
@@ -21196,6 +21367,21 @@ function purgarMapasEnMemoria() {
   // Se quedó fuera del barrido original y crece igual que los otros: una
   // entrada por jugador que espante un cuervo, para siempre.
   stats._cuervoUltimo       = purgarMapaDeTiempos(_cuervoUltimo,       ahora, PURGA_EDAD_MS);
+  stats._pescaUltimo        = purgarMapaDeTiempos(_pescaUltimo,        ahora, PURGA_EDAD_MS);
+  stats._casillasUltimoEnvio = purgarMapaDeTiempos(_casillasUltimoEnvio, ahora, PURGA_EDAD_MS);
+  // Sesiones y cachés de jugadores que nunca vuelven también deben caducar.
+  const caducadas = (mapa, vencida) => {
+    let borradas = 0;
+    for (const [clave, valor] of mapa) {
+      if (!valor || vencida(valor)) { mapa.delete(clave); borradas++; }
+    }
+    return borradas;
+  };
+  stats._pescaSesiones = caducadas(_pescaSesiones, s => ahora - s.t0 > PESCA_SESION_MS);
+  stats._pvpEspadas = caducadas(_pvpEspadas, c => c.hasta <= ahora);
+  stats._cacheFantasma = caducadas(_cacheFantasma, c => ahora - c.t >= FANTASMA_CACHE_MS);
+  stats._tradUso = caducadas(_tradUso, u => ahora - u.desde > 60000);
+  stats._nftCacheJugador = caducadas(_nftCacheJugador, c => ahora - c.at > 2 * 60 * 1000);
 
   // ── Historial de chat de salas que ya no tiene nadie ──────────────────────
   // El historial es por sala y las salas llevan canal; una partida larga puede
@@ -22039,7 +22225,9 @@ const GFBrawlMotor = (function () {
     vaca:      { vel: 0.90, vida: 1.15, arma: 'colmillos',  super: 'embestida', etiqueta: 'Bull' }
   };
 
-  function especie(id) { return ESPECIES[id] || ESPECIES.perro; }
+  function propia(tabla, clave) { return Object.prototype.hasOwnProperty.call(tabla, clave); }
+  function finito(valor, respaldo, min, max) { var n = Number(valor); return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : respaldo; }
+  function especie(id) { return propia(ESPECIES, id) ? ESPECIES[id] : ESPECIES.perro; }
 
   // =========================================================================
   // LA REJILLA
@@ -22055,7 +22243,9 @@ const GFBrawlMotor = (function () {
        '+' comedero  se pisa; de vez en cuando sale carne que cura
        '.' libre */
   function crearRejilla(def) {
-    var W = def.ancho | 0, Hh = def.alto | 0, C = def.celda || 32;
+    if (!def || !Number.isInteger(def.ancho) || !Number.isInteger(def.alto) || def.ancho < 1 || def.alto < 1 || def.ancho * def.alto > 65536) throw new TypeError('dimensiones de arena inválidas');
+    var W = def.ancho, Hh = def.alto, C = def.celda === undefined ? 32 : Number(def.celda);
+    if (!Number.isFinite(C) || C <= 0 || C > 1024) throw new TypeError('tamaño de casilla inválido');
     var celdas = new Array(W * Hh);
     var cajas = {};
     var curas = [];
@@ -22082,7 +22272,7 @@ const GFBrawlMotor = (function () {
   }
 
   function celdaEn(R, cx, cy) {
-    if (cx < 0 || cy < 0 || cx >= R.ancho || cy >= R.alto) return '#';
+    if (!Number.isInteger(cx) || !Number.isInteger(cy) || cx < 0 || cy < 0 || cx >= R.ancho || cy >= R.alto) return '#';
     return R.celdas[cy * R.ancho + cx];
   }
 
@@ -22153,7 +22343,12 @@ const GFBrawlMotor = (function () {
    * lado a lado en un fotograma lento.
    */
   function moverCirculo(R, x, y, dx, dy, r) {
+    if (![x, y, dx, dy, r].every(Number.isFinite) || r <= 0) {
+      return [finito(x, R.anchoPx / 2, 0, R.anchoPx), finito(y, R.altoPx / 2, 0, R.altoPx)];
+    }
     var largo = Math.max(Math.abs(dx), Math.abs(dy));
+    var limite = Math.min(Math.max(R.anchoPx, R.altoPx) * 2, r * 0.9 * 4096);
+    if (largo > limite) { dx *= limite / largo; dy *= limite / largo; largo = limite; }
     var pasos = Math.max(1, Math.ceil(largo / (r * 0.9)));
     var sx = dx / pasos, sy = dy / pasos;
     var p = [x, y];
@@ -22173,6 +22368,8 @@ const GFBrawlMotor = (function () {
    * (El choque con los luchadores lo hace el servidor aparte.)
    */
   function avanzarBala(R, b, dist, alPaso) {
+    if (!b || ![b.x, b.y, b.dx, b.dy, b.resto, dist].every(Number.isFinite) || dist < 0) return { fin: true };
+    dist = Math.min(dist, Math.max(0, b.resto) + 6, Math.max(R.anchoPx, R.altoPx) * 2);
     var n = Math.max(1, Math.ceil(dist / 6));
     var paso = dist / n;
     for (var i = 0; i < n; i++) {
@@ -22193,6 +22390,7 @@ const GFBrawlMotor = (function () {
 
   /** ¿Pasa una bala de A a B? (los arbustos y el agua no tapan). */
   function lineaDeTiro(R, x0, y0, x1, y1) {
+    if (![x0, y0, x1, y1].every(Number.isFinite) || x0 < 0 || y0 < 0 || x1 < 0 || y1 < 0 || x0 > R.anchoPx || x1 > R.anchoPx || y0 > R.altoPx || y1 > R.altoPx) return false;
     var dx = x1 - x0, dy = y1 - y0;
     var largo = Math.sqrt(dx * dx + dy * dy);
     var n = Math.max(1, Math.ceil(largo / 8));
@@ -22221,9 +22419,10 @@ const GFBrawlMotor = (function () {
    * }
    */
   function crearPartida(op) {
+    if (!op || !Array.isArray(op.luchadores) || op.luchadores.length < 1 || op.luchadores.length > 64 || op.luchadores.some(function (s) { return !s || typeof s !== 'object'; })) throw new TypeError('luchadores inválidos');
     var ahora = op.ahora || function () { return Date.now(); };
     var azar = op.azar || Math.random;
-    var def = typeof op.arena === 'string' ? ARENAS[op.arena] : op.arena;
+    var def = typeof op.arena === 'string' ? (propia(ARENAS, op.arena) ? ARENAS[op.arena] : null) : op.arena;
     if (!def) throw new Error('arena desconocida: ' + op.arena);
     var R = crearRejilla(def);
     var t0 = ahora();
@@ -22236,7 +22435,7 @@ const GFBrawlMotor = (function () {
       def: def,
       R: R,
       luchadores: [],
-      porId: {},
+      porId: Object.create(null),
       balas: [],
       sigBala: 1,
       objetos: [],
@@ -22295,7 +22494,7 @@ const GFBrawlMotor = (function () {
   }
 
   function agregarCajas(P) {
-    if (!ARENAS[P.arenaId]) return;
+    if (!propia(ARENAS, P.arenaId)) return;
     var R = P.R, candidatos = [];
     for (var y = 2; y < R.alto - 2; y++) for (var x = 2; x < R.ancho - 2; x++) {
       var idx = y * R.ancho + x;
@@ -22389,7 +22588,7 @@ const GFBrawlMotor = (function () {
        mascota). Si encima se les sumara el extra de su especie, el cocodrilo
        de la ronda 5 se pasaría de ese techo. */
     var multVida = s.vidaFija ? 1 : esp.vida;
-    var maxHp = Math.max(1, Math.round((Number(s.maxHp) || 92) * REGLAS.ESCALA_VIDA * multVida));
+    var maxHp = Math.max(1, Math.round(finito(s.maxHp, 92, 1, 1000000) * REGLAS.ESCALA_VIDA * multVida));
     var salud = Number.isFinite(Number(s.salud)) ? Math.max(0, Math.min(1, Number(s.salud))) : 1;
     salud = Math.max(REGLAS.SALUD_MINIMA_ENTRADA, salud);
     var l = {
@@ -22400,11 +22599,11 @@ const GFBrawlMotor = (function () {
       playerName: String(s.playerName || 'Player').slice(0, 40),
       petName: String(s.petName || 'Pet').slice(0, 24),
       address: String(s.address || ''),
-      especie: ESPECIES[s.especie] ? s.especie : 'perro',
-      nivel: Math.max(1, Number(s.nivel) || 1),
+      especie: propia(ESPECIES, s.especie) ? s.especie : 'perro',
+      nivel: finito(s.nivel, 1, 1, 1000000),
       maxHp: maxHp,
       hp: Math.max(1, Math.round(maxHp * salud)),
-      ataque: Math.max(1, Number(s.ataque) || 12),
+      ataque: finito(s.ataque, 12, 1, 100000),
       x: x, y: y, r: REGLAS.RADIO,
       vel: REGLAS.VEL * esp.vel,
       velBase: REGLAS.VEL * esp.vel,
@@ -22738,6 +22937,7 @@ const GFBrawlMotor = (function () {
   function paso(P) {
     if (!P || P.fase === 'fin') return;
     var ahora = P.ahora();
+    if (!Number.isFinite(ahora)) return;
     if (P.fase === 'cuenta') {
       if (ahora < P.tCombate) return;
       P.fase = 'combate';
@@ -23275,6 +23475,7 @@ const GFBrawlMotor = (function () {
 
   /** Camino por casillas (BFS con diagonales que no muerden esquinas). */
   function buscarRuta(R, x0, y0, x1, y1, maxNodos) {
+    if (![x0, y0, x1, y1].every(Number.isFinite) || x0 < 0 || y0 < 0 || x0 >= R.anchoPx || y0 >= R.altoPx) return null;
     var W = R.ancho, Hh = R.alto;
     var a = Math.floor(x0 / R.celda) + Math.floor(y0 / R.celda) * W;
     var bx = Math.floor(x1 / R.celda), by = Math.floor(y1 / R.celda);
@@ -23828,6 +24029,7 @@ const GFBrawlMotor = (function () {
 
   /** ¿Se puede ir andando en línea recta? (con el ancho del cuerpo) */
   function lineaLibre(R, x0, y0, x1, y1, r) {
+    if (![x0, y0, x1, y1, r].every(Number.isFinite) || x0 < 0 || y0 < 0 || x1 < 0 || y1 < 0 || x0 > R.anchoPx || x1 > R.anchoPx || y0 > R.altoPx || y1 > R.altoPx) return false;
     var dx = x1 - x0, dy = y1 - y0;
     var largo = Math.sqrt(dx * dx + dy * dy);
     if (largo < 1) return true;
@@ -23929,7 +24131,9 @@ const BRAWL_ARENAS = Object.keys(GFBrawlMotor.ARENAS);
 const BRAWL_MAX_JUGADORES = 6;
 const BRAWL_BUSQUEDA_MS = 150000;
 const BRAWL_SALA_MS = BRAWL_BUSQUEDA_MS;            // juntados dos, se espera esto a que entren más
-const BRAWL_ESPERA_LIBRE_MS = 20000;   // tras esto en cola, se empareja con cualquier nivel
+// Tras esto en cola, se empareja con cualquier nivel (2026-10-11: eran 20 s y
+// dos amigos de niveles distintos no se juntaban en la misma sala a tiempo).
+const BRAWL_ESPERA_LIBRE_MS = 8000;
 
 /** La arena sale del id de la partida: todos los de una partida ven la misma. */
 function brawlElegirArena(semilla) {
@@ -24483,7 +24687,14 @@ function brawlAvisarSala() {
 function brawlComprobarListos() {
   if (!brawlSala || !brawlSala.regs.length) return false;
   const vivos = brawlSala.regs.filter((r) => isBattleAdmissionCurrent(r.socket, r.ticket));
-  if (!vivos.length || !vivos.every((r) => r.ticket && r.ticket.listo)) return false;
+  /* "EN LAS BATALLAS LOS OTROS JUGADORES NO ENTRAN CONMIGO" (2026-10-11).
+     Quien abría la sala solo y le daba a "Ready" la lanzaba al instante (todos
+     los de la sala, que era él, estaban listos): la partida empezaba contra
+     bots y el amigo que llegaba un segundo después caía en otra. El "todos
+     listos" solo adelanta la salida con DOS jugadores de verdad o más; solo,
+     se espera a que entre alguien o a que acabe la cuenta atrás. */
+  if (vivos.length < 2) return false;
+  if (!vivos.every((r) => r.ticket && r.ticket.listo)) return false;
   brawlLanzarSala();
   return true;
 }
@@ -26053,6 +26264,7 @@ app.use((req, res, next) => {
 
 app.use((err, req, res, next) => {
   console.error('❌ Error no manejado:', err);
+  if (res.headersSent) return next(err);
   res.status(500).json({ 
     error: 'internal_server_error', 
     message: NODE_ENV === 'development' ? err.message : undefined 
@@ -26138,6 +26350,17 @@ let _cerrando = false;
 function cerrarOrdenadamente(motivo, codigo) {
   if (_cerrando) return;
   _cerrando = true;
+  for (const timer of _intervalosAsync) clearInterval(timer);
+  _intervalosAsync.clear();
+  for (const v of _venenos.values()) clearTimeout(v.reloj);
+  _venenos.clear();
+  for (const timer of _identidadTimer.values()) clearTimeout(timer);
+  for (const timer of _casillasTimer.values()) clearTimeout(timer);
+  _identidadTimer.clear();
+  _casillasTimer.clear();
+  for (const prov of _nftProveedores.values()) { try { prov.destroy(); } catch (_) {} }
+  _nftProveedores.clear();
+  try { provider.destroy(); } catch (_) {}
   console.log(`🛑 Cerrando servidor (${motivo})...`);
   // Un tope: si algo se queda colgado, no se puede dejar el proceso zombi.
   const rendicion = setTimeout(() => process.exit(codigo), 8000);
