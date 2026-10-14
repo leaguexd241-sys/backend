@@ -21,6 +21,10 @@ const http = require("http");
 const { Server } = require("socket.io");
 const https = require('https');
 const compression = require('compression');
+const { createChainAudit } = require('./litvm-chain-audit.cjs');
+const { mountImpactAnalytics } = require('./litvm-impact-analytics.cjs');
+// Defined early: socket callbacks can safely check the future analytics mount.
+let impactAnalytics = null;
 
 // Express 4 no propaga rechazos de handlers async al middleware de errores.
 function asyncRoute(handler) {
@@ -5130,6 +5134,15 @@ function anotarTiempoJugado(socket) {
     socket._jugandoDesde = ahora;
     // Menos de un segundo no se anota, y mas de 24 h es un reloj roto.
     if (!quien || rato < 1000 || rato > 86400000) return;
+    if (impactAnalytics) {
+      impactAnalytics.recordPlaytimeSegment({
+        playerName: quien,
+        address: socket.authenticatedAddress || null,
+        sessionKey: socket.handshake?.auth?.sesion || socket.id,
+        from: ahora - rato,
+        to: ahora
+      }).catch(() => console.warn('[LitVM impact] No se pudo persistir el segmento de partida.'));
+    }
     UserActivity.updateOne(
       { playerName: quien },
       { $inc: { tiempoJugadoMs: rato } },
@@ -26246,6 +26259,25 @@ io.on('connection', (socket) => {
 
 console.log('✅ Amistades cargadas: sockets friends:* (solicitudes, presencia y privados)');
 
+
+// --- AUDITORIA LITVM: ledger aditivo, sin modificar datos ni contadores legacy ---
+const chainAudit = createChainAudit({
+  mongoose, ethers, provider, GamePlayer,
+  RelayTransaction: RelayedTransaction,
+  contractAddress: CONTRACTS.ITEMS_CONTRACT.address,
+  contractAbi: CONTRACTS.ITEMS_CONTRACT.abi,
+  chainId: CHAIN_ID,
+  getRelayerWallet: () => relayerWallet
+});
+impactAnalytics = mountImpactAnalytics({
+  app, mongoose, ethers, provider, GamePlayer, UserActivity, PlayerPlaytime,
+  RelayTransaction: RelayedTransaction, chainAudit,
+  getRelayerWallet: () => relayerWallet,
+  contractAddress: CONTRACTS.ITEMS_CONTRACT.address,
+  chainId: CHAIN_ID, explorerUrl: EXPLORER_URL,
+  adminAuth, apiLimiter, strictLimiter, csrfProtection
+});
+chainAudit.startMaintenance();
 
 // --- MANEJO DE ERRORES ---
 // FIX: '/api/*' como string también se rompe en Express 5 / path-to-regexp 8+
