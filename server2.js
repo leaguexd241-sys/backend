@@ -12791,8 +12791,12 @@ const MONSTRUOS_BOTIN = {
     botin: [['Semillax', 1, 3], ['Semillax1', 1, 3], ['carbon', 1, 2]] },
   zombi_podrido: { nombre: 'Rotting Ghoul', salas: ['cementerio'], enfriaMs: 6 * 60 * 1000, exp: 130, montones: [1, 2], instancias: 5,
     botin: [['Semillax3', 1, 3], ['Semillax4', 1, 3], ['carbon', 1, 3]] },
-  esqueleto_cementerio: { nombre: 'Bone Archer', salas: ['cementerio'], enfriaMs: 5 * 60 * 1000, exp: 120, montones: [1, 2], instancias: 7,
+  esqueleto_cementerio: { nombre: 'Bone Archer', salas: ['cementerio'], enfriaMs: 5 * 60 * 1000, exp: 120, montones: [1, 2], instancias: 11,
     botin: [['mineral_piedra', 2, 4], ['carbon', 1, 2]] },
+  // (2026-10-19) "Quiero que en el cementerio existan esqueletos": más
+  // arqueros (de 5 a 8) y el guerrero esqueleto, cuerpo a cuerpo (8).
+  esqueleto_guerrero: { nombre: 'Skeleton Warrior', salas: ['cementerio'], enfriaMs: 5 * 60 * 1000, exp: 130, montones: [1, 2], instancias: 11,
+    botin: [['mineral_piedra_hierro', 1, 2], ['mineral_piedra', 1, 3], ['carbon', 1, 2]] },
   espectro_cementerio: { nombre: 'Restless Spirit', salas: ['cementerio'], enfriaMs: 7 * 60 * 1000, exp: 170, montones: [1, 2], instancias: 5,
     botin: [['mineral_piedra_cobre', 1, 3], ['Semillax2', 1, 3]] },
   golem_cripta: { nombre: 'Crypt Golem', salas: ['cementerio'], enfriaMs: 8 * 60 * 1000, exp: 200, montones: [2, 3], instancias: 4,
@@ -12902,25 +12906,47 @@ app.post('/api/monstruos/botin/recoger', apiLimiter, authMiddleware, csrfProtect
     if (Date.now() > b.hasta) { _botinPendiente.delete(id); return res.json({ ok: false, motivo: 'caducado' }); }
     if (b.recogiendo) return res.json({ ok: false, motivo: 'en_curso' });
     b.recogiendo = true;
+    /* EN COLA Y SIN ESPERAR A LA CADENA (2026-10-19): "cuando mato un
+       monstruo suelta objetos y, al pasar por encima, tarda mucho en
+       tomarlos; quiero que los tome y que las transacciones se hagan en cola".
+       Igual que el suelo (_ticketSuelo): con ticket se contesta ya y el
+       acuñado va a la cola del jugador ('suelo:' + cuenta: una transacción
+       detrás de otra y sin pisarse la factura); el resultado llega por el
+       socket ('botin:acunado' / 'botin:fallido'). Sin ticket, como antes. */
     const tipo = ITEM_TIPO_MAP[b.itemId];
-    let factura = null;
-    try { factura = tipo ? await mintGatherReward(b.address, tipo, b.cantidad) : null; } catch (e) { factura = null; }
-    if (!factura || !factura.id) {
-      b.recogiendo = false;                        // se puede volver a intentar
-      return res.status(502).json({ ok: false, motivo: 'cadena', message: 'The chain is busy. Try picking it up again.' });
-    }
-    _botinPendiente.delete(id);
-    try {
-      const doc = await GamePlayer.findOne({ playerName: gp.playerName });
-      if (doc) {
-        const r2 = ponerFacturaEnSlots(doc.inventory, doc.chest, b.itemId, factura);
-        doc.inventory = r2.inventory; doc.chest = r2.chest;
-        doc.markModified('inventory'); doc.markModified('chest');
-        await doc.save();
+    const conTicket = _ticketSuelo(req.body && req.body.ticket);
+    const trabajo = enColaDelJugador('suelo:' + String(b.address || '').toLowerCase(), async () => {
+      let factura = null;
+      try { factura = tipo ? await mintGatherReward(b.address, tipo, b.cantidad) : null; } catch (e) { factura = null; }
+      if (!factura || !factura.id) {
+        b.recogiendo = false;                      // se puede volver a intentar
+        return null;
       }
-    } catch (e) { console.warn('⚠️  botín: casilla en Mongo:', e.message); }
-    return res.json({ ok: true, itemId: b.itemId, cantidad: b.cantidad,
-      factura: { invoiceId: factura.id, manualId: factura.manualId, cantidad: factura.cantidad } });
+      _botinPendiente.delete(id);
+      try {
+        const doc = await GamePlayer.findOne({ playerName: gp.playerName });
+        if (doc) {
+          const r2 = ponerFacturaEnSlots(doc.inventory, doc.chest, b.itemId, factura);
+          doc.inventory = r2.inventory; doc.chest = r2.chest;
+          doc.markModified('inventory'); doc.markModified('chest');
+          await doc.save();
+        }
+      } catch (e) { console.warn('⚠️  botín: casilla en Mongo:', e.message); }
+      return { invoiceId: factura.id, manualId: factura.manualId, cantidad: factura.cantidad };
+    }).catch((e) => {
+      b.recogiendo = false;
+      console.warn('⚠️  botín: cola de recoger:', e && e.message);
+      return null;
+    });
+    const datos = { itemId: b.itemId, cantidad: b.cantidad };
+    if (!conTicket) {
+      const factura = await trabajo;
+      if (!factura) return res.status(502).json({ ok: false, motivo: 'cadena', message: 'The chain is busy. Try picking it up again.' });
+      return res.json(Object.assign({ ok: true }, datos, { factura }));
+    }
+    trabajo.then((factura) => _avisarJugadorSuelo(gp.playerName, factura ? 'botin:acunado' : 'botin:fallido',
+      Object.assign({ ticket: conTicket, id }, datos, factura ? { factura } : { message: 'The chain is busy: the loot is still there, step on it again.' })));
+    return res.json(Object.assign({ ok: true, pendiente: true, ticket: conTicket, id }, datos));
   } catch (e) {
     console.error('POST /api/monstruos/botin/recoger:', e);
     return res.status(500).json({ error: 'internal_error' });
@@ -13075,6 +13101,20 @@ function _montonPublico(m) {
            deNombre: m.deNombre, caducaEn: m.hasta };
 }
 
+/* EL TICKET DEL SUELO (2026-10-19). El cliente nuevo manda uno al recoger o
+   soltar: el servidor contesta YA y el resultado de la cadena le llega por el
+   socket con ese ticket ('suelo:acunado' / 'suelo:fallido' al recoger,
+   'suelo:soltado' / 'suelo:soltar_fallido' al soltar). Sin ticket (un cliente
+   de antes) se espera a la cadena y se contesta entero, como siempre. */
+function _ticketSuelo(t) {
+  const s = String(t || '');
+  return /^[a-z0-9]{6,32}$/i.test(s) ? s : null;
+}
+/** A todas las pestañas del jugador. */
+function _avisarJugadorSuelo(playerName, evento, datos) {
+  for (const s of socketsDeJugador(playerName)) { try { s.emit(evento, datos); } catch (_) {} }
+}
+
 setInterval(() => {
   const ahora = Date.now();
   for (const [id, m] of _sueloSalvaje) {
@@ -13127,8 +13167,13 @@ app.post('/api/salvaje/soltar', apiLimiter, authMiddleware, csrfProtection, asyn
     const invoiceId = Number(req.body && req.body.invoiceId);
     const pedida = Math.max(1, Math.floor(Number(req.body && req.body.cantidad) || 1));
     const address = String(gp.address || '').toLowerCase();
+    /* SOLTAR VARIOS SEGUIDOS (2026-10-19): "cuando quiero soltar un objeto se
+       tarda mucho; quiero soltar varios y que las transacciones se hagan en
+       cola". Lo de arriba se comprueba ya; la quema va a la cola del jugador
+       ('suelo:' + cuenta) y, con ticket, se contesta sin esperarla. */
+    const conTicket = _ticketSuelo(req.body && req.body.ticket);
 
-    const r = await enColaDelJugador('suelo:' + address, async () => {
+    const trabajo = enColaDelJugador('suelo:' + address, async () => {
       const c = contratoItemsServidor();
       if (!c) return { status: 503, body: { error: 'relayer_unavailable' } };
       const facturas = (await facturasLibresDeCadena(address)).filter(f => f.tipo === tipo && f.cantidad > 0);
@@ -13158,8 +13203,17 @@ app.post('/api/salvaje/soltar', apiLimiter, authMiddleware, csrfProtection, asyn
       console.log(`🌲 ${gp.playerName} soltó ${cantidad} ${itemId} en ${yo.sala}`);
       return { status: 200, body: { ok: true, monton: _montonPublico(m),
         gastado: { itemId, invoiceId: f.id, manualId: f.manualId, cantidadRestante: quedan } } };
+    }).catch((e) => {
+      console.error('POST /api/salvaje/soltar (cola):', e);
+      return { status: 500, body: { error: 'internal_error', message: 'Could not drop it. Try again.' } };
     });
-    return res.status(r.status).json(r.body);
+    if (!conTicket) {
+      const r = await trabajo;
+      return res.status(r.status).json(r.body);
+    }
+    trabajo.then((r) => _avisarJugadorSuelo(gp.playerName, r.status === 200 ? 'suelo:soltado' : 'suelo:soltar_fallido',
+      Object.assign({ ticket: conTicket }, r.body)));
+    return res.json({ ok: true, pendiente: true, ticket: conTicket });
   } catch (e) {
     console.error('POST /api/salvaje/soltar:', e);
     return res.status(500).json({ error: 'internal_error' });
@@ -13179,26 +13233,49 @@ app.post('/api/salvaje/recoger', apiLimiter, authMiddleware, csrfProtection, asy
     if (Math.hypot(m.x - yo.x, m.y - yo.y) > SUELO_ALCANCE) return res.json({ ok: false, motivo: 'lejos' });
     if (m.recogiendo) return res.json({ ok: false, motivo: 'en_curso' });
     m.recogiendo = gp.playerName;
-    let factura = null;
-    try { factura = await mintGatherReward(String(gp.address || '').toLowerCase(), itemTipoOnChain(m.itemId), m.cantidad); }
-    catch (e) { factura = null; }
-    if (!factura || !factura.id) {
-      m.recogiendo = null;                      // se puede volver a intentar
-      return res.status(502).json({ ok: false, motivo: 'cadena', message: 'The chain is busy. Try picking it up again.' });
-    }
-    _sueloSalvaje.delete(id);
-    try {
-      const doc = await GamePlayer.findOne({ playerName: gp.playerName });
-      if (doc) {
-        const r2 = ponerFacturaEnSlots(doc.inventory, doc.chest, m.itemId, factura);
-        doc.inventory = r2.inventory; doc.chest = r2.chest;
-        doc.markModified('inventory'); doc.markModified('chest');
-        await doc.save();
-      }
-    } catch (e) { console.warn('⚠️  suelo: recoger en Mongo:', e.message); }
+    /* EN COLA Y SIN ESPERAR A LA CADENA (2026-10-19): "paso por encima y
+       tarda mucho en tomarlo; quiero que lo tome y que las transacciones se
+       hagan en cola". El montón queda reservado (ya no lo ve ni lo coge nadie
+       más: sale de la sala ahora), y el acuñado va a la cola del jugador, la
+       misma que soltar: una transacción detrás de otra, y dos acuñados no se
+       pisan la misma factura. Si la cadena falla, el montón vuelve. */
+    const address = String(gp.address || '').toLowerCase();
+    const conTicket = _ticketSuelo(req.body && req.body.ticket);
     try { io.to(m.sala).emit('suelo:fuera', { id, por: String(gp.Username || gp.playerName).slice(0, 40) }); } catch (_) {}
-    return res.json({ ok: true, itemId: m.itemId, cantidad: m.cantidad, deNombre: m.deNombre,
-      factura: { invoiceId: factura.id, manualId: factura.manualId, cantidad: factura.cantidad } });
+    const trabajo = enColaDelJugador('suelo:' + address, async () => {
+      let factura = null;
+      try { factura = await mintGatherReward(address, itemTipoOnChain(m.itemId), m.cantidad); }
+      catch (e) { factura = null; }
+      if (!factura || !factura.id) {
+        m.recogiendo = null;                    // se puede volver a intentar
+        if (_sueloSalvaje.get(id) === m) { try { io.to(m.sala).emit('suelo:nuevo', _montonPublico(m)); } catch (_) {} }
+        return null;
+      }
+      _sueloSalvaje.delete(id);
+      try {
+        const doc = await GamePlayer.findOne({ playerName: gp.playerName });
+        if (doc) {
+          const r2 = ponerFacturaEnSlots(doc.inventory, doc.chest, m.itemId, factura);
+          doc.inventory = r2.inventory; doc.chest = r2.chest;
+          doc.markModified('inventory'); doc.markModified('chest');
+          await doc.save();
+        }
+      } catch (e) { console.warn('⚠️  suelo: recoger en Mongo:', e.message); }
+      return { invoiceId: factura.id, manualId: factura.manualId, cantidad: factura.cantidad };
+    }).catch((e) => {
+      m.recogiendo = null;
+      console.warn('⚠️  suelo: cola de recoger:', e && e.message);
+      return null;
+    });
+    const datos = { itemId: m.itemId, cantidad: m.cantidad, deNombre: m.deNombre };
+    if (!conTicket) {
+      const factura = await trabajo;
+      if (!factura) return res.status(502).json({ ok: false, motivo: 'cadena', message: 'The chain is busy. Try picking it up again.' });
+      return res.json(Object.assign({ ok: true }, datos, { factura }));
+    }
+    trabajo.then((factura) => _avisarJugadorSuelo(gp.playerName, factura ? 'suelo:acunado' : 'suelo:fallido',
+      Object.assign({ ticket: conTicket, id }, datos, factura ? { factura } : { message: 'The chain is busy: the item is back on the ground.' })));
+    return res.json(Object.assign({ ok: true, pendiente: true, ticket: conTicket, id }, datos));
   } catch (e) {
     console.error('POST /api/salvaje/recoger:', e);
     return res.status(500).json({ error: 'internal_error' });
