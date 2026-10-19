@@ -41,6 +41,7 @@ const MARKET_FEE_BPS = 500; // 5.00% de comisión/royalty
 const ITEM_CATALOG = {
   Semillax:  { name: 'Semillas de Zanahoria', category: 'semillas', icon: '/Game/Objetos/Plantas/planta_zanahorias/item_saco.png', maxStack: 50 },
   Semillax1: { name: 'Semillas de Tomate',    category: 'semillas', icon: '/Game/Objetos/Plantas/planta_tomates/semillas_tomate.png', maxStack: 50 },
+  Semillax4: { name: 'Strawberry Seed',      category: 'semillas', icon: '/Game/Objetos/Plantas/planta_fresa/item_semilla_fresa.png', maxStack: 50 },
   Semillax2: { name: 'Semillas de Trigo',     category: 'semillas', icon: '/Game/Objetos/Plantas/planta_trigo/item_semilla_trigo.png', maxStack: 50 },
   Semillax3: { name: 'Semillas de Calabaza',  category: 'semillas', icon: '/Game/Objetos/Plantas/planta_calabaza/item_semilla_calabaza.png', maxStack: 50 },
 
@@ -61,8 +62,16 @@ const ITEM_CATALOG = {
   balde_con_agua: { name: 'Balde con Agua', category: 'herramientas', icon: '/Game/Source/item_pozo2.png', maxStack: 5 },
 
   mineral_piedra: { name: 'Piedra', category: 'minerales', icon: '/Game/Source/piedra.png', maxStack: 20 },
-  mineral_cobre:  { name: 'Cobre',  category: 'minerales', icon: '/Game/Source/cobre.png', maxStack: 20 },
-  mineral_hierro: { name: 'Hierro', category: 'minerales', icon: '/Game/Source/hierro.png', maxStack: 20 },
+  mineral_cobre:  { name: 'Lingote de Cobre',  category: 'minerales', icon: '/Game/Source/cobre.png', maxStack: 20 },
+  mineral_hierro: { name: 'Lingote de Hierro', category: 'minerales', icon: '/Game/Source/hierro.png', maxStack: 20 },
+
+  // Piedra en bruto y carbón: lo que sale de la mina desde que hay horno.
+  // Sin estas entradas no se podrían publicar en el mercado (el catálogo de
+  // aquí es el que decide qué se puede listar).
+  mineral_piedra_cobre:  { name: 'Piedra de Cobre',  category: 'minerales', icon: '/Game/Source/piedra_cobre.png',  maxStack: 20 },
+  mineral_piedra_hierro: { name: 'Piedra de Hierro', category: 'minerales', icon: '/Game/Source/piedra_hierro.png', maxStack: 20 },
+  mineral_carbon:        { name: 'Piedra de Carbón', category: 'minerales', icon: '/Game/Source/piedra_carbon.png', maxStack: 20 },
+  carbon:                { name: 'Carbón',           category: 'minerales', icon: '/Game/Objetos/carbon.png',       maxStack: 20 },
 
   palo:             { name: 'Palo',             category: 'madera', icon: '/Game/Source/palo.png', maxStack: 20 },
   tablon_de_madera: { name: 'Tablón de Madera', category: 'madera', icon: '/Game/Source/madera.png', maxStack: 20 },
@@ -77,6 +86,9 @@ const ITEM_CATALOG = {
   tomate_buena: { name: 'Tomate Bueno',   category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_tomates/item_tomate_bueno.png', maxStack: 20 },
   tomate_corta: { name: 'Tomate (brote)', category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_tomates/item_planta.png', maxStack: 20 },
   tomate_mala:  { name: 'Tomate Podrido', category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_tomates/item_tomate_malo.png', maxStack: 20 },
+  fresa_buena:  { name: 'Good Strawberry',   category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_fresa/item_fresa_buena.png', maxStack: 20 },
+  fresa_corta:  { name: 'Unripe Strawberry', category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_fresa/item_planta.png', maxStack: 20 },
+  fresa_mala:   { name: 'Rotten Strawberry', category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_fresa/item_fresa_podrida.png', maxStack: 20 },
 
   trigo_buena: { name: 'Trigo Bueno',   category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_trigo/item_trigo_bueno.png', maxStack: 20 },
   trigo_corta: { name: 'Trigo (brote)', category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_trigo/item_planta_trigo.png', maxStack: 20 },
@@ -84,7 +96,26 @@ const ITEM_CATALOG = {
 
   calabaza_buena: { name: 'Calabaza Buena',   category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_calabaza/item_calabaza_buena.png', maxStack: 20 },
   calabaza_corta: { name: 'Calabaza (brote)', category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_calabaza/item_planta_calabaza.png', maxStack: 20 },
-  calabaza_mala:  { name: 'Calabaza Podrida', category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_calabaza/item_calabaza_podrida.png', maxStack: 20 }
+  calabaza_mala:  { name: 'Calabaza Podrida', category: 'cultivos', icon: '/Game/Objetos/Plantas/planta_calabaza/item_calabaza_podrida.png', maxStack: 20 },
+
+  // Construcción (2026-10-03): la parcela que se coloca en la isla.
+  parcela: { name: 'Parcela', category: 'construccion', icon: '/Game/Objetos/construccion/parcela.png', maxStack: 20 },
+  pala_construccion: { name: 'Pala de construcción', category: 'construccion', icon: '/Game/Objetos/construccion/pala_construccion.png', maxStack: 1 },
+  // El bote de basura y los cofres de la isla (2026-10-05).
+  basura: { name: 'Bote de basura',   category: 'construccion', icon: '/Game/Objetos/cofres/basura.png', maxStack: 10 },
+  cofre1: { name: 'Cofre de madera',  category: 'construccion', icon: '/Game/Objetos/cofres/cofre1.png', maxStack: 5 },
+  cofre2: { name: 'Cofre reforzado',  category: 'construccion', icon: '/Game/Objetos/cofres/cofre2.png', maxStack: 5 },
+  cofre3: { name: 'Cofre mágico',     category: 'construccion', icon: '/Game/Objetos/cofres/cofre3.png', maxStack: 5 },
+  cofre4: { name: 'Cofre legendario', category: 'construccion', icon: '/Game/Objetos/cofres/cofre4.png', maxStack: 5 },
+
+  // Equipo (2026-10-05). Los peces NO están: no se compran en ningún sitio,
+  // solo se pescan (y se comen o se venden en la tienda).
+  espada_madera:  { name: 'Wooden Sword', category: 'herramientas', icon: '/Game/Objetos/armas/espada_madera.png',   maxStack: 1 },
+  espada_cobre:   { name: 'Copper Sword', category: 'herramientas', icon: '/Game/Objetos/armas/espada_cobre.png',    maxStack: 1 },
+  espada_hierro:  { name: 'Iron Sword',   category: 'herramientas', icon: '/Game/Objetos/armas/espada_hierro.png',   maxStack: 1 },
+  cana_pescar:    { name: 'Fishing Rod',  category: 'herramientas', icon: '/Game/Objetos/pesca/cana_pescar.png',     maxStack: 1 },
+  espantapajaros: { name: 'Scarecrow',    category: 'herramientas', icon: '/Game/Objetos/granja/espantapajaros.png', maxStack: 10 },
+  antorcha:       { name: 'Torch',        category: 'herramientas', icon: '/Game/Objetos/antorcha/antorcha.png',     maxStack: 20 }
 };
 
 const CATEGORIES = [
@@ -93,36 +124,115 @@ const CATEGORIES = [
   { id: 'minerales',    label: 'Minerales' },
   { id: 'madera',       label: 'Madera' },
   { id: 'cultivos',     label: 'Cultivos' },
+  { id: 'construccion', label: 'Construcción' },
   { id: 'otros',        label: 'Otros' }
 ];
 
 function catalogMeta(itemId) {
-  return ITEM_CATALOG[itemId] || { name: itemId, category: 'otros', icon: '', maxStack: 20 };
+  return Object.prototype.hasOwnProperty.call(ITEM_CATALOG, itemId) ? ITEM_CATALOG[itemId]
+    : { name: itemId, category: 'otros', icon: '', maxStack: 20 };
 }
 
 function round2(n) {
   return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 }
 
+function validMarketAmount(n) {
+  return Number.isFinite(n) && n > 0 && Number.isSafeInteger(Math.round(n * 100));
+}
+
 function escapeRegex(str) {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-module.exports = function registerMarketplaceRoutes(app, ctx) {
+// Session propagation is local to this module: other game queries do not
+// inherit a market transaction or any global Mongoose setting.
+function createMarketAtomic(mongoose) {
+  const { AsyncLocalStorage } = require('node:async_hooks');
+  const scope = new AsyncLocalStorage();
+  const queryMethods = new Set(['find', 'findOne', 'findById', 'findOneAndUpdate',
+    'findOneAndDelete', 'updateOne', 'updateMany', 'deleteOne', 'deleteMany', 'countDocuments']);
+  async function transaction(work) {
+    if (scope.getStore()) return work();
+    const session = await mongoose.startSession();
+    try {
+      return await session.withTransaction(() => scope.run(session, work), {
+        readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary'
+      });
+    } finally {
+      // Cleanup cannot turn a committed payment into an apparent failure.
+      try { await session.endSession(); } catch (error) { console.warn('⚠️ Marketplace session cleanup failed:', error.code || error.name); }
+    }
+  }
+  function model(raw) {
+    return new Proxy(raw, {
+      get(target, key) {
+        const value = Reflect.get(target, key, target);
+        if (typeof value !== 'function') return value;
+        return function (...args) {
+          const session = scope.getStore();
+          if (!session) return value.apply(target, args);
+          if (key === 'create') {
+            const multiple = Array.isArray(args[0]);
+            return target.create(multiple ? args[0] : [args[0]], { ...args[1], session })
+              .then(docs => multiple ? docs : docs[0]);
+          }
+          if (key === 'insertMany') return target.insertMany(args[0], { ...args[1], session });
+          if (!queryMethods.has(key)) throw new Error('Unsupported transactional market operation: ' + String(key));
+          return value.apply(target, args).session(session);
+        };
+      }
+    });
+  }
+  function handler(work) {
+    return async function (req, res, next) {
+      let result;
+      const aborted = new Error('marketplace_request_aborted');
+      try {
+        await transaction(async () => {
+          // withTransaction may retry: never send an HTTP response from its
+          // callback, and reconstruct its response on every attempt.
+          result = { status: 200, body: undefined };
+          const draft = { status(code) { result.status = code; return draft; },
+            commitStatus(code) { result.status = code; result.commitOnError = true; return draft; },
+            json(body) { result.body = body; return draft; } };
+          await work(req, draft, next);
+          if (result.status >= 400 && !result.commitOnError) throw aborted;
+        });
+      } catch (error) {
+        if (error !== aborted) {
+          console.error('❌ Marketplace transaction rolled back:', error.code || error.name || 'database_error');
+          return res.status(503).json({ error: 'marketplace_transaction_unavailable',
+            message: 'No se completó la operación. El mercado necesita una base de datos con transacciones disponibles.' });
+        }
+      }
+      return res.status(result.status).json(result.body);
+    };
+  }
+  return { transaction, model, handler };
+}
+
+module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
+  const atomic = createMarketAtomic(ctx.mongoose);
+  const app = { get: (...args) => rawApp.get(...args) };
+  for (const method of ['post', 'patch', 'delete']) app[method] = (...args) => {
+    const work = args.pop(); return rawApp[method](...args, atomic.handler(work));
+  };
   const {
     mongoose,
     authMiddleware,
     csrfProtection,
     apiLimiter,
     strictLimiter,
-    GamePlayer,
-    PlayerStats,
-    Listing,
+    GamePlayer: RawGamePlayer,
+    PlayerStats: RawPlayerStats,
+    Listing: RawListing,
     // Comprobador de admin de server2.js (env ADMIN_ADDRESSES o isAdmin
     // on-chain). Si no llega, NADIE es admin: es preferible que el panel de
     // productos limitados no exista a que lo pueda usar cualquiera.
     isAdminAddress = async () => false
   } = ctx;
+  const GamePlayer = atomic.model(RawGamePlayer), PlayerStats = atomic.model(RawPlayerStats), Listing = atomic.model(RawListing);
 
   const writeLimiter = strictLimiter || apiLimiter;
 
@@ -210,8 +320,8 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
 
   // Reutiliza el modelo si ya está registrado (evita OverwriteModelError si el
   // módulo se carga más de una vez).
-  const MarketHistory = mongoose.models.MarketHistory
-    || mongoose.model('MarketHistory', marketHistorySchema);
+  const MarketHistory = atomic.model(mongoose.models.MarketHistory
+    || mongoose.model('MarketHistory', marketHistorySchema));
 
   function serializeHistory(h) {
     return {
@@ -253,13 +363,17 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
   // jugador: primero rellena stacks existentes del mismo ítem, y usa slots
   // vacíos (0-39) para el resto. Devuelve null si no hay espacio suficiente.
   function computeInsertPlan(inventory, itemId, qty, maxStack) {
+    if (!Array.isArray(inventory) || !Number.isSafeInteger(qty) || qty < 1 ||
+        !Number.isSafeInteger(maxStack) || maxStack < 1) return null;
     const ops = [];
     let remaining = qty;
-    const usedIds = new Set((inventory || []).map(e => e.id));
+    const usedIds = new Set(inventory.filter(e => e && Number.isInteger(e.id)).map(e => e.id));
 
     for (const entry of inventory || []) {
       if (remaining <= 0) break;
-      if (entry.objeto === itemId && Number(entry.cantidad) < maxStack) {
+      if (entry && Number.isInteger(entry.id) && entry.id >= 0 && entry.id < 40 &&
+          entry.objeto === itemId && Number.isSafeInteger(Number(entry.cantidad)) &&
+          Number(entry.cantidad) >= 0 && Number(entry.cantidad) < maxStack) {
         const space = maxStack - Number(entry.cantidad);
         const add = Math.min(space, remaining);
         if (add > 0) {
@@ -285,15 +399,25 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
   }
 
   async function applyInsertPlan(address, itemId, ops) {
+    // Se marca que el MARKET ha tocado este inventario. /api/save lo consulta
+    // para no sobrescribir la compra con la copia vieja que tiene la pestaña
+    // del juego (ver el comentario de `marketWriteAt` en el esquema).
+    // Va ANTES de insertar: si el guardado del juego llegara justo en medio,
+    // es preferible que vea la marca de más y recargue, a que no la vea y
+    // borre el ítem.
+    const marked = await GamePlayer.updateOne({ address }, { $set: { marketWriteAt: new Date() } }).exec();
+    if (marked.matchedCount !== 1) throw new Error('market_inventory_missing');
+
     for (const op of ops) {
       if (op.type === 'inc') {
-        await GamePlayer.updateOne(
-          { address, 'inventory.id': op.id },
+        const updated = await GamePlayer.updateOne(
+          { address, inventory: { $elemMatch: { id: op.id, objeto: itemId } } },
           { $inc: { 'inventory.$.cantidad': op.amount } }
         ).exec();
+        if (updated.matchedCount !== 1) throw new Error('market_inventory_changed');
       } else {
-        await GamePlayer.updateOne(
-          { address },
+        const updated = await GamePlayer.updateOne(
+          { address, 'inventory.id': { $ne: op.id } },
           {
             $push: {
               inventory: {
@@ -307,6 +431,7 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
             }
           }
         ).exec();
+        if (updated.matchedCount !== 1) throw new Error('market_inventory_changed');
       }
     }
   }
@@ -345,10 +470,29 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       const address = (req.user.address || '').toLowerCase();
       const { category, search, currency, sort } = req.query;
 
+      /* TODO LO QUE VIENE DE LA QUERY SE FUERZA A TEXTO ANTES DE ENTRAR AL
+         FILTRO DE MONGO.
+         Express monta objetos con la notación de corchetes: una petición como
+             ?category[$ne]=todos
+         llega aquí como `{ $ne: 'todos' }`, y Mongo lo interpreta como un
+         OPERADOR, no como un valor. Es inyección NoSQL. Aquí el daño es
+         pequeño —solo cambia qué anuncios se listan, y los anuncios son
+         públicos— pero es el mismo descuido que en un endpoint de escritura
+         sería serio, y arreglarlo cuesta un String().
+
+         `currency` y `sort` ya estaban con lista blanca, y `search` ya pasaba
+         por `escapeRegex`, que hace su propio String(). El único suelto era
+         `category`.
+
+         Al `search` se le pone además un tope de largo: sin él, una cadena de
+         cien mil caracteres construye un regex enorme que se pasea por los 300
+         anuncios en cada petición. */
       const filter = {};
-      if (category && category !== 'todos') filter.category = category;
+      const categoriaTxt = (typeof category === 'string') ? category : '';
+      const buscarTxt = (typeof search === 'string') ? search.slice(0, 80) : '';
+      if (categoriaTxt && categoriaTxt !== 'todos') filter.category = categoriaTxt;
       if (currency && ['oro', 'plata'].includes(currency)) filter.currency = currency;
-      if (search) filter.name = new RegExp(escapeRegex(search), 'i');
+      if (buscarTxt) filter.name = new RegExp(escapeRegex(buscarTxt), 'i');
 
       let sortOpt = { createdAt: -1 };
       if (sort === 'price_asc') sortOpt = { pricePerUnit: 1 };
@@ -397,10 +541,10 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       if (!itemId || typeof itemId !== 'string') {
         return res.status(400).json({ error: 'invalid_item' });
       }
-      if (!Number.isInteger(qty) || qty < 1) {
+      if (!Number.isSafeInteger(qty) || qty < 1) {
         return res.status(400).json({ error: 'invalid_qty' });
       }
-      if (!(pricePerUnit > 0)) {
+      if (!validMarketAmount(pricePerUnit) || !validMarketAmount(round2(qty * pricePerUnit))) {
         return res.status(400).json({ error: 'invalid_price' });
       }
       if (!['oro', 'plata'].includes(currency)) {
@@ -556,7 +700,7 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       }
 
       let qty = req.body && req.body.qty ? Math.floor(Number(req.body.qty)) : listing.qty;
-      if (!Number.isInteger(qty) || qty < 1 || qty > listing.qty) {
+      if (!Number.isSafeInteger(qty) || qty < 1 || qty > listing.qty) {
         return res.status(400).json({ error: 'invalid_qty' });
       }
 
@@ -572,6 +716,7 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       }
 
       const totalPrice = round2(qty * listing.pricePerUnit);
+      if (!validMarketAmount(totalPrice)) return res.status(400).json({ error: 'invalid_price' });
       const fee = round2(totalPrice * MARKET_FEE_BPS / 10000);
       const sellerReceives = round2(totalPrice - fee);
       const field = currencyField(listing.currency);
@@ -616,10 +761,11 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       }
 
       // 4) Pagar al vendedor (95% — 5% queda como comisión del mercado)
-      await PlayerStats.updateOne(
+      const sellerPaid = await PlayerStats.updateOne(
         { address: listing.owner },
         { $inc: { [field]: sellerReceives } }
       ).exec();
+      if (sellerPaid.matchedCount !== 1) throw new Error('market_seller_stats_missing');
 
       // 5) Entregar el ítem al comprador
       await applyInsertPlan(address, listing.itemId, plan);
@@ -817,8 +963,8 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
     resolvedAt:   { type: Date, default: null }
   }, { collection: 'market_offers' });
 
-  const MarketOffer = mongoose.models.MarketOffer
-    || mongoose.model('MarketOffer', marketOfferSchema);
+  const MarketOffer = atomic.model(mongoose.models.MarketOffer
+    || mongoose.model('MarketOffer', marketOfferSchema));
 
   function serializeOffer(o, listing) {
     const meta = catalogMeta(o.itemId);
@@ -847,15 +993,22 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
   }
 
   /** Devuelve el dinero retenido de una oferta. Idempotente por `status`. */
-  async function devolverRetencion(offer) {
-    const field = currencyField(offer.currency);
-    const gp = await GamePlayer.findOne({ address: offer.buyer }).lean();
-    if (!gp) return false;
-    await PlayerStats.updateOne(
-      { playerName: gp.playerName },
-      { $inc: { [field]: offer.total } }
-    ).exec();
-    return true;
+  async function devolverRetencion(offer, resolution = 'cancelled') {
+    return atomic.transaction(async () => {
+      // Claim and credit commit together. Stale copies from the expiry
+      // worker or a second HTTP request cannot refund the same escrow twice.
+      const claimed = await MarketOffer.findOneAndUpdate(
+        { _id: offer._id, status: 'pending' },
+        { $set: { status: resolution, resolvedAt: new Date() } }, { new: true }).exec();
+      if (!claimed) return false;
+      const field = currencyField(claimed.currency);
+      const gp = await GamePlayer.findOne({ address: claimed.buyer }).lean();
+      if (!gp) throw new Error('market_refund_player_missing');
+      const refunded = await PlayerStats.updateOne(
+        { playerName: gp.playerName }, { $inc: { [field]: claimed.total } }).exec();
+      if (refunded.matchedCount !== 1) throw new Error('market_refund_stats_missing');
+      return true;
+    });
   }
 
   /** Caduca las ofertas pasadas de fecha y devuelve el dinero retenido. */
@@ -867,10 +1020,7 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
 
     for (const o of vencidas) {
       try {
-        await devolverRetencion(o);
-        o.status = 'expired';
-        o.resolvedAt = new Date();
-        await o.save();
+        await devolverRetencion(o, 'expired');
       } catch (e) {
         console.warn('⚠️ No se pudo caducar la oferta', String(o._id), e.message);
       }
@@ -903,10 +1053,10 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       const pricePerUnit = round2(Number(req.body && req.body.pricePerUnit));
       const message = String((req.body && req.body.message) || '').replace(/<[^>]*>/g, '').trim().slice(0, 140);
 
-      if (!Number.isInteger(qty) || qty < 1 || qty > listing.qty) {
+      if (!Number.isSafeInteger(qty) || qty < 1 || qty > listing.qty) {
         return res.status(400).json({ error: 'invalid_qty' });
       }
-      if (!Number.isFinite(pricePerUnit) || pricePerUnit <= 0) {
+      if (!validMarketAmount(pricePerUnit) || !validMarketAmount(round2(qty * pricePerUnit))) {
         return res.status(400).json({ error: 'invalid_price' });
       }
 
@@ -918,9 +1068,6 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       const previa = await MarketOffer.findOne({ listingId, buyer: address, status: 'pending' });
       if (previa) {
         await devolverRetencion(previa);
-        previa.status = 'cancelled';
-        previa.resolvedAt = new Date();
-        await previa.save();
       }
 
       const total = round2(qty * pricePerUnit);
@@ -1010,16 +1157,14 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       if (offer.seller !== address) return res.status(403).json({ error: 'not_your_offer' });
       if (offer.status !== 'pending') return res.status(409).json({ error: 'offer_not_pending' });
       if (offer.expiresAt <= new Date()) {
-        await devolverRetencion(offer);
-        offer.status = 'expired'; offer.resolvedAt = new Date(); await offer.save();
-        return res.status(409).json({ error: 'offer_expired' });
+        await devolverRetencion(offer, 'expired');
+        return res.commitStatus(409).json({ error: 'offer_expired' });
       }
 
       const listing = await Listing.findById(offer.listingId).exec();
       if (!listing) {
         await devolverRetencion(offer);
-        offer.status = 'cancelled'; offer.resolvedAt = new Date(); await offer.save();
-        return res.status(409).json({ error: 'listing_gone', message: 'Esa publicación ya no existe. Se devolvió el dinero al comprador.' });
+        return res.commitStatus(409).json({ error: 'listing_gone', message: 'Esa publicación ya no existe. Se devolvió el dinero al comprador.' });
       }
 
       const meta = catalogMeta(offer.itemId);
@@ -1056,10 +1201,11 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       const sellerReceives = round2(offer.total - fee);
       const field = currencyField(offer.currency);
 
-      await PlayerStats.updateOne(
+      const sellerPaid = await PlayerStats.updateOne(
         { address: offer.seller },
         { $inc: { [field]: sellerReceives } }
       ).exec();
+      if (sellerPaid.matchedCount !== 1) throw new Error('market_seller_stats_missing');
 
       await applyInsertPlan(offer.buyer, offer.itemId, plan);
 
@@ -1116,10 +1262,9 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       if (offer.status !== 'pending') return res.status(409).json({ error: 'offer_not_pending' });
 
       // Sea quien sea el que la cierra, el dinero retenido vuelve al comprador.
-      await devolverRetencion(offer);
-      offer.status = quien === 'seller' ? 'rejected' : 'cancelled';
-      offer.resolvedAt = new Date();
-      await offer.save();
+      const resolution = quien === 'seller' ? 'rejected' : 'cancelled';
+      if (!(await devolverRetencion(offer, resolution))) return res.status(409).json({ error: 'offer_not_pending' });
+      offer.status = resolution;
 
       const gp = await getGamePlayerByAddress(address);
       const stats = gp ? await PlayerStats.findOne({ playerName: gp.playerName }).lean() : null;
@@ -1162,8 +1307,8 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
     createdAt:    { type: Date, default: Date.now }
   }, { collection: 'market_limited' });
 
-  const LimitedListing = mongoose.models.LimitedListing
-    || mongoose.model('LimitedListing', limitedListingSchema);
+  const LimitedListing = atomic.model(mongoose.models.LimitedListing
+    || mongoose.model('LimitedListing', limitedListingSchema));
 
   // Cuántas unidades lleva compradas cada jugador de cada lote (para el tope).
   const limitedPurchaseSchema = new mongoose.Schema({
@@ -1172,8 +1317,8 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
     qty:       { type: Number, default: 0 }
   }, { collection: 'market_limited_purchases' });
 
-  const LimitedPurchase = mongoose.models.LimitedPurchase
-    || mongoose.model('LimitedPurchase', limitedPurchaseSchema);
+  const LimitedPurchase = atomic.model(mongoose.models.LimitedPurchase
+    || mongoose.model('LimitedPurchase', limitedPurchaseSchema));
 
   function serializeLimited(d, comprado) {
     const meta = catalogMeta(d.itemId);
@@ -1250,7 +1395,7 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       const note = String(b.note || '').replace(/<[^>]*>/g, '').trim().slice(0, 160);
 
       if (!Number.isInteger(qty) || qty < 1 || qty > 1000000) return res.status(400).json({ error: 'invalid_qty' });
-      if (!Number.isFinite(pricePerUnit) || pricePerUnit <= 0) return res.status(400).json({ error: 'invalid_price' });
+      if (!validMarketAmount(pricePerUnit) || !validMarketAmount(round2(qty * pricePerUnit))) return res.status(400).json({ error: 'invalid_price' });
 
       const meta = catalogMeta(itemId);
       const doc = await LimitedListing.create({
@@ -1286,7 +1431,8 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       if (b.active !== undefined) doc.active = !!b.active;
       if (b.pricePerUnit !== undefined) {
         const p = round2(Number(b.pricePerUnit));
-        if (Number.isFinite(p) && p > 0) doc.pricePerUnit = p;
+        if (!validMarketAmount(p)) return res.status(400).json({ error: 'invalid_price' });
+        doc.pricePerUnit = p;
       }
       if (b.addQty !== undefined) {
         const add = Math.floor(Number(b.addQty));
@@ -1341,6 +1487,7 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       if (new Date(doc.endsAt).getTime() <= ahora)  return res.status(409).json({ error: 'ended', message: 'Esta oferta limitada ya terminó' });
 
       const qty = Math.max(1, Math.floor(Number((req.body && req.body.qty) || 1)));
+      if (!Number.isSafeInteger(qty)) return res.status(400).json({ error: 'invalid_qty' });
       if (qty > doc.remaining) return res.status(409).json({ error: 'not_enough_stock', remaining: doc.remaining });
 
       const gp = await getGamePlayerByAddress(address);
@@ -1363,6 +1510,7 @@ module.exports = function registerMarketplaceRoutes(app, ctx) {
       if (!plan) return res.status(400).json({ error: 'inventory_full', message: 'Tu inventario está lleno' });
 
       const total = round2(qty * doc.pricePerUnit);
+      if (!validMarketAmount(total)) return res.status(400).json({ error: 'invalid_price' });
       const field = currencyField(doc.currency);
       await getOrCreateStats(gp.playerName, address, gp);
 
