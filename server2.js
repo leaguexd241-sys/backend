@@ -3096,6 +3096,17 @@ const dailyMissionSchema = new mongoose.Schema({
     max: 23
   }
 }, { timestamps: true });
+/* (2026-10-19) MISIONES DE CAZAR Y AUTOMÁTICAS. Una misión es de ENTREGAR
+   (lo de siempre: traer `requiredAmount` de `itemId`) o de CAZAR (vencer
+   `requiredAmount` monstruos de `monstruo`; '*' = cualquiera, 'jugador' = en
+   PvP). `auto` marca el día que generó el servidor con las reglas del panel
+   (MisionesAutoConfig) porque el administrador no cargó nada a mano. */
+dailyMissionSchema.path('missions').schema.add({
+  tipo:     { type: String, enum: ['entregar', 'cazar'], default: 'entregar' },
+  monstruo: { type: String, default: '' }
+});
+dailyMissionSchema.path('missions').schema.path('itemId').required(false);
+dailyMissionSchema.add({ auto: { type: Boolean, default: false } });
 const DailyMission = mongoose.model('DailyMission', dailyMissionSchema);
 
 const userDailyProgressSchema = new mongoose.Schema({
@@ -3120,7 +3131,52 @@ const userDailyProgressSchema = new mongoose.Schema({
     { playerName: 1, npcId: 1, day: 1 }
   ]
 });
+// (2026-10-19) Lo que de verdad se entregó en cada misión cumplida: lo lee la
+// lista de entregas del panel (quién cumplió qué y qué recibió).
+userDailyProgressSchema.path('completedMissions').schema.add({
+  tipo: String, titulo: String, exp: Number, oro: Number, plata: Number,
+  itemId: String, itemCantidad: Number
+});
 const UserDailyProgress = mongoose.model('UserDailyProgress', userDailyProgressSchema);
+
+/* (2026-10-19) LAS CAZAS DEL DÍA de cada jugador, para las misiones de
+   cazar: `porTipo` cuenta cada monstruo vencido (y 'jugador' en PvP),
+   `total` todos, y `usados` lo que ya se gastó en misiones entregadas (cada
+   misión de cazar consume sus cazas: dos misiones de 5 lobos piden 10). */
+const misionCazaSchema = new mongoose.Schema({
+  playerName: { type: String, required: true },
+  day:        { type: String, required: true },
+  total:      { type: Number, default: 0 },
+  porTipo:    { type: mongoose.Schema.Types.Mixed, default: {} },
+  usados:     { type: mongoose.Schema.Types.Mixed, default: {} }
+}, { timestamps: true, collection: 'mision_cazas', minimize: false });
+misionCazaSchema.index({ playerName: 1, day: 1 }, { unique: true });
+misionCazaSchema.index({ day: 1 });
+const MisionCaza = mongoose.model('MisionCaza', misionCazaSchema);
+
+/* (2026-10-19) LAS REGLAS DE LAS MISIONES AUTOMÁTICAS de un NPC (panel
+   misiones.html, "Automatic missions"). Si un día no tiene misiones cargadas
+   a mano y el NPC tiene las reglas activas, el servidor genera las del día:
+   cuántas, qué mezcla de entregar/cazar, de qué listas sale lo que se pide y
+   qué recompensas (con su probabilidad) se pueden dar. */
+const misionesAutoConfigSchema = new mongoose.Schema({
+  npcId:        { type: String, required: true, unique: true },
+  activo:       { type: Boolean, default: false },
+  cuantas:      { type: Number, default: 3 },
+  pesoEntregar: { type: Number, default: 60 },
+  pesoCazar:    { type: Number, default: 40 },
+  pedidos:      [{ itemId: String, nombre: String, min: Number, max: Number }],
+  presas:       [{ tipo: String, nombre: String, min: Number, max: Number }],
+  premios:      [{ itemId: String, nombre: String, min: Number, max: Number, peso: Number }],
+  probPremio:   { type: Number, default: 75 },
+  expMin:       { type: Number, default: 40 },  expMax:   { type: Number, default: 140 },
+  oroMin:       { type: Number, default: 0 },   oroMax:   { type: Number, default: 0 },
+  plataMin:     { type: Number, default: 10 },  plataMax: { type: Number, default: 60 },
+  horaReinicio: { type: Number, default: 0 },
+  semilla:      { type: Number, default: 0 },
+  actualizadoPor: { type: String, default: null }
+}, { timestamps: true, collection: 'misiones_auto_config' });
+const MisionesAutoConfig = mongoose.model('MisionesAutoConfig', misionesAutoConfigSchema);
 
 
  
@@ -7327,6 +7383,9 @@ io.on("connection", (socket) => {
       if (await esFantasma({ playerName: socket.authenticatedPlayer, address: socket.authenticatedAddress })) {
         return socket.emit('plantError', { plotId, error: 'You are a ghost — revive first.', fantasma: true });
       }
+      if (!(await gfSocketConNombre(socket))) {
+        return socket.emit('plantError', { plotId, error: GF_SIN_NOMBRE.message, sinNombre: true });
+      }
       if (String(plotId || '').startsWith('isla_') &&
           !(await parcelaIslaDeJugador(socket.authenticatedAddress, plotId))) {
         return socket.emit('plantError', { plotId, error: 'That plot is not yours.' });
@@ -7617,7 +7676,15 @@ io.on("connection", (socket) => {
       // si se queda quieto y nunca llega a emitir un playerMove.
       // Se valida aquí porque el cliente lo usa para COMPONER UNA RUTA de
       // sprites: sin filtro, un "../.." se saldría de la carpeta Soulbound.
-      soulbound: NOMBRE_SOULBOUND_VALIDO.test(String(soulbound || '')) ? String(soulbound) : null,
+      /* (2026-10-19) "Cuando un usuario sale de una casa y no se mueve, adopta
+         MI personaje; cuando se mueve, se pone el suyo." Muchos joinRoom (al
+         salir de una casa, de la mina, de los mapas nuevos) no mandan el
+         personaje: se ponía null y los demás lo pintaban con sus texturas
+         globales, que son las de SU propio personaje. Si no viene, se
+         conserva el último que mandó este socket. */
+      soulbound: NOMBRE_SOULBOUND_VALIDO.test(String(soulbound || ''))
+        ? (socket._soulbound = String(soulbound))
+        : (socket._soulbound || (previo && NOMBRE_SOULBOUND_VALIDO.test(String(previo.soulbound || '')) ? previo.soulbound : null)),
       // Color elegido para el nombre. Va en la foto de la sala para que quien
       // entra vea a los demas ya con su color, sin esperar a que se muevan.
       nameColor: socket._nameColor || null,
@@ -7707,6 +7774,13 @@ io.on("connection", (socket) => {
       // Lo pone el servidor, nunca el paquete (`...data` no puede fijarlo).
       ultimoPaso: seMovio ? Date.now() : (antesMov.ultimoPaso || Date.now())
     };
+    // (2026-10-19) El personaje: uno válido se recuerda; uno que falte o no
+    // valga no pisa el que ya se sabía (ver joinRoom).
+    {
+      const sb = String((data && data.soulbound) || '');
+      if (NOMBRE_SOULBOUND_VALIDO.test(sb)) socket._soulbound = sb;
+      else rooms[room][socket.id].soulbound = socket._soulbound || antesMov.soulbound || null;
+    }
 
     socket.to(room).emit("playerMoved", rooms[room][socket.id]);
   });
@@ -7724,6 +7798,7 @@ io.on("connection", (socket) => {
       const id = String((data && data.soulbound) || '');
       if (!NOMBRE_SOULBOUND_VALIDO.test(id)) return;
       rooms[room][socket.id].soulbound = id;
+      socket._soulbound = id;
       socket.to(room).emit('cambioSoulbound', { id: socket.id, soulbound: id });
     } catch (_) {}
   });
@@ -12030,6 +12105,52 @@ function normalizarVentanaMuertes(gp) {
 }
 
 /** El GamePlayer de quien hace la petición, o null si no cuadra la sesión. */
+/* ─────────────────────────────────────────────────────────────────────────
+   SIN NOMBRE NO HAY BOTÍN, NI TIENDAS, NI BATALLAS (2026-10-19).
+   "A los usuarios que no tengan nombre puesto aún niégales recibir drops de
+   cualquier cosa, persona o monstruo, y el acceso a las dos tiendas, a
+   batallar, pescar, sembrar y hacer misiones."
+   El nombre nace en '---' (GamePlayer.Username) y se fija UNA sola vez desde
+   el juego (/api/save). Por eso el "sí" se guarda en caché para siempre y el
+   "no" solo 10 s: al ponérselo, se nota enseguida. Si Mongo falla NO se
+   bloquea (mejor dejar jugar que cerrar el juego a todos).
+   Lo usan: el botín de monstruos (no se reparte), recoger del suelo, pescar,
+   sembrar (socket plantSeed), las misiones, el alquimista, el mercado P2P,
+   la arena (brawl:*) y el PvP del mapa salvaje.
+   ───────────────────────────────────────────────────────────────────────── */
+const GF_SIN_NOMBRE = { error: 'name_required', message: 'Choose your character name first to do this.' };
+const _gfNombreCache = new Map();
+function gfNombreValido(u) { u = String(u == null ? '' : u).trim(); return !!u && u !== '---'; }
+async function gfTieneNombrePorDireccion(address) {
+  const a = String(address || '').toLowerCase();
+  if (!a) return true;                     // sin identidad: decide la propia ruta
+  const c = _gfNombreCache.get(a);
+  if (c && (c.ok || Date.now() - c.at < 10000)) return c.ok;
+  let ok = true;
+  try {
+    const auth = await PlayerAuth.findOne({ address: a }, { playerName: 1 }).lean().exec();
+    if (auth && auth.playerName) {
+      const gp = await GamePlayer.findOne({ playerName: auth.playerName }, { Username: 1 }).lean().exec();
+      ok = !!gp && gfNombreValido(gp.Username);
+    }
+  } catch (e) { return true; }
+  _gfNombreCache.set(a, { ok, at: Date.now() });
+  if (_gfNombreCache.size > 20000) {
+    for (const [k, v] of _gfNombreCache) if (!v.ok) _gfNombreCache.delete(k);
+  }
+  return ok;
+}
+/** Middleware de Express (después de authMiddleware). */
+function gfExigeNombre(req, res, next) {
+  gfTieneNombrePorDireccion(req.user && req.user.address)
+    .then((ok) => (ok ? next() : res.status(403).json(GF_SIN_NOMBRE)))
+    .catch(() => next());
+}
+/** Lo mismo para un socket (su cuenta autenticada). */
+function gfSocketConNombre(socket) {
+  return gfTieneNombrePorDireccion(socket && socket.authenticatedAddress).catch(() => true);
+}
+
 async function jugadorDeLaSesion(req) {
   const address = String((req.user && req.user.address) || '').toLowerCase();
   if (!address) return null;
@@ -12611,12 +12732,43 @@ function pescaCercaDelAgua(px, py, radio = 3) {
   return false;
 }
 
+/* (2026-10-19) EL AGUA DE LOS OTROS MAPAS. "Quisiera pescar en el agua de
+   los tres mapas nuevos y en la del mapa salvaje." Las casillas de agua de
+   cada uno (16 px; tools/generar-agua-pesca.py, con la misma regla de "píxel
+   azul" que el juego; en la tundra también el lago helado). */
+const GF_PESCA_ZONAS = {"salvaje":{"tile":16,"w":314,"h":314,"rle":"138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149"},"cementerio":{"tile":16,"w":314,"h":314,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;259-266;257-268;256-271;254-275;253-275;252-275;251-276;250-276;250-276;250-277;250-277;250-277;251-277;251-276;252-275;253-274;255-271;259-268;263-264;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;59-62;57-65,68-72;49-74;47-76;46-78;44-80;41-84;40-86;39-86;39-87;38-88;38-88;37-88;36-88;36-89;35-89;33-91;31-92;30-93;29-93;29-94;29-94;30-93;31-93;32-93;33-93;33-93;33-92;34-92;34-92;34-91;35-90;35-89;36-88;37-87;37-87;38-86;39-85;40-83;41-82;43-79;49-76;51-75;55-65,68-73;57-63;60-61;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"},"desierto":{"tile":16,"w":314,"h":314,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;184-198;182-202;178-203;176-203;175-203;168-203;168-203;167-203;167-203;167-203;167-203;167-203;166-203;166-203;166-203;167-203;167-203;168-203;168-203;169-203;169-203;170-203;172-209;175-208;178-206;180-203;182-201;185-188,196-199;;;;;;;;;;;;;;;;;;;;;;;38-48;35-51;31-53;30-54;29-55;29-55;28-55;28-55;28-54;28-54;28-54;28-55;28-55;28-55;29-54;30-54;31-52;33-49;37-47;41-44;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;250-254;247-256;243-261;240-264;237-266;236-268;235-269;235-269;234-270;234-271;234-271;234-272;234-272;234-272;234-272;234-272;235-272;235-271;236-271;236-270;237-270;238-268;238-266;239-263;240-262;242-260;245-258;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"},"tundra":{"tile":16,"w":314,"h":314,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;106-114;96-99,104-118,124-125;94-100,103-126;93-128;92-130;91-138;89-138;88-139;87-139;87-140;86-140;86-141;86-142;85-143;84-144;83-145;83-145;82-145;81-146;79-146;77-146;76-146;76-146;77-146;78-146;79-146;80-146;81-146;81-146;81-145;81-144;81-142;81-141;81-140;81-140;82-139;83-139;84-139;85-138;86-137;88-131;91-130;99-129;105-111,117-127;123-125;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;252-264;250-266;249-267;248-268;247-269;246-269;246-269;246-269;246-269;246-269;247-269;247-268;248-267;250-266;253-265;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"}};
+const _gfPescaZonas = {};
+function gfZonaCercaDelAgua(zona, px, py, radio = 3) {
+  const z = GF_PESCA_ZONAS[zona];
+  if (!z) return false;
+  if (!_gfPescaZonas[zona]) {
+    const m = new Uint8Array(z.w * z.h);
+    z.rle.split(';').forEach((fila, y) => {
+      if (!fila) return;
+      fila.split(',').forEach((r) => {
+        const [a, b] = r.split('-').map(Number);
+        for (let x = a; x <= b; x++) m[y * z.w + x] = 1;
+      });
+    });
+    _gfPescaZonas[zona] = m;
+  }
+  const m = _gfPescaZonas[zona];
+  const cx = Math.floor(px / z.tile), cy = Math.floor(py / z.tile);
+  for (let y = cy - radio; y <= cy + radio; y++) {
+    if (y < 0 || y >= z.h) continue;
+    for (let x = cx - radio; x <= cx + radio; x++) {
+      if (x >= 0 && x < z.w && m[y * z.w + x]) return true;
+    }
+  }
+  return false;
+}
+
 /** Donde le ve el servidor (sala del mapa), o null si no le ve. */
 function pescaPosicionVista(playerName) {
   for (const s of socketsDeJugador(playerName)) {
     const sala = s.playerData && s.playerData.room;
     const basePesca = zonaDeSala(sala) === 'island' ? 'isla' : salaBase(sala);
-    if (!sala || !['game','isla'].includes(basePesca) || !rooms[sala] || !rooms[sala][s.id]) continue;
+    if (!sala || !(['game','isla'].includes(basePesca) || GF_PESCA_ZONAS[basePesca]) || !rooms[sala] || !rooms[sala][s.id]) continue;
     const p = rooms[sala][s.id];
     if (Number.isFinite(p.x) && Number.isFinite(p.y) && (p.x || p.y)) return { x: p.x, y: p.y, sala: basePesca };
   }
@@ -12626,7 +12778,7 @@ function pescaPosicionVista(playerName) {
 const _pescaSesiones = new Map();      // playerName -> { id, t0, picaEn }
 const _pescaUltimo = new Map();        // playerName -> último lanzamiento
 
-app.post('/api/pesca/lanzar', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+app.post('/api/pesca/lanzar', apiLimiter, authMiddleware, csrfProtection, gfExigeNombre, async (req, res) => {
   try {
     const gp = await jugadorDeLaSesion(req);
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
@@ -12638,7 +12790,9 @@ app.post('/api/pesca/lanzar', apiLimiter, authMiddleware, csrfProtection, async 
     const x = Number(req.body && req.body.x), y = Number(req.body && req.body.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'posicion' });
     const vista = pescaPosicionVista(gp.playerName);
-    if (!vista || !(vista.sala === 'isla' ? gfLandsNearWater(x,y) : pescaCercaDelAgua(x,y))) return res.status(400).json({ error: 'lejos_del_agua' });
+    if (!vista || !(vista.sala === 'isla' ? gfLandsNearWater(x,y)
+                    : GF_PESCA_ZONAS[vista.sala] ? gfZonaCercaDelAgua(vista.sala, x, y)
+                    : pescaCercaDelAgua(x,y))) return res.status(400).json({ error: 'lejos_del_agua' });
     if (vista && Math.hypot(vista.x - x, vista.y + 40 - y) > 260) {
       return res.status(400).json({ error: 'lejos_del_agua' });
     }
@@ -12685,7 +12839,7 @@ app.post('/api/pesca/enganchar', apiLimiter, authMiddleware, csrfProtection, asy
   }
 });
 
-app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, gfExigeNombre, async (req, res) => {
   try {
     const gp = await jugadorDeLaSesion(req);
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
@@ -12859,6 +13013,7 @@ app.post('/api/monstruos/derrotado', apiLimiter, authMiddleware, csrfProtection,
       return res.status(429).json({ error: 'demasiado_pronto', esperaMs: def.enfriaMs - (ahora - ultimo) });
     }
     _monstruoUltimo.set(clave, ahora);
+    gfAnotarCaza(gp.playerName, tipo);          // (2026-10-19) misiones de cazar
 
     // La experiencia, como la de la arena (ver expDeArena más abajo).
     let expTotal = null;
@@ -12876,8 +13031,9 @@ app.post('/api/monstruos/derrotado', apiLimiter, authMiddleware, csrfProtection,
       programarIdentidadEnCadena(gp.playerName);
     } catch (e) { console.warn('⚠️  monstruo: exp de ' + gp.playerName + ':', e.message); }
 
-    // Los montones del suelo.
-    const cuantos = def.montones[0] + Math.floor(Math.random() * (def.montones[1] - def.montones[0] + 1));
+    // Los montones del suelo. (2026-10-19) Sin nombre puesto, ninguno.
+    const conNombre = gfNombreValido(gp.Username);
+    const cuantos = !conNombre ? 0 : def.montones[0] + Math.floor(Math.random() * (def.montones[1] - def.montones[0] + 1));
     const botin = [];
     for (let i = 0; i < cuantos; i++) {
       const [itemId, min, max] = def.botin[Math.floor(Math.random() * def.botin.length)];
@@ -12889,14 +13045,14 @@ app.post('/api/monstruos/derrotado', apiLimiter, authMiddleware, csrfProtection,
     }
     console.log(`🐉 ${gp.playerName} venció a ${def.nombre}: +${def.exp} exp, ${botin.length} montones`);
     UserActivity.updateOne({ playerName: gp.playerName }, { $inc: { monstruos: 1 } }).catch(() => {});
-    return res.json({ ok: true, tipo, exp: def.exp, expTotal, botin, caducaMs: BOTIN_CADUCA_MS });
+    return res.json({ ok: true, tipo, exp: def.exp, expTotal, botin, caducaMs: BOTIN_CADUCA_MS, sinNombre: !conNombre });
   } catch (e) {
     console.error('POST /api/monstruos/derrotado:', e);
     return res.status(500).json({ error: 'internal_error' });
   }
 });
 
-app.post('/api/monstruos/botin/recoger', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+app.post('/api/monstruos/botin/recoger', apiLimiter, authMiddleware, csrfProtection, gfExigeNombre, async (req, res) => {
   try {
     const gp = await jugadorDeLaSesion(req);
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
@@ -13220,7 +13376,7 @@ app.post('/api/salvaje/soltar', apiLimiter, authMiddleware, csrfProtection, asyn
   }
 });
 
-app.post('/api/salvaje/recoger', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+app.post('/api/salvaje/recoger', apiLimiter, authMiddleware, csrfProtection, gfExigeNombre, async (req, res) => {
   try {
     const gp = await jugadorDeLaSesion(req);
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
@@ -13337,10 +13493,14 @@ io.on('connection', (socket) => {
       if (!sv) return;
       const ella = await cuentaDelSocket(sv);
       if (!ella || ella === yo) return;
+      if (!(await gfSocketConNombre(socket)) || !(await gfSocketConNombre(sv))) {
+        return socket.emit('pvp:rechazado', { motivo: 'sin_nombre' });
+      }
       if (!(await _espadasDe(yo)).has(arma)) return socket.emit('pvp:rechazado', { motivo: 'sin_espada' });
       if (await esFantasma({ playerName: yo }) || await esFantasma({ playerName: ella })) return;
       const r = await _herirJugador(ella, PVP_DANO[arma]);
       if (!r || !r.quita) return;
+      if (r.muerto) gfAnotarCaza(yo, 'jugador');   // (2026-10-19) misiones de cazar
       const deNombre = String(pa.username || yo).slice(0, 40);
       for (const s of socketsDeJugador(ella)) {
         try { s.emit('pvp:herido', { de: socket.id, deNombre, dano: r.quita, stats: r.stats, muerto: r.muerto,
@@ -13916,7 +14076,7 @@ app.get('/api/alchemist/catalog', apiLimiter, authMiddleware, async (req, res) =
 
 // ── POST /api/alchemist/buy ─────────────────────────────────────────────────
 // body: { itemId, qty }
-app.post('/api/alchemist/buy', apiLimiter, authMiddleware, csrfProtection, gfAlchemistBuy);
+app.post('/api/alchemist/buy', apiLimiter, authMiddleware, csrfProtection, gfExigeNombre, gfAlchemistBuy);
 
 
 // =============================================================================
@@ -14648,10 +14808,13 @@ async function getDailyMissionsHandler(req, res) {
     const targetDate = date || new Date().toISOString().split('T')[0];
     
     // Buscar misiones del día
-    const dailyMission = await DailyMission.findOne({ 
+    let dailyMission = await DailyMission.findOne({ 
       npcId, 
       day: targetDate 
     });
+
+    // (2026-10-19) Sin misiones cargadas a mano: las automáticas del NPC.
+    if (!dailyMission) dailyMission = await gfMisionesAutoDelDia(npcId, targetDate);
 
     if (!dailyMission) {
       return res.status(404).json({ 
@@ -15194,6 +15357,7 @@ app.post('/api/missions/daily/complete',
   apiLimiter,
   authMiddleware,
   csrfProtection,
+  gfExigeNombre,
   body('npcId').isString().notEmpty(),
   body('missionId').isString().notEmpty(),
   async (req, res) => {
@@ -15234,14 +15398,27 @@ app.post('/api/missions/daily/complete',
       const gp = await GamePlayer.findOne({ playerName });
       if (!gp) return res.status(404).json({ error: 'player_not_found' });
 
-      const itemId   = resolveMissionItemId(mission.itemId);
+      // (2026-10-19) Las de CAZAR no piden objetos: piden cazas del día.
+      const esCaza   = mission.tipo === 'cazar';
+      const itemId   = esCaza ? null : resolveMissionItemId(mission.itemId);
       const pedido   = Math.max(1, parseInt(mission.requiredAmount, 10) || 1);
       // Copias propias: mongoose no detecta mutaciones dentro de un Array
       // suelto, así que se trabaja aparte y al final se reasigna + markModified.
       let inventory = Array.isArray(gp.inventory) ? gp.inventory.map(s => ({ ...s })) : [];
       let chest     = Array.isArray(gp.chest)     ? gp.chest.map(s => ({ ...s }))     : [];
 
-      const tiene = contarEnSlots(inventory, itemId) + contarEnSlots(chest, itemId);
+      if (esCaza) {
+        const cazas = await gfCazasDelDia(playerName, day);
+        const llevo = gfCazasDe(cazas, mission.monstruo);
+        if (llevo < pedido) {
+          return res.status(400).json({
+            error: 'not_enough_kills',
+            message: `You still need ${pedido - llevo} more`,
+            monstruo: mission.monstruo || '*', required: pedido, have: llevo
+          });
+        }
+      }
+      const tiene = esCaza ? pedido : contarEnSlots(inventory, itemId) + contarEnSlots(chest, itemId);
       if (tiene < pedido) {
         return res.status(400).json({
           error: 'not_enough_items',
@@ -15253,7 +15430,7 @@ app.post('/api/missions/daily/complete',
       // ── 4. Quemar los materiales EN LA CADENA ────────────────────────────
       // Primero la cadena y solo después Mongo: si la quema falla, el jugador
       // conserva sus materiales y la misión sigue sin entregar.
-      const tipoEntrega = itemTipoOnChain(itemId);
+      const tipoEntrega = esCaza ? null : itemTipoOnChain(itemId);
       if (tipoEntrega) {
         const quemadas = await burnItemOnChain(address, tipoEntrega, pedido);
         if (quemadas < pedido) {
@@ -15268,11 +15445,11 @@ app.post('/api/missions/daily/complete',
           }
           return res.status(502).json({ error: 'burn_failed', burned: quemadas, required: pedido });
         }
-      } else {
+      } else if (!esCaza) {
         console.warn(`⚠️  misión ${missionId}: '${itemId}' no tiene tipo on-chain, se descuenta solo en BD`);
       }
 
-      const gasto = descontarDeSlots(chest, inventory, itemId, pedido);
+      const gasto = esCaza ? { inventory, chest } : descontarDeSlots(chest, inventory, itemId, pedido);
       inventory = gasto.inventory;
       chest     = gasto.chest;
 
@@ -15414,7 +15591,13 @@ app.post('/api/missions/daily/complete',
       await gp.save();
 
       // ── 6. Marcar el progreso del día ────────────────────────────────────
-      progress.completedMissions.push({ missionId, completedAt: new Date(), claimedReward: true });
+      // (2026-10-19) Con lo que se entregó de verdad, para la lista del panel.
+      const tituloMision = (mission.texts && mission.texts['en-US'] && mission.texts['en-US'].title) || missionId;
+      progress.completedMissions.push({ missionId, completedAt: new Date(), claimedReward: true,
+        tipo: esCaza ? 'cazar' : 'entregar', titulo: String(tituloMision).slice(0, 120),
+        exp: expReward, oro: oroEntregado, plata: plataEntregado,
+        itemId: rewardId || null, itemCantidad: entregadas });
+      if (esCaza) await gfGastarCazas(playerName, day, mission.monstruo, pedido);
       progress.completedCount  = progress.completedMissions.length;
       progress.lastInteraction = new Date();
       await progress.save();
@@ -15478,7 +15661,14 @@ function sanearMisionesDelDia(missions) {
     if (ids.has(missionId)) throw new Error(`missionId repetido: ${missionId}`);
     ids.add(missionId);
 
-    const itemId = limpiarTexto(m.itemId, 60);
+    // (2026-10-19) De entregar (un ítem) o de cazar (un monstruo, '*' o 'jugador').
+    const tipo = m.tipo === 'cazar' ? 'cazar' : 'entregar';
+    const monstruo = tipo === 'cazar' ? (limpiarTexto(m.monstruo, 40) || '*') : '';
+    if (tipo === 'cazar' && monstruo !== '*' && monstruo !== 'jugador' &&
+        !Object.prototype.hasOwnProperty.call(MONSTRUOS_BOTIN, monstruo)) {
+      throw new Error(`la misión ${missionId} pide un monstruo que no existe: ${monstruo}`);
+    }
+    const itemId = tipo === 'cazar' ? ('caza_' + (monstruo === '*' ? 'todos' : monstruo)) : limpiarTexto(m.itemId, 60);
     if (!itemId) throw new Error(`la misión ${missionId} no tiene itemId`);
 
     const requiredAmount = Math.max(1, Math.min(9999, parseInt(m.requiredAmount, 10) || 1));
@@ -15492,7 +15682,7 @@ function sanearMisionesDelDia(missions) {
     const goldReward   = Math.max(0, Math.min(1000,   parseInt(m.goldReward,   10) || 0));
     const silverReward = Math.max(0, Math.min(100000, parseInt(m.silverReward, 10) || 0));
 
-    const salida = { missionId, itemId, requiredAmount, expReward, goldReward, silverReward, texts: {} };
+    const salida = { missionId, tipo, monstruo, itemId, requiredAmount, expReward, goldReward, silverReward, texts: {} };
 
     const rewardItemId = limpiarTexto(m.rewardItemId, 60);
     if (rewardItemId) {
@@ -15525,7 +15715,8 @@ function sanearMisionesDelDia(missions) {
     // no solo en inglés: cualquier idioma sin nombre acababa enseñando el id.
     MISSION_LANGS.forEach(lang => {
       if (!salida.texts[lang].itemName) {
-        salida.texts[lang].itemName = salida.texts['es-419'].itemName || bonito(itemId);
+        salida.texts[lang].itemName = salida.texts['es-419'].itemName ||
+          (tipo === 'cazar' ? gfNombrePresa(monstruo) : bonito(itemId));
       }
       if (salida.rewardItemId && !salida.texts[lang].rewardName) {
         salida.texts[lang].rewardName = salida.texts['es-419'].rewardName || bonito(salida.rewardItemId);
@@ -15536,8 +15727,9 @@ function sanearMisionesDelDia(missions) {
     // rellena con lo que haya en español y, si tampoco hay, con el nombre
     // legible del ítem (nunca con el identificador crudo).
     if (!salida.texts['en-US'].title) {
-      salida.texts['en-US'].title = salida.texts['es-419'].title ||
-        `Bring ${requiredAmount} ${salida.texts['en-US'].itemName || bonito(itemId)}`;
+      salida.texts['en-US'].title = salida.texts['es-419'].title || (tipo === 'cazar'
+        ? `Defeat ${requiredAmount} ${salida.texts['en-US'].itemName}`
+        : `Bring ${requiredAmount} ${salida.texts['en-US'].itemName || bonito(itemId)}`);
     }
 
     return salida;
@@ -15768,6 +15960,401 @@ app.delete('/api/admin/missions/history', adminAuth, strictLimiter, async (req, 
 });
 
 console.log('✅ Missions history: GET/DELETE /api/admin/missions/history');
+
+// ============================================================================
+// MISIONES AUTOMÁTICAS, DE CAZAR Y LISTA DE ENTREGAS              (2026-10-19)
+// ============================================================================
+// "Que el Farmer Joe tenga misiones automáticas, aunque en misiones.html yo
+// pueda decidir qué objetos dar como recompensa (que sean aleatorias) y qué
+// tipo de misiones: no solo recolección, también matar monstruos o enemigos
+// en cantidad. Misiones manuales más cómodas, y la lista de quién cumplió qué
+// misiones (o no) y qué recibió, con su cartera, nombre y nivel."
+//
+//   · Un día SIN misiones cargadas a mano se genera solo si el NPC tiene sus
+//     reglas activas (MisionesAutoConfig; Farmer Joe las trae de serie). La
+//     generación es DETERMINISTA (semilla = NPC + día + `semilla`): dos
+//     peticiones a la vez dan las mismas misiones, y "Reroll" cambia la
+//     semilla. Se guarda como un DailyMission normal con `auto: true`, así que
+//     entregar va por el mismo camino de siempre.
+//   · Las de CAZAR cuentan lo vencido HOY (MisionCaza), sea en el mapa
+//     salvaje, los mapas nuevos o la mina; 'jugador' cuenta los abatidos en
+//     PvP. Al entregarla se gastan sus cazas.
+
+/** Los monstruos que se pueden pedir: los de la tabla de botín, '*' y 'jugador'. */
+function gfNombrePresa(tipo) {
+  if (!tipo || tipo === '*') return 'monsters';
+  if (tipo === 'jugador') return 'players (PvP)';
+  const d = Object.prototype.hasOwnProperty.call(MONSTRUOS_BOTIN, tipo) ? MONSTRUOS_BOTIN[tipo] : null;
+  return d && d.nombre ? d.nombre : String(tipo);
+}
+
+/** Apunta una caza del día (no espera: si Mongo falla, la pelea sigue). */
+function gfAnotarCaza(playerName, tipo) {
+  if (!playerName || playerName === '---' || !/^[a-z0-9_]{2,40}$/i.test(String(tipo || ''))) return;
+  const day = new Date().toISOString().split('T')[0];
+  MisionCaza.updateOne({ playerName, day }, { $inc: { total: 1, ['porTipo.' + tipo]: 1 } }, { upsert: true })
+    .catch((e) => console.warn('⚠️  caza de ' + playerName + ':', e.message));
+}
+
+/** Lo cazado hoy y aún sin gastar: { '*': n, <tipo>: n, ... }. */
+async function gfCazasDelDia(playerName, day) {
+  const out = { '*': 0 };
+  try {
+    const d = await MisionCaza.findOne({ playerName, day }).lean();
+    if (!d) return out;
+    const usados = d.usados || {};
+    out['*'] = Math.max(0, (Number(d.total) || 0) - (Number(usados['*']) || 0));
+    Object.keys(d.porTipo || {}).forEach((t) => {
+      out[t] = Math.max(0, (Number(d.porTipo[t]) || 0) - (Number(usados[t]) || 0));
+    });
+  } catch (e) { console.warn('⚠️  cazas del día:', e.message); }
+  return out;
+}
+function gfCazasDe(cazas, monstruo) {
+  const k = !monstruo || monstruo === '*' ? '*' : monstruo;
+  return Math.max(0, Number(cazas && cazas[k]) || 0);
+}
+async function gfGastarCazas(playerName, day, monstruo, cuantas) {
+  const k = !monstruo || monstruo === '*' ? '*' : monstruo;
+  try { await MisionCaza.updateOne({ playerName, day }, { $inc: { ['usados.' + k]: cuantas } }); }
+  catch (e) { console.warn('⚠️  gastar cazas:', e.message); }
+}
+
+/* Las reglas de serie. Farmer Joe ACTIVO: lo de la granja (cosechas, madera,
+   piedra) y los monstruos del mapa salvaje; recompensas de granja. El
+   guardián, apagado (sigue con lo que se le cargue a mano). */
+const MISIONES_AUTO_POR_DEFECTO = {
+  granjero: {
+    activo: true, cuantas: 3, pesoEntregar: 60, pesoCazar: 40,
+    pedidos: [
+      { itemId: 'zanahoria_buena', nombre: 'Carrots', min: 3, max: 8 },
+      { itemId: 'tomate_buena', nombre: 'Tomatoes', min: 3, max: 8 },
+      { itemId: 'trigo_buena', nombre: 'Wheat', min: 3, max: 8 },
+      { itemId: 'calabaza_buena', nombre: 'Pumpkins', min: 2, max: 5 },
+      { itemId: 'fresa_buena', nombre: 'Strawberries', min: 3, max: 8 },
+      { itemId: 'madera_pinos', nombre: 'Pine Wood', min: 5, max: 15 },
+      { itemId: 'mineral_piedra', nombre: 'Stone', min: 4, max: 10 },
+      { itemId: 'carbon', nombre: 'Coal', min: 2, max: 6 }
+    ],
+    presas: [
+      { tipo: 'lobo_salvaje', nombre: 'Shadow Wolves', min: 2, max: 5 },
+      { tipo: 'arana_salvaje', nombre: 'Thorn Spiders', min: 2, max: 5 },
+      { tipo: 'golem_salvaje', nombre: 'Stone Golems', min: 1, max: 3 },
+      { tipo: '*', nombre: 'monsters', min: 4, max: 10 }
+    ],
+    premios: [
+      { itemId: 'Semillax', nombre: 'Carrot Seeds', min: 2, max: 5, peso: 3 },
+      { itemId: 'Semillax1', nombre: 'Tomato Seeds', min: 2, max: 5, peso: 3 },
+      { itemId: 'Semillax2', nombre: 'Wheat Seeds', min: 2, max: 5, peso: 3 },
+      { itemId: 'Semillax3', nombre: 'Pumpkin Seeds', min: 1, max: 3, peso: 2 },
+      { itemId: 'Semillax4', nombre: 'Strawberry Seeds', min: 2, max: 4, peso: 2 },
+      { itemId: 'pocion_vida', nombre: 'Health Potion', min: 1, max: 2, peso: 2 },
+      { itemId: 'tablon_de_madera', nombre: 'Wooden Planks', min: 2, max: 4, peso: 1 },
+      { itemId: 'antorcha', nombre: 'Torches', min: 1, max: 3, peso: 1 }
+    ],
+    probPremio: 75, expMin: 40, expMax: 140, oroMin: 0, oroMax: 0, plataMin: 10, plataMax: 60,
+    horaReinicio: 0, semilla: 0
+  },
+  guardian: {
+    activo: false, cuantas: 3, pesoEntregar: 30, pesoCazar: 70,
+    pedidos: [], presas: [{ tipo: '*', nombre: 'monsters', min: 5, max: 12 }], premios: [],
+    probPremio: 60, expMin: 60, expMax: 180, oroMin: 0, oroMax: 0, plataMin: 10, plataMax: 80,
+    horaReinicio: 0, semilla: 0
+  }
+};
+
+async function gfReglasAuto(npcId) {
+  const doc = await MisionesAutoConfig.findOne({ npcId }).lean();
+  if (doc) return doc;
+  return Object.assign({ npcId, porDefecto: true }, MISIONES_AUTO_POR_DEFECTO[npcId] || MISIONES_AUTO_POR_DEFECTO.guardian);
+}
+
+/** Números al azar con semilla (mulberry32 sobre un hash del texto). */
+function gfAzarConSemilla(texto) {
+  let h = 1779033703 ^ texto.length;
+  for (let i = 0; i < texto.length; i++) { h = Math.imul(h ^ texto.charCodeAt(i), 3432918353); h = (h << 13) | (h >>> 19); }
+  let a = h >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const GF_MISION_TEXTOS = {
+  granjero: {
+    entregar: ['Farmer Joe needs supplies for the farm. Bring them before the day ends.',
+               'The barn is running low. Joe will pay well for a full delivery.',
+               'Market day is coming and Joe is short on stock. Help him out!'],
+    cazar:    ['Monsters keep scaring the animals at night. Clear them out and come back to Joe.',
+               'Something has been raiding the crops. Hunt them down for Joe.',
+               'Joe wants the roads safe for the farmers. Thin out the beasts.'],
+    entregarEs: 'El granjero Joe necesita provisiones para la granja.',
+    cazarEs: 'Los monstruos asustan a los animales: acaba con ellos y vuelve con Joe.'
+  },
+  guardian: {
+    entregar: ['The guardian needs materials to reinforce the town walls.'],
+    cazar:    ['The guardian asks you to push back the monsters around the town.'],
+    entregarEs: 'El guardián necesita materiales para reforzar las murallas.',
+    cazarEs: 'El guardián te pide que hagas retroceder a los monstruos.'
+  }
+};
+
+/** Las misiones de un día según las reglas (sin guardar). */
+function gfGenerarMisiones(reglas, npcId, day) {
+  const azar = gfAzarConSemilla(npcId + '|' + day + '|' + (Number(reglas.semilla) || 0));
+  const entre = (a, b) => {
+    a = Math.max(0, Math.round(Number(a) || 0)); b = Math.max(0, Math.round(Number(b) || 0));
+    if (b < a) { const t = a; a = b; b = t; }
+    return a + Math.floor(azar() * (b - a + 1));
+  };
+  const uno = (l) => l[Math.floor(azar() * l.length) % l.length];
+  const pedidos = (reglas.pedidos || []).filter((p) => p && p.itemId);
+  const presas  = (reglas.presas  || []).filter((p) => p && p.tipo);
+  const premios = (reglas.premios || []).filter((p) => p && p.itemId && itemTipoOnChain(p.itemId));
+  const cuantas = Math.max(1, Math.min(10, parseInt(reglas.cuantas, 10) || 3));
+  const pe = pedidos.length ? Math.max(0, Number(reglas.pesoEntregar) || 0) : 0;
+  const pc = presas.length  ? Math.max(0, Number(reglas.pesoCazar)    || 0) : 0;
+  if (pe + pc <= 0) return [];
+  const textos = GF_MISION_TEXTOS[npcId] || GF_MISION_TEXTOS.granjero;
+  const usadosP = new Set(), usadosC = new Set();
+  const out = [];
+  for (let i = 0; i < cuantas; i++) {
+    const caza = azar() * (pe + pc) >= pe;
+    const m = { missionId: `auto${i + 1}_${day.replace(/-/g, '')}_${Number(reglas.semilla) || 0}`, texts: {} };
+    if (caza) {
+      let libres = presas.filter((p) => !usadosC.has(p.tipo));
+      if (!libres.length) libres = presas;
+      const p = uno(libres); usadosC.add(p.tipo);
+      const n = Math.max(1, entre(p.min || 1, p.max || p.min || 5));
+      const nombre = String(p.nombre || gfNombrePresa(p.tipo)).slice(0, 60);
+      m.tipo = 'cazar'; m.monstruo = p.tipo; m.requiredAmount = n;
+      m.texts['en-US']  = { title: `Defeat ${n} ${nombre}`, description: uno(textos.cazar), itemName: nombre };
+      m.texts['es-419'] = { title: `Derrota ${n} ${nombre}`, description: textos.cazarEs, itemName: nombre };
+    } else {
+      let libres = pedidos.filter((p) => !usadosP.has(p.itemId));
+      if (!libres.length) libres = pedidos;
+      const p = uno(libres); usadosP.add(p.itemId);
+      const n = Math.max(1, entre(p.min || 1, p.max || p.min || 5));
+      const nombre = String(p.nombre || p.itemId).slice(0, 60);
+      m.tipo = 'entregar'; m.itemId = p.itemId; m.requiredAmount = n;
+      m.texts['en-US']  = { title: `Bring ${n} ${nombre}`, description: uno(textos.entregar), itemName: nombre };
+      m.texts['es-419'] = { title: `Trae ${n} ${nombre}`, description: textos.entregarEs, itemName: nombre };
+    }
+    m.expReward    = entre(reglas.expMin, reglas.expMax);
+    m.goldReward   = entre(reglas.oroMin, reglas.oroMax);
+    m.silverReward = entre(reglas.plataMin, reglas.plataMax);
+    if (premios.length && azar() * 100 < Math.max(0, Math.min(100, Number(reglas.probPremio ?? 75)))) {
+      const totalPeso = premios.reduce((s, p) => s + Math.max(0, Number(p.peso) || 1), 0);
+      let r = azar() * totalPeso, elegido = premios[0];
+      for (const p of premios) { r -= Math.max(0, Number(p.peso) || 1); if (r <= 0) { elegido = p; break; } }
+      m.rewardItemId = elegido.itemId;
+      m.rewardAmount = Math.max(1, entre(elegido.min || 1, elegido.max || elegido.min || 1));
+      const nombreP = String(elegido.nombre || elegido.itemId).slice(0, 60);
+      m.texts['en-US'].rewardName = nombreP;
+      m.texts['es-419'].rewardName = nombreP;
+    }
+    out.push(m);
+  }
+  return out;
+}
+
+/** Las del día si el NPC tiene reglas activas (y se guardan como `auto`). */
+async function gfMisionesAutoDelDia(npcId, day) {
+  try {
+    if (!MISSION_NPCS.includes(npcId)) return null;
+    const reglas = await gfReglasAuto(npcId);
+    if (!reglas || !reglas.activo) return null;
+    const crudas = gfGenerarMisiones(reglas, npcId, day);
+    if (!crudas.length) return null;
+    const limpias = sanearMisionesDelDia(crudas);
+    const hora = Math.max(0, Math.min(23, parseInt(reglas.horaReinicio, 10) || 0));
+    const doc = await DailyMission.findOneAndUpdate(
+      { npcId, day },
+      { $setOnInsert: { missions: limpias, dailyResetHour: hora, auto: true } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    console.log(`📜 Misiones automáticas de ${npcId} para ${day}: ${limpias.length}`);
+    return doc;
+  } catch (e) {
+    console.warn('⚠️  misiones automáticas de ' + npcId + ':', e.message);
+    return null;
+  }
+}
+
+function gfSanearReglas(b) {
+  const num = (v, a, z, d) => { const n = Number(v); return Number.isFinite(n) ? Math.max(a, Math.min(z, Math.round(n))) : d; };
+  const txt = (v, max) => String(v == null ? '' : v).replace(/<[^>]*>/g, '').trim().slice(0, max);
+  const lista = (l, fn) => (Array.isArray(l) ? l.slice(0, 40).map(fn).filter(Boolean) : []);
+  const rango = (o) => { const min = num(o.min, 1, 9999, 1); const max = num(o.max, 1, 9999, min); return { min: Math.min(min, max), max: Math.max(min, max) }; };
+  return {
+    activo: !!b.activo,
+    cuantas: num(b.cuantas, 1, 10, 3),
+    pesoEntregar: num(b.pesoEntregar, 0, 100, 60),
+    pesoCazar: num(b.pesoCazar, 0, 100, 40),
+    pedidos: lista(b.pedidos, (p) => {
+      const itemId = txt(p && p.itemId, 60);
+      return itemId ? Object.assign({ itemId, nombre: txt(p.nombre, 60) }, rango(p)) : null;
+    }),
+    presas: lista(b.presas, (p) => {
+      const tipo = txt(p && p.tipo, 40);
+      if (!tipo || (tipo !== '*' && tipo !== 'jugador' && !Object.prototype.hasOwnProperty.call(MONSTRUOS_BOTIN, tipo))) return null;
+      return Object.assign({ tipo, nombre: txt(p.nombre, 60) }, rango(p));
+    }),
+    premios: lista(b.premios, (p) => {
+      const itemId = txt(p && p.itemId, 60);
+      if (!itemId || !itemTipoOnChain(itemId)) return null;      // solo lo que se puede acuñar
+      return Object.assign({ itemId, nombre: txt(p.nombre, 60), peso: num(p.peso, 1, 100, 1) }, rango(p));
+    }),
+    probPremio: num(b.probPremio, 0, 100, 75),
+    // Los mismos topes que una misión a mano (el oro son dólares de verdad).
+    expMin: num(b.expMin, 0, 100000, 40), expMax: num(b.expMax, 0, 100000, 140),
+    oroMin: num(b.oroMin, 0, 1000, 0), oroMax: num(b.oroMax, 0, 1000, 0),
+    plataMin: num(b.plataMin, 0, 100000, 0), plataMax: num(b.plataMax, 0, 100000, 0),
+    horaReinicio: num(b.horaReinicio, 0, 23, 0)
+  };
+}
+
+// Lo que se puede elegir en el panel: los monstruos y los ítems acuñables.
+app.get('/api/admin/missions/catalogo', adminAuth, apiLimiter, (req, res) => {
+  const monstruos = [{ tipo: '*', nombre: 'Any monster' }, { tipo: 'jugador', nombre: 'Players (PvP kills)' }]
+    .concat(Object.keys(MONSTRUOS_BOTIN).map((k) => ({ tipo: k, nombre: MONSTRUOS_BOTIN[k].nombre, salas: MONSTRUOS_BOTIN[k].salas })));
+  return res.json({ success: true, monstruos, items: Object.keys(ITEM_TIPO_MAP) });
+});
+
+app.get('/api/admin/missions/auto/:npcId', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const npcId = String(req.params.npcId || '');
+    if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
+    return res.json({ success: true, npcId, reglas: await gfReglasAuto(npcId) });
+  } catch (e) {
+    console.error('GET /api/admin/missions/auto:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+app.put('/api/admin/missions/auto/:npcId', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const npcId = String(req.params.npcId || '');
+    if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
+    const limpias = gfSanearReglas(req.body || {});
+    const doc = await MisionesAutoConfig.findOneAndUpdate({ npcId },
+      { $set: Object.assign(limpias, { actualizadoPor: (req.user && req.user.address) || null }) },
+      { upsert: true, new: true, setDefaultsOnInsert: true }).lean();
+    console.log(`📜 Reglas automáticas de ${npcId} guardadas (activo=${doc.activo})`);
+    return res.json({ success: true, npcId, reglas: doc });
+  } catch (e) {
+    console.error('PUT /api/admin/missions/auto:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// Vista previa: lo que saldría ese día con las reglas que se mandan (o las guardadas).
+app.post('/api/admin/missions/auto/:npcId/preview', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const npcId = String(req.params.npcId || '');
+    if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(String((req.body || {}).day || '')) ? req.body.day : new Date().toISOString().split('T')[0];
+    const base = req.body && req.body.reglas ? Object.assign(gfSanearReglas(req.body.reglas), { semilla: Number(req.body.reglas.semilla) || 0 })
+                                             : await gfReglasAuto(npcId);
+    const missions = sanearMisionesDelDia(gfGenerarMisiones(Object.assign({}, base, { activo: true }), npcId, day));
+    return res.json({ success: true, npcId, day, missions });
+  } catch (e) {
+    return res.status(400).json({ error: e.message || 'preview_failed' });
+  }
+});
+
+// Otra tirada para HOY: nueva semilla y se rehace el día si era automático.
+app.post('/api/admin/missions/auto/:npcId/reroll', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const npcId = String(req.params.npcId || '');
+    if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
+    const day = new Date().toISOString().split('T')[0];
+    const actual = await gfReglasAuto(npcId);
+    const semilla = (Number(actual.semilla) || 0) + 1;
+    const base = actual.porDefecto ? gfSanearReglas(actual) : {};
+    await MisionesAutoConfig.findOneAndUpdate({ npcId }, { $set: Object.assign(base, { semilla }) }, { upsert: true, setDefaultsOnInsert: true });
+    const hoy = await DailyMission.findOne({ npcId, day }).lean();
+    if (hoy && !hoy.auto) return res.status(409).json({ error: 'today_is_manual', message: 'Today has manual missions: delete them first.' });
+    await DailyMission.deleteOne({ npcId, day, auto: true });
+    const doc = await gfMisionesAutoDelDia(npcId, day);
+    return res.json({ success: true, npcId, day, semilla, missions: doc ? doc.missions : [] });
+  } catch (e) {
+    console.error('POST /api/admin/missions/auto/reroll:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// QUIÉN CUMPLIÓ QUÉ: las misiones de un NPC en un día, y por cada jugador que
+// hizo algo ese día (entregó o cazó) cuáles cumplió y qué recibió, con su
+// cartera, su nombre y su nivel.
+app.get('/api/admin/missions/entregas', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const npcId = String(req.query.npcId || 'granjero');
+    if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.day || '')) ? String(req.query.day) : new Date().toISOString().split('T')[0];
+    const limite = Math.min(1000, Math.max(1, parseInt(req.query.limit, 10) || 300));
+    const buscar = String(req.query.search || '').trim();
+    const rx = buscar ? new RegExp(buscar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') : null;
+
+    const daily = await DailyMission.findOne({ npcId, day }).lean();
+    const misiones = ((daily && daily.missions) || []).map((m) => ({
+      missionId: m.missionId, tipo: m.tipo || 'entregar', monstruo: m.monstruo || '', itemId: m.itemId || '',
+      requiredAmount: m.requiredAmount, titulo: (m.texts && m.texts['en-US'] && m.texts['en-US'].title) || m.missionId,
+      expReward: m.expReward || 0, goldReward: m.goldReward || 0, silverReward: m.silverReward || 0,
+      rewardItemId: m.rewardItemId || null, rewardAmount: m.rewardAmount || 0
+    }));
+    const hayCaza = misiones.some((m) => m.tipo === 'cazar');
+
+    const progresos = await UserDailyProgress.find({ npcId, day }).limit(limite).lean();
+    const cazas = hayCaza ? await MisionCaza.find({ day }).limit(limite).lean() : [];
+    const nombres = new Set(progresos.map((p) => p.playerName).concat(cazas.map((c) => c.playerName)));
+    const fichas = await GamePlayer.find({ playerName: { $in: Array.from(nombres) } })
+      .select('playerName Username nivel address -_id').lean();
+    const ficha = new Map(fichas.map((f) => [f.playerName, f]));
+    const sinDir = fichas.filter((f) => !f.address).map((f) => f.playerName);
+    if (sinDir.length) {
+      (await PlayerAuth.find({ playerName: { $in: sinDir } }).select('playerName address -_id').lean())
+        .forEach((a) => { const f = ficha.get(a.playerName); if (f && !f.address) f.address = a.address; });
+    }
+    const progPor = new Map(progresos.map((p) => [p.playerName, p]));
+    const cazaPor = new Map(cazas.map((c) => [c.playerName, c]));
+
+    let filas = Array.from(nombres).map((n) => {
+      const f = ficha.get(n) || {};
+      const p = progPor.get(n);
+      const hechas = (p && p.completedMissions) || [];
+      const c = cazaPor.get(n);
+      const tot = { exp: 0, oro: 0, plata: 0, items: {} };
+      hechas.forEach((h) => {
+        tot.exp += Number(h.exp) || 0; tot.oro += Number(h.oro) || 0; tot.plata += Number(h.plata) || 0;
+        if (h.itemId && h.itemCantidad) tot.items[h.itemId] = (tot.items[h.itemId] || 0) + Number(h.itemCantidad);
+      });
+      return {
+        playerName: n,
+        username: f.Username && f.Username !== '---' ? f.Username : null,
+        address: f.address || null,
+        nivel: Number(f.nivel || 0),
+        completadas: hechas.map((h) => ({ missionId: h.missionId, completedAt: h.completedAt, tipo: h.tipo || null,
+          titulo: h.titulo || null, exp: h.exp ?? null, oro: h.oro ?? null, plata: h.plata ?? null,
+          itemId: h.itemId || null, itemCantidad: h.itemCantidad ?? null })),
+        pendientes: misiones.filter((m) => !hechas.some((h) => h.missionId === m.missionId)).map((m) => m.missionId),
+        cazas: c ? { total: c.total || 0, porTipo: c.porTipo || {} } : null,
+        recibido: tot,
+        ultima: hechas.length ? hechas.map((h) => h.completedAt).sort().slice(-1)[0] : null
+      };
+    });
+    if (rx) filas = filas.filter((f) => rx.test(f.playerName) || rx.test(f.username || '') || rx.test(f.address || ''));
+    filas.sort((a, b) => (b.completadas.length - a.completadas.length) || String(b.ultima || '').localeCompare(String(a.ultima || '')));
+    return res.json({ success: true, npcId, day, auto: !!(daily && daily.auto), misiones, total: filas.length, rows: filas });
+  } catch (e) {
+    console.error('GET /api/admin/missions/entregas:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+console.log('✅ Missions auto/caza/entregas: /api/admin/missions/{catalogo,auto,entregas}');
 
 app.delete('/api/admin/missions/daily/:npcId/:day', adminAuth, strictLimiter, async (req, res) => {
   try {
@@ -20992,6 +21579,7 @@ app.post('/api/marketplace/onchain/settle',
     body('itemId').isString().notEmpty(),
     body('qty').isInt({ min: 1, max: 10000 })
   ],
+  (req, res, next) => (req.body && req.body.op === 'escrow' ? gfExigeNombre(req, res, next) : next()),
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -26677,6 +27265,7 @@ io.on('connection', (socket) => {
     let ticket = null;
     try {
       if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
+      if (!(await gfSocketConNombre(socket))) return emitBattle(socket, 'brawl:error', { error: 'name_required' });
       if (brawlRecuperarSolicitud(socket, 'bot')) return;
       ticket = reserveBattleAdmission(socket, 'bot');
       if (!ticket) return emitBattle(socket, 'brawl:error', { error: 'already_in_battle' });
@@ -26692,6 +27281,7 @@ io.on('connection', (socket) => {
     let ticket = null;
     try {
       if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
+      if (!(await gfSocketConNombre(socket))) return emitBattle(socket, 'brawl:error', { error: 'name_required' });
       // Quien estaba en la cola y se cansa de esperar pasa directo a practicar.
       if (socket._battleTicket && socket._battleTicket.mode === 'pvp' && !socketMatch.has(socket.id)) {
         removeBattleQueueSocket(socket);
@@ -26713,6 +27303,7 @@ io.on('connection', (socket) => {
     let ticket = null;
     try {
       if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
+      if (!(await gfSocketConNombre(socket))) return emitBattle(socket, 'brawl:error', { error: 'name_required' });
       // brawlRecuperarSolicitud también vuelve a confirmar la cola.
       if (brawlRecuperarSolicitud(socket, 'pvp')) return;
       ticket = reserveBattleAdmission(socket, 'pvp');
