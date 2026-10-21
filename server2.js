@@ -2489,8 +2489,8 @@ async function checkGameAccess(address) {
       };
     }
   } catch (e) {
-    // Si la consulta falla no se deja fuera a nadie: se sigue con el resto.
     console.warn('⚠️  No se pudo comprobar la suspensión:', e.message);
+    throw e;
   }
 
   if (ac.mode === 'whitelist') {
@@ -2541,9 +2541,9 @@ async function enforceGameAccess(req, res, next) {
     }
     return res.status(403).json({ error: 'not_whitelisted', message: 'This wallet is not on the whitelist' });
   } catch (e) {
-    // Ante un fallo del chequeo NO se deja fuera a todo el mundo.
-    console.warn('⚠️  enforceGameAccess falló (se permite el paso):', e.message);
-    return next();
+    console.warn('⚠️  enforceGameAccess no pudo verificar el acceso:', e.message);
+    res.setHeader('Retry-After', '5');
+    return res.status(503).json({ error: 'game_access_unavailable', message: 'Access verification temporarily unavailable' });
   }
 }
 
@@ -9099,7 +9099,7 @@ app.get('/api/auth/csrf-token', (req, res) => {
 // CORREGIDO: Nonce endpoint - AHORA FUNCIONA CORRECTAMENTE
 app.get('/api/auth/nonce', nonceLimiter, async (req, res) => {
   try {
-    const address = (req.query.address || '').toLowerCase();
+    const address = typeof req.query.address === 'string' ? req.query.address.toLowerCase() : '';
     console.log(`🔢 Solicitando nonce para dirección: ${address}`);
     
     if (!address || !isValidEthereumAddress(address)) {
@@ -9112,6 +9112,12 @@ app.get('/api/auth/nonce', nonceLimiter, async (req, res) => {
     
     // Verificar si el usuario ya tiene un nonce válido (menos de 10 minutos)
     const existingPlayer = await PlayerAuth.findOne({ address }).exec();
+
+    if (existingPlayer && existingPlayer.loginBlockedUntil && existingPlayer.loginBlockedUntil > new Date()) {
+      const remaining = Math.ceil((existingPlayer.loginBlockedUntil - new Date()) / 1000);
+      return res.status(429).json({ error: 'account_temporarily_blocked', retryAfter: remaining,
+        message: 'Cuenta bloqueada temporalmente por demasiados intentos' });
+    }
     
     if (existingPlayer && existingPlayer.nonce && existingPlayer.nonceTimestamp) {
       const now = new Date();
@@ -9130,17 +9136,6 @@ app.get('/api/auth/nonce', nonceLimiter, async (req, res) => {
       } else {
         console.log(`🔄 Nonce expirado para ${address.substring(0, 10)}... (edad: ${Math.floor(nonceAge/1000)}s)`);
       }
-    }
-    
-    const player = await PlayerAuth.findOne({ address }).exec();
-    if (player && player.loginBlockedUntil && player.loginBlockedUntil > new Date()) {
-      const remaining = Math.ceil((player.loginBlockedUntil - new Date()) / 1000);
-      console.log(`🚫 Cuenta bloqueada para ${address.substring(0, 10)}... por ${remaining}s`);
-      return res.status(429).json({ 
-        error: 'account_temporarily_blocked', 
-        retryAfter: remaining,
-        message: 'Cuenta bloqueada temporalmente por demasiados intentos'
-      });
     }
     
     const nonce = generateNonce();
@@ -9188,6 +9183,11 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
   const startTime = Date.now();
   try {
     const { address, signature, token, message } = req.body || {};
+
+    if ([address, signature, token, message].some(value => typeof value !== 'string' || !value) ||
+        address.length > 42 || signature.length > 1024 || token.length > 256 || message.length > 8192) {
+      return res.status(400).json({ error: 'invalid_login_parameters', message: 'Parámetros de autenticación inválidos' });
+    }
     
     console.log(`🔐 Intentando login para: ${address ? address.substring(0, 10) + '...' : 'dirección no proporcionada'}`);
     console.log('📦 Body recibido:', { 
@@ -9227,7 +9227,12 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
     console.log(`🔍 Estado del nonce para ${lcAddress.substring(0, 10)}...:`);
     console.log(`   - nonceTimestamp: ${player.nonceTimestamp}`);
 
-    if (!player.nonce) {
+    if (player.loginBlockedUntil && player.loginBlockedUntil > new Date()) {
+      return res.status(429).json({ error: 'account_temporarily_blocked',
+        retryAfter: Math.ceil((player.loginBlockedUntil - new Date()) / 1000) });
+    }
+
+    if (!player.nonce || !player.nonceTimestamp || !Number.isFinite(player.nonceTimestamp.getTime())) {
       console.log(`❌ Nonce no encontrado para ${lcAddress.substring(0, 10)}...`);
       return res.status(401).json({ 
         error: 'authentication_failed',
@@ -9238,7 +9243,7 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
     if (player.nonceTimestamp && (Date.now() - player.nonceTimestamp.getTime() > 10 * 60 * 1000)) {
       console.log(`⏰ Nonce expirado para ${lcAddress.substring(0, 10)}...`);
       await PlayerAuth.updateOne(
-        { address: lcAddress }, 
+        { address: lcAddress, nonce: player.nonce, nonceTimestamp: player.nonceTimestamp }, 
         { $set: { nonce: null, nonceTimestamp: null } }
       );
       return res.status(401).json({ 
@@ -9357,7 +9362,21 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
         return res.status(403).json({ error: 'not_whitelisted' });
       }
     } catch (accErr) {
-      console.warn('⚠️  checkGameAccess falló (se permite el login por defecto):', accErr.message);
+      console.warn('⚠️  checkGameAccess no pudo verificar el login:', accErr.message);
+      res.setHeader('Retry-After', '5');
+      return res.status(503).json({ error: 'game_access_unavailable', message: 'Access verification temporarily unavailable' });
+    }
+
+    // Consumir el desafío en una sola escritura condicional antes de emitir
+    // tokens. Dos firmas concurrentes del mismo nonce solo tienen un ganador.
+    const claimedNonce = await PlayerAuth.findOneAndUpdate(
+      { address: lcAddress, nonce: player.nonce,
+        nonceTimestamp: { $gte: new Date(Date.now() - 10 * 60 * 1000) },
+        $or: [{ loginBlockedUntil: null }, { loginBlockedUntil: { $lte: new Date() } }] },
+      { $set: { nonce: null, nonceTimestamp: null } }, { new: true }
+    );
+    if (!claimedNonce) {
+      return res.status(401).json({ error: 'authentication_failed', message: 'Nonce already used or expired' });
     }
 
     // ✅ AUTENTICACIÓN EXITOSA
@@ -9403,8 +9422,6 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
 
     // Preparar datos de actualización para PlayerAuth
     const updateData = {
-      nonce: null,
-      nonceTimestamp: null,
       refreshTokenHash: refreshHash,
       refreshTokenId,
       lastLogin: new Date(),
@@ -9483,7 +9500,7 @@ app.post('/api/auth/refresh', apiLimiter, async (req, res) => {
     let payload;
     try {
       payload = jwt.verify(raw, JWT_SECRET, { algorithms: ['HS256'] });
-      if (payload.type !== 'refresh') {
+      if (payload.type !== 'refresh' || typeof payload.address !== 'string' || !isValidEthereumAddress(payload.address)) {
         console.log('❌ Token no es de tipo refresh');
         throw new Error('Invalid token type');
       }
@@ -9520,7 +9537,7 @@ app.post('/api/auth/refresh', apiLimiter, async (req, res) => {
       });
     }
 
-    if (storedToken.expiresAt < new Date()) {
+    if (storedToken.expiresAt <= new Date()) {
       console.log(`❌ Refresh token expirado para ${payload.address.substring(0, 10)}...`);
       await RefreshToken.deleteOne({ _id: storedToken._id });
       return res.status(401).json({ 
@@ -9533,9 +9550,6 @@ app.post('/api/auth/refresh', apiLimiter, async (req, res) => {
 
     // ✅ Token válido - proceder con el refresh
     console.log(`✅ Refresh token válido para ${payload.address.substring(0, 10)}...`);
-    
-    // Eliminar token antiguo
-    await RefreshToken.deleteOne({ _id: storedToken._id });
     
     // Crear nuevos tokens
     const newRefreshTokenId = uuidv4();
@@ -9552,24 +9566,31 @@ app.post('/api/auth/refresh', apiLimiter, async (req, res) => {
       jti: uuidv4() 
     }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRES });
 
-    // Guardar nuevo refresh token
+    // Preparar todo antes de reemplazar el token: un fallo de firma, hash o
+    // lectura no debe destruir la sesión que todavía usa el navegador.
     const decoded = jwt.decode(newRawRefresh);
     const expiresAt = new Date(decoded.exp * 1000);
     
-    await RefreshToken.create({
-      token: crypto.createHash('sha256').update(newRawRefresh).digest('hex'),
-      address: payload.address.toLowerCase(),
-      expiresAt,
-      userAgent: req.headers['user-agent'],
-      ip: req.clientIp
-    });
-
     // Obtener playerName
     const gamePlayer = await GamePlayer.findOne({ address: payload.address.toLowerCase() }).exec();
     const playerName = gamePlayer ? gamePlayer.playerName : payload.address;
 
-    // Actualizar en PlayerAuth
-    await PlayerAuth.updateOne({ 
+    // Una sola operación Mongo reemplaza el valor anterior, incluso entre
+    // procesos. Una petición concurrente no puede reutilizar el mismo token.
+    const rotated = await RefreshToken.findOneAndUpdate(
+      { _id: storedToken._id, token: tokenHash, expiresAt: { $gt: new Date() } },
+      { $set: { token: crypto.createHash('sha256').update(newRawRefresh).digest('hex'),
+        address: payload.address.toLowerCase(), expiresAt,
+        userAgent: req.headers['user-agent'], ip: req.clientIp } }, { new: true }
+    );
+    if (!rotated) {
+      return res.status(401).json({ error: 'refresh_token_not_found', canRetry: false,
+        requiresReauth: true, message: 'Token de refresco ya utilizado o expirado' });
+    }
+
+    // RefreshToken es la autoridad de renovación. Estos campos son metadatos;
+    // su fallo no debe perder la cookie ya rotada y dejar una sesión huérfana.
+    try { await PlayerAuth.updateOne({ 
       address: payload.address.toLowerCase() 
     }, { 
       $set: {
@@ -9578,7 +9599,9 @@ app.post('/api/auth/refresh', apiLimiter, async (req, res) => {
         lastLogin: new Date(),
         playerName: playerName
       }
-    });
+    }); } catch (metadataError) {
+      console.warn('⚠️  No se pudieron actualizar metadatos de refresh:', metadataError.message);
+    }
 
     // Configurar cookies
     const accessCookieOpts = setCookieOptions(15 * 60);
@@ -12066,6 +12089,9 @@ const DANO_MONSTRUOS = {
   serpiente_mordisco: 14,      // su mordisco al salir del suelo
   monstruo_golpe: 8,           // golpe de un monstruo del mapa salvaje
   monstruo_poder: 11,          // su poder (rayo, onda, espinas…)
+  // (2026-10-20) Los JEFES de cada mapa (gf-jefes.js): pegan más fuerte.
+  jefe_golpe: 16,              // su golpe de cerca
+  jefe_poder: 20,              // sus poderes (onda, púas, lluvia, orbes)
   // (2026-10-18) Dentro de un remolino del desierto: una vez por segundo
   // como mucho (gf-zonas.js); el remolino no persigue, arrastra.
   remolino_arena: 4
@@ -12738,6 +12764,10 @@ function pescaCercaDelAgua(px, py, radio = 3) {
    azul" que el juego; en la tundra también el lago helado). */
 const GF_PESCA_ZONAS = {"salvaje":{"tile":16,"w":314,"h":314,"rle":"138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149,256-281;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;20-45,138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149;138-149"},"cementerio":{"tile":16,"w":314,"h":314,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;259-266;257-268;256-271;254-275;253-275;252-275;251-276;250-276;250-276;250-277;250-277;250-277;251-277;251-276;252-275;253-274;255-271;259-268;263-264;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;59-62;57-65,68-72;49-74;47-76;46-78;44-80;41-84;40-86;39-86;39-87;38-88;38-88;37-88;36-88;36-89;35-89;33-91;31-92;30-93;29-93;29-94;29-94;30-93;31-93;32-93;33-93;33-93;33-92;34-92;34-92;34-91;35-90;35-89;36-88;37-87;37-87;38-86;39-85;40-83;41-82;43-79;49-76;51-75;55-65,68-73;57-63;60-61;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"},"desierto":{"tile":16,"w":314,"h":314,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;184-198;182-202;178-203;176-203;175-203;168-203;168-203;167-203;167-203;167-203;167-203;167-203;166-203;166-203;166-203;167-203;167-203;168-203;168-203;169-203;169-203;170-203;172-209;175-208;178-206;180-203;182-201;185-188,196-199;;;;;;;;;;;;;;;;;;;;;;;38-48;35-51;31-53;30-54;29-55;29-55;28-55;28-55;28-54;28-54;28-54;28-55;28-55;28-55;29-54;30-54;31-52;33-49;37-47;41-44;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;250-254;247-256;243-261;240-264;237-266;236-268;235-269;235-269;234-270;234-271;234-271;234-272;234-272;234-272;234-272;234-272;235-272;235-271;236-271;236-270;237-270;238-268;238-266;239-263;240-262;242-260;245-258;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"},"tundra":{"tile":16,"w":314,"h":314,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;106-114;96-99,104-118,124-125;94-100,103-126;93-128;92-130;91-138;89-138;88-139;87-139;87-140;86-140;86-141;86-142;85-143;84-144;83-145;83-145;82-145;81-146;79-146;77-146;76-146;76-146;77-146;78-146;79-146;80-146;81-146;81-146;81-145;81-144;81-142;81-141;81-140;81-140;82-139;83-139;84-139;85-138;86-137;88-131;91-130;99-129;105-111,117-127;123-125;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;252-264;250-266;249-267;248-268;247-269;246-269;246-269;246-269;246-269;246-269;247-269;247-268;248-267;250-266;253-265;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"}};
 const _gfPescaZonas = {};
+/* (2026-10-21) LA MINA: sus charcas (la capa `area_agua` de Maps/mina.json,
+   en casillas de 16 px). Con ellas se pesca en la mina (desde la orilla o
+   desde el bote) y se sabe dónde se puede poner un bote. */
+GF_PESCA_ZONAS.mina = {"tile":16,"w":313,"h":313,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;174-181;174-181;172-183;172-183;170-183;170-183;168-183;168-183;138-141,166-185;138-141,166-185;136-143,164-187;136-143,164-187;134-143,164-187;134-143,164-187;130-147,174-185;130-147,174-185;130-155;130-155;130-157;130-157;128-157;128-157;128-155;128-155;130-153;130-153;130-153;130-153;130-139,144-151;130-139,144-151;130-137;130-137;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"};
 function gfZonaCercaDelAgua(zona, px, py, radio = 3) {
   const z = GF_PESCA_ZONAS[zona];
   if (!z) return false;
@@ -12970,7 +13000,17 @@ const MONSTRUOS_BOTIN = {
   golem_hielo: { nombre: 'Ice Golem', salas: ['tundra'], enfriaMs: 7 * 60 * 1000, exp: 190, montones: [2, 2], instancias: 5,
     botin: [['mineral_piedra_hierro', 1, 3], ['mineral_piedra', 2, 4]] },
   bruja_ventisca: { nombre: 'Blizzard Witch', salas: ['tundra'], enfriaMs: 12 * 60 * 1000, exp: 270, montones: [2, 3], instancias: 4,
-    botin: [['mineral_piedra_hierro', 1, 3], ['carbon', 2, 4], ['mineral_piedra_cobre', 1, 3]] }
+    botin: [['mineral_piedra_hierro', 1, 3], ['carbon', 2, 4], ['mineral_piedra_cobre', 1, 3]] },
+  // (2026-10-20) LOS JEFES: uno por mapa, vuelven a la media hora y sueltan
+  // mucho (gf-jefes.js; el arte, tools/generar-jefes.py).
+  jefe_golem: { nombre: 'The Mossback Titan', salas: ['salvaje'], enfriaMs: 30 * 60 * 1000, exp: 1500, montones: [5, 7], instancias: 1,
+    botin: [['mineral_piedra_hierro', 3, 6], ['mineral_piedra_cobre', 3, 6], ['pocion_vida', 1, 2], ['Semillax3', 2, 4], ['tablon_de_madera', 3, 6]] },
+  jefe_arana: { nombre: 'The Bone Widow', salas: ['cementerio'], enfriaMs: 30 * 60 * 1000, exp: 1600, montones: [5, 7], instancias: 1,
+    botin: [['pocion_antidoto', 1, 2], ['pocion_vida', 1, 2], ['mineral_piedra_hierro', 3, 5], ['carbon', 4, 8], ['antorcha', 2, 4]] },
+  jefe_escorpion: { nombre: 'The Sand Emperor', salas: ['desierto'], enfriaMs: 30 * 60 * 1000, exp: 1600, montones: [5, 7], instancias: 1,
+    botin: [['mineral_piedra_cobre', 4, 7], ['pocion_vida', 1, 2], ['Semillax4', 2, 4], ['madera_seca', 4, 8], ['carbon', 3, 6]] },
+  jefe_lobo: { nombre: 'Frostfang, the Pack King', salas: ['tundra'], enfriaMs: 30 * 60 * 1000, exp: 1700, montones: [5, 7], instancias: 1,
+    botin: [['mineral_piedra_hierro', 4, 7], ['pocion_vida', 1, 2], ['madera_pinos', 6, 10], ['carbon', 4, 8], ['antorcha', 2, 3]] }
 };
 const BOTIN_CADUCA_MS = 10 * 60 * 1000;
 const _monstruoUltimo = new Map();     // 'jugador|tipo' -> hora de la última victoria
@@ -13151,7 +13191,10 @@ const PVP_ZONAS = {
 };
 function esSalaSalvaje(sala) { return SALAS_SALVAJES.has(salaBase(sala)); }
 // Vida que quita cada espada a otro jugador (la vida va de 0 a 100).
-const PVP_DANO = { espada_madera: 4, espada_cobre: 6, espada_hierro: 9 };
+const PVP_DANO = { espada_madera: 4, espada_cobre: 6, espada_hierro: 9, arco: 5, baston_mago: 6 };
+// (2026-10-21) El arco y el bastón dan de lejos: su alcance propio (generoso,
+// como el de la espada: las dos posiciones llegan con el retraso de la red).
+const PVP_ALCANCE_ARMA = { arco: 420, baston_mago: 360 };
 // Generoso: las dos posiciones llegan con el retraso de la red.
 const PVP_ALCANCE = 150;
 const PVP_ENFRIA_MS = 300;
@@ -13296,7 +13339,7 @@ app.get('/api/salvaje/suelo', apiLimiter, authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/salvaje/soltar', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+app.post('/api/salvaje/soltar', apiLimiter, authMiddleware, csrfProtection, gfExigeVip, async (req, res) => {
   try {
     const gp = await jugadorDeLaSesion(req);
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
@@ -13488,7 +13531,7 @@ io.on('connection', (socket) => {
       const pa = filas[socket.id], pv = filas[victimaId];
       if (!pa || !pv) return;
       if (!_enZonaPvp(pa, salaBase(sala)) || !_enZonaPvp(pv, salaBase(sala))) return socket.emit('pvp:rechazado', { motivo: 'zona' });
-      if (Math.hypot(Number(pa.x) - Number(pv.x), Number(pa.y) - Number(pv.y)) > PVP_ALCANCE) return;
+      if (Math.hypot(Number(pa.x) - Number(pv.x), Number(pa.y) - Number(pv.y)) > (PVP_ALCANCE_ARMA[arma] || PVP_ALCANCE)) return;
       const sv = io.sockets.sockets.get(victimaId);
       if (!sv) return;
       const ella = await cuentaDelSocket(sv);
@@ -13884,6 +13927,239 @@ app.post('/api/antorchas/poner', apiLimiter, authMiddleware, csrfProtection, asy
     console.error('POST /api/antorchas/poner:', e);
     return res.status(500).json({ error: 'internal_error' });
   }
+});
+
+// =============================================================================
+// EL BOTE                                                          (2026-10-21)
+// -----------------------------------------------------------------------------
+// "Quiero en la tienda poder comprar o vender un bote 2.5D (su tabla de
+// creación automática) que pueda poner en cualquier agua de GameScene, el
+// desierto, la nieve, la mina, el cementerio y el mapa salvaje; pescar desde
+// él; bajarme y, con la pala, quitarlo de vuelta al inventario. Y que los
+// demás vean el bote, cuando me subo, cuando pesco y cuando me bajo y lo
+// quito con la pala."
+//
+// Como la antorcha: ponerlo QUEMA 1 de la tabla `bote` y queda apuntado en
+// Mongo (sin caducidad) hasta que su dueño lo recoge con la pala de
+// construcción, que lo vuelve a ACUÑAR (mintGatherReward, en la cola del
+// jugador). Es del mundo y no del canal (se avisa a las diez salas de la
+// zona). Un bote por jugador.
+//
+// Subir y remar: el cliente (gf-botes.js) sienta al jugador en el bote y solo
+// le deja moverse por el agua; aquí se lleva quién va a bordo (en memoria) y
+// dónde queda el bote al bajarse. Se comprueba: que sea SU bote, que esté en
+// esa zona y cerca, y que el sitio sea AGUA (las casillas de la pesca).
+// =============================================================================
+const BOTE_ZONAS = new Set(['game', 'mina', 'salvaje', 'cementerio', 'desierto', 'tundra']);
+const BOTE_ALCANCE = 260;          // de los pies del jugador al sitio del bote
+const BOTE_MAX_ZONA = 80;
+const boteSchema = new mongoose.Schema({
+  zona:       { type: String, required: true, index: true },
+  playerName: { type: String, required: true, unique: true },     // uno por jugador
+  deNombre:   { type: String, default: '' },
+  x:          { type: Number, required: true },
+  y:          { type: Number, required: true }
+}, { timestamps: true, versionKey: false });
+const Bote = mongoose.model('Bote', boteSchema);
+const _boteABordo = new Map();     // id del bote -> socket.id de quien rema
+const _botePos = new Map();        // id del bote -> { x, y } mientras se rema
+
+/** ¿Es agua (de la que se pesca) ese punto de esa zona? */
+function gfEsAgua(zona, x, y) {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+  if (zona === 'game') return pescaCercaDelAgua(x, y, 0);
+  if (GF_PESCA_ZONAS[zona]) return gfZonaCercaDelAgua(zona, x, y, 0);
+  return false;
+}
+function _botePublico(b) {
+  const id = String(b._id);
+  return { id, zona: b.zona, x: Math.round(b.x), y: Math.round(b.y), dueno: b.playerName,
+           deNombre: String(b.deNombre || '').slice(0, 40), aBordo: _boteABordo.get(id) || null };
+}
+function _idBoteValido(id) { return typeof id === 'string' && /^[a-f0-9]{24}$/.test(id); }
+
+app.get('/api/botes', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const zona = String((req.query && req.query.zona) || '');
+    if (!BOTE_ZONAS.has(zona)) return res.json({ ok: true, lista: [] });
+    const lista = await Bote.find({ zona }).limit(BOTE_MAX_ZONA).lean();
+    return res.json({ ok: true, lista: lista.map(_botePublico), yo: gp.playerName });
+  } catch (e) {
+    console.error('GET /api/botes:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/botes/poner', apiLimiter, authMiddleware, csrfProtection, gfExigeNombre, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    if (!relayerWallet) return res.status(503).json({ error: 'relayer_unavailable' });
+    const zona = String((req.body && req.body.zona) || '');
+    if (!BOTE_ZONAS.has(zona)) return res.status(400).json({ error: 'zona_invalida' });
+    const yo = _salaYPosicion(gp.playerName);
+    if (!yo || salaBase(yo.sala) !== zona) {
+      return res.status(403).json({ error: 'fuera_de_zona', message: 'Walk a little first: you are not in this place yet.' });
+    }
+    const x = Number(req.body && req.body.x), y = Number(req.body && req.body.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || Math.hypot(x - yo.x, y - (yo.y + 40)) > BOTE_ALCANCE) {
+      return res.status(400).json({ error: 'lejos', message: 'Put the boat on the water closer to you.' });
+    }
+    if (!gfEsAgua(zona, x, y)) return res.status(400).json({ error: 'no_es_agua', message: 'The boat goes on the water.' });
+    const address = String(gp.address || '').toLowerCase();
+    const r = await enColaDelJugador('bote:' + address, async () => {
+      if (await Bote.exists({ playerName: gp.playerName })) {
+        return { status: 409, body: { error: 'ya_tienes', message: 'You already have a boat on the water: pick it up with the shovel first.' } };
+      }
+      if (await Bote.countDocuments({ zona }) >= BOTE_MAX_ZONA) {
+        return { status: 429, body: { error: 'zona_llena', message: 'There are too many boats here. Try later.' } };
+      }
+      const c = contratoItemsServidor();
+      if (!c) return { status: 503, body: { error: 'relayer_unavailable' } };
+      const facturas = await facturasLibresDeCadena(address);
+      const del = facturas.filter(f => f.tipo === 'bote' && f.cantidad > 0).sort((a, b) => a.cantidad - b.cantidad)[0];
+      if (!del) return { status: 400, body: { error: 'no_tienes', message: 'You have no boat.' } };
+      await txRelayer('bote: poner', (o) => c.decreaseInvoiceQuantity(del.id, 1, o));
+      const quedan = del.cantidad - 1;
+      const doc = await Bote.create({ zona, playerName: gp.playerName, deNombre: String(gp.Username || gp.playerName).slice(0, 40),
+                                      x: Math.round(x), y: Math.round(y) });
+      try {
+        const g = await GamePlayer.findOne({ playerName: gp.playerName });
+        if (g) {
+          const r2 = quitarUnaDeFacturaEnSlots(g.inventory, g.chest, del.id, quedan);
+          g.inventory = r2.inventory; g.chest = r2.chest;
+          g.markModified('inventory'); g.markModified('chest');
+          await g.save();
+        }
+      } catch (e) { console.warn('⚠️  bote: casilla en Mongo:', e.message); }
+      const pub = _botePublico(doc);
+      _avisarZona(zona, 'bote:nuevo', pub);
+      console.log(`⛵ ${gp.playerName} puso su bote en ${zona} (${pub.x}, ${pub.y})`);
+      return { status: 200, body: { ok: true, bote: pub,
+        gastado: { itemId: 'bote', invoiceId: del.id, manualId: del.manualId, cantidadRestante: quedan } } };
+    });
+    return res.status(r.status).json(r.body);
+  } catch (e) {
+    console.error('POST /api/botes/poner:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+/* Con la PALA de construcción, su dueño lo saca del agua y vuelve a la bolsa. */
+app.post('/api/botes/recoger', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    if (!relayerWallet) return res.status(503).json({ error: 'relayer_unavailable' });
+    const id = String((req.body && req.body.id) || '');
+    if (!_idBoteValido(id)) return res.status(400).json({ error: 'no_existe' });
+    const doc = await Bote.findById(id).lean();
+    if (!doc) return res.status(404).json({ error: 'no_existe' });
+    if (doc.playerName !== gp.playerName) return res.status(403).json({ error: 'no_es_tuyo', message: 'It is not your boat.' });
+    if (_boteABordo.has(id)) return res.status(409).json({ error: 'a_bordo', message: 'Get off the boat first.' });
+    const yo = _salaYPosicion(gp.playerName);
+    const pos = _botePos.get(id) || doc;
+    if (!yo || salaBase(yo.sala) !== doc.zona || Math.hypot(pos.x - yo.x, pos.y - (yo.y + 40)) > BOTE_ALCANCE) {
+      return res.status(400).json({ error: 'lejos', message: 'Walk closer to your boat.' });
+    }
+    const g0 = await GamePlayer.findOne({ playerName: gp.playerName }).select('inventory chest').lean();
+    const casillas = [].concat(g0 && Array.isArray(g0.inventory) ? g0.inventory : [], g0 && Array.isArray(g0.chest) ? g0.chest : []);
+    if (!casillas.some(s => s && s.objeto === 'pala_construccion' && Number(s.cantidad) > 0)) {
+      return res.status(400).json({ error: 'sin_pala', message: 'You need the Construction Shovel to pick up the boat.' });
+    }
+    const address = String(gp.address || '').toLowerCase();
+    const r = await enColaDelJugador('bote:' + address, async () => {
+      // Primero se saca del agua (nadie más puede recogerlo dos veces) y
+      // luego se acuña; si la cadena falla, el bote vuelve a su sitio.
+      const quitado = await Bote.findOneAndDelete({ _id: id, playerName: gp.playerName }).lean();
+      if (!quitado) return { status: 404, body: { error: 'no_existe' } };
+      _botePos.delete(id);
+      let factura = null;
+      try { factura = await mintGatherReward(address, 'bote', 1); } catch (e) { factura = null; }
+      if (!factura || !factura.id) {
+        try {
+          const vuelto = await Bote.create({ zona: quitado.zona, playerName: quitado.playerName, deNombre: quitado.deNombre, x: quitado.x, y: quitado.y });
+          _avisarZona(quitado.zona, 'bote:nuevo', _botePublico(vuelto));
+        } catch (e2) { console.warn('⚠️  bote: no se pudo devolver al agua:', e2.message); }
+        return { status: 502, body: { error: 'cadena', message: 'The chain is busy. Try again.' } };
+      }
+      try {
+        const g = await GamePlayer.findOne({ playerName: gp.playerName });
+        if (g) {
+          const r2 = ponerFacturaEnSlots(g.inventory, g.chest, 'bote', factura);
+          g.inventory = r2.inventory; g.chest = r2.chest;
+          g.markModified('inventory'); g.markModified('chest');
+          await g.save();
+        }
+      } catch (e) { console.warn('⚠️  bote: recoger en Mongo:', e.message); }
+      _avisarZona(quitado.zona, 'bote:quitado', { id, por: String(gp.Username || gp.playerName).slice(0, 40),
+                                                 x: Math.round(quitado.x), y: Math.round(quitado.y) });
+      console.log(`⛵ ${gp.playerName} recogió su bote con la pala (${quitado.zona})`);
+      return { status: 200, body: { ok: true, itemId: 'bote',
+        factura: { invoiceId: factura.id, manualId: factura.manualId, cantidad: factura.cantidad } } };
+    });
+    return res.status(r.status).json(r.body);
+  } catch (e) {
+    console.error('POST /api/botes/recoger:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+io.on('connection', (socket) => {
+  /* Bajarse (o irse): el bote queda donde estaba y se avisa a la zona. */
+  const bajarse = async (x, y) => {
+    const id = socket._boteId;
+    if (!id) return;
+    socket._boteId = null;
+    if (_boteABordo.get(id) !== socket.id) return;
+    _boteABordo.delete(id);
+    try {
+      const doc = await Bote.findById(id);
+      if (!doc) { _botePos.delete(id); return; }
+      const p = (Number.isFinite(x) && Number.isFinite(y) && gfEsAgua(doc.zona, x, y)) ? { x, y } : (_botePos.get(id) || null);
+      if (p) { doc.x = Math.round(p.x); doc.y = Math.round(p.y); await doc.save(); }
+      _botePos.delete(id);
+      _avisarZona(doc.zona, 'bote:estado', _botePublico(doc));
+    } catch (e) { console.warn('⚠️  bote: bajar:', e.message); }
+  };
+
+  socket.on('bote:subir', async (d) => {
+    try {
+      if (frenado(socket, 'bote_subir', 400)) return;
+      const id = String((d && d.id) || '');
+      if (!_idBoteValido(id)) return;
+      const yo = await cuentaDelSocket(socket);
+      if (!yo) return;
+      const doc = await Bote.findById(id).lean();
+      if (!doc || doc.playerName !== yo) return socket.emit('bote:rechazado', { id, motivo: 'no_es_tuyo' });
+      const sala = socket.playerData && socket.playerData.room;
+      const fila = sala && rooms[sala] && rooms[sala][socket.id];
+      if (!fila || salaBase(sala) !== doc.zona) return socket.emit('bote:rechazado', { id, motivo: 'fuera_de_zona' });
+      if (Math.hypot(doc.x - Number(fila.x), doc.y - (Number(fila.y) + 40)) > BOTE_ALCANCE) return socket.emit('bote:rechazado', { id, motivo: 'lejos' });
+      const otro = _boteABordo.get(id);
+      if (otro && otro !== socket.id && io.sockets.sockets.get(otro)) return socket.emit('bote:rechazado', { id, motivo: 'ocupado' });
+      if (socket._boteId && socket._boteId !== id) await bajarse();
+      _boteABordo.set(id, socket.id);
+      socket._boteId = id;
+      _avisarZona(doc.zona, 'bote:estado', _botePublico(doc));
+    } catch (e) { console.warn('⚠️  bote: subir:', e.message); }
+  });
+
+  /* Mientras rema: dónde va el bote (para que no vuelva atrás si se corta). */
+  socket.on('bote:pos', async (d) => {
+    const id = socket._boteId;
+    if (!id || !d || String(d.id) !== id || frenado(socket, 'bote_pos', 700)) return;
+    const x = Number(d.x), y = Number(d.y);
+    const sala = socket.playerData && socket.playerData.room;
+    if (sala && gfEsAgua(salaBase(sala), x, y)) _botePos.set(id, { x: Math.round(x), y: Math.round(y) });
+  });
+
+  socket.on('bote:bajar', (d) => { bajarse(Number(d && d.x), Number(d && d.y)); });
+  socket.on('disconnect', () => { bajarse(); });
 });
 
 // =============================================================================
@@ -14968,6 +15244,10 @@ const ITEM_TIPO_MAP = {
   // TIPOS_DE_CONSTRUCCION. Sus tablas se dan de alta solas.
   basura: 'basura',
   cofre1: 'cofre1', cofre2: 'cofre2', cofre3: 'cofre3', cofre4: 'cofre4',
+  // (2026-10-21) El bote (se pone en el agua, se rema, se pesca desde él y se
+  // recoge con la pala: ver "EL BOTE"), el arco y el bastón de mago (armas a
+  // distancia en gf-espada.js). Sus tablas se dan de alta solas.
+  bote: 'bote', arco: 'arco', baston_mago: 'baston_mago',
 };
 
 function itemTipoOnChain(itemId) {
@@ -15005,6 +15285,7 @@ const ITEM_MAX_STACK = {
   pes9: 20, pes10: 20, pes11: 20, pes12: 20, pes13: 20, pes14: 20,
   basura: 10,
   cofre1: 5, cofre2: 5, cofre3: 5, cofre4: 5,
+  bote: 1, arco: 1, baston_mago: 1,
 };
 
 // ── TABLAS CON LÍMITES DE DISEÑO (2026-10-03) ─────────────────────────────────
@@ -15026,7 +15307,7 @@ const TABLAS_MANUALES = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_PARCELAS, TABL
    bastaría una llamada al relay para ponerse nivel 150 en la cadena o
    "colocar" parcelas sin haberlas comprado. */
 const GF_ALLOC_KEYS = ['strength','defense','wisdom','patience','farming','woodcutting','fishing','combat'];
-const TABLAS_SOLO_SERVIDOR = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_CONS_PARCELAS, ...GF_ALLOC_KEYS.map(k => 'player_' + k)]);
+const TABLAS_SOLO_SERVIDOR = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_CONS_PARCELAS, 'vip', ...GF_ALLOC_KEYS.map(k => 'player_' + k)]);
 /* Tablas que SOLO ACUÑA el servidor, pero que el cliente sí puede GASTAR
    (2026-10-05): los peces. Se pescan (POST /api/pesca/recoger, que acuña con
    el relayer) y se comen o se venden (el cliente baja la factura por el
@@ -15736,12 +16017,19 @@ function sanearMisionesDelDia(missions) {
   });
 }
 
+// Validate a real UTC calendar day, including leap years, before any database write.
+function gfMissionDayValid(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(value + 'T00:00:00.000Z');
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
 // Leer las misiones de un NPC en un día (para editarlas en el panel)
 app.get('/api/admin/missions/daily/:npcId/:day', adminAuth, apiLimiter, async (req, res) => {
   try {
     const { npcId, day } = req.params;
     if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: 'day debe ser YYYY-MM-DD' });
+    if (!gfMissionDayValid(day)) return res.status(400).json({ error: 'day debe ser una fecha válida YYYY-MM-DD' });
 
     const doc = await DailyMission.findOne({ npcId, day }).lean();
     res.json({ success: true, npcId, day, found: !!doc, mission: doc || null });
@@ -15778,7 +16066,7 @@ app.put('/api/admin/missions/daily', adminAuth, strictLimiter, async (req, res) 
     const { npcId, day, missions, dailyResetHour } = req.body || {};
 
     if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day || '')) return res.status(400).json({ error: 'day debe ser YYYY-MM-DD' });
+    if (!gfMissionDayValid(day)) return res.status(400).json({ error: 'day debe ser una fecha válida YYYY-MM-DD' });
 
     let limpias;
     try {
@@ -15791,7 +16079,7 @@ app.put('/api/admin/missions/daily', adminAuth, strictLimiter, async (req, res) 
 
     const doc = await DailyMission.findOneAndUpdate(
       { npcId, day },
-      { $set: { missions: limpias, dailyResetHour: hora } },
+      { $set: { missions: limpias, dailyResetHour: hora, auto: false } },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
 
@@ -15808,8 +16096,8 @@ app.post('/api/admin/missions/copy', adminAuth, strictLimiter, async (req, res) 
   try {
     const { npcId, fromDay, toDay, repeatDays } = req.body || {};
     if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDay || '')) return res.status(400).json({ error: 'fromDay inválido' });
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(toDay || '')) return res.status(400).json({ error: 'toDay inválido' });
+    if (!gfMissionDayValid(fromDay)) return res.status(400).json({ error: 'fromDay inválido' });
+    if (!gfMissionDayValid(toDay)) return res.status(400).json({ error: 'toDay inválido' });
 
     const origen = await DailyMission.findOne({ npcId, day: fromDay }).lean();
     if (!origen) return res.status(404).json({ error: 'no hay misiones en fromDay' });
@@ -15822,7 +16110,7 @@ app.post('/api/admin/missions/copy', adminAuth, strictLimiter, async (req, res) 
       const d = new Date(base.getTime() + i * 86400000).toISOString().slice(0, 10);
       await DailyMission.findOneAndUpdate(
         { npcId, day: d },
-        { $set: { missions: origen.missions, dailyResetHour: origen.dailyResetHour } },
+        { $set: { missions: origen.missions, dailyResetHour: origen.dailyResetHour, auto: false } },
         { upsert: true, new: true, setDefaultsOnInsert: true }
       );
       creados.push(d);
@@ -15879,7 +16167,7 @@ app.get('/api/admin/missions/history', adminAuth, apiLimiter, async (req, res) =
       { $group: {
           _id: '$playerName',
           ultima: { $max: '$lastInteraction' },
-          dias:   { $sum: 1 },
+          dias:   { $addToSet: '$day' },
           entregas: { $sum: '$completedCount' }
       } }
     ]);
@@ -15896,7 +16184,7 @@ app.get('/api/admin/missions/history', adminAuth, apiLimiter, async (req, res) =
         misiones:   Number(j.misiones || 0),
         // Lo que queda registrado día a día; es lo que se puede limpiar.
         entregasRegistradas: Number(a.entregas || 0),
-        diasConActividad:    Number(a.dias || 0),
+        diasConActividad:    Array.isArray(a.dias) ? a.dias.length : 0,
         ultimaEntrega:       a.ultima || null
       };
     });
@@ -15960,6 +16248,209 @@ app.delete('/api/admin/missions/history', adminAuth, strictLimiter, async (req, 
 });
 
 console.log('✅ Missions history: GET/DELETE /api/admin/missions/history');
+
+// ============================================================================
+// EL VIP                                                         (2026-10-20)
+// ============================================================================
+// "En la casa del granjero Joe está Rosalind the Weaver: al darle clic, un
+// panel que venda 3 cosas: un VIP de 1 mes, de 3 y de 6 meses, que se pueda
+// comprar en oro, plata y bronce. Haz la tabla `vip` en la blockchain (y si ya
+// existe, úsala) para que el tiempo del VIP quede en la cadena: cuándo vence y
+// cuándo inició. Al lado de la hora, la marca del VIP; al tocarla, la
+// información y sus facturas guardadas en la blockchain."
+//
+//   · Cada compra es UNA factura de la tabla `vip` del contrato de objetos:
+//     cantidad = días, manualId = vip:<cuenta>:<inicio>:<fin>:<plan>:<moneda>:<precio>
+//     (segundos Unix). Comprar con VIP activo ALARGA: empieza donde acaba el
+//     que hay. La cadena manda; Mongo (VipEstado) es un espejo para mirar
+//     rápido (el botón de amigos, soltar cosas, el mercado).
+//   · Sin VIP: no se sueltan cosas al suelo para otros, no se usa el mercado
+//     P2P (la tienda del juego sí), no se entra en la propia isla ni se viaja
+//     a islas de otros sin VIP.
+const VIP_PLANES = {
+  '1m': { dias: 30,  nombre: 'VIP · 1 month',  precio: { oro: 5,  plata: 5000,  bronce: 5000000 } },
+  '3m': { dias: 90,  nombre: 'VIP · 3 months', precio: { oro: 12, plata: 12000, bronce: 12000000 } },
+  '6m': { dias: 180, nombre: 'VIP · 6 months', precio: { oro: 20, plata: 20000, bronce: 20000000 } }
+};
+const VIP_MONEDAS = ['oro', 'plata', 'bronce'];
+const vipEstadoSchema = new mongoose.Schema({
+  address:    { type: String, required: true, unique: true, lowercase: true },
+  playerName: { type: String, default: null },
+  inicio:     { type: Date, default: null },
+  fin:        { type: Date, default: null },
+  leidoEn:    { type: Date, default: Date.now }
+}, { collection: 'vip_estado' });
+const VipEstado = mongoose.models.VipEstado || mongoose.model('VipEstado', vipEstadoSchema);
+
+/** Las facturas VIP de una cuenta, leídas de la cadena (ordenadas por inicio). */
+function gfVipLeerFacturas(rows, address) {
+  const a = String(address || '').toLowerCase();
+  return (rows || []).filter(f => f.tipo === 'vip' && f.owner === a).map((f) => {
+    const p = String(f.manualId || '').split(':');
+    const inicio = Number(p[2]) * 1000, fin = Number(p[3]) * 1000;
+    return { id: f.id, dias: f.cantidad, manualId: f.manualId,
+             inicio: Number.isFinite(inicio) && inicio > 0 ? inicio : null,
+             fin: Number.isFinite(fin) && fin > 0 ? fin : null,
+             plan: p[4] || null, moneda: p[5] || null, precio: Number(p[6]) || null };
+  }).sort((x, y) => (x.inicio || 0) - (y.inicio || 0));
+}
+/** Del listado: si está activo, desde cuándo (el tramo seguido) y hasta cuándo. */
+function gfVipResumen(facturas) {
+  const ahora = Date.now();
+  let fin = 0;
+  facturas.forEach(f => { if (f.fin && f.fin > fin) fin = f.fin; });
+  let inicio = null;
+  if (fin > ahora) {
+    // El tramo seguido que acaba en `fin`: hacia atrás mientras no haya hueco.
+    const orden = facturas.filter(f => f.inicio && f.fin).sort((x, y) => y.fin - x.fin);
+    let desde = fin;
+    for (const f of orden) { if (f.fin >= desde - 1000 && f.inicio < desde) desde = f.inicio; }
+    inicio = desde;
+  }
+  return { activo: fin > ahora, inicio, fin: fin || null, msRestantes: Math.max(0, fin - ahora),
+           diasRestantes: Math.max(0, Math.ceil((fin - ahora) / 86400000)) };
+}
+const _gfVipCache = new Map();   // address -> { fin, at }
+async function gfTieneVipPorDireccion(address) {
+  const a = String(address || '').toLowerCase();
+  if (!a) return false;
+  const c = _gfVipCache.get(a);
+  if (c && Date.now() - c.at < 30000) return c.fin > Date.now();
+  let fin = 0;
+  try {
+    const d = await VipEstado.findOne({ address: a }).lean();
+    fin = d && d.fin ? new Date(d.fin).getTime() : 0;
+  } catch (e) { return false; }
+  _gfVipCache.set(a, { fin, at: Date.now() });
+  return fin > Date.now();
+}
+/** Middleware: sin VIP, 403 vip_required (después de authMiddleware). */
+function gfExigeVip(req, res, next) {
+  gfTieneVipPorDireccion(req.user && req.user.address)
+    .then((ok) => (ok ? next() : res.status(403).json({ error: 'vip_required', message: 'You need VIP to do this. Talk to Rosalind the Weaver in Farmer Joe\'s house.' })))
+    .catch(() => res.status(403).json({ error: 'vip_required' }));
+}
+/** Cobra `cantidad` de una moneda (atómico) y lo deja pendiente para la cadena. */
+async function gfCobrarStat(playerName, stat, cantidad) {
+  const doc = await PlayerStats.findOneAndUpdate(
+    { playerName, [stat]: { $gte: cantidad } },
+    { $inc: { [stat]: -cantidad }, $addToSet: { chainPending: stat } },
+    { new: true });
+  if (doc && !doc.chainPendingSince) {
+    await PlayerStats.updateOne({ _id: doc._id, chainPendingSince: null }, { $set: { chainPendingSince: new Date() } });
+  }
+  return doc;
+}
+async function gfDevolverStat(playerName, stat, cantidad) {
+  const doc = await PlayerStats.findOneAndUpdate({ playerName }, { $inc: { [stat]: cantidad }, $addToSet: { chainPending: stat } }, { new: true });
+  if (doc && !doc.chainPendingSince) {
+    await PlayerStats.updateOne({ _id: doc._id, chainPendingSince: null }, { $set: { chainPendingSince: new Date() } });
+  }
+  return doc;
+}
+/** El precio en bronce de viajar hasta otro jugador (botón de amigos). */
+const GF_VIAJE_OTRO_MAPA = 3000;
+function gfPrecioViaje(socket, salaDestino, pDestino) {
+  const miSala = socket.playerData && socket.playerData.room;
+  const yoEn = miSala && rooms[miSala] && rooms[miSala][socket.id];
+  if (yoEn && salaBase(miSala) === salaBase(salaDestino)) {
+    const d = Math.hypot((Number(yoEn.x) || 0) - (Number(pDestino.x) || 0), (Number(yoEn.y) || 0) - (Number(pDestino.y) || 0));
+    return Math.max(100, Math.round(100 + d * 0.5));
+  }
+  return GF_VIAJE_OTRO_MAPA;
+}
+
+async function gfVipEstadoDe(gp) {
+  const address = String(gp.address || '').toLowerCase();
+  const facturas = gfVipLeerFacturas(await facturasDeCadena(address), address);
+  const resumen = gfVipResumen(facturas);
+  await VipEstado.updateOne({ address }, { $set: { playerName: gp.playerName, inicio: resumen.inicio ? new Date(resumen.inicio) : null,
+                                                   fin: resumen.fin ? new Date(resumen.fin) : null, leidoEn: new Date() } }, { upsert: true });
+  _gfVipCache.set(address, { fin: resumen.fin || 0, at: Date.now() });
+  return { ...resumen, facturas: facturas.reverse() };
+}
+
+app.get('/api/vip/estado', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    let estado;
+    try { estado = await gfVipEstadoDe(gp); }
+    catch (e) {
+      // La cadena no contesta: lo del espejo, sin facturas.
+      const d = await VipEstado.findOne({ address: String(gp.address).toLowerCase() }).lean();
+      const fin = d && d.fin ? new Date(d.fin).getTime() : 0;
+      estado = { activo: fin > Date.now(), inicio: d && d.inicio ? new Date(d.inicio).getTime() : null, fin: fin || null,
+                 msRestantes: Math.max(0, fin - Date.now()), diasRestantes: Math.max(0, Math.ceil((fin - Date.now()) / 86400000)),
+                 facturas: [], sinCadena: true };
+    }
+    return res.json({ ok: true, ...estado, planes: VIP_PLANES });
+  } catch (e) {
+    console.error('GET /api/vip/estado:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// ¿Tiene VIP ese jugador? (para visitar su isla)
+app.get('/api/vip/de/:playerName', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await GamePlayer.findOne({ playerName: String(req.params.playerName || '').slice(0, 80) }).select('address').lean();
+    return res.json({ ok: true, vip: !!(gp && await gfTieneVipPorDireccion(gp.address)) });
+  } catch (e) { return res.status(500).json({ error: 'internal_server_error' }); }
+});
+
+app.post('/api/vip/comprar', apiLimiter, authMiddleware, csrfProtection, gfExigeNombre, async (req, res) => {
+  try {
+    const clave = String((req.body && req.body.plan) || '');
+    const moneda = String((req.body && req.body.moneda) || '');
+    const plan = Object.prototype.hasOwnProperty.call(VIP_PLANES, clave) ? VIP_PLANES[clave] : null;
+    if (!plan) return res.status(400).json({ error: 'plan_invalido' });
+    if (!VIP_MONEDAS.includes(moneda)) return res.status(400).json({ error: 'moneda_invalida' });
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const address = String(gp.address || '').toLowerCase();
+    return await enColaDelJugador(address, async () => {
+      const precio = plan.precio[moneda];
+      // 1) La tabla y el contrato, ANTES de cobrar nada.
+      const lista = await crearTablaSiFalta('vip');
+      const c = contratoItemsServidor();
+      if (!lista || !c) return res.status(503).json({ error: 'chain_unavailable', message: 'The VIP table is not ready on the chain. Try again later.' });
+      const previas = gfVipLeerFacturas(await facturasDeCadena(address), address);
+      const resumen = gfVipResumen(previas);
+      // 2) El cobro (atómico: no se puede gastar dos veces lo mismo).
+      const cobrado = await gfCobrarStat(gp.playerName, moneda, precio);
+      if (!cobrado) {
+        const st = await PlayerStats.findOne({ playerName: gp.playerName }).select(moneda).lean();
+        return res.status(400).json({ error: 'insufficient_funds', moneda, need: precio, have: Math.floor(Number(st && st[moneda]) || 0) });
+      }
+      // 3) La factura en la cadena: empieza ahora o donde acaba el VIP que hay.
+      const inicio = Math.max(Date.now(), resumen.activo ? resumen.fin : 0);
+      const fin = inicio + plan.dias * 86400000;
+      const manualId = ['vip', address.slice(2, 10), Math.floor(inicio / 1000), Math.floor(fin / 1000), clave, moneda, precio].join(':');
+      let receipt = null;
+      try { receipt = await txRelayer('vip ' + clave, o => c.createInvoice(address, 'vip', plan.dias, manualId, o)); }
+      catch (e) { receipt = null; }
+      if (!receipt || !(receipt.status === 1 || receipt.status === 1n)) {
+        await gfDevolverStat(gp.playerName, moneda, precio);
+        return res.status(502).json({ error: 'mint_failed', message: 'The chain did not confirm the VIP. Your coins were returned.' });
+      }
+      const facturaId = idDeFacturaCreada(c, receipt);
+      // 4) El espejo y la respuesta.
+      await VipEstado.updateOne({ address }, { $set: { playerName: gp.playerName, inicio: new Date(resumen.activo ? resumen.inicio : inicio),
+                                                       fin: new Date(fin), leidoEn: new Date() } }, { upsert: true });
+      _gfVipCache.set(address, { fin, at: Date.now() });
+      console.log(`👑 ${gp.playerName} compró ${clave} con ${precio} ${moneda}: VIP hasta ${new Date(fin).toISOString()}`);
+      let estado;
+      try { estado = await gfVipEstadoDe(gp); } catch (e) { estado = { ...gfVipResumen(previas.concat([{ inicio, fin }])), facturas: [] }; }
+      return res.json({ ok: true, plan: clave, moneda, precio, facturaId, transactionHash: receipt.hash || receipt.transactionHash,
+                        ...estado, stats: buildStatsResponse(cobrado), planes: VIP_PLANES });
+    });
+  } catch (e) {
+    console.error('POST /api/vip/comprar:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+console.log('✅ VIP: /api/vip/{estado,de,comprar}');
 
 // ============================================================================
 // MISIONES AUTOMÁTICAS, DE CAZAR Y LISTA DE ENTREGAS              (2026-10-19)
@@ -16256,10 +16747,13 @@ app.post('/api/admin/missions/auto/:npcId/preview', adminAuth, apiLimiter, async
   try {
     const npcId = String(req.params.npcId || '');
     if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
-    const day = /^\d{4}-\d{2}-\d{2}$/.test(String((req.body || {}).day || '')) ? req.body.day : new Date().toISOString().split('T')[0];
+    const requestedDay = (req.body || {}).day;
+    if (requestedDay && !gfMissionDayValid(requestedDay)) return res.status(400).json({ error: 'day debe ser una fecha válida YYYY-MM-DD' });
+    const day = requestedDay || new Date().toISOString().split('T')[0];
     const base = req.body && req.body.reglas ? Object.assign(gfSanearReglas(req.body.reglas), { semilla: Number(req.body.reglas.semilla) || 0 })
                                              : await gfReglasAuto(npcId);
-    const missions = sanearMisionesDelDia(gfGenerarMisiones(Object.assign({}, base, { activo: true }), npcId, day));
+    const generated = gfGenerarMisiones(Object.assign({}, base, { activo: true }), npcId, day);
+    const missions = generated.length ? sanearMisionesDelDia(generated) : [];
     return res.json({ success: true, npcId, day, missions });
   } catch (e) {
     return res.status(400).json({ error: e.message || 'preview_failed' });
@@ -16272,12 +16766,13 @@ app.post('/api/admin/missions/auto/:npcId/reroll', adminAuth, strictLimiter, asy
     const npcId = String(req.params.npcId || '');
     if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
     const day = new Date().toISOString().split('T')[0];
-    const actual = await gfReglasAuto(npcId);
-    const semilla = (Number(actual.semilla) || 0) + 1;
-    const base = actual.porDefecto ? gfSanearReglas(actual) : {};
-    await MisionesAutoConfig.findOneAndUpdate({ npcId }, { $set: Object.assign(base, { semilla }) }, { upsert: true, setDefaultsOnInsert: true });
+    // Reject a manual day BEFORE changing tomorrow's seed or creating a configuration.
     const hoy = await DailyMission.findOne({ npcId, day }).lean();
     if (hoy && !hoy.auto) return res.status(409).json({ error: 'today_is_manual', message: 'Today has manual missions: delete them first.' });
+    const actual = await gfReglasAuto(npcId);
+    const base = actual.porDefecto ? gfSanearReglas(actual) : {};
+    const updated = await MisionesAutoConfig.findOneAndUpdate({ npcId }, { $set: base, $inc: { semilla: 1 } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean();
+    const semilla = Number(updated.semilla) || 0;
     await DailyMission.deleteOne({ npcId, day, auto: true });
     const doc = await gfMisionesAutoDelDia(npcId, day);
     return res.json({ success: true, npcId, day, semilla, missions: doc ? doc.missions : [] });
@@ -16294,7 +16789,8 @@ app.get('/api/admin/missions/entregas', adminAuth, apiLimiter, async (req, res) 
   try {
     const npcId = String(req.query.npcId || 'granjero');
     if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
-    const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.day || '')) ? String(req.query.day) : new Date().toISOString().split('T')[0];
+    if (req.query.day && !gfMissionDayValid(req.query.day)) return res.status(400).json({ error: 'day debe ser una fecha válida YYYY-MM-DD' });
+    const day = req.query.day || new Date().toISOString().split('T')[0];
     const limite = Math.min(1000, Math.max(1, parseInt(req.query.limit, 10) || 300));
     const buscar = String(req.query.search || '').trim();
     const rx = buscar ? new RegExp(buscar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') : null;
@@ -16360,7 +16856,7 @@ app.delete('/api/admin/missions/daily/:npcId/:day', adminAuth, strictLimiter, as
   try {
     const { npcId, day } = req.params;
     if (!MISSION_NPCS.includes(npcId)) return res.status(400).json({ error: 'npcId inválido' });
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: 'day debe ser YYYY-MM-DD' });
+    if (!gfMissionDayValid(day)) return res.status(400).json({ error: 'day debe ser una fecha válida YYYY-MM-DD' });
 
     const r = await DailyMission.deleteOne({ npcId, day });
     res.json({ success: true, deleted: r.deletedCount });
@@ -16459,7 +16955,7 @@ const ADMIN_CAMPOS_SEGUROS = [
   'deforestacion', 'deforestacion_exp', 'fuerza', 'fuerza_exp',
   'agricultura', 'agricultura_exp'
 ];
-const ADMIN_CAMPOS_ONCHAIN = ['vida', 'agua', 'comida', 'oro', 'plata', 'exp'];
+const ADMIN_CAMPOS_ONCHAIN = ['vida', 'agua', 'comida', 'oro', 'plata', 'bronce', 'exp'];
 
 // ── GET /api/admin/players ─────────────────────────────────────────────────
 // Lista paginada con búsqueda por dirección o nombre de personaje.
@@ -19299,6 +19795,9 @@ const playerStatsSchema = new mongoose.Schema({
   vidaCongelada: { type: Boolean, default: false },
   oro:        { type: Number, default: 0,      min: 0 },
   plata:      { type: Number, default: 0,      min: 0 },
+  // (2026-10-20) La moneda de bronce: 1 de plata = 1000 de bronce. Su tabla
+  // en el contrato de estadísticas es `bronce`, igual que `oro` y `plata`.
+  bronce:     { type: Number, default: 0,      min: 0 },
   // Experiencia del personaje (GamePlayer.nivel_exp). Se lleva al contrato con
   // su propia tabla `exp`, igual que oro y plata.
   exp:        { type: Number, default: 0,      min: 0 },
@@ -19308,6 +19807,7 @@ const playerStatsSchema = new mongoose.Schema({
     comida: { type: Number, default: null },
     oro:    { type: Number, default: null },
     plata:  { type: Number, default: null },
+    bronce: { type: Number, default: null },
     exp:    { type: Number, default: null },
   },
   manualIds: {
@@ -19316,6 +19816,7 @@ const playerStatsSchema = new mongoose.Schema({
     comida: { type: String, default: null },
     oro:    { type: String, default: null },
     plata:  { type: String, default: null },
+    bronce: { type: String, default: null },
     exp:    { type: String, default: null },
   },
   // Marca de tiempo de la ÚLTIMA regeneración pasiva de vitales aplicada.
@@ -19363,7 +19864,7 @@ const playerStatsSchema = new mongoose.Schema({
 
 const PlayerStats = mongoose.model('PlayerStats', playerStatsSchema);
 
-const STAT_TYPES_LIST    = ['vida', 'agua', 'comida', 'oro', 'plata', 'exp'];
+const STAT_TYPES_LIST    = ['vida', 'agua', 'comida', 'oro', 'plata', 'bronce', 'exp'];
 
 // ⚠️ ESCALA DE LAS VITALES: en el juego las barras se pintan como `${valor}%`
 // SIN dividir, así que la escala real de vida/agua/comida es 0..100.
@@ -19374,11 +19875,11 @@ const STAT_TYPES_LIST    = ['vida', 'agua', 'comida', 'oro', 'plata', 'exp'];
 //     unidades, lo que agota el cupo (`limit`) del tipo en el contrato; cuando
 //     quedaban 7 o 5 disponibles, el jugador nuevo nacía con 7% o 5%.
 const VITAL_MAX          = 100;
-const STAT_DEFAULTS_MAP  = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 0, plata: 0, exp: 0 };
+const STAT_DEFAULTS_MAP  = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 0, plata: 0, bronce: 0, exp: 0 };
 // Valores con los que se CREA la factura de un jugador nuevo. Separado de
 // STAT_DEFAULTS_MAP porque ese mapa actúa como "piso" en el sync — si oro/plata
 // tuvieran piso 1000, cada sync regalaría monedas a jugadores que ya gastaron.
-const STAT_INITIAL_MAP   = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 1000, plata: 1000, exp: 0 };
+const STAT_INITIAL_MAP   = { vida: VITAL_MAX, agua: VITAL_MAX, comida: VITAL_MAX, oro: 1000, plata: 1000, bronce: 1000, exp: 0 };
 
 const isVitalStat = (stat) => stat === 'vida' || stat === 'agua' || stat === 'comida';
 const VITAL_STATS = ['vida', 'agua', 'comida'];
@@ -19670,6 +20171,7 @@ const STAT_TIPO_CONFIG = {
   comida: { perInvoiceLimit: VITAL_MAX,     headroom: 1_000_000, autoRaise: true },
   oro:    { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: true },
   plata:  { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: true },
+  bronce: { perInvoiceLimit: 1_000_000_000_000, headroom: 1_000_000_000, autoRaise: true },
   exp:    { perInvoiceLimit: 1_000_000_000, headroom: 1_000_000, autoRaise: true },
 };
 
@@ -19853,6 +20355,14 @@ async function applyStatOnChain(contract, stat, invId, target, gasPrice) {
 // ── MARKETPLACE ROUTES MOUNT ────────────────────────────────────────────────
 // Se monta aquí (y no más arriba) porque necesita GamePlayer, Listing (ya
 // definidos) y PlayerStats (recién definido arriba) al mismo tiempo.
+/* (2026-10-20) EL MERCADO P2P PIDE NOMBRE Y VIP para publicar, comprar y
+   ofertar (no para cancelar, rechazar ni mirar). Va ANTES de montar las rutas
+   del mercado (Express las prueba en orden). */
+const GF_MERCADO_CON_VIP = /^\/(list|buy\/[^/]+|offer\/[^/]+|offer\/[^/]+\/accept|limited\/[^/]+\/buy)$/;
+app.use('/api/marketplace', (req, res, next) => {
+  if (req.method !== 'POST' || !GF_MERCADO_CON_VIP.test(req.path)) return next();
+  return authMiddleware(req, res, () => gfExigeNombre(req, res, () => gfExigeVip(req, res, next)));
+});
 require('./marketplace-routes')(app, {
   mongoose,
   authMiddleware,
@@ -20055,10 +20565,18 @@ const TABLAS_RECOMENDADAS = [
   { tipo: 'cobre',          limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de cobre (objeto espada_cobre; 1 por casilla)' },
   { tipo: 'hierro',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Espada de hierro (objeto espada_hierro; 1 por casilla)' },
   { tipo: 'basura',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Bote de basura de la isla (10 por casilla)' },
+  // (2026-10-20) Cada compra de VIP es una factura: cantidad = días; el manualId
+  // lleva cuándo empieza y cuándo vence (vip:<cuenta>:<inicio>:<fin>:<plan>:<moneda>:<precio>).
+  { tipo: 'vip',            limit: 1_000_000_000, perInvoiceLimit: 400, para: 'VIP: cada compra (cantidad = días; inicio y vencimiento en el manualId)' },
   { tipo: 'cofre1',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Cofre de madera, 5 huecos (5 por casilla)' },
   { tipo: 'cofre2',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Cofre reforzado, 7 huecos (solo crafteo; 5 por casilla)' },
   { tipo: 'cofre3',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Cofre mágico, 13 huecos (solo crafteo; 5 por casilla)' },
-  { tipo: 'cofre4',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Cofre legendario, 20 huecos (solo crafteo; 5 por casilla)' }
+  { tipo: 'cofre4',         limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Cofre legendario, 20 huecos (solo crafteo; 5 por casilla)' },
+  // (2026-10-21) El bote: UNO por factura (al recogerlo con la pala se acuña
+  // y no debe apilarse con otro bote en la misma casilla).
+  { tipo: 'bote',           limit: 1_000_000_000, perInvoiceLimit: 1,  para: 'Bote para el agua (1 por casilla; ver EL BOTE)' },
+  { tipo: 'arco',           limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Arco (objeto arco; 1 por casilla)' },
+  { tipo: 'baston_mago',    limit: 1_000_000_000, perInvoiceLimit: 50, para: 'Bastón de mago (objeto baston_mago; 1 por casilla)' }
 ];
 
 // ── EL NIVEL PROPIO DE LA MASCOTA ────────────────────────────────────────────
@@ -21117,6 +21635,8 @@ app.get('/api/lands/visita', apiLimiter, authMiddleware, async (req, res) => {
     const dueno = await GamePlayer.findOne({ playerName: de }).select('playerName Username address').lean();
     const addr = String((dueno && dueno.address) || '').toLowerCase();
     if (!dueno || !/^0x[0-9a-f]{40}$/.test(addr)) return res.status(404).json({ error: 'no_existe' });
+    // (2026-10-20) Una isla sin VIP está cerrada: ni su dueño ni las visitas.
+    if (!(await gfTieneVipPorDireccion(addr))) return res.status(403).json({ error: 'isla_sin_vip' });
 
     const conectado = socketsDeJugador(dueno.playerName).length > 0;
     let amigo = false;
@@ -21159,7 +21679,7 @@ app.get('/api/lands/visita', apiLimiter, authMiddleware, async (req, res) => {
 });
 
 // POST /api/lands/colocar  { tipo:'parcela', gx, gy }
-app.post('/api/lands/colocar', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+app.post('/api/lands/colocar', apiLimiter, authMiddleware, csrfProtection, gfExigeVip, async (req, res) => {
   try {
     const gp = await gpDeLaSesion(req);
     if (!gp) return res.status(404).json({ error: 'player_not_found' });
@@ -21579,7 +22099,7 @@ app.post('/api/marketplace/onchain/settle',
     body('itemId').isString().notEmpty(),
     body('qty').isInt({ min: 1, max: 10000 })
   ],
-  (req, res, next) => (req.body && req.body.op === 'escrow' ? gfExigeNombre(req, res, next) : next()),
+  (req, res, next) => (req.body && req.body.op === 'escrow' ? gfExigeNombre(req, res, () => gfExigeVip(req, res, next)) : next()),
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -21803,7 +22323,7 @@ function buildStatsResponse(doc) {
     vida:   clampStat('vida',   doc.vida),
     agua:   clampStat('agua',   doc.agua),
     comida: clampStat('comida', doc.comida),
-    oro: doc.oro, plata: doc.plata,
+    oro: doc.oro, plata: doc.plata, bronce: doc.bronce ?? 0,
     exp: doc.exp ?? 0,
     invoiceIds: {
       vida:   doc.invoiceIds?.vida   ?? null,
@@ -21811,6 +22331,7 @@ function buildStatsResponse(doc) {
       comida: doc.invoiceIds?.comida ?? null,
       oro:    doc.invoiceIds?.oro    ?? null,
       plata:  doc.invoiceIds?.plata  ?? null,
+      bronce: doc.invoiceIds?.bronce ?? null,
       exp:    doc.invoiceIds?.exp    ?? null,
     }
   };
@@ -22024,6 +22545,41 @@ app.post('/api/player/skills/allocate', apiLimiter, authMiddleware, csrfProtecti
     });
   } catch (_) { return res.status(503).json({ error: 'chain_unavailable' }); }
 });
+/* (2026-10-20) REINICIAR LOS PUNTOS. "Falta el botón de resetear puntos
+   para poder reorganizar todo." Los puntos repartidos son facturas
+   `player_<habilidad>` en la cadena: se borran todas (las del jugador) y los
+   puntos vuelven a estar libres (el total sale del nivel). Con un freno de un
+   minuto por jugador: cada reinicio son hasta ocho transacciones. */
+const _gfResetPuntos = new Map();
+app.post('/api/player/skills/reset', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const ahora = Date.now(), ultimo = _gfResetPuntos.get(gp.playerName) || 0;
+    if (ahora - ultimo < 60000) return res.status(429).json({ error: 'demasiado_pronto', esperaMs: 60000 - (ahora - ultimo) });
+    const address = String(gp.address).toLowerCase();
+    return await enColaDelJugador(address, async () => {
+      const rows = await facturasDeCadena(gp.address);
+      const c = contratoItemsServidor();
+      if (!c) return res.status(503).json({ error: 'chain_unavailable' });
+      const mias = rows.filter(f => f.owner === address && f.tipo.startsWith('player_') &&
+                                   GF_ALLOC_KEYS.includes(f.tipo.slice(7)) && f.cantidad > 0);
+      _gfResetPuntos.set(gp.playerName, ahora);
+      let devueltos = 0, fallos = 0;
+      for (const f of mias) {
+        try {
+          const receipt = await txRelayer('reset skill ' + f.tipo, o => c.deleteInvoice(f.id, o));
+          if (receipt && (receipt.status === 1 || receipt.status === 1n)) devueltos += f.cantidad; else fallos++;
+        } catch (_) { fallos++; }
+      }
+      const fresh = await GamePlayer.findOne({ playerName: gp.playerName });
+      const state = await gfCharacterSnapshot(fresh);
+      console.log(`↺ ${gp.playerName} reinició sus puntos: ${devueltos} devueltos` + (fallos ? `, ${fallos} sin confirmar` : ''));
+      return res.json({ ...state, reset: devueltos, incompleto: fallos > 0 });
+    });
+  } catch (_) { return res.status(503).json({ error: 'chain_unavailable' }); }
+});
+
 async function gfCharacterCosts(playerName, reason, costs, doc) {
   const result = { ...costs };
   const mirror = await PlayerSkills.findOne({ playerName }).select('allocations').lean();
@@ -23024,6 +23580,7 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
 // Mismo criterio anti-eliminación que /api/stats/update: en la cadena no se baja
 // de 1, para que la factura no se borre y siga siendo movible.
 const SILVER_PER_GOLD = 1000;
+const BRONZE_PER_SILVER = 1000;   // (2026-10-20) 1 de plata = 1000 de bronce
 
 // ── REGALO SEMANAL DE MONEDA                                  (2026-08-05) ──
 // Dos botones en el hub de moneda: "Get Gold" y "Get Silver". Cada uno se puede
@@ -23036,14 +23593,16 @@ const SILVER_PER_GOLD = 1000;
 // que el oro regalado es tan real como el ganado jugando.
 const WEEKLY_GIFTS = {
   gold:   { stat: 'oro',   amount: 2000, label: 'Gold'   },
-  silver: { stat: 'plata', amount: 1000, label: 'Silver' }
+  silver: { stat: 'plata', amount: 1000, label: 'Silver' },
+  // (2026-10-20) "Pon el botón de bronce también: 1000 cada 7 días."
+  bronze: { stat: 'bronce', amount: 1000, label: 'Bronze' }
 };
 const WEEKLY_GIFT_MS = 7 * 24 * 60 * 60 * 1000;
 
 const weeklyGiftSchema = new mongoose.Schema({
   playerName: { type: String, required: true, index: true },
   address:    { type: String, lowercase: true, index: true },
-  kind:       { type: String, enum: ['gold', 'silver'], required: true },
+  kind:       { type: String, enum: ['gold', 'silver', 'bronze'], required: true },
   claimedAt:  { type: Date, default: Date.now }
 }, { collection: 'weekly_gifts' });
 weeklyGiftSchema.index({ playerName: 1, kind: 1 }, { unique: true });
@@ -23141,8 +23700,52 @@ app.post('/api/currency/exchange', apiLimiter, authMiddleware, csrfProtection, a
     const qty = Math.floor(Number(amount));
 
     if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ error: 'invalid_amount' });
-    if (direction !== 'silverToGold' && direction !== 'goldToSilver') {
+    if (direction !== 'silverToGold' && direction !== 'goldToSilver' &&
+        direction !== 'silverToBronze' && direction !== 'bronzeToSilver') {
       return res.status(400).json({ error: 'invalid_direction' });
+    }
+    // (2026-10-20) PLATA ⇄ BRONCE: 1 de plata = 1000 de bronce. `amount` se
+    // cuenta en PLATA (la unidad grande), como el oro en el cambio de arriba.
+    if (direction === 'silverToBronze' || direction === 'bronzeToSilver') {
+      const gpB = await GamePlayer.findOne({ address }).lean();
+      if (!gpB || !gpB.playerName) return res.status(404).json({ error: 'player_not_found' });
+      const docB = await PlayerStats.findOne({ playerName: gpB.playerName });
+      if (!docB) return res.status(404).json({ error: 'stats_not_found. Call /sync first' });
+      const plataB = Number(docB.plata || 0), bronceB = Number(docB.bronce || 0), costeB = qty * BRONZE_PER_SILVER;
+      let nuevaPlata, nuevoBronce;
+      if (direction === 'bronzeToSilver') {
+        if (bronceB < costeB) return res.status(400).json({ error: 'insufficient_bronze', need: costeB, have: bronceB });
+        nuevoBronce = bronceB - costeB; nuevaPlata = plataB + qty;
+      } else {
+        if (plataB < qty) return res.status(400).json({ error: 'insufficient_silver', need: qty, have: plataB });
+        nuevaPlata = plataB - qty; nuevoBronce = bronceB + costeB;
+      }
+      const contratoB = getStatsContract();
+      const gasB = await getSafeGasPriceStats();
+      const erroresB = [];
+      const aplicarB = async (stat, newVal) => {
+        const invId = docB.invoiceIds && docB.invoiceIds[stat];
+        if (!contratoB || !invId) { docB[stat] = newVal; return; }
+        const r = await applyStatOnChain(contratoB, stat, invId, newVal, gasB);
+        if (r.ok) docB[stat] = newVal;
+        else {
+          if (r.chainQty !== null && r.chainQty !== undefined) docB[stat] = clampStat(stat, r.chainQty);
+          erroresB.push({ stat, error: r.error });
+        }
+      };
+      // Primero se QUITA y luego se DA.
+      if (direction === 'bronzeToSilver') {
+        await aplicarB('bronce', nuevoBronce);
+        if (erroresB.length) return res.status(502).json({ error: 'exchange_failed', errors: erroresB });
+        await aplicarB('plata', nuevaPlata);
+      } else {
+        await aplicarB('plata', nuevaPlata);
+        if (erroresB.length) return res.status(502).json({ error: 'exchange_failed', errors: erroresB });
+        await aplicarB('bronce', nuevoBronce);
+      }
+      await docB.save();
+      console.log(`💱 Cambio ${direction} x${qty} para ${gpB.playerName}: plata=${docB.plata} bronce=${docB.bronce}`);
+      return res.json({ ok: true, rate: BRONZE_PER_SILVER, stats: buildStatsResponse(docB), errors: erroresB.length ? erroresB : undefined });
     }
 
     const gp = await GamePlayer.findOne({ address }).lean();
@@ -27265,10 +27868,14 @@ io.on('connection', (socket) => {
     let ticket = null;
     try {
       if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
-      if (!(await gfSocketConNombre(socket))) return emitBattle(socket, 'brawl:error', { error: 'name_required' });
       if (brawlRecuperarSolicitud(socket, 'bot')) return;
       ticket = reserveBattleAdmission(socket, 'bot');
       if (!ticket) return emitBattle(socket, 'brawl:error', { error: 'already_in_battle' });
+      // Sin nombre de personaje no se entra: se suelta la plaza recién tomada.
+      if (!(await gfSocketConNombre(socket))) {
+        releaseBattleAdmission(socket, ticket);
+        return emitBattle(socket, 'brawl:error', { error: 'name_required' });
+      }
       await brawlIniciarDiaria(socket, ticket);
     } catch (e) {
       releaseBattleAdmission(socket, ticket);
@@ -27281,7 +27888,6 @@ io.on('connection', (socket) => {
     let ticket = null;
     try {
       if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
-      if (!(await gfSocketConNombre(socket))) return emitBattle(socket, 'brawl:error', { error: 'name_required' });
       // Quien estaba en la cola y se cansa de esperar pasa directo a practicar.
       if (socket._battleTicket && socket._battleTicket.mode === 'pvp' && !socketMatch.has(socket.id)) {
         removeBattleQueueSocket(socket);
@@ -27291,6 +27897,10 @@ io.on('connection', (socket) => {
       if (brawlRecuperarSolicitud(socket, 'practica')) return;
       ticket = reserveBattleAdmission(socket, 'practica');
       if (!ticket) return emitBattle(socket, 'brawl:error', { error: 'already_in_battle' });
+      if (!(await gfSocketConNombre(socket))) {
+        releaseBattleAdmission(socket, ticket);
+        return emitBattle(socket, 'brawl:error', { error: 'name_required' });
+      }
       await brawlIniciarPractica(socket, ticket);
     } catch (e) {
       releaseBattleAdmission(socket, ticket);
@@ -27303,11 +27913,14 @@ io.on('connection', (socket) => {
     let ticket = null;
     try {
       if (!socket.authenticatedAddress) return emitBattle(socket, 'brawl:error', { error: 'not_authenticated' });
-      if (!(await gfSocketConNombre(socket))) return emitBattle(socket, 'brawl:error', { error: 'name_required' });
       // brawlRecuperarSolicitud también vuelve a confirmar la cola.
       if (brawlRecuperarSolicitud(socket, 'pvp')) return;
       ticket = reserveBattleAdmission(socket, 'pvp');
       if (!ticket) return emitBattle(socket, 'brawl:error', { error: 'already_in_battle' });
+      if (!(await gfSocketConNombre(socket))) {
+        releaseBattleAdmission(socket, ticket);
+        return emitBattle(socket, 'brawl:error', { error: 'name_required' });
+      }
       const player = await conPlazo(construirJugadorDeSocket(socket), BATTLE_PLAZO_BD_MS, null);
       if (!isBattleAdmissionCurrent(socket, ticket)) return;
       if (!player || !player.playerName || player.playerName === '---') {
@@ -27950,7 +28563,28 @@ io.on('connection', (socket) => {
         resp.islaDe = dueno;
         resp.islaDeNombre = dueno === otro ? nombre
           : (((await fichasDe([dueno])).get(dueno)) || {}).username || dueno;
+        // (2026-10-20) A una isla sin VIP no se viaja.
+        const fdI = await GamePlayer.findOne({ playerName: dueno }).select('address').lean();
+        if (!fdI || !(await gfTieneVipPorDireccion(fdI.address))) {
+          return socket.emit('friends:ir', { ok: false, motivo: 'isla_sin_vip', ...base });
+        }
       }
+      /* (2026-10-20) "Si alguien desea teletransportarse hacia mí por medio del
+         botón de amigos, tiene que tener un precio según la distancia." Se
+         cobra en BRONCE: primero se dice el precio (motivo 'precio') y, si el
+         jugador acepta, se vuelve a pedir con { pagar: true, precio }. */
+      const precio = gfPrecioViaje(socket, sala, p);
+      resp.precio = precio;
+      const stYo = await PlayerStats.findOne({ playerName: yo }).select('bronce').lean();
+      const saldo = Math.floor(Number(stYo && stYo.bronce) || 0);
+      if (!(data && data.pagar) || Math.floor(Number(data.precio) || 0) < precio) {
+        return socket.emit('friends:ir', { ...resp, ok: false, motivo: 'precio', saldo });
+      }
+      const pagado = await gfCobrarStat(yo, 'bronce', precio);
+      if (!pagado) return socket.emit('friends:ir', { ...resp, ok: false, motivo: 'sin_bronce', saldo });
+      resp.pagado = precio;
+      resp.stats = buildStatsResponse(pagado);
+      console.log(`🧭 ${yo} viaja con ${otro} por ${precio} de bronce`);
       socket.emit('friends:ir', resp);
     } catch (e) {
       console.error('friends:ir', e);

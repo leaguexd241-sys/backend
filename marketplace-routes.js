@@ -115,7 +115,11 @@ const ITEM_CATALOG = {
   espada_hierro:  { name: 'Iron Sword',   category: 'herramientas', icon: '/Game/Objetos/armas/espada_hierro.png',   maxStack: 1 },
   cana_pescar:    { name: 'Fishing Rod',  category: 'herramientas', icon: '/Game/Objetos/pesca/cana_pescar.png',     maxStack: 1 },
   espantapajaros: { name: 'Scarecrow',    category: 'herramientas', icon: '/Game/Objetos/granja/espantapajaros.png', maxStack: 10 },
-  antorcha:       { name: 'Torch',        category: 'herramientas', icon: '/Game/Objetos/antorcha/antorcha.png',     maxStack: 20 }
+  antorcha:       { name: 'Torch',        category: 'herramientas', icon: '/Game/Objetos/antorcha/antorcha.png',     maxStack: 20 },
+  // (2026-10-21) El bote y las dos armas a distancia.
+  bote:           { name: 'Boat',         category: 'herramientas', icon: '/Game/Objetos/bote/bote.png',             maxStack: 1 },
+  arco:           { name: 'Bow',          category: 'herramientas', icon: '/Game/Objetos/armas/arco.png',            maxStack: 1 },
+  baston_mago:    { name: 'Wizard Staff', category: 'herramientas', icon: '/Game/Objetos/armas/baston_mago.png',     maxStack: 1 }
 };
 
 const CATEGORIES = [
