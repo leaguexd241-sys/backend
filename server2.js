@@ -8259,7 +8259,10 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH', 'HEAD'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Cache-Control', 'Origin', 'X-CSRF-Token', 'x-csrf-token', 'X-Requested-With', 'Access-Control-Request-Method', 'Access-Control-Request-Headers', 'X-GF-Sesion'],
+  // (2026-10-21) + las tres del informe de errores de los clientes ya publicados
+  // (GameScene ErrorReporter): sin ellas el navegador cortaba la petición en
+  // la consulta previa y el cliente la reintentaba cada 2 s.
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Cache-Control', 'Origin', 'X-CSRF-Token', 'x-csrf-token', 'X-Requested-With', 'Access-Control-Request-Method', 'Access-Control-Request-Headers', 'X-GF-Sesion', 'X-Error-Report', 'X-Client-Version', 'X-Game-Build'],
   exposedHeaders: ['Set-Cookie', 'X-CSRF-Token', 'X-Token-Expires-Soon'],
   maxAge: 86400,
   preflightContinue: false,
@@ -13194,7 +13197,9 @@ function esSalaSalvaje(sala) { return SALAS_SALVAJES.has(salaBase(sala)); }
 const PVP_DANO = { espada_madera: 4, espada_cobre: 6, espada_hierro: 9, arco: 5, baston_mago: 6 };
 // (2026-10-21) El arco y el bastón dan de lejos: su alcance propio (generoso,
 // como el de la espada: las dos posiciones llegan con el retraso de la red).
-const PVP_ALCANCE_ARMA = { arco: 420, baston_mago: 360 };
+// (2026-10-21) El cliente llega a 300 x 1,35 (combate) x 1,3 (poder B) + 30 px:
+// se deja ese margen más el retraso de las posiciones de la sala.
+const PVP_ALCANCE_ARMA = { arco: 600, baston_mago: 520 };
 // Generoso: las dos posiciones llegan con el retraso de la red.
 const PVP_ALCANCE = 150;
 const PVP_ENFRIA_MS = 300;
@@ -20814,6 +20819,28 @@ async function asegurarTablasDelJuego() {
     if (antes && antes.exists) continue;
     const ok = await tablaExiste(t.tipo);
     (ok ? out.creadas : out.faltan).push(t.tipo);
+  }
+  /* (2026-10-21) "La tabla de la moneda de bronce o del VIP se debe crear
+     automáticamente." La de `vip` está en TABLAS_RECOMENDADAS (arriba). Las
+     de los STATS (vida, agua, comida, oro, plata, BRONCE, exp) solo se
+     creaban al sincronizar los stats de un jugador (ensureStatTipo), y eso
+     no llega a pasar si el nodo va saturado (el sync cae a la BD): el
+     bronce se quedaba sin tabla. Ahora también aquí, una a una, con los
+     límites de STAT_TIPO_CONFIG. Las que ya existen no se tocan. */
+  const cStats = getStatsContract();
+  if (cStats) {
+    for (const stat of STAT_TYPES_LIST) {
+      const antes = await infoTablaCadena(stat);
+      if (antes && antes.exists) continue;
+      if (!antes) { out.faltan.push(stat); continue; }        // el nodo no contestó
+      let info = null;
+      try { info = await ensureStatTipo(cStats, stat, await getSafeGasPriceStats(), { force: true }); }
+      catch (e) { console.warn(`⚠️  Tabla de stat [${stat}]:`, e.message); }
+      // ensureStatTipo manda con el nonce de la cadena: el gestor se resincroniza.
+      try { await relayerNonceManager.resetNonce(); } catch (_) {}
+      _infoTablaCache.delete(stat);
+      (info && info.exists ? out.creadas : out.faltan).push(stat);
+    }
   }
   if (out.creadas.length) console.log('🧾 Tablas creadas al repasar:', out.creadas.join(', '));
   if (out.faltan.length) console.warn('⚠️  Tablas que no se pudieron crear (se reintenta):', out.faltan.join(', '));
