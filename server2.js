@@ -17190,9 +17190,46 @@ app.patch('/api/admin/players/:playerName', adminAuth, strictLimiter, async (req
       setMongo.petLevel = Math.max(1, Math.min(MAX_LEVEL_MASCOTA, setMongo.petLevel));
       setMongo.petExp = expMascotaParaNivel(setMongo.petLevel);
     }
+    /* (2026-10-25) EL NIVEL, TAMBIÉN EN LA CADENA. "Quiero ponerle otro nivel
+       al personaje: solo se cambia el off-chain, no el on-chain, y yo trabajo
+       con el on-chain." El nivel no se guarda suelto: sale de la experiencia
+       (nivelPorExperiencia), que vive en GamePlayer.nivel_exp Y en la factura
+       `exp`. Cambiar solo `nivel` lo deshacía el siguiente guardado, y la tabla
+       `nivel` de la cadena (que además solo sube) no se movía.
+       Ahora las tres casillas (Nivel, Exp y Exp on-chain) fijan UNA
+       experiencia que va a los dos sitios, y la tabla de nivel de la cadena se
+       pone a ese nivel exacto (más abajo). Si llega más de una, manda la
+       factura, luego la experiencia y luego el nivel. */
+    let expObjetivo = null;
+    if (cambios.exp !== undefined) expObjetivo = Number(cambios.exp);
+    else if (setMongo.nivel_exp !== undefined) expObjetivo = setMongo.nivel_exp;
+    else if (setMongo.nivel !== undefined) {
+      const L = Math.max(1, Math.min(MAX_LEVEL_PERSONAJE, setMongo.nivel));
+      expObjetivo = expTotalParaNivel(L);
+    }
+    if (expObjetivo !== null) {
+      for (let i = aplicados.length - 1; i >= 0; i--) {
+        if (aplicados[i].campo === 'nivel' || aplicados[i].campo === 'nivel_exp') aplicados.splice(i, 1);
+      }
+      if (!Number.isFinite(expObjetivo) || expObjetivo < 0) {
+        errores.push({ campo: 'exp', error: 'valor_invalido' });
+        delete setMongo.nivel; delete setMongo.nivel_exp; delete cambios.exp;
+        expObjetivo = null;
+      } else {
+        expObjetivo = Math.floor(expObjetivo);
+        setMongo.nivel_exp = expObjetivo;
+        setMongo.nivel = nivelPorExperiencia(expObjetivo);
+        cambios.exp = expObjetivo;   // la factura `exp` va con ella (paso 2)
+        aplicados.push({ campo: 'nivel', de: gp.nivel, a: setMongo.nivel });
+        aplicados.push({ campo: 'nivel_exp', de: gp.nivel_exp, a: expObjetivo });
+      }
+    }
+    const tocaNivel = expObjetivo !== null || setMongo.petLevel !== undefined;
     if (Object.keys(setMongo).length) {
       await GamePlayer.updateOne({ playerName }, { $set: setMongo });
-      try { _identidadFirma.delete(playerName); programarIdentidadEnCadena(playerName); } catch (_) {}
+      // El nivel va aparte, exacto y esperando la respuesta (paso 3); el resto
+      // (los nombres), con el antirrebote de siempre.
+      if (!tocaNivel) { try { _identidadFirma.delete(playerName); programarIdentidadEnCadena(playerName); } catch (_) {} }
     }
 
     // 2. Campos que son FACTURAS del contrato
@@ -17225,6 +17262,47 @@ app.patch('/api/admin/players/:playerName', adminAuth, strictLimiter, async (req
         }
         await doc.save();
       }
+    }
+
+    // 3. La tabla `nivel` de la cadena (personaje y mascota), exacta.
+    if (tocaNivel) {
+      try {
+        const t = _identidadTimer.get(playerName);
+        if (t) { clearTimeout(t); _identidadTimer.delete(playerName); }
+        _identidadFirma.delete(playerName);
+        const exacto = { pj: expObjetivo !== null, pet: setMongo.petLevel !== undefined };
+        const r = await enColaDelJugador('id:' + playerName, () => sincronizarIdentidadEnCadena(playerName, { exacto }));
+        if (r && r.ok) {
+          aplicados.push({ campo: 'nivel_en_cadena', a: r.objetivo ? r.objetivo.pj : undefined,
+                           nota: 'tabla de nivel on-chain (mascota: ' + (r.objetivo ? r.objetivo.pet : '?') + ')' });
+        } else {
+          errores.push({ campo: 'nivel_en_cadena', error: (r && r.motivo) || 'no_se_pudo_escribir' });
+        }
+      } catch (e) {
+        errores.push({ campo: 'nivel_en_cadena', error: e.message });
+      }
+    }
+
+    /* 4. Si el jugador está conectado, su navegador adopta lo nuevo
+       (gf-admin-ajuste.js). Sin esto devolvía lo viejo: _syncExp manda la
+       experiencia ABSOLUTA en cuanto gana un punto, y la tienda el oro. */
+    if (aplicados.length) {
+      try {
+        const [st, g] = await Promise.all([
+          PlayerStats.findOne({ playerName }).lean(),
+          GamePlayer.findOne({ playerName }).select('nivel nivel_exp petExp').lean()
+        ]);
+        const stats = {};
+        for (const a of aplicados) {
+          if (ADMIN_CAMPOS_ONCHAIN.includes(a.campo) && st && typeof st[a.campo] === 'number') stats[a.campo] = clampStat(a.campo, st[a.campo]);
+        }
+        if (expObjetivo !== null && g) stats.exp = Math.max(0, Number(g.nivel_exp) || 0);
+        avisarAJugador(playerName, 'admin:ajuste', {
+          stats,
+          nivel: g ? g.nivel : undefined,
+          pet: (setMongo.petLevel !== undefined && g) ? progresoMascota(g.petExp) : null
+        });
+      } catch (_) {}
     }
 
     console.log(`🛠️  [admin ${req.admin.address || req.admin.role}] editó ${playerName}: ${aplicados.map(a => a.campo).join(', ') || 'nada'}`);
@@ -21466,7 +21544,13 @@ function manualIdNombre(quien, nombre) { return `${quien}:${nombre}`; }
  *     dice '---' pero la cadena tiene el nombre de ESTA cartera, se recupera;
  *   · si una tabla no existe todavía, esa parte se salta sin error.
  */
-async function sincronizarIdentidadEnCadena(playerName) {
+async function sincronizarIdentidadEnCadena(playerName, opciones) {
+  // (2026-10-25) `exacto: { pj, pet }`: lo pide el administrador (PATCH de
+  // admin.html) para lo que ÉL cambió. Ese nivel de la cadena se pone EXACTO,
+  // también hacia abajo: la regla de "solo sube" es para el juego, no para
+  // quien corrige una cuenta. Lo que no tocó sigue con las reglas de siempre
+  // (si la mascota va por delante en la cadena, se recupera; no se baja).
+  const exactoDe = (quien) => !!(opciones && opciones.exacto && opciones.exacto[quien]);
   const c = contratoItemsServidor();
   if (!c || !playerName || playerName === '---') return { ok: false, motivo: 'sin_contrato' };
 
@@ -21506,6 +21590,12 @@ async function sincronizarIdentidadEnCadena(playerName) {
         } else if (f.cantidad < quiero) {
           await txRelayer(`nivel ${quien} (subir)`, (o) => c.increaseInvoiceQuantity(f.id, quiero - f.cantidad, o));
           console.log(`🏷️  ${playerName}: nivel ${quien} ${f.cantidad} → ${quiero} en la cadena`);
+        } else if (f.cantidad > quiero && exactoDe(quien)) {
+          // Nunca por debajo de 1: una factura a 0 deja de estar activa.
+          if (quiero >= 1) {
+            await txRelayer(`nivel ${quien} (bajar)`, (o) => c.decreaseInvoiceQuantity(f.id, f.cantidad - quiero, o));
+            console.log(`🏷️  ${playerName}: nivel ${quien} ${f.cantidad} → ${quiero} en la cadena (administrador)`);
+          }
         } else if (f.cantidad > quiero && quien === 'pet') {
           // La cadena va por delante: Mongo perdió la experiencia de la
           // mascota. Se recupera hasta ese nivel (nunca se baja).
@@ -29750,6 +29840,42 @@ io.on('connection', (socket) => {
 
 console.log('✅ Amistades cargadas: sockets friends:* (solicitudes, presencia y privados)');
 
+
+/* (2026-10-25) EL ESCANEO HISTÓRICO DE LA AUDITORÍA, EN PAUSA.
+   En la consola del juego: "Bandwidth limit exceeded" (-31002) del RPC de
+   LitVM. El RPC corta a la IP del servidor (desde otra IP responde bien) y con
+   él caen la carga del inventario (call-view 500), /api/player/skills (503) y
+   las lecturas del relayer.
+   El escaneo histórico del panel de impacto (botón "analizarCC") pide CADA
+   bloque desde el despliegue del contrato (33.405.472) con todas sus
+   transacciones, más otra lectura de comprobación, una cada 250 ms: unos 2
+   bloques/s contra los 3,67 que produce la cadena (medido el 25-10 con la
+   cabeza en 64.597.148, 31 millones de bloques por detrás). No termina nunca,
+   se reanuda solo en cada arranque (autoResume) y gasta el mismo cupo que el
+   juego.
+   Queda en pausa salvo LITVM_AUDIT_HISTORICO=1 (mejor con su propio RPC en
+   LITVM_AUDIT_RPC_URL). La captura en vivo de las transacciones del relayer y
+   la conciliación de sus recibos siguen igual. Va FUERA del bloque de abajo:
+   ese bloque y el módulo embebido los vigila tools/impact-backend-bundle.test.cjs. */
+const LITVM_AUDIT_HISTORICO = process.env.LITVM_AUDIT_HISTORICO === '1';
+if (!LITVM_AUDIT_HISTORICO) {
+  // Se registra antes que la ruta del módulo: el botón ya no lo arranca.
+  app.post('/api/admin/impact/scan', adminAuth, strictLimiter, csrfProtection, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.status(409).json({ error: 'historical_scan_paused',
+      message: 'The historical chain scan is paused: it used up the same RPC quota as the game. ' +
+               'Set LITVM_AUDIT_HISTORICO=1 (ideally with its own LITVM_AUDIT_RPC_URL) to run it.' });
+  });
+  // Y el que quedó a medias no se reanuda solo: el mantenimiento del módulo
+  // solo lo retoma si `autoResume` no es false. Mongo guarda la orden hasta
+  // conectar, y va antes que la primera pasada del mantenimiento (a los 5 s).
+  mongoose.connection.collection('litvm_chain_scans').updateOne(
+    { _id: CHAIN_ID + ':' + String(CONTRACTS.ITEMS_CONTRACT.address).toLowerCase(), status: { $ne: 'complete' } },
+    { $set: { autoResume: false, nextRetryAt: null, retryReason: 'historical_scan_paused', updatedAt: new Date() } }
+  ).then((r) => {
+    if (r && r.modifiedCount) console.log('⏸️  [LitVM audit] escaneo histórico en pausa (LITVM_AUDIT_HISTORICO=1 para reanudarlo)');
+  }).catch((e) => console.warn('⚠️  [LitVM audit] no se pudo pausar el escaneo histórico:', e && e.message));
+}
 
 // --- AUDITORIA LITVM: ledger aditivo, sin modificar datos ni contadores legacy ---
 // Las funciones integradas eliminan dependencias de archivos adicionales al desplegar.
