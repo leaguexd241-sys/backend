@@ -6710,6 +6710,10 @@ function zonaDeSala(sala) {
   if (b === 'cementerio') return 'cemetery';
   if (b === 'desierto') return 'desert';
   if (b === 'tundra') return 'tundra';
+  // (2026-10-25) Los de nivel 8, 9 y 10.
+  if (b === 'glaciar') return 'glacier';
+  if (b === 'caverna') return 'caverns';
+  if (b === 'pradera') return 'meadow';
   if (b === 'isla' || b.startsWith('isla@')) return 'island';
   if (b.startsWith('batalla') || b.startsWith('battle') || b.startsWith('arena')) return 'battle';
   return 'travel';
@@ -12770,6 +12774,10 @@ const _gfPescaZonas = {};
 /* (2026-10-21) LA MINA: sus charcas (la capa `area_agua` de Maps/mina.json,
    en casillas de 16 px). Con ellas se pesca en la mina (desde la orilla o
    desde el bote) y se sabe dónde se puede poner un bote. */
+// (2026-10-25) El glaciar, la caverna y la pradera (tools/generar-agua-pesca.py).
+GF_PESCA_ZONAS.glaciar = {"tile":16,"w":314,"h":314,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;260-263;256-267;255-269;254-271;253-272;252-273;252-273;251-274;251-274;251-274;251-274;252-273;253-271;254-270;255-268;256-266;258-262;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;93-97;84-99;78-100;76-105;74-108;73-109;72-110;68-111;66-111;65-112;65-113;64-113;63-114;63-114;62-114;62-115;62-116;62-117;62-118;62-118;62-118;64-117;65-116;66-116;67-115;68-114;70-113;72-111;73-108;75-102;77-100;81-96;83-93;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"};
+GF_PESCA_ZONAS.caverna = {"tile":16,"w":314,"h":314,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;154-157;141-148,152-159;135-160;131-162;128-169;127-170;126-171;125-172;124-173;124-174;123-175;122-177;122-179;122-179;121-179;121-179;121-179;121-179;121-179;121-179;121-179;121-179;121-179;121-178;122-178;124-176;124-174;125-172;125-171;127-170;129-169;132-168;137-166;139-148;142-146;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"};
+GF_PESCA_ZONAS.pradera = {"tile":16,"w":314,"h":314,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;261-266;260-268;245-273;244-276,279-281;244-282;243-283;242-284;241-286;240-288;238-289;236-290;235-290;234-291;234-291;233-291;233-291;233-291;232-291;232-292;232-292;232-293;232-293;232-292;232-292;232-291;233-290;233-290;234-289;235-288;236-288;240-287;241-284;241-281;242-280;244-279;246-278;250-277;251-274;252-262,267-272;255-259;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;64-67;61-69;53-71;52-74;51-75;50-76;50-77;49-78;48-79;47-81;47-82;46-83;46-83;46-83;46-82;47-82;47-81;47-80;48-79;49-78;52-77;54-75;56-73;61-70;63-68;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"};
 GF_PESCA_ZONAS.mina = {"tile":16,"w":313,"h":313,"rle":";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;174-181;174-181;172-183;172-183;170-183;170-183;168-183;168-183;138-141,166-185;138-141,166-185;136-143,164-187;136-143,164-187;134-143,164-187;134-143,164-187;130-147,174-185;130-147,174-185;130-155;130-155;130-157;130-157;128-157;128-157;128-155;128-155;130-153;130-153;130-153;130-153;130-139,144-151;130-139,144-151;130-137;130-137;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;"};
 function gfZonaCercaDelAgua(zona, px, py, radio = 3) {
   const z = GF_PESCA_ZONAS[zona];
@@ -13013,7 +13021,37 @@ const MONSTRUOS_BOTIN = {
   jefe_escorpion: { nombre: 'The Sand Emperor', salas: ['desierto'], enfriaMs: 30 * 60 * 1000, exp: 1600, montones: [5, 7], instancias: 1,
     botin: [['mineral_piedra_cobre', 4, 7], ['pocion_vida', 1, 2], ['Semillax4', 2, 4], ['madera_seca', 4, 8], ['carbon', 3, 6]] },
   jefe_lobo: { nombre: 'Frostfang, the Pack King', salas: ['tundra'], enfriaMs: 30 * 60 * 1000, exp: 1700, montones: [5, 7], instancias: 1,
-    botin: [['mineral_piedra_hierro', 4, 7], ['pocion_vida', 1, 2], ['madera_pinos', 6, 10], ['carbon', 4, 8], ['antorcha', 2, 3]] }
+    botin: [['mineral_piedra_hierro', 4, 7], ['pocion_vida', 1, 2], ['madera_pinos', 6, 10], ['carbon', 4, 8], ['antorcha', 2, 3]] },
+  // (2026-10-25) LOS DE NIVEL 8, 9 Y 10 (Maps/<mapa>.json, capa `monstruos`;
+  // gf-salvaje.js). Más duros que los de antes: más experiencia y más botín.
+  // EL GLACIAR (nivel 8):
+  oso_polar: { nombre: 'Frost Bear', salas: ['glaciar'], enfriaMs: 5 * 60 * 1000, exp: 220, montones: [1, 2], instancias: 8,
+    botin: [['madera_pinos', 2, 4], ['carbon', 1, 3]] },
+  yeti_glaciar: { nombre: 'Glacier Yeti', salas: ['glaciar'], enfriaMs: 7 * 60 * 1000, exp: 300, montones: [2, 2], instancias: 7,
+    botin: [['mineral_piedra_hierro', 1, 3], ['mineral_piedra', 2, 4]] },
+  espectro_hielo: { nombre: 'Frost Wraith', salas: ['glaciar'], enfriaMs: 9 * 60 * 1000, exp: 320, montones: [2, 3], instancias: 7,
+    botin: [['mineral_piedra_cobre', 1, 3], ['carbon', 2, 4], ['mineral_piedra_hierro', 1, 2]] },
+  // LA CAVERNA (nivel 9):
+  murcielago_gigante: { nombre: 'Giant Cave Bat', salas: ['caverna'], enfriaMs: 5 * 60 * 1000, exp: 260, montones: [1, 2], instancias: 9,
+    botin: [['carbon', 1, 3], ['Semillax2', 1, 3]] },
+  troll_cueva: { nombre: 'Cave Troll', salas: ['caverna'], enfriaMs: 8 * 60 * 1000, exp: 360, montones: [2, 2], instancias: 7,
+    botin: [['mineral_piedra_hierro', 1, 3], ['mineral_carbon', 1, 2], ['mineral_piedra', 2, 4]] },
+  golem_cristal: { nombre: 'Crystal Golem', salas: ['caverna'], enfriaMs: 9 * 60 * 1000, exp: 400, montones: [2, 3], instancias: 7,
+    botin: [['mineral_piedra_cobre', 2, 4], ['mineral_piedra_hierro', 1, 3]] },
+  // LA PRADERA (nivel 10):
+  jabali_espinoso: { nombre: 'Thornback Boar', salas: ['pradera'], enfriaMs: 5 * 60 * 1000, exp: 330, montones: [1, 2], instancias: 9,
+    botin: [['madera_con_hojas', 2, 4], ['Semillax3', 1, 3]] },
+  driada_salvaje: { nombre: 'Wild Dryad', salas: ['pradera'], enfriaMs: 9 * 60 * 1000, exp: 420, montones: [2, 3], instancias: 7,
+    botin: [['Semillax4', 1, 3], ['Semillax3', 1, 3], ['madera_con_hojas', 2, 4]] },
+  golem_musgo: { nombre: 'Bramble Golem', salas: ['pradera'], enfriaMs: 9 * 60 * 1000, exp: 450, montones: [2, 3], instancias: 7,
+    botin: [['tablon_de_madera', 1, 3], ['mineral_piedra', 2, 4], ['madera_pinos', 2, 4]] },
+  // Sus jefes (gf-jefes.js).
+  jefe_yeti: { nombre: 'The Glacier King', salas: ['glaciar'], enfriaMs: 30 * 60 * 1000, exp: 2200, montones: [5, 7], instancias: 1,
+    botin: [['mineral_piedra_hierro', 4, 8], ['pocion_vida', 1, 2], ['madera_pinos', 6, 10], ['carbon', 4, 8], ['mineral_piedra_cobre', 3, 6]] },
+  jefe_murcielago: { nombre: 'Nightwing, the Cave Matriarch', salas: ['caverna'], enfriaMs: 30 * 60 * 1000, exp: 2400, montones: [5, 7], instancias: 1,
+    botin: [['mineral_piedra_cobre', 4, 8], ['mineral_piedra_hierro', 3, 6], ['pocion_vida', 1, 2], ['mineral_carbon', 2, 4], ['antorcha', 2, 4]] },
+  jefe_ent: { nombre: 'Oakheart, the Elder Grove', salas: ['pradera'], enfriaMs: 30 * 60 * 1000, exp: 2600, montones: [5, 7], instancias: 1,
+    botin: [['tablon_de_madera', 3, 6], ['Semillax4', 2, 4], ['Semillax3', 2, 4], ['pocion_vida', 1, 2], ['madera_con_hojas', 4, 8]] }
 };
 const BOTIN_CADUCA_MS = 10 * 60 * 1000;
 const _monstruoUltimo = new Map();     // 'jugador|tipo' -> hora de la última victoria
@@ -13029,7 +13067,12 @@ function _salaDeJugadorVista(playerName) {
 
 setInterval(() => {
   const ahora = Date.now();
-  for (const [id, b] of _botinPendiente) if (ahora > b.hasta) _botinPendiente.delete(id);
+  for (const [id, b] of _botinPendiente) {
+    if (ahora <= b.hasta) continue;
+    _botinPendiente.delete(id);
+    // (2026-10-22) Las monedas del tesoro que nadie recogió vuelven a él.
+    if (b.incentivo && !b.recogiendo) tesoroDevolverReserva(b.cantidad, 'caducado');
+  }
   for (const [k, t] of _monstruoUltimo) if (ahora - t > 60 * 60 * 1000) _monstruoUltimo.delete(k);
 }, 5 * 60 * 1000).unref();
 
@@ -13043,6 +13086,10 @@ app.post('/api/monstruos/derrotado', apiLimiter, authMiddleware, csrfProtection,
     if (!def) return res.status(400).json({ error: 'tipo_desconocido' });
     const sala = _salaDeJugadorVista(gp.playerName);
     if (!sala || !def.salas.includes(sala)) return res.status(403).json({ error: 'fuera_de_zona' });
+    // (2026-10-22) Los mapas tienen nivel mínimo (GF_NIVEL_MAPA): por debajo no se gana nada.
+    const nivelPj = await gfNivelDeJugador(gp);
+    const nivelMin = gfNivelMinimoSala(sala);
+    if (nivelMin && nivelPj < nivelMin) return res.status(403).json({ error: 'nivel_bajo', nivelMinimo: nivelMin, nivel: nivelPj });
     /* CUÁL de ellos (2026-10-11): en el mapa salvaje hay varios de cada
        especie (Maps/salvaje.json, capa `monstruos`) y el enfriamiento es de
        cada uno. `n` no puede pasar de los que hay: matar al mismo dos veces
@@ -13086,6 +13133,18 @@ app.post('/api/monstruos/derrotado', apiLimiter, authMiddleware, csrfProtection,
                                 itemId, cantidad, hasta: ahora + BOTIN_CADUCA_MS });
       botin.push({ id, itemId, cantidad });
     }
+    // (2026-10-22) EL INCENTIVO DEL TESORO: monedas de bronce que, al pisarlas,
+    // se suman a las del jugador (ver "EL TESORO Y SUS INCENTIVOS").
+    try {
+      const premio = await tesoroIncentivo(gp, def, tipo, nivelPj);
+      if (premio) {
+        const id = crypto.randomBytes(8).toString('hex');
+        _botinPendiente.set(id, { playerName: gp.playerName, address: String(gp.address || '').toLowerCase(),
+                                  itemId: 'moneda_bronce', cantidad: premio.cantidad, hasta: ahora + BOTIN_CADUCA_MS,
+                                  incentivo: { vip: premio.vip, nivel: premio.nivel, monstruo: tipo } });
+        botin.push({ id, itemId: 'moneda_bronce', cantidad: premio.cantidad, moneda: 'bronce', incentivo: true });
+      }
+    } catch (e) { console.warn('⚠️  tesoro: incentivo de ' + gp.playerName + ':', e.message); }
     console.log(`🐉 ${gp.playerName} venció a ${def.nombre}: +${def.exp} exp, ${botin.length} montones`);
     UserActivity.updateOne({ playerName: gp.playerName }, { $inc: { monstruos: 1 } }).catch(() => {});
     return res.json({ ok: true, tipo, exp: def.exp, expTotal, botin, caducaMs: BOTIN_CADUCA_MS, sinNombre: !conNombre });
@@ -13104,6 +13163,21 @@ app.post('/api/monstruos/botin/recoger', apiLimiter, authMiddleware, csrfProtect
     if (!b || b.playerName !== gp.playerName) return res.json({ ok: false, motivo: 'no_existe' });
     if (Date.now() > b.hasta) { _botinPendiente.delete(id); return res.json({ ok: false, motivo: 'caducado' }); }
     if (b.recogiendo) return res.json({ ok: false, motivo: 'en_curso' });
+    // (2026-10-22) Monedas del tesoro: se SUMAN a las del jugador (no hay cadena que esperar).
+    if (b.incentivo) {
+      b.recogiendo = true;
+      let doc = null;
+      try { doc = await tesoroPagar(gp, b); }
+      catch (e) {
+        // No se abonó nada: el montón sigue ahí (y si caduca, vuelve al tesoro).
+        b.recogiendo = false;
+        console.warn('⚠️  tesoro: pago a ' + gp.playerName + ':', e.message);
+        return res.status(503).json({ ok: false, motivo: 'tesoro', message: 'The coins could not be picked up. Step on them again.' });
+      }
+      _botinPendiente.delete(id);
+      if (!doc) return res.status(503).json({ ok: false, motivo: 'tesoro', message: 'The coins slipped away. Try again later.' });
+      return res.json({ ok: true, incentivo: true, itemId: b.itemId, moneda: 'bronce', cantidad: b.cantidad, stats: buildStatsResponse(doc) });
+    }
     b.recogiendo = true;
     /* EN COLA Y SIN ESPERAR A LA CADENA (2026-10-19): "cuando mato un
        monstruo suelta objetos y, al pasar por encima, tarda mucho en
@@ -13185,12 +13259,17 @@ const PVP_ZONA = { x0: 0, y0: 0, x1: 2240, y1: 5024 };
    que se suelta en el suelo. Cada uno con SU zona (la capa `zonas` de su
    mapa, tools/generar-zonas.py): el cementerio entero; el desierto al sur de
    y = 2600; la tundra al norte de y = 2400. */
-const SALAS_SALVAJES = new Set([SALVAJE_SALA, 'cementerio', 'desierto', 'tundra']);
+const SALAS_SALVAJES = new Set([SALVAJE_SALA, 'cementerio', 'desierto', 'tundra', 'glaciar', 'caverna', 'pradera']);
 const PVP_ZONAS = {
   salvaje: PVP_ZONA,
   cementerio: { x0: 0, y0: 0, x1: 5024, y1: 5024 },
   desierto: { x0: 0, y0: 2600, x1: 5024, y1: 5024 },
-  tundra: { x0: 0, y0: 0, x1: 5024, y1: 2400 }
+  tundra: { x0: 0, y0: 0, x1: 5024, y1: 2400 },
+  // (2026-10-25) El glaciar al norte de y = 2000, la caverna al oeste de
+  // x = 2300 y la pradera al norte de y = 1500 (tools/generar-zonas.py).
+  glaciar: { x0: 0, y0: 0, x1: 5024, y1: 2000 },
+  caverna: { x0: 0, y0: 0, x1: 2300, y1: 5024 },
+  pradera: { x0: 0, y0: 0, x1: 5024, y1: 1500 }
 };
 function esSalaSalvaje(sala) { return SALAS_SALVAJES.has(salaBase(sala)); }
 // Vida que quita cada espada a otro jugador (la vida va de 0 a 100).
@@ -13591,7 +13670,7 @@ io.on('connection', (socket) => {
 // los que están DESPIERTOS (si todos duermen, se queda como estaba).
 // El tajo de cada uno se reenvía a la sala ('combate:tajo'): así se ve.
 // =============================================================================
-const MOBS_SALAS = new Set(['mina', 'salvaje', 'cementerio', 'desierto', 'tundra']);
+const MOBS_SALAS = new Set(['mina', 'salvaje', 'cementerio', 'desierto', 'tundra', 'glaciar', 'caverna', 'pradera']);
 const MOBS_GRUPOS = new Set(['salvaje', 'zombis', 'espectros', 'serpiente']);
 const _mobsSalas = new Map();     // sala -> { host, miembros: Map<socketId, desde>, dormidos: Set<socketId> }
 
@@ -13829,7 +13908,7 @@ app.post('/api/espantapajaros/colocar', apiLimiter, authMiddleware, csrfProtecti
 // por jugador y ANTORCHA_MAX_ZONA por zona.
 // =============================================================================
 const ANTORCHA_MS = 30 * 60 * 1000;
-const ANTORCHA_ZONAS = new Set(['game', 'mina', 'salvaje', 'cementerio', 'desierto', 'tundra']);
+const ANTORCHA_ZONAS = new Set(['game', 'mina', 'salvaje', 'cementerio', 'desierto', 'tundra', 'glaciar', 'caverna', 'pradera']);
 const ANTORCHA_MAX_ZONA = 120;
 const ANTORCHA_MAX_JUGADOR = 6;
 const ANTORCHA_ALCANCE = 260;
@@ -13955,7 +14034,7 @@ app.post('/api/antorchas/poner', apiLimiter, authMiddleware, csrfProtection, asy
 // dónde queda el bote al bajarse. Se comprueba: que sea SU bote, que esté en
 // esa zona y cerca, y que el sitio sea AGUA (las casillas de la pesca).
 // =============================================================================
-const BOTE_ZONAS = new Set(['game', 'mina', 'salvaje', 'cementerio', 'desierto', 'tundra']);
+const BOTE_ZONAS = new Set(['game', 'mina', 'salvaje', 'cementerio', 'desierto', 'tundra', 'glaciar', 'caverna', 'pradera']);
 const BOTE_ALCANCE = 260;          // de los pies del jugador al sitio del bote
 const BOTE_MAX_ZONA = 80;
 const boteSchema = new mongoose.Schema({
@@ -17305,7 +17384,8 @@ const INVITA_LETRAS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const INVITA_CODIGO_RE = /^[A-HJ-NP-Z2-9]{8}$/;
 const DISCORD_RE = /^(?:[a-z0-9_.]{2,32}|[^\s#@:]{2,32}#\d{4})$/i;
 const TIEMPO_POR_SALA = { mina: 'tiempoMinaMs', tienda: 'tiempoTiendaMs', salvaje: 'tiempoSalvajeMs',
-                          cementerio: 'tiempoSalvajeMs', desierto: 'tiempoSalvajeMs', tundra: 'tiempoSalvajeMs' };
+                          cementerio: 'tiempoSalvajeMs', desierto: 'tiempoSalvajeMs', tundra: 'tiempoSalvajeMs',
+                          glaciar: 'tiempoSalvajeMs', caverna: 'tiempoSalvajeMs', pradera: 'tiempoSalvajeMs' };
 
 /** Cierra el tramo de la sala en la que estaba el socket y lo suma a su campo. */
 function anotarTiempoDeSala(socket) {
@@ -20357,6 +20437,428 @@ async function applyStatOnChain(contract, stat, invId, target, gasPrice) {
   }
 }
 
+// =============================================================================
+// EL TESORO Y SUS INCENTIVOS                                       (2026-10-22)
+// -----------------------------------------------------------------------------
+// "En la tiendajuego, si alguien vende o compra se le cobra una comisión del
+// 1,5 % y en el control quiero saber cuánto tiene ese tesoro de comisiones;
+// así mismo, si alguien vende o compra un objeto en la tienda P2P, el 1,5 % se
+// va al tesoro. Dentro del tesoro se repartirá un incentivo: según sea free o
+// VIP, su nivel y su suerte, un monstruo o enemigo vencido puede soltar
+// monedas que, al tomarlas, no van al inventario sino que se suman a sus
+// monedas. En el panel, aunque la probabilidad se ajusta sola, quiero un modo
+// manual para subirla o bajarla a los free o a los VIP. Los usuarios sin
+// nombre no tienen este mecanismo."
+//
+// TODO EN BRONCE, la moneda más pequeña (1 plata = 1.000, 1 oro = 1.000.000):
+// el 1,5 % de 2 de oro no cabe en oro entero.
+//
+// LO QUE ENTRA
+//   · La tienda del juego: el navegador cobra el 1,5 % (tienda_sistema.js,
+//     _comisionBronce) y lo avisa en POST /api/tesoro/comision. El importe NO
+//     se toma del navegador: se recalcula con TIENDA_PRECIOS (el mismo
+//     catálogo que ve el jugador, tools/tienda-precios-a-servidor.js). Cada
+//     aviso lleva un `ref` que solo cuenta una vez, y hay un tope por jugador
+//     y día. (El saldo de la tienda lo fija el navegador desde siempre —
+//     /api/stats/update—: esto no lo empeora y le pone techo.)
+//   · El mercado P2P (marketplace-routes.js): la comisión ya la cobraba el
+//     servidor al vendedor; ahora es el 1,5 % y se apunta aquí DENTRO de la
+//     misma transacción de Mongo que la venta (se le pasan Tesoro y TesoroMov).
+//
+// LO QUE SALE
+//   · /api/monstruos/derrotado tira los dados (tesoroIncentivo). Si sale, la
+//     cantidad se RESERVA (saldo → reservado) y va como un montón más del
+//     botín ('moneda_bronce', incentivo: true). Al pisarlo,
+//     /api/monstruos/botin/recoger la abona en la moneda de bronce del
+//     jugador (PlayerStats, pendiente de cadena): nunca va al inventario.
+//     Lo que caduca sin recoger vuelve al saldo; y al arrancar el servidor,
+//     las reservas que dejó colgadas el proceso anterior vuelven solas
+//     (tesoroListo) antes de reservar nada nuevo.
+//   · La probabilidad: AUTO = base free/VIP + nivel + "suerte" (cada monstruo
+//     seguido sin premio la sube un poco y se pone a cero al cobrar) o MANUAL =
+//     el % que fija el panel para free y para VIP (con o sin esos bonos). Los
+//     jefes, el doble. La cantidad: una parte del saldo según lo duro que sea
+//     el monstruo, el VIP y el nivel, entre un mínimo y un tope.
+//   · Sin nombre (gfNombreValido) no hay incentivo.
+//
+// EL PANEL: tesoro.html en el centro de control — GET /api/admin/tesoro,
+// POST /api/admin/tesoro/config y POST /api/admin/tesoro/ajuste.
+// =============================================================================
+// <TIENDA_PRECIOS>
+const TIENDA_PRECIOS = {"Semillax":[10,5,"p"],"Semillax1":[15,7,"p"],"Semillax2":[8,3,"p"],"Semillax3":[25,12,"p"],"Semillax4":[20,10,"p"],"Regaderax":[120,60,"p"],"Tijerasx":[200,100,"p"],"hacha_de_madera":[300,150,"p"],"pico_de_madera":[400,200,"p"],"zanahoria_buena":[20,14,"p"],"tomate_buena":[28,20,"p"],"trigo_buena":[13,9,"p"],"fresa_buena":[40,28,"p"],"calabaza_buena":[48,34,"p"],"balde_con_agua":[8,3,"p"],"pes1":[0,12,"p"],"pes2":[0,22,"p"],"pes3":[0,70,"p"],"pes4":[0,10,"p"],"pes5":[0,16,"p"],"pes6":[0,95,"p"],"pes7":[0,40,"p"],"pes8":[0,75,"p"],"pes9":[0,32,"p"],"pes10":[0,24,"p"],"pes11":[0,18,"p"],"pes12":[0,160,"p"],"pes13":[0,55,"p"],"pes14":[0,85,"p"],"parcela":[200,100,"p"],"pala_construccion":[300,150,"p"],"espantapajaros":[120,60,"p"],"antorcha":[40,20,"p"],"basura":[120,60,"p"],"cofre1":[2,1,"o"],"cofre2":[0,250,"p"],"cofre3":[0,700,"p"],"cofre4":[0,2000,"p"],"espada_madera":[80,40,"p"],"espada_cobre":[250,125,"p"],"espada_hierro":[600,300,"p"],"cana_pescar":[150,75,"p"],"arco":[300,150,"p"],"baston_mago":[450,225,"p"],"bote":[500,250,"p"]};
+// </TIENDA_PRECIOS>
+const TESORO_ID = 'principal';
+const TESORO_COMISION_BPS = 150;                       // 1,5 %
+const TESORO_BRONCE_POR = Object.freeze({ bronce: 1, plata: 1000, oro: 1000000 });
+const TESORO_TOPE_TIENDA_DIA = 20 * 1000000;           // comisión de tienda contada por jugador y día (bronce)
+const TESORO_PROB_MAX = 0.75;
+const TESORO_CONFIG_BASE = Object.freeze({
+  activo: true,
+  modo: 'auto',                                        // 'auto' | 'manual'
+  manual: Object.freeze({ free: 5, vip: 10, conBonos: false }),            // % por monstruo
+  auto: Object.freeze({ baseFree: 4, baseVip: 7, porNivel: 0.25, nivelTope: 40, rachaPaso: 0.5, rachaTope: 6 }),
+  parteDelTesoro: 0.25,                                // % del saldo por pago (antes de multiplicadores)
+  pagoMin: 100,                                        // bronce
+  pagoMax: 250000,                                     // bronce
+  vipExtraPago: 1.5,                                   // el VIP cobra más
+  topeDiario: 25                                       // premios por jugador y día
+});
+
+/* LOS MAPAS POR NIVEL (2026-10-22): "el mapa salvaje en nivel 4, la mina en
+   el 2, el de hielo en el 7, el desierto en el 5 y el cementerio en el 6".
+   La misma tabla que gf-niveles-mapas.js (el cliente ni deja entrar); aquí,
+   para que nadie gane nada por debajo y para el botón de amigos. */
+const GF_NIVEL_MAPA = Object.freeze({ mina: 2, salvaje: 4, desierto: 5, cementerio: 6, tundra: 7,
+                                      // (2026-10-25) El glaciar, la caverna y la pradera.
+                                      glaciar: 8, caverna: 9, pradera: 10 });
+function gfNivelMinimoSala(sala) {
+  const b = salaBase(String(sala || ''));
+  return Object.prototype.hasOwnProperty.call(GF_NIVEL_MAPA, b) ? GF_NIVEL_MAPA[b] : 0;
+}
+/** El nivel del personaje: la experiencia vive en GamePlayer y en PlayerStats (la mayor manda). */
+async function gfNivelDeJugador(gp) {
+  if (!gp) return 0;
+  let exp = Math.max(0, Number(gp.nivel_exp) || 0);
+  try {
+    const st = await PlayerStats.findOne({ playerName: gp.playerName }).select('exp').lean();
+    if (st) exp = Math.max(exp, Number(st.exp) || 0);
+  } catch (_) {}
+  return nivelPorExperiencia(exp);
+}
+
+const tesoroSchema = new mongoose.Schema({
+  _id:       { type: String, default: TESORO_ID },
+  saldo:     { type: Number, default: 0 },
+  reservado: { type: Number, default: 0 },
+  ingresado: { tienda: { type: Number, default: 0 }, p2p: { type: Number, default: 0 }, admin: { type: Number, default: 0 } },
+  ingresos:  { tienda: { type: Number, default: 0 }, p2p: { type: Number, default: 0 } },
+  pagado:    { free: { type: Number, default: 0 }, vip: { type: Number, default: 0 } },
+  pagos:     { free: { type: Number, default: 0 }, vip: { type: Number, default: 0 } },
+  retirado:  { type: Number, default: 0 },
+  caducados: { type: Number, default: 0 },
+  config:    { type: mongoose.Schema.Types.Mixed, default: null }
+}, { collection: 'tesoro', timestamps: true, versionKey: false, minimize: false });
+const Tesoro = mongoose.models.Tesoro || mongoose.model('Tesoro', tesoroSchema);
+
+const tesoroMovSchema = new mongoose.Schema({
+  t:          { type: Date, default: Date.now },
+  tipo:       { type: String, enum: ['ingreso', 'pago', 'ajuste'], required: true },
+  origen:     { type: String, default: '' },           // tienda | p2p | monstruo | admin
+  bronce:     { type: Number, required: true },
+  playerName: { type: String, default: null },
+  vip:        { type: Boolean, default: null },
+  nivel:      { type: Number, default: null },
+  detalle:    { type: String, default: '' },
+  ref:        { type: String }                         // solo la tienda: cuenta una vez
+}, { collection: 'tesoro_movimientos', versionKey: false });
+tesoroMovSchema.index({ t: 1 }, { expireAfterSeconds: 400 * 86400 });
+tesoroMovSchema.index({ ref: 1 }, { unique: true, sparse: true });
+tesoroMovSchema.index({ tipo: 1, t: -1 });
+const TesoroMov = mongoose.models.TesoroMov || mongoose.model('TesoroMov', tesoroMovSchema);
+// Las colecciones existen antes de la primera venta P2P: crear una colección
+// DENTRO de una transacción falla en los Mongo antiguos.
+Promise.all([Tesoro.init(), TesoroMov.init()]).catch((e) => console.warn('⚠️  tesoro: índices:', e.message));
+
+function _diaUTC() { return new Date().toISOString().slice(0, 10); }
+const _tesoroRacha = new Map();        // playerName -> monstruos seguidos sin premio (la "suerte")
+const _tesoroDia = new Map();          // playerName -> { dia, n }  premios de hoy
+const _tesoroTiendaDia = new Map();    // playerName -> { dia, bronce }  comisión de tienda contada hoy
+setInterval(() => {
+  const hoy = _diaUTC();
+  for (const [k, v] of _tesoroDia) if (v.dia !== hoy) _tesoroDia.delete(k);
+  for (const [k, v] of _tesoroTiendaDia) if (v.dia !== hoy) _tesoroTiendaDia.delete(k);
+  if (_tesoroRacha.size > 50000) _tesoroRacha.clear();
+}, 60 * 60 * 1000).unref();
+
+/** Cualquier configuración que llegue, acotada a lo que tiene sentido. */
+function tesoroNormalizarConfig(c) {
+  const B = TESORO_CONFIG_BASE, src = (c && typeof c === 'object') ? c : {};
+  const num = (v, def, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
+  const m = src.manual && typeof src.manual === 'object' ? src.manual : {};
+  const a = src.auto && typeof src.auto === 'object' ? src.auto : {};
+  const out = {
+    activo: typeof src.activo === 'boolean' ? src.activo : B.activo,
+    modo: src.modo === 'manual' ? 'manual' : 'auto',
+    manual: { free: num(m.free, B.manual.free, 0, 75), vip: num(m.vip, B.manual.vip, 0, 75),
+              conBonos: typeof m.conBonos === 'boolean' ? m.conBonos : B.manual.conBonos },
+    auto: { baseFree: num(a.baseFree, B.auto.baseFree, 0, 50), baseVip: num(a.baseVip, B.auto.baseVip, 0, 50),
+            porNivel: num(a.porNivel, B.auto.porNivel, 0, 2), nivelTope: Math.round(num(a.nivelTope, B.auto.nivelTope, 1, 150)),
+            rachaPaso: num(a.rachaPaso, B.auto.rachaPaso, 0, 5), rachaTope: num(a.rachaTope, B.auto.rachaTope, 0, 30) },
+    parteDelTesoro: num(src.parteDelTesoro, B.parteDelTesoro, 0.01, 5),
+    pagoMin: Math.round(num(src.pagoMin, B.pagoMin, 1, 1000000)),
+    pagoMax: Math.round(num(src.pagoMax, B.pagoMax, 1, 1e12)),
+    vipExtraPago: num(src.vipExtraPago, B.vipExtraPago, 1, 5),
+    topeDiario: Math.round(num(src.topeDiario, B.topeDiario, 1, 500))
+  };
+  if (out.pagoMax < out.pagoMin) out.pagoMax = out.pagoMin;
+  return out;
+}
+let _tesoroCfg = null, _tesoroCfgEn = 0;
+async function tesoroConfig() {
+  if (_tesoroCfg && Date.now() - _tesoroCfgEn < 10000) return _tesoroCfg;
+  let guardada = null;
+  try { const t = await Tesoro.findById(TESORO_ID).select('config').lean(); guardada = t && t.config; }
+  catch (e) { if (_tesoroCfg) return _tesoroCfg; }
+  _tesoroCfg = tesoroNormalizarConfig(guardada);
+  _tesoroCfgEn = Date.now();
+  return _tesoroCfg;
+}
+
+/** Probabilidad (0..TESORO_PROB_MAX) de que un monstruo suelte monedas del tesoro. */
+function tesoroProbabilidad(cfg, o) {
+  const a = cfg.auto, nivel = Math.max(0, Number(o.nivel) || 0), racha = Math.max(0, Number(o.racha) || 0);
+  const bonos = Math.min(nivel, a.nivelTope) * a.porNivel + Math.min(racha * a.rachaPaso, a.rachaTope);
+  let pct;
+  if (cfg.modo === 'manual') pct = (o.vip ? cfg.manual.vip : cfg.manual.free) + (cfg.manual.conBonos ? bonos : 0);
+  else pct = (o.vip ? a.baseVip : a.baseFree) + bonos;
+  if (o.jefe) pct *= 2;
+  return Math.max(0, Math.min(TESORO_PROB_MAX, pct / 100));
+}
+/** Cuánto (bronce entero). `azar` en 0..1 (por defecto, Math.random). */
+function tesoroCantidad(cfg, saldo, o, azar) {
+  const r = Number.isFinite(azar) ? azar : Math.random();
+  const dureza = Math.min(4, Math.max(0.6, (Number(o.exp) || 100) / 150));
+  const nivel = Math.max(0, Math.min(40, Number(o.nivel) || 0));
+  let c = Math.max(0, Number(saldo) || 0) * (cfg.parteDelTesoro / 100) * dureza *
+          (o.vip ? cfg.vipExtraPago : 1) * (1 + nivel * 0.02) * (o.jefe ? 2.5 : 1) * (0.7 + 0.6 * r);
+  c = Math.min(c, cfg.pagoMax, Math.max(0, Number(saldo) || 0));
+  return Math.floor(c);
+}
+
+/* Las reservas que quedaron colgadas (el proceso anterior se cayó con montones
+   sin recoger) vuelven al saldo UNA vez, antes de la primera reserva nueva. */
+let _tesoroListo = null;
+function tesoroListo() {
+  if (!_tesoroListo) {
+    _tesoroListo = Tesoro.updateOne({ _id: TESORO_ID, reservado: { $gt: 0 } },
+      [{ $set: { saldo: { $add: ['$saldo', '$reservado'] }, reservado: 0 } }])
+      .then((r) => { if (r && r.modifiedCount) console.log('🏦 tesoro: las reservas del arranque anterior vuelven al saldo'); return true; })
+      .catch((e) => { _tesoroListo = null; console.warn('⚠️  tesoro: reservas del arranque:', e.message); return false; });
+  }
+  return _tesoroListo;
+}
+
+/** ¿Suelta monedas este monstruo? null, o { cantidad, vip, nivel, prob } YA reservado. */
+async function tesoroIncentivo(gp, def, tipo, nivel) {
+  if (!gp || !gfNombreValido(gp.Username)) return null;
+  const cfg = await tesoroConfig();
+  if (!cfg.activo) return null;
+  if (!(await tesoroListo())) return null;
+  const quien = gp.playerName, hoy = _diaUTC();
+  const dia = _tesoroDia.get(quien);
+  const deHoy = dia && dia.dia === hoy ? dia.n : 0;
+  if (deHoy >= cfg.topeDiario) return null;
+  const vip = await gfTieneVipPorDireccion(gp.address);
+  const racha = _tesoroRacha.get(quien) || 0;
+  const jefe = /^jefe_/.test(String(tipo || ''));
+  const prob = tesoroProbabilidad(cfg, { vip, nivel, racha, jefe });
+  if (!(Math.random() < prob)) { _tesoroRacha.set(quien, racha + 1); return null; }
+  const t = await Tesoro.findById(TESORO_ID).select('saldo').lean();
+  const cantidad = tesoroCantidad(cfg, t ? t.saldo : 0, { vip, nivel, exp: def && def.exp, jefe });
+  if (!(cantidad >= cfg.pagoMin)) return null;                 // el tesoro no da para un pago: la racha sigue
+  const r = await Tesoro.findOneAndUpdate({ _id: TESORO_ID, saldo: { $gte: cantidad } },
+    { $inc: { saldo: -cantidad, reservado: cantidad } }, { new: true, projection: { saldo: 1 } }).lean();
+  if (!r) return null;
+  _tesoroRacha.set(quien, 0);
+  _tesoroDia.set(quien, { dia: hoy, n: deHoy + 1 });
+  return { cantidad, vip, nivel, prob };
+}
+async function tesoroDevolverReserva(cantidad, motivo) {
+  const n = Math.max(0, Math.floor(Number(cantidad) || 0));
+  if (!n) return;
+  try { await Tesoro.updateOne({ _id: TESORO_ID }, { $inc: { saldo: n, reservado: -n, caducados: motivo === 'caducado' ? 1 : 0 } }); }
+  catch (e) { console.warn('⚠️  tesoro: devolver reserva:', e.message); }
+}
+/** Al pisar el montón: a la moneda de bronce del jugador (no al inventario). */
+async function tesoroPagar(gp, b) {
+  const doc = await gfDevolverStat(gp.playerName, 'bronce', b.cantidad);
+  if (!doc) { await tesoroDevolverReserva(b.cantidad, 'sin_stats'); return null; }
+  const grupo = b.incentivo && b.incentivo.vip ? 'vip' : 'free';
+  try {
+    await Tesoro.updateOne({ _id: TESORO_ID }, { $inc: { reservado: -b.cantidad, ['pagado.' + grupo]: b.cantidad, ['pagos.' + grupo]: 1 } });
+  } catch (e) { console.warn('⚠️  tesoro: apuntar el pago:', e.message); }
+  TesoroMov.create({ tipo: 'pago', origen: 'monstruo', bronce: b.cantidad, playerName: gp.playerName, vip: grupo === 'vip',
+                     nivel: b.incentivo ? b.incentivo.nivel : null, detalle: b.incentivo ? String(b.incentivo.monstruo || '') : '' })
+    .catch((e) => console.warn('⚠️  tesoro: movimiento de pago:', e.message));
+  console.log(`🏦 ${gp.playerName} recogió ${b.cantidad} de bronce del tesoro (${grupo})`);
+  return doc;
+}
+
+/** La comisión de la tienda del juego (bronce). La MISMA cuenta que tienda_sistema.js (_comisionBronce). */
+function tesoroComisionTienda(itemId, operacion, cantidad) {
+  const p = Object.prototype.hasOwnProperty.call(TIENDA_PRECIOS, itemId) ? TIENDA_PRECIOS[itemId] : null;
+  if (!p) return 0;
+  const unidad = Number(operacion === 'compra' ? p[0] : p[1]) || 0;
+  const bruto = unidad * (p[2] === 'p' ? TESORO_BRONCE_POR.plata : TESORO_BRONCE_POR.oro) * (Math.floor(Number(cantidad)) || 0);
+  return bruto > 0 ? Math.max(1, Math.round(bruto * TESORO_COMISION_BPS / 10000)) : 0;
+}
+
+app.post('/api/tesoro/comision', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const b = req.body || {};
+    const operacion = String(b.operacion || ''), itemId = String(b.itemId || '').slice(0, 60);
+    const cantidad = Math.floor(Number(b.cantidad) || 0), ref = String(b.ref || '');
+    if (operacion !== 'compra' && operacion !== 'venta') return res.status(400).json({ error: 'operacion_invalida' });
+    if (!(cantidad >= 1 && cantidad <= 999)) return res.status(400).json({ error: 'cantidad_invalida' });
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(ref)) return res.status(400).json({ error: 'ref_invalida' });
+    const total = tesoroComisionTienda(itemId, operacion, cantidad);
+    if (!total) return res.status(400).json({ error: 'objeto_sin_precio' });
+    const hoy = _diaUTC(), d = _tesoroTiendaDia.get(gp.playerName);
+    const llevado = d && d.dia === hoy ? d.bronce : 0;
+    const bronce = Math.max(0, Math.min(total, TESORO_TOPE_TIENDA_DIA - llevado));
+    if (!bronce) return res.json({ ok: true, bronce: 0, tope: true });
+    try {
+      await TesoroMov.create({ tipo: 'ingreso', origen: 'tienda', bronce, playerName: gp.playerName,
+                               detalle: operacion + ' ' + itemId + ' x' + cantidad, ref: 'tienda:' + gp.playerName + ':' + ref });
+    } catch (e) {
+      if (e && e.code === 11000) return res.json({ ok: true, bronce: 0, repetido: true });
+      throw e;
+    }
+    _tesoroTiendaDia.set(gp.playerName, { dia: hoy, bronce: llevado + bronce });
+    await Tesoro.updateOne({ _id: TESORO_ID }, { $inc: { saldo: bronce, 'ingresado.tienda': bronce, 'ingresos.tienda': 1 } }, { upsert: true });
+    return res.json({ ok: true, bronce });
+  } catch (e) {
+    console.error('POST /api/tesoro/comision:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+/* ── EL PANEL ──────────────────────────────────────────────────────────── */
+function tesoroPublico(t) {
+  const x = t || {};
+  const sub = (o, k) => Math.max(0, Number(o && o[k]) || 0);
+  return {
+    saldo: Math.max(0, Number(x.saldo) || 0), reservado: Math.max(0, Number(x.reservado) || 0),
+    ingresado: { tienda: sub(x.ingresado, 'tienda'), p2p: sub(x.ingresado, 'p2p'), admin: sub(x.ingresado, 'admin') },
+    ingresos: { tienda: sub(x.ingresos, 'tienda'), p2p: sub(x.ingresos, 'p2p') },
+    pagado: { free: sub(x.pagado, 'free'), vip: sub(x.pagado, 'vip') },
+    pagos: { free: sub(x.pagos, 'free'), vip: sub(x.pagos, 'vip') },
+    retirado: Math.max(0, Number(x.retirado) || 0), caducados: Math.max(0, Number(x.caducados) || 0),
+    actualizado: x.updatedAt || null
+  };
+}
+
+app.get('/api/admin/tesoro', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const ahora = Date.now(), hace30 = new Date(ahora - 30 * 86400000), hace24h = new Date(ahora - 86400000);
+    const limites = [0, expTotalParaNivel(2), expTotalParaNivel(4), expTotalParaNivel(5), expTotalParaNivel(6), expTotalParaNivel(7), Number.MAX_SAFE_INTEGER];
+    const [t, cfg, cuentas, vipLista, conNombre, activos24h, grupos, ultimos, top, buckets] = await Promise.all([
+      Tesoro.findById(TESORO_ID).lean(),
+      tesoroConfig(),
+      GamePlayer.countDocuments({}),
+      VipEstado.find({ fin: { $gt: new Date() } }).select('playerName').lean(),
+      GamePlayer.countDocuments({ Username: { $exists: true, $nin: [null, '', '---'] } }),
+      PlayerPlaytime.countDocuments({ ultimaVez: { $gte: hace24h } }),
+      TesoroMov.aggregate([
+        { $match: { t: { $gte: hace30 } } },
+        { $group: { _id: { dia: { $dateToString: { format: '%Y-%m-%d', date: '$t', timezone: 'UTC' } }, tipo: '$tipo', origen: '$origen', vip: '$vip' },
+                    bronce: { $sum: '$bronce' }, n: { $sum: 1 } } }
+      ]),
+      TesoroMov.find({}).sort({ t: -1 }).limit(30).lean(),
+      TesoroMov.aggregate([
+        { $match: { tipo: 'pago', t: { $gte: hace30 } } },
+        { $group: { _id: '$playerName', bronce: { $sum: '$bronce' }, n: { $sum: 1 }, vip: { $last: '$vip' } } },
+        { $sort: { bronce: -1 } }, { $limit: 10 }
+      ]),
+      GamePlayer.aggregate([
+        { $project: { e: { $convert: { input: '$nivel_exp', to: 'double', onError: 0, onNull: 0 } } } },
+        { $bucket: { groupBy: '$e', boundaries: limites, default: 'otros', output: { n: { $sum: 1 } } } }
+      ])
+    ]);
+    const nombresVip = vipLista.map(v => v.playerName).filter(Boolean);
+    const vipActivos24h = nombresVip.length
+      ? await PlayerPlaytime.countDocuments({ ultimaVez: { $gte: hace24h }, playerName: { $in: nombresVip } }) : 0;
+
+    // La serie de los últimos 30 días (UTC), un punto por día aunque esté vacío.
+    const dias = [];
+    for (let i = 29; i >= 0; i--) dias.push(new Date(ahora - i * 86400000).toISOString().slice(0, 10));
+    const porDia = new Map(dias.map(d => [d, { dia: d, tienda: 0, p2p: 0, admin: 0, pagoFree: 0, pagoVip: 0, premios: 0 }]));
+    for (const g of grupos) {
+      const fila = porDia.get(g._id.dia);
+      if (!fila) continue;
+      if (g._id.tipo === 'ingreso' && (g._id.origen === 'tienda' || g._id.origen === 'p2p')) fila[g._id.origen] += g.bronce;
+      else if (g._id.tipo === 'ajuste' && g.bronce > 0) fila.admin += g.bronce;
+      else if (g._id.tipo === 'pago') { fila[g._id.vip ? 'pagoVip' : 'pagoFree'] += g.bronce; fila.premios += g.n; }
+    }
+
+    // Cuántos llegan a cada mapa (el nivel sale de la experiencia de GamePlayer).
+    const tramos = { 'otros': 0 };
+    for (const b of buckets) tramos[String(b._id)] = b.n;
+    const enTramo = (desde) => limites.filter(l => l >= desde && l < Number.MAX_SAFE_INTEGER).reduce((s, l) => s + (tramos[String(l)] || 0), 0);
+    const mapas = Object.keys(GF_NIVEL_MAPA).map(sala => ({ sala, nivel: GF_NIVEL_MAPA[sala], jugadores: enTramo(expTotalParaNivel(GF_NIVEL_MAPA[sala])) }));
+    const niveles = [
+      { tramo: '1', jugadores: tramos['0'] || 0 }, { tramo: '2-3', jugadores: tramos[String(limites[1])] || 0 },
+      { tramo: '4', jugadores: tramos[String(limites[2])] || 0 }, { tramo: '5', jugadores: tramos[String(limites[3])] || 0 },
+      { tramo: '6', jugadores: tramos[String(limites[4])] || 0 }, { tramo: '7+', jugadores: tramos[String(limites[5])] || 0 }
+    ];
+
+    // Lo que daría ahora, con la configuración de ahora (para el panel).
+    const saldo = t ? Math.max(0, Number(t.saldo) || 0) : 0;
+    const ejemplos = [1, 4, 7, 10, 20, 40].map(nivel => ({
+      nivel,
+      free: tesoroProbabilidad(cfg, { vip: false, nivel, racha: 0 }), vip: tesoroProbabilidad(cfg, { vip: true, nivel, racha: 0 }),
+      freeRacha: tesoroProbabilidad(cfg, { vip: false, nivel, racha: 1000 }), vipRacha: tesoroProbabilidad(cfg, { vip: true, nivel, racha: 1000 }),
+      pagoFree: tesoroCantidad(cfg, saldo, { vip: false, nivel, exp: 130 }, 0.5), pagoVip: tesoroCantidad(cfg, saldo, { vip: true, nivel, exp: 130 }, 0.5)
+    }));
+
+    return res.json({
+      ok: true, tesoro: tesoroPublico(t), config: cfg, base: TESORO_CONFIG_BASE, comisionBps: TESORO_COMISION_BPS,
+      bronce: TESORO_BRONCE_POR, probMax: TESORO_PROB_MAX, ejemplos,
+      jugadores: { cuentas, vip: nombresVip.length, free: Math.max(0, cuentas - nombresVip.length), conNombre,
+                   sinNombre: Math.max(0, cuentas - conNombre), activos24h, vipActivos24h },
+      niveles, mapas, serie: dias.map(d => porDia.get(d)),
+      top: top.map(r => ({ playerName: r._id, bronce: r.bronce, premios: r.n, vip: !!r.vip })),
+      ultimos: ultimos.map(m => ({ t: m.t, tipo: m.tipo, origen: m.origen, bronce: m.bronce, playerName: m.playerName,
+                                   vip: m.vip, nivel: m.nivel, detalle: m.detalle }))
+    });
+  } catch (e) {
+    console.error('GET /api/admin/tesoro:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/admin/tesoro/config', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const c = tesoroNormalizarConfig(req.body && req.body.config);
+    await Tesoro.updateOne({ _id: TESORO_ID }, { $set: { config: c } }, { upsert: true });
+    _tesoroCfg = c; _tesoroCfgEn = Date.now();
+    console.log(`🏦 tesoro: configuración cambiada por ${(req.admin && req.admin.address) || 'admin'} (${c.modo}${c.activo ? '' : ', APAGADO'})`);
+    return res.json({ ok: true, config: c });
+  } catch (e) {
+    console.error('POST /api/admin/tesoro/config:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/admin/tesoro/ajuste', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const tipo = String((req.body && req.body.tipo) || '');
+    const bronce = Math.floor(Number(req.body && req.body.bronce) || 0);
+    const motivo = String((req.body && req.body.motivo) || '').trim().slice(0, 120);
+    if (tipo !== 'ingreso' && tipo !== 'retiro') return res.status(400).json({ error: 'tipo_invalido' });
+    if (!(bronce >= 1 && bronce <= 1e12)) return res.status(400).json({ error: 'cantidad_invalida' });
+    if (motivo.length < 3) return res.status(400).json({ error: 'motivo_requerido' });
+    const quien = (req.admin && req.admin.address) || 'admin';
+    let t;
+    if (tipo === 'ingreso') {
+      t = await Tesoro.findOneAndUpdate({ _id: TESORO_ID }, { $inc: { saldo: bronce, 'ingresado.admin': bronce } }, { new: true, upsert: true }).lean();
+    } else {
+      t = await Tesoro.findOneAndUpdate({ _id: TESORO_ID, saldo: { $gte: bronce } }, { $inc: { saldo: -bronce, retirado: bronce } }, { new: true }).lean();
+      if (!t) return res.status(409).json({ error: 'saldo_insuficiente' });
+    }
+    await TesoroMov.create({ tipo: 'ajuste', origen: 'admin', bronce: tipo === 'ingreso' ? bronce : -bronce,
+                             playerName: null, detalle: motivo + ' — ' + quien });
+    console.log(`🏦 tesoro: ${tipo} de ${bronce} bronce por ${quien} (${motivo})`);
+    return res.json({ ok: true, tesoro: tesoroPublico(t) });
+  } catch (e) {
+    console.error('POST /api/admin/tesoro/ajuste:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+console.log('✅ Tesoro: /api/tesoro/comision y /api/admin/tesoro{,/config,/ajuste}');
+
 // ── MARKETPLACE ROUTES MOUNT ────────────────────────────────────────────────
 // Se monta aquí (y no más arriba) porque necesita GamePlayer, Listing (ya
 // definidos) y PlayerStats (recién definido arriba) al mismo tiempo.
@@ -20377,6 +20879,11 @@ require('./marketplace-routes')(app, {
   GamePlayer,
   PlayerStats,
   Listing,
+  // (2026-10-22) La comisión del mercado (1,5 %) va al tesoro, dentro de la
+  // misma transacción que la venta (ver "EL TESORO Y SUS INCENTIVOS").
+  Tesoro,
+  TesoroMov,
+  TESORO_ID,
   // Quién puede crear lotes limitados. Se pasa la versión CACHEADA porque el
   // mercado la consulta en cada listado y sin caché serían lecturas on-chain
   // constantes. Si no se pasara, el marketplace trata a todo el mundo como no
@@ -28595,6 +29102,13 @@ io.on('connection', (socket) => {
         if (!fdI || !(await gfTieneVipPorDireccion(fdI.address))) {
           return socket.emit('friends:ir', { ok: false, motivo: 'isla_sin_vip', ...base });
         }
+      }
+      // (2026-10-22) Los mapas tienen nivel mínimo: se mira ANTES de decir el precio.
+      const nivelMinIr = gfNivelMinimoSala(sala);
+      if (nivelMinIr) {
+        const gpYo = await GamePlayer.findOne({ playerName: yo }).select('playerName nivel_exp').lean();
+        const miNivel = await gfNivelDeJugador(gpYo);
+        if (miNivel < nivelMinIr) return socket.emit('friends:ir', { ok: false, motivo: 'nivel', nivelMinimo: nivelMinIr, nivel: miNivel, zona, ...base });
       }
       /* (2026-10-20) "Si alguien desea teletransportarse hacia mí por medio del
          botón de amigos, tiene que tener un precio según la distancia." Se

@@ -32,7 +32,11 @@
 //    de POST /api/save/:playerName los conserva sin tocar ese endpoint.
 // =============================================================================
 
-const MARKET_FEE_BPS = 500; // 5.00% de comisión/royalty
+// (2026-10-22) "Si alguien vende o compra en la tienda P2P, la comisión del
+// 1,5 % se va al tesoro." Era el 5 % y desaparecía; ahora es el 1,5 % y entra
+// en el tesoro de server2.js ("EL TESORO Y SUS INCENTIVOS") en la MISMA
+// transacción que la venta (ver ingresarAlTesoro).
+const MARKET_FEE_BPS = 150; // 1.50% de comisión → tesoro
 
 // ── Catálogo de ítems (nombre para mostrar, categoría, ícono, stack máximo) ─
 // Debe mantenerse en sincronía con `this.ItemDefinitions` en GameScene.js.
@@ -234,9 +238,30 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
     // Comprobador de admin de server2.js (env ADMIN_ADDRESSES o isAdmin
     // on-chain). Si no llega, NADIE es admin: es preferible que el panel de
     // productos limitados no exista a que lo pueda usar cualquiera.
-    isAdminAddress = async () => false
+    isAdminAddress = async () => false,
+    // (2026-10-22) El tesoro de server2.js. Sin él, la comisión se cobra igual
+    // y no se apunta en ningún sitio (como antes).
+    Tesoro: RawTesoro = null,
+    TesoroMov: RawTesoroMov = null,
+    TESORO_ID = 'principal'
   } = ctx;
   const GamePlayer = atomic.model(RawGamePlayer), PlayerStats = atomic.model(RawPlayerStats), Listing = atomic.model(RawListing);
+  const Tesoro = RawTesoro ? atomic.model(RawTesoro) : null;
+  const TesoroMov = RawTesoroMov ? atomic.model(RawTesoroMov) : null;
+
+  /* La comisión de una venta al tesoro, EN BRONCE (1 plata = 1.000, 1 oro =
+     1.000.000; el mercado cobra con dos decimales). Va dentro de la
+     transacción del que llama: si la venta se deshace, esto también. */
+  async function ingresarAlTesoro(currency, fee, sellerName, itemId, qty) {
+    if (!Tesoro || !(fee > 0)) return;
+    const bronce = Math.round(fee * (currency === 'plata' ? 1000 : 1000000));
+    if (!(bronce > 0)) return;
+    await Tesoro.updateOne({ _id: TESORO_ID }, { $inc: { saldo: bronce, 'ingresado.p2p': bronce, 'ingresos.p2p': 1 } }, { upsert: true }).exec();
+    if (TesoroMov) {
+      await TesoroMov.create({ t: new Date(), tipo: 'ingreso', origen: 'p2p', bronce,
+                               playerName: sellerName || null, detalle: 'p2p ' + itemId + ' x' + qty });
+    }
+  }
 
   const writeLimiter = strictLimiter || apiLimiter;
 
@@ -764,12 +789,13 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         await Listing.deleteOne({ _id: listingUpdated._id }).exec();
       }
 
-      // 4) Pagar al vendedor (95% — 5% queda como comisión del mercado)
+      // 4) Pagar al vendedor (98,5 % — el 1,5 % de comisión va al tesoro)
       const sellerPaid = await PlayerStats.updateOne(
         { address: listing.owner },
         { $inc: { [field]: sellerReceives } }
       ).exec();
       if (sellerPaid.matchedCount !== 1) throw new Error('market_seller_stats_missing');
+      await ingresarAlTesoro(listing.currency, fee, listing.ownerName, listing.itemId, qty);
 
       // 5) Entregar el ítem al comprador
       await applyInsertPlan(address, listing.itemId, plan);
@@ -1210,6 +1236,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         { $inc: { [field]: sellerReceives } }
       ).exec();
       if (sellerPaid.matchedCount !== 1) throw new Error('market_seller_stats_missing');
+      await ingresarAlTesoro(offer.currency, fee, offer.sellerName, offer.itemId, offer.qty);
 
       await applyInsertPlan(offer.buyer, offer.itemId, plan);
 
