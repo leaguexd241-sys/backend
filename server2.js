@@ -12372,6 +12372,34 @@ app.post('/api/pet/revive', apiLimiter, authMiddleware, csrfProtection, async (r
   }
 });
 
+/* (2026-10-26) LA MUERTE, TAMBIÉN DESDE EL SERVIDOR. "Mi personaje llega a 0 %
+   de vida y no muere." La muerte solo la declaraba el navegador, DESPUÉS del
+   golpe: si entretanto llegaba un reenvío viejo de la vida (el cliente
+   devolvía lo que pintaba, ver gf-character-skills.js), el servidor volvía a 8
+   y /api/player/death respondía "sigue vivo". Ahora, cuando es el SERVIDOR
+   quien deja la vida a 0 (un golpe, un mordisco, el veneno), el jugador muere
+   en ese mismo momento. /api/player/death sigue igual (si ya es fantasma,
+   devuelve su estado). */
+async function gfMorirSiVidaCero(playerName, stats) {
+  if (!playerName || !stats || clampStat('vida', stats.vida) > 0) return null;
+  const gp = await GamePlayer.findOne({ playerName });
+  if (!gp) return null;
+  if (gp.isGhost) return estadoVivo(gp);
+  normalizarVentanaMuertes(gp);
+  if (!gp.deathWindowAt) gp.deathWindowAt = new Date();
+  gp.deathCount = Math.max(0, Number(gp.deathCount) || 0) + 1;
+  gp.isGhost = true;
+  await gp.save();
+  olvidarFantasma(gp.playerName, gp.address);
+  if (!stats.vidaCongelada) {
+    stats.vidaCongelada = true;
+    try { await stats.save(); } catch (e) { console.warn('⚠️  no se pudo congelar la vida:', e.message); }
+  }
+  console.log(`👻 ${gp.playerName} ha muerto en el servidor (${gp.deathCount} en 24 h) — ` +
+              `revivir cuesta ${precioRevivir(gp.deathCount - 1)} de plata`);
+  return estadoVivo(gp);
+}
+
 // ── POST /api/player/death ──────────────────────────────────────────────────
 // El personaje se ha quedado sin vida: pasa a fantasma. El servidor comprueba
 // que de verdad está a 0 antes de creérselo — así nadie se declara muerto para
@@ -12704,6 +12732,10 @@ async function _ticDeVeneno(playerName) {
       doc.vida = clampStat('vida', actual - dano);
       marcarPendienteDeCadena(doc, ['vida']);
       await doc.save();
+      // (2026-10-26) El veneno que deja la vida a 0 también mata.
+      if (clampStat('vida', doc.vida) <= 0) {
+        try { await gfMorirSiVidaCero(playerName, doc); } catch (e) { console.warn('⚠️  muerte por veneno:', e.message); }
+      }
     }
     v.restante -= Math.max(dano, v.porTic);
     const stats = buildStatsResponse(doc);
@@ -16468,7 +16500,10 @@ app.get('/api/vip/estado', apiLimiter, authMiddleware, async (req, res) => {
                  msRestantes: Math.max(0, fin - Date.now()), diasRestantes: Math.max(0, Math.ceil((fin - Date.now()) / 86400000)),
                  facturas: [], sinCadena: true };
     }
-    return res.json({ ok: true, ...estado, planes: VIP_PLANES });
+    // (2026-10-26) `ahora`: el panel cuenta los días con la hora del SERVIDOR,
+    // no con la del PC (en la captura iba 3,5 h atrasada: "361 días" y un
+    // inicio "en el futuro").
+    return res.json({ ok: true, ...estado, planes: VIP_PLANES, ahora: Date.now() });
   } catch (e) {
     console.error('GET /api/vip/estado:', e);
     return res.status(500).json({ error: 'internal_server_error' });
@@ -16527,7 +16562,7 @@ app.post('/api/vip/comprar', apiLimiter, authMiddleware, csrfProtection, gfExige
       let estado;
       try { estado = await gfVipEstadoDe(gp); } catch (e) { estado = { ...gfVipResumen(previas.concat([{ inicio, fin }])), facturas: [] }; }
       return res.json({ ok: true, plan: clave, moneda, precio, facturaId, transactionHash: receipt.hash || receipt.transactionHash,
-                        ...estado, stats: buildStatsResponse(cobrado), planes: VIP_PLANES });
+                        ...estado, stats: buildStatsResponse(cobrado), planes: VIP_PLANES, ahora: Date.now() });
     });
   } catch (e) {
     console.error('POST /api/vip/comprar:', e);
@@ -20732,7 +20767,15 @@ async function tesoroIncentivo(gp, def, tipo, nivel) {
   const prob = tesoroProbabilidad(cfg, { vip, nivel, racha, jefe });
   if (!(Math.random() < prob)) { _tesoroRacha.set(quien, racha + 1); return null; }
   const t = await Tesoro.findById(TESORO_ID).select('saldo').lean();
-  const cantidad = tesoroCantidad(cfg, t ? t.saldo : 0, { vip, nivel, exp: def && def.exp, jefe });
+  let cantidad = tesoroCantidad(cfg, t ? t.saldo : 0, { vip, nivel, exp: def && def.exp, jefe });
+  /* (2026-10-26) "Los enemigos no sueltan monedas de bronce, solo objetos." El
+     pago es una parte del saldo (0,25 % con sus multiplicadores): con menos de
+     unos 25 000 de bronce en el tesoro no llegaba nunca al mínimo y el premio
+     se descartaba en silencio aunque el tesoro pudiera pagarlo. Si el tesoro
+     tiene para el mínimo, se paga el mínimo. Sin saldo para eso, nada (la
+     regla de siempre: lo que sale, sale del tesoro). */
+  const saldoTesoro = t ? Math.max(0, Math.floor(Number(t.saldo) || 0)) : 0;
+  if (cantidad < cfg.pagoMin && saldoTesoro >= cfg.pagoMin) cantidad = cfg.pagoMin;
   if (!(cantidad >= cfg.pagoMin)) return null;                 // el tesoro no da para un pago: la racha sigue
   const r = await Tesoro.findOneAndUpdate({ _id: TESORO_ID, saldo: { $gte: cantidad } },
     { $inc: { saldo: -cantidad, reservado: cantidad } }, { new: true, projection: { saldo: 1 } }).lean();
@@ -23719,6 +23762,13 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
 
     const gasPrice = await getSafeGasPriceStats();
     const pendientes = [];   // stats que quedaron sin factura en este sync
+    /* (2026-10-26) "Me regalaron 1000 monedas de la nada." El bronce llegó el
+       20-10: a una cuenta que YA tenía oro o plata en la cadena se le creaba
+       la factura de bronce con los 1000 de bienvenida de las cuentas nuevas
+       (STAT_INITIAL_MAP). Para esas cuentas el bronce nace con lo que diga
+       Mongo (0 si nunca tuvo; lo cambiado o regalado si ya tenía), y en la
+       cadena con el piso de 1 si es 0. Las cuentas nuevas siguen con sus 1000. */
+    const cuentaConMonedas = !!(chainMap.oro || chainMap.plata);
 
     for (const stat of STAT_TYPES_LIST) {
       // ── 1. La tabla del tipo tiene que existir y tener cupo ───────────────
@@ -23823,6 +23873,11 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
       let createVal = stat === 'exp'
         ? Math.max(0, Math.round(Number(statsDoc.exp || 0)))
         : (STAT_INITIAL_MAP[stat] || 0);
+      let valorEnMongo = null;
+      if (stat === 'bronce' && cuentaConMonedas) {
+        valorEnMongo = Math.max(0, Math.round(clampStat('bronce', Number(statsDoc.bronce || 0))));
+        createVal = Math.max(STAT_CHAIN_FLOOR, valorEnMongo);
+      }
       if (createVal > tipo.perInvoiceLimit) createVal = tipo.perInvoiceLimit;
 
       // Nunca una factura parcial: si tras asegurar el cupo la tabla sigue sin
@@ -23845,7 +23900,7 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
         if (newId) {
           statsDoc.invoiceIds[stat] = newId;
           statsDoc.manualIds[stat]  = manualId;
-          statsDoc[stat]            = clampStat(stat, createVal);
+          statsDoc[stat]            = clampStat(stat, valorEnMongo !== null ? valorEnMongo : createVal);
           _tipoCheckCache.delete(stat); // el cupo del tipo cambió
           console.log(`✅ Factura [${stat}] creada: id=${newId} qty=${createVal}`);
         } else {
@@ -24184,10 +24239,18 @@ app.post('/api/stats/:playerName/consume', apiLimiter, authMiddleware, csrfProte
     console.log(`🍖 Consumo [${reason}] de ${playerName}: ${JSON.stringify(costs)} → ` +
                 `vida=${doc.vida} agua=${doc.agua} comida=${doc.comida} (pendiente de liquidar)`);
 
+    // (2026-10-26) El golpe que deja la vida a 0 mata aquí mismo.
+    let muerte = null;
+    if (esDano) {
+      try { muerte = await gfMorirSiVidaCero(playerName, doc); }
+      catch (e) { console.warn('⚠️  muerte en /consume:', e.message); }
+    }
+
     return res.json({
       ok: true,
       spent: costs,
       stats: buildStatsResponse(doc),
+      player: muerte ? muerte.player : undefined,
       // Informativo: cuándo se escribirá en la cadena.
       settlesInMs: CHAIN_SETTLE_DELAY_MS
     });
@@ -24333,6 +24396,26 @@ app.post('/api/currency/exchange', apiLimiter, authMiddleware, csrfProtection, a
     if (direction === 'silverToBronze' || direction === 'bronzeToSilver') {
       const gpB = await GamePlayer.findOne({ address }).lean();
       if (!gpB || !gpB.playerName) return res.status(404).json({ error: 'player_not_found' });
+      /* (2026-10-26) "No puedo cambiar plata por bronce." El cambio escribía
+         las DOS facturas en la cadena en el acto y, con el RPC cortado
+         ("Bandwidth limit exceeded"), fallaba siempre ("Exchange failed").
+         Ahora es como el VIP y el regalo semanal: un solo movimiento atómico en
+         Mongo (no se puede gastar dos veces la misma plata) y las facturas las
+         pone al día el liquidador en cuanto la cadena conteste. */
+      const costeX = qty * BRONZE_PER_SILVER, deBronce = direction === 'bronzeToSilver';
+      const hecho = await PlayerStats.findOneAndUpdate(
+        { playerName: gpB.playerName, ...(deBronce ? { bronce: { $gte: costeX } } : { plata: { $gte: qty } }) },
+        { $inc: deBronce ? { bronce: -costeX, plata: qty } : { plata: -qty, bronce: costeX },
+          $addToSet: { chainPending: { $each: ['plata', 'bronce'] } } },
+        { new: true });
+      if (hecho) {
+        if (!hecho.chainPendingSince) {
+          await PlayerStats.updateOne({ _id: hecho._id, chainPendingSince: null }, { $set: { chainPendingSince: new Date() } });
+        }
+        console.log(`💱 Cambio ${direction} x${qty} para ${gpB.playerName}: plata=${hecho.plata} bronce=${hecho.bronce} (la cadena, con el liquidador)`);
+        return res.json({ ok: true, rate: BRONZE_PER_SILVER, stats: buildStatsResponse(hecho), settlesInMs: CHAIN_SETTLE_DELAY_MS });
+      }
+      // No había bastante (o no hay stats): la respuesta de siempre.
       const docB = await PlayerStats.findOne({ playerName: gpB.playerName });
       if (!docB) return res.status(404).json({ error: 'stats_not_found. Call /sync first' });
       const plataB = Number(docB.plata || 0), bronceB = Number(docB.bronce || 0), costeB = qty * BRONZE_PER_SILVER;
@@ -29856,26 +29939,93 @@ console.log('✅ Amistades cargadas: sockets friends:* (solicitudes, presencia y
    Queda en pausa salvo LITVM_AUDIT_HISTORICO=1 (mejor con su propio RPC en
    LITVM_AUDIT_RPC_URL). La captura en vivo de las transacciones del relayer y
    la conciliación de sus recibos siguen igual. Va FUERA del bloque de abajo:
-   ese bloque y el módulo embebido los vigila tools/impact-backend-bundle.test.cjs. */
-const LITVM_AUDIT_HISTORICO = process.env.LITVM_AUDIT_HISTORICO === '1';
-if (!LITVM_AUDIT_HISTORICO) {
-  // Se registra antes que la ruta del módulo: el botón ya no lo arranca.
-  app.post('/api/admin/impact/scan', adminAuth, strictLimiter, csrfProtection, (req, res) => {
+   ese bloque y el módulo embebido los vigila tools/impact-backend-bundle.test.cjs.
+
+   (2026-10-26) "El botón de pausar el proceso que afecta el RPC no está en el
+   panel admin ni en el centro de control." Ahora se pausa y se reanuda desde
+   admin.html (y el centro de control): GET/POST /api/admin/impact/historico.
+   La decisión del panel se guarda en el propio documento del escaneo
+   (`pausaAdmin`) y manda sobre la variable: sobrevive a reinicios y
+   despliegues. Sin decisión del panel, manda LITVM_AUDIT_HISTORICO.
+   Pausar no gasta RPC: el escaneo en curso se corta solo en su siguiente
+   bloque (se le cambia el dueño y su `renew` deja de casar) y el
+   mantenimiento ya no lo retoma (`autoResume: false`). */
+const LITVM_AUDIT_HISTORICO_ENV = process.env.LITVM_AUDIT_HISTORICO === '1';
+const _AUDIT_SCAN_ID = CHAIN_ID + ':' + String(CONTRACTS.ITEMS_CONTRACT.address).toLowerCase();
+let _auditHistoricoActivo = LITVM_AUDIT_HISTORICO_ENV;
+const _auditScans = () => mongoose.connection.collection('litvm_chain_scans');
+const _auditPausaSet = () => ({ autoResume: false, nextRetryAt: null, retryReason: 'historical_scan_paused',
+                                status: 'paused', phase: 'paused', owner: 'pausa-admin', leaseUntil: new Date(0), updatedAt: new Date() });
+async function _auditEstadoHistorico() {
+  const d = await _auditScans().findOne({ _id: _AUDIT_SCAN_ID }, { projection: {
+    status: 1, phase: 1, pausaAdmin: 1, autoResume: 1, fromBlock: 1, nextBlock: 1, targetBlock: 1,
+    processedBlocks: 1, retryReason: 1, nextRetryAt: 1, updatedAt: 1, completedAt: 1 } });
+  return { activo: _auditHistoricoActivo, porPanel: d && typeof d.pausaAdmin === 'boolean', variable: LITVM_AUDIT_HISTORICO_ENV,
+           scan: d ? { status: d.status || 'idle', phase: d.phase || null, fromBlock: d.fromBlock ?? null, nextBlock: d.nextBlock ?? null,
+                       targetBlock: d.targetBlock ?? null, processedBlocks: d.processedBlocks ?? 0, retryReason: d.retryReason || null,
+                       nextRetryAt: d.nextRetryAt || null, updatedAt: d.updatedAt || null, completedAt: d.completedAt || null } : null };
+}
+// El botón "analizarCC" (la ruta del módulo, que se registra después): en
+// pausa responde 409; si no, sigue a la del módulo.
+app.post('/api/admin/impact/scan', (req, res, next) => {
+  if (_auditHistoricoActivo) return next('route');
+  return adminAuth(req, res, () => {
     res.set('Cache-Control', 'no-store');
     res.status(409).json({ error: 'historical_scan_paused',
-      message: 'The historical chain scan is paused: it used up the same RPC quota as the game. ' +
-               'Set LITVM_AUDIT_HISTORICO=1 (ideally with its own LITVM_AUDIT_RPC_URL) to run it.' });
+      message: 'The historical chain scan is paused because it used up the same RPC quota as the game. Resume it with the "Resume" button.' });
   });
-  // Y el que quedó a medias no se reanuda solo: el mantenimiento del módulo
-  // solo lo retoma si `autoResume` no es false. Mongo guarda la orden hasta
-  // conectar, y va antes que la primera pasada del mantenimiento (a los 5 s).
-  mongoose.connection.collection('litvm_chain_scans').updateOne(
-    { _id: CHAIN_ID + ':' + String(CONTRACTS.ITEMS_CONTRACT.address).toLowerCase(), status: { $ne: 'complete' } },
-    { $set: { autoResume: false, nextRetryAt: null, retryReason: 'historical_scan_paused', updatedAt: new Date() } }
-  ).then((r) => {
-    if (r && r.modifiedCount) console.log('⏸️  [LitVM audit] escaneo histórico en pausa (LITVM_AUDIT_HISTORICO=1 para reanudarlo)');
-  }).catch((e) => console.warn('⚠️  [LitVM audit] no se pudo pausar el escaneo histórico:', e && e.message));
-}
+});
+app.get('/api/admin/impact/historico', adminAuth, apiLimiter, async (req, res) => {
+  try { res.set('Cache-Control', 'no-store'); return res.json({ ok: true, ...await _auditEstadoHistorico() }); }
+  catch (e) { return res.status(503).json({ error: 'estado_no_disponible', message: e.message }); }
+});
+app.post('/api/admin/impact/historico', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    const activo = req.body && req.body.activo === true;
+    const quien = String((req.admin && (req.admin.address || req.admin.role)) || 'admin');
+    const ahora = new Date();
+    if (!activo) {
+      _auditHistoricoActivo = false;
+      // La decisión (aunque el escaneo no exista todavía o ya esté completo).
+      await _auditScans().updateOne({ _id: _AUDIT_SCAN_ID }, { $set: { pausaAdmin: true },
+        $setOnInsert: { chainId: CHAIN_ID, contractAddress: String(CONTRACTS.ITEMS_CONTRACT.address).toLowerCase(), nextBlock: 0 } }, { upsert: true });
+      // Y la pausa en sí, si no está completo: el que corre se corta en su
+      // siguiente bloque y el mantenimiento no lo retoma.
+      await _auditScans().updateOne({ _id: _AUDIT_SCAN_ID, status: { $ne: 'complete' } }, { $set: _auditPausaSet() });
+      console.log(`⏸️  [LitVM audit] escaneo histórico PAUSADO desde el panel (${quien})`);
+    } else {
+      _auditHistoricoActivo = true;
+      await _auditScans().updateOne({ _id: _AUDIT_SCAN_ID }, { $set: { pausaAdmin: false } });
+      await _auditScans().updateOne({ _id: _AUDIT_SCAN_ID, status: 'paused' }, {
+        $set: { status: 'interrupted', phase: 'stopped', autoResume: true, leaseUntil: new Date(0), nextRetryAt: null, retryReason: null, updatedAt: ahora },
+        $unset: { owner: '' } });
+      // Sin esperar: arrancar lee la cadena y la respuesta no debe colgarse.
+      if (chainAudit && typeof chainAudit.startScan === 'function') {
+        chainAudit.startScan({ resume: true }).catch((e) => console.warn('⚠️  [LitVM audit] reanudar:', e && e.message));
+      }
+      console.log(`▶️  [LitVM audit] escaneo histórico REANUDADO desde el panel (${quien})`);
+    }
+    return res.json({ ok: true, ...await _auditEstadoHistorico() });
+  } catch (e) {
+    console.warn('⚠️  POST /api/admin/impact/historico:', e.message);
+    return res.status(503).json({ error: 'no_se_pudo_cambiar', message: e.message });
+  }
+});
+/* Al arrancar: si el panel lo pausó (o, sin decisión del panel, si la
+   variable no lo pide), el que quedó a medias no se reanuda solo. Mongo guarda
+   la orden hasta conectar y va antes que la primera pasada del mantenimiento
+   (a los 5 s). Luego se lee la decisión del panel para la ruta de arriba. */
+_auditScans().updateOne(
+  { _id: _AUDIT_SCAN_ID, status: { $ne: 'complete' },
+    $or: LITVM_AUDIT_HISTORICO_ENV ? [{ pausaAdmin: true }] : [{ pausaAdmin: true }, { pausaAdmin: { $exists: false } }] },
+  { $set: _auditPausaSet() }
+).then((r) => {
+  if (r && r.modifiedCount) console.log('⏸️  [LitVM audit] escaneo histórico en pausa (se reanuda desde el panel de administración)');
+}).catch((e) => console.warn('⚠️  [LitVM audit] no se pudo pausar el escaneo histórico:', e && e.message));
+_auditScans().findOne({ _id: _AUDIT_SCAN_ID }, { projection: { pausaAdmin: 1 } }).then((d) => {
+  if (d && typeof d.pausaAdmin === 'boolean') _auditHistoricoActivo = !d.pausaAdmin;
+}).catch(() => {});
 
 // --- AUDITORIA LITVM: ledger aditivo, sin modificar datos ni contadores legacy ---
 // Las funciones integradas eliminan dependencias de archivos adicionales al desplegar.
