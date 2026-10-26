@@ -12987,12 +12987,16 @@ app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, gfExi
 //       la pesca) y se apunta en su casilla de Mongo. Cada montón, una vez.
 //     · lo que no se recoge caduca a los 10 minutos.
 // =============================================================================
+/* (2026-10-26) "Me das el mineral del carbón al matar enemigos, pero esa es la
+   piedra no minada." El objeto `carbon` se dibuja con el YACIMIENTO de la mina
+   (Game/Objetos/carbon.png): lo que se gana es el carbón ya minado,
+   `mineral_carbon` ("Coal Ore"), que también arde en el horno. */
 const MONSTRUOS_BOTIN = {
-  fantasma_mina: { nombre: 'Mine Wraith', salas: ['mina'], enfriaMs: 5*60*1000, exp: 80, montones: [1,2], instancias: 2, botin: [['carbon',1,2],['Semillax',1,2]] },
+  fantasma_mina: { nombre: 'Mine Wraith', salas: ['mina'], enfriaMs: 5*60*1000, exp: 80, montones: [1,2], instancias: 2, botin: [['mineral_carbon',1,2],['Semillax',1,2]] },
   mago_mina: { nombre: 'Ash Sorcerer', salas: ['mina'], enfriaMs: 8*60*1000, exp: 140, montones: [2,2], instancias: 2, botin: [['mineral_piedra_cobre',1,2],['Semillax2',1,2]] },
   serpiente_mina: {
     nombre: 'Magma Serpent', salas: ['mina'], enfriaMs: 20 * 60 * 1000, exp: 450, montones: [3, 4], instancias: 1,
-    botin: [['mineral_piedra_cobre', 2, 4], ['mineral_piedra_hierro', 2, 4], ['carbon', 3, 5], ['mineral_piedra', 3, 6]]
+    botin: [['mineral_piedra_cobre', 2, 4], ['mineral_piedra_hierro', 2, 4], ['mineral_carbon', 3, 5], ['mineral_piedra', 3, 6]]
   },
   // Los del mapa salvaje (gf-salvaje.js, zona 5): más flojos y más a menudo.
   golem_salvaje: {
@@ -13001,7 +13005,7 @@ const MONSTRUOS_BOTIN = {
   },
   lobo_salvaje: {
     nombre: 'Shadow Wolf', salas: ['salvaje'], enfriaMs: 4 * 60 * 1000, exp: 90, montones: [1, 2], instancias: 5,
-    botin: [['madera_pinos', 2, 4], ['carbon', 1, 2]]
+    botin: [['madera_pinos', 2, 4], ['mineral_carbon', 1, 2]]
   },
   arana_salvaje: {
     nombre: 'Thorn Spider', salas: ['salvaje'], enfriaMs: 5 * 60 * 1000, exp: 110, montones: [1, 2], instancias: 5,
@@ -13009,63 +13013,63 @@ const MONSTRUOS_BOTIN = {
   },
   brujo_salvaje: {
     nombre: 'Storm Wraith', salas: ['salvaje'], enfriaMs: 12 * 60 * 1000, exp: 260, montones: [2, 3], instancias: 2,
-    botin: [['mineral_piedra_hierro', 1, 3], ['carbon', 2, 4], ['mineral_piedra_cobre', 1, 3]]
+    botin: [['mineral_piedra_hierro', 1, 3], ['mineral_carbon', 2, 4], ['mineral_piedra_cobre', 1, 3]]
   },
   // (2026-10-18) Los de los mapas nuevos (Maps/<mapa>.json, capa
   // `monstruos`; tools/generar-zonas.py). `instancias` con algo de holgura.
   // EL CEMENTERIO (todo PvP):
   zombi_cementerio: { nombre: 'Grave Zombie', salas: ['cementerio'], enfriaMs: 5 * 60 * 1000, exp: 110, montones: [1, 2], instancias: 6,
-    botin: [['Semillax', 1, 3], ['Semillax1', 1, 3], ['carbon', 1, 2]] },
+    botin: [['Semillax', 1, 3], ['Semillax1', 1, 3], ['mineral_carbon', 1, 2]] },
   zombi_podrido: { nombre: 'Rotting Ghoul', salas: ['cementerio'], enfriaMs: 6 * 60 * 1000, exp: 130, montones: [1, 2], instancias: 5,
-    botin: [['Semillax3', 1, 3], ['Semillax4', 1, 3], ['carbon', 1, 3]] },
+    botin: [['Semillax3', 1, 3], ['Semillax4', 1, 3], ['mineral_carbon', 1, 3]] },
   esqueleto_cementerio: { nombre: 'Bone Archer', salas: ['cementerio'], enfriaMs: 5 * 60 * 1000, exp: 120, montones: [1, 2], instancias: 11,
-    botin: [['mineral_piedra', 2, 4], ['carbon', 1, 2]] },
+    botin: [['mineral_piedra', 2, 4], ['mineral_carbon', 1, 2]] },
   // (2026-10-19) "Quiero que en el cementerio existan esqueletos": más
   // arqueros (de 5 a 8) y el guerrero esqueleto, cuerpo a cuerpo (8).
   esqueleto_guerrero: { nombre: 'Skeleton Warrior', salas: ['cementerio'], enfriaMs: 5 * 60 * 1000, exp: 130, montones: [1, 2], instancias: 11,
-    botin: [['mineral_piedra_hierro', 1, 2], ['mineral_piedra', 1, 3], ['carbon', 1, 2]] },
+    botin: [['mineral_piedra_hierro', 1, 2], ['mineral_piedra', 1, 3], ['mineral_carbon', 1, 2]] },
   espectro_cementerio: { nombre: 'Restless Spirit', salas: ['cementerio'], enfriaMs: 7 * 60 * 1000, exp: 170, montones: [1, 2], instancias: 5,
     botin: [['mineral_piedra_cobre', 1, 3], ['Semillax2', 1, 3]] },
   golem_cripta: { nombre: 'Crypt Golem', salas: ['cementerio'], enfriaMs: 8 * 60 * 1000, exp: 200, montones: [2, 3], instancias: 4,
     botin: [['mineral_piedra_hierro', 1, 3], ['mineral_piedra', 2, 4]] },
   nigromante_cementerio: { nombre: 'The Necromancer', salas: ['cementerio'], enfriaMs: 20 * 60 * 1000, exp: 520, montones: [3, 4], instancias: 2,
-    botin: [['mineral_piedra_hierro', 2, 4], ['mineral_piedra_cobre', 2, 4], ['carbon', 3, 5], ['mineral_carbon', 1, 3]] },
+    botin: [['mineral_piedra_hierro', 2, 4], ['mineral_piedra_cobre', 2, 4], ['mineral_carbon', 3, 5]] },
   // EL DESIERTO:
   escorpion_desierto: { nombre: 'Dune Scorpion', salas: ['desierto'], enfriaMs: 5 * 60 * 1000, exp: 110, montones: [1, 2], instancias: 9,
     botin: [['madera_seca', 2, 4], ['mineral_piedra', 1, 3]] },
   momia_desierto: { nombre: 'Wrapped Mummy', salas: ['desierto'], enfriaMs: 6 * 60 * 1000, exp: 140, montones: [1, 2], instancias: 6,
-    botin: [['Semillax2', 1, 3], ['madera_seca', 1, 3], ['carbon', 1, 2]] },
+    botin: [['Semillax2', 1, 3], ['madera_seca', 1, 3], ['mineral_carbon', 1, 2]] },
   golem_arena: { nombre: 'Sandstone Golem', salas: ['desierto'], enfriaMs: 7 * 60 * 1000, exp: 190, montones: [2, 2], instancias: 5,
     botin: [['mineral_piedra', 2, 4], ['mineral_piedra_cobre', 1, 3]] },
   // LA TUNDRA:
   lobo_escarcha: { nombre: 'Frost Wolf', salas: ['tundra'], enfriaMs: 4 * 60 * 1000, exp: 100, montones: [1, 2], instancias: 8,
-    botin: [['madera_pinos', 2, 4], ['carbon', 1, 2]] },
+    botin: [['madera_pinos', 2, 4], ['mineral_carbon', 1, 2]] },
   golem_hielo: { nombre: 'Ice Golem', salas: ['tundra'], enfriaMs: 7 * 60 * 1000, exp: 190, montones: [2, 2], instancias: 5,
     botin: [['mineral_piedra_hierro', 1, 3], ['mineral_piedra', 2, 4]] },
   bruja_ventisca: { nombre: 'Blizzard Witch', salas: ['tundra'], enfriaMs: 12 * 60 * 1000, exp: 270, montones: [2, 3], instancias: 4,
-    botin: [['mineral_piedra_hierro', 1, 3], ['carbon', 2, 4], ['mineral_piedra_cobre', 1, 3]] },
+    botin: [['mineral_piedra_hierro', 1, 3], ['mineral_carbon', 2, 4], ['mineral_piedra_cobre', 1, 3]] },
   // (2026-10-20) LOS JEFES: uno por mapa, vuelven a la media hora y sueltan
   // mucho (gf-jefes.js; el arte, tools/generar-jefes.py).
   jefe_golem: { nombre: 'The Mossback Titan', salas: ['salvaje'], enfriaMs: 30 * 60 * 1000, exp: 1500, montones: [5, 7], instancias: 1,
     botin: [['mineral_piedra_hierro', 3, 6], ['mineral_piedra_cobre', 3, 6], ['pocion_vida', 1, 2], ['Semillax3', 2, 4], ['tablon_de_madera', 3, 6]] },
   jefe_arana: { nombre: 'The Bone Widow', salas: ['cementerio'], enfriaMs: 30 * 60 * 1000, exp: 1600, montones: [5, 7], instancias: 1,
-    botin: [['pocion_antidoto', 1, 2], ['pocion_vida', 1, 2], ['mineral_piedra_hierro', 3, 5], ['carbon', 4, 8], ['antorcha', 2, 4]] },
+    botin: [['pocion_antidoto', 1, 2], ['pocion_vida', 1, 2], ['mineral_piedra_hierro', 3, 5], ['mineral_carbon', 4, 8], ['antorcha', 2, 4]] },
   jefe_escorpion: { nombre: 'The Sand Emperor', salas: ['desierto'], enfriaMs: 30 * 60 * 1000, exp: 1600, montones: [5, 7], instancias: 1,
-    botin: [['mineral_piedra_cobre', 4, 7], ['pocion_vida', 1, 2], ['Semillax4', 2, 4], ['madera_seca', 4, 8], ['carbon', 3, 6]] },
+    botin: [['mineral_piedra_cobre', 4, 7], ['pocion_vida', 1, 2], ['Semillax4', 2, 4], ['madera_seca', 4, 8], ['mineral_carbon', 3, 6]] },
   jefe_lobo: { nombre: 'Frostfang, the Pack King', salas: ['tundra'], enfriaMs: 30 * 60 * 1000, exp: 1700, montones: [5, 7], instancias: 1,
-    botin: [['mineral_piedra_hierro', 4, 7], ['pocion_vida', 1, 2], ['madera_pinos', 6, 10], ['carbon', 4, 8], ['antorcha', 2, 3]] },
+    botin: [['mineral_piedra_hierro', 4, 7], ['pocion_vida', 1, 2], ['madera_pinos', 6, 10], ['mineral_carbon', 4, 8], ['antorcha', 2, 3]] },
   // (2026-10-25) LOS DE NIVEL 8, 9 Y 10 (Maps/<mapa>.json, capa `monstruos`;
   // gf-salvaje.js). Más duros que los de antes: más experiencia y más botín.
   // EL GLACIAR (nivel 8):
   oso_polar: { nombre: 'Frost Bear', salas: ['glaciar'], enfriaMs: 5 * 60 * 1000, exp: 220, montones: [1, 2], instancias: 8,
-    botin: [['madera_pinos', 2, 4], ['carbon', 1, 3]] },
+    botin: [['madera_pinos', 2, 4], ['mineral_carbon', 1, 3]] },
   yeti_glaciar: { nombre: 'Glacier Yeti', salas: ['glaciar'], enfriaMs: 7 * 60 * 1000, exp: 300, montones: [2, 2], instancias: 7,
     botin: [['mineral_piedra_hierro', 1, 3], ['mineral_piedra', 2, 4]] },
   espectro_hielo: { nombre: 'Frost Wraith', salas: ['glaciar'], enfriaMs: 9 * 60 * 1000, exp: 320, montones: [2, 3], instancias: 7,
-    botin: [['mineral_piedra_cobre', 1, 3], ['carbon', 2, 4], ['mineral_piedra_hierro', 1, 2]] },
+    botin: [['mineral_piedra_cobre', 1, 3], ['mineral_carbon', 2, 4], ['mineral_piedra_hierro', 1, 2]] },
   // LA CAVERNA (nivel 9):
   murcielago_gigante: { nombre: 'Giant Cave Bat', salas: ['caverna'], enfriaMs: 5 * 60 * 1000, exp: 260, montones: [1, 2], instancias: 9,
-    botin: [['carbon', 1, 3], ['Semillax2', 1, 3]] },
+    botin: [['mineral_carbon', 1, 3], ['Semillax2', 1, 3]] },
   troll_cueva: { nombre: 'Cave Troll', salas: ['caverna'], enfriaMs: 8 * 60 * 1000, exp: 360, montones: [2, 2], instancias: 7,
     botin: [['mineral_piedra_hierro', 1, 3], ['mineral_carbon', 1, 2], ['mineral_piedra', 2, 4]] },
   golem_cristal: { nombre: 'Crystal Golem', salas: ['caverna'], enfriaMs: 9 * 60 * 1000, exp: 400, montones: [2, 3], instancias: 7,
@@ -13079,7 +13083,7 @@ const MONSTRUOS_BOTIN = {
     botin: [['tablon_de_madera', 1, 3], ['mineral_piedra', 2, 4], ['madera_pinos', 2, 4]] },
   // Sus jefes (gf-jefes.js).
   jefe_yeti: { nombre: 'The Glacier King', salas: ['glaciar'], enfriaMs: 30 * 60 * 1000, exp: 2200, montones: [5, 7], instancias: 1,
-    botin: [['mineral_piedra_hierro', 4, 8], ['pocion_vida', 1, 2], ['madera_pinos', 6, 10], ['carbon', 4, 8], ['mineral_piedra_cobre', 3, 6]] },
+    botin: [['mineral_piedra_hierro', 4, 8], ['pocion_vida', 1, 2], ['madera_pinos', 6, 10], ['mineral_carbon', 4, 8], ['mineral_piedra_cobre', 3, 6]] },
   jefe_murcielago: { nombre: 'Nightwing, the Cave Matriarch', salas: ['caverna'], enfriaMs: 30 * 60 * 1000, exp: 2400, montones: [5, 7], instancias: 1,
     botin: [['mineral_piedra_cobre', 4, 8], ['mineral_piedra_hierro', 3, 6], ['pocion_vida', 1, 2], ['mineral_carbon', 2, 4], ['antorcha', 2, 4]] },
   jefe_ent: { nombre: 'Oakheart, the Elder Grove', salas: ['pradera'], enfriaMs: 30 * 60 * 1000, exp: 2600, montones: [5, 7], instancias: 1,
@@ -15620,6 +15624,16 @@ function resolveMissionItemId(itemId) {
   return MISSION_ITEM_ALIASES[raw] || MISSION_ITEM_ALIASES[raw.toLowerCase()] || raw;
 }
 
+/* (2026-10-26) Lo que se GANA nunca es la roca de carbón: `carbon` se dibuja
+   con el yacimiento de la mina (Game/Objetos/carbon.png). Un premio de
+   "carbón" es el carbón ya minado, `mineral_carbon` ("Coal Ore"). Solo para
+   premios: lo que se PIDE en una misión sigue siendo lo que diga. */
+function gfPremioJusto(itemId) {
+  const id = String(itemId || '').trim();
+  const k = id.toLowerCase();
+  return (k === 'carbon' || k === 'coal' || k === 'carbón') ? 'mineral_carbon' : id;
+}
+
 /** Suma cuántas unidades de `itemId` hay en un array guardado (inventory/chest). */
 function contarEnSlots(slots, itemId) {
   if (!Array.isArray(slots)) return 0;
@@ -15852,7 +15866,7 @@ app.post('/api/missions/daily/complete',
 
       // ── 5. Recompensas ───────────────────────────────────────────────────
       const expReward = Math.max(0, parseInt(mission.expReward, 10) || 0);
-      const rewardId  = mission.rewardItemId ? String(mission.rewardItemId) : null;
+      const rewardId  = mission.rewardItemId ? gfPremioJusto(mission.rewardItemId) : null;
       const rewardQty = rewardId ? Math.max(1, parseInt(mission.rewardAmount, 10) || 1) : 0;
 
       const avisos = [];
@@ -16083,7 +16097,7 @@ function sanearMisionesDelDia(missions) {
 
     const rewardItemId = limpiarTexto(m.rewardItemId, 60);
     if (rewardItemId) {
-      salida.rewardItemId = rewardItemId;
+      salida.rewardItemId = gfPremioJusto(rewardItemId);
       salida.rewardAmount = Math.max(1, Math.min(9999, parseInt(m.rewardAmount, 10) || 1));
     }
 
@@ -16572,6 +16586,151 @@ app.post('/api/vip/comprar', apiLimiter, authMiddleware, csrfProtection, gfExige
 console.log('✅ VIP: /api/vip/{estado,de,comprar}');
 
 // ============================================================================
+// EL MAPA DEL MUNDO: VIAJAR PAGANDO                               (2026-10-26)
+// ============================================================================
+// "Al presionar la M, un mapa de los mundos para viajar entre ellos; al
+// tocar, que pregunte si deseo viajar por tantas monedas, según lo lejos que
+// esté el personaje, y que reconozca si no cumple los niveles o está bloqueado."
+//
+//   · La tabla la escribe tools/generar-mapa-mundo.py (Game/MAPAS/mundo/
+//     mapa_mundo.json): dónde cae cada mapa en el dibujo (`rect`, en px del
+//     dibujo) y cada destino (`px` en el dibujo; `destino` = dónde se aparece,
+//     en coordenadas del juego; null = la entrada propia de esa escena).
+//     tools/mapa-mundo.test.cjs vigila que esta copia y el JSON no se separen.
+//   · Dónde estás lo sabe el SERVIDOR (tu sala y tu posición de `rooms`), no
+//     el navegador: el precio es la distancia en el dibujo entre ese punto y el
+//     destino. Se cobra en BRONCE, como el viaje con amigos.
+//   · Nivel (GF_NIVEL_MAPA) y VIP (la isla) se miran aquí también: el panel
+//     los enseña, pero quien decide es esto.
+//   · Si el navegador no puede arrancar el viaje después de pagar (ya estaba
+//     cambiando de escena), devuelve el billete y se le reembolsa.
+const GF_MAPA_MUNDO = {"version":"20261026a","tam":[2240,1888],"regiones":[{"sala":"glaciar","mapa":[5024,5024],"rect":[672,48,448,448]},{"sala":"tundra","mapa":[5024,5024],"rect":[672,496,448,448]},{"sala":"cementerio","mapa":[5024,5024],"rect":[224,944,448,448]},{"sala":"salvaje","mapa":[5024,5024],"rect":[672,944,448,448]},{"sala":"game","mapa":[5008,5008],"rect":[1120,944,448,448]},{"sala":"desierto","mapa":[5024,5024],"rect":[672,1392,448,448]},{"sala":"pradera","mapa":[5024,5024],"rect":[1120,1392,448,448]},{"sala":"mina","mapa":[5008,5008],"rect":[1194,570,300,300]},{"sala":"caverna","mapa":[5024,5024],"rect":[298,1466,300,300]},{"sala":"isla","mapa":[4096,3072],"rect":[1622,1040,340,255]}],"destinos":[{"id":"pueblo","mundo":1,"sala":"game","px":[1308,1155],"destino":[2097,2359]},{"id":"salvaje","mundo":6,"sala":"salvaje","px":[1109,1141],"destino":[4896,2208]},{"id":"cementerio","mundo":7,"sala":"cementerio","px":[651,1141],"destino":[4790,2208]},{"id":"desierto","mundo":8,"sala":"desierto","px":[989,1413],"destino":[3552,230]},{"id":"tundra","mundo":9,"sala":"tundra","px":[989,919],"destino":[3552,4740]},{"id":"glaciar","mundo":10,"sala":"glaciar","px":[989,471],"destino":[3552,4740]},{"id":"caverna","mundo":11,"sala":"caverna","px":[539,1600],"destino":[4040,2250]},{"id":"pradera","mundo":12,"sala":"pradera","px":[1141,1611],"destino":[234,2456]},{"id":"pueblo_tienda","mundo":2,"sala":"tienda","px":[1259,1073],"destino":null},{"id":"pueblo_mina","mundo":3,"sala":"mina","px":[1344,720],"destino":null},{"id":"pueblo_casa_L","mundo":1,"sala":"game","px":[1253,1235],"destino":[1488,3313]},{"id":"pueblo_casa_comida","mundo":1,"sala":"game","px":[1339,1233],"destino":[2444,3290]},{"id":"pueblo_casa_comida2","mundo":1,"sala":"game","px":[1382,1234],"destino":[2928,3307]},{"id":"pueblo_casa_posiones","mundo":1,"sala":"game","px":[1339,1077],"destino":[2452,1552]},{"id":"pueblo_casa_herreria","mundo":1,"sala":"game","px":[1401,1121],"destino":[3137,2035]},{"id":"pueblo_casa_npc1","mundo":1,"sala":"game","px":[1252,999],"destino":[1472,672]},{"id":"pueblo_casa_npc2","mundo":1,"sala":"game","px":[1296,998],"destino":[1962,667]},{"id":"pueblo_cabana","mundo":1,"sala":"game","px":[1184,985],"destino":[715,523]},{"id":"pueblo_arena","mundo":1,"sala":"game","px":[1373,955],"destino":[2832,170]},{"id":"salvaje_cabana","mundo":6,"sala":"salvaje","px":[922,1093],"destino":[2804,1728]},{"id":"cementerio_bruja","mundo":7,"sala":"cementerio","px":[246,1132],"destino":[250,2250]},{"id":"cementerio_cripta","mundo":7,"sala":"cementerio","px":[408,1137],"destino":[2064,2190]},{"id":"desierto_ruinas","mundo":8,"sala":"desierto","px":[775,1692],"destino":[1152,3390]},{"id":"tundra_santuario","mundo":9,"sala":"tundra","px":[954,583],"destino":[3168,1006]},{"id":"tundra_lago","mundo":9,"sala":"tundra","px":[930,716],"destino":[2896,2494]},{"id":"glaciar_ruinas","mundo":10,"sala":"glaciar","px":[940,115],"destino":[3008,782]},{"id":"glaciar_lago","mundo":10,"sala":"glaciar","px":[887,339],"destino":[2416,3294]},{"id":"caverna_mina","mundo":11,"sala":"caverna","px":[367,1565],"destino":[1152,1694]},{"id":"caverna_lago","mundo":11,"sala":"caverna","px":[476,1691],"destino":[2976,3806]},{"id":"pradera_circulo","mundo":12,"sala":"pradera","px":[1280,1486],"destino":[1792,1086]},{"id":"pradera_granja","mundo":12,"sala":"pradera","px":[1460,1657],"destino":[3808,3006]},{"id":"isla","mundo":4,"sala":"isla","px":[1792,1167],"destino":null,"vip":true}]};
+const GF_MAPA_PRECIO = Object.freeze({ base: 100, porPx: 2.5, minimo: 100, maximo: 6000, redondeo: 10 });
+const _gfMapaRegion = new Map(GF_MAPA_MUNDO.regiones.map((r) => [r.sala, r]));
+const _gfMapaDestino = new Map(GF_MAPA_MUNDO.destinos.map((d) => [d.id, d]));
+const _gfMapaBilletes = new Map();   // billete → { playerName, precio, hasta }
+
+/** El punto del dibujo de una sala (y, si es un mapa, de la posición dentro). */
+function gfMapaPxDeSala(sala, x, y) {
+  const b = salaBase(String(sala || ''));
+  const punto = (id) => (_gfMapaDestino.get(id) || _gfMapaDestino.get('pueblo')).px;
+  if (b === 'tienda') return punto('pueblo_tienda');
+  if (b.startsWith('casa:')) return punto(b === 'casa:cabana_monte' ? 'salvaje_cabana' : 'pueblo_' + b.slice(5));
+  if (b === 'isla' || b.startsWith('isla@')) return punto('isla');
+  const r = _gfMapaRegion.get(b);
+  if (!r) return punto('pueblo');           // la arena, un viaje a medias…: el pueblo
+  const [rx, ry, rw, rh] = r.rect, [mw, mh] = r.mapa;
+  const fx = Number.isFinite(Number(x)) && x !== null ? Math.max(0, Math.min(1, Number(x) / mw)) : 0.5;
+  const fy = Number.isFinite(Number(y)) && y !== null ? Math.max(0, Math.min(1, Number(y) / mh)) : 0.5;
+  return [Math.round(rx + fx * rw), Math.round(ry + fy * rh)];
+}
+/** La sala y la posición del jugador (la de su socket vivo). */
+function gfMapaDondeEsta(playerName) {
+  for (const s of socketsDeJugador(playerName)) {
+    const sala = s.playerData && s.playerData.room;
+    if (!sala) continue;
+    const yo = rooms[sala] && rooms[sala][s.id];
+    return { sala, x: yo ? Number(yo.x) : null, y: yo ? Number(yo.y) : null };
+  }
+  return null;
+}
+function gfMapaPrecio(desde, d) {
+  const P = GF_MAPA_PRECIO;
+  const dist = Math.hypot(d.px[0] - desde[0], d.px[1] - desde[1]);
+  return Math.max(P.minimo, Math.min(P.maximo, Math.round((P.base + dist * P.porPx) / P.redondeo) * P.redondeo));
+}
+/** Para el panel: dónde estás, tu nivel, tu VIP y cada destino (precio y bloqueo). */
+async function gfMapaEstado(gp) {
+  const pos = gfMapaDondeEsta(gp.playerName);
+  const aqui = pos ? gfMapaPxDeSala(pos.sala, pos.x, pos.y) : null;
+  const [nivel, vip] = await Promise.all([gfNivelDeJugador(gp), gfTieneVipPorDireccion(gp.address)]);
+  const destinos = {};
+  for (const d of GF_MAPA_MUNDO.destinos) {
+    const nivelMin = gfNivelMinimoSala(d.sala);
+    destinos[d.id] = {
+      precio: aqui ? gfMapaPrecio(aqui, d) : null, nivelMin,
+      bloqueo: nivel < nivelMin ? 'nivel' : (d.vip && !vip ? 'vip' : null),
+      aqui: !!aqui && Math.hypot(d.px[0] - aqui[0], d.px[1] - aqui[1]) < 14
+    };
+  }
+  // De visita en la isla de OTRO (sala 'isla@<su nombre>') se puede pagar el
+  // viaje a la tuya: el dibujo tiene una sola isla, pero no es la misma.
+  const b = pos ? salaBase(pos.sala) : '';
+  if (b.startsWith('isla@') && b !== 'isla@' + encodeURIComponent(gp.playerName) && destinos.isla) destinos.isla.aqui = false;
+  return { aqui, sala: pos ? salaBase(pos.sala) : null, nivel, vip, destinos };
+}
+
+app.get('/api/viaje/mapa', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const st = await PlayerStats.findOne({ playerName: gp.playerName }).select('bronce').lean();
+    return res.json({ ok: true, version: GF_MAPA_MUNDO.version, ...await gfMapaEstado(gp),
+                      bronce: Math.floor(Number(st && st.bronce) || 0), precio: GF_MAPA_PRECIO });
+  } catch (e) {
+    console.error('GET /api/viaje/mapa:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+app.post('/api/viaje/mapa', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const id = String((req.body && req.body.destino) || '');
+    const d = _gfMapaDestino.get(id);
+    if (!d) return res.status(400).json({ error: 'destino_desconocido' });
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    return await enColaDelJugador(String(gp.address || gp.playerName).toLowerCase(), async () => {
+      const estado = await gfMapaEstado(gp);
+      const e = estado.destinos[id];
+      if (!estado.aqui) return res.status(409).json({ error: 'sin_posicion', message: 'Walk a few steps and try again.' });
+      if (e.aqui) return res.status(409).json({ error: 'ya_estas_aqui' });
+      if (e.bloqueo === 'nivel') return res.status(403).json({ error: 'nivel_bajo', nivelMinimo: e.nivelMin, nivel: estado.nivel });
+      if (e.bloqueo === 'vip') return res.status(403).json({ error: 'vip_required' });
+      // El precio visto en el panel es el tope: si al pagar sale más (te
+      // moviste lejos), se vuelve a preguntar.
+      const visto = Number(req.body && req.body.precio);
+      if (Number.isFinite(visto) && e.precio > visto) return res.status(409).json({ error: 'precio_cambio', precio: e.precio });
+      const doc = await gfCobrarStat(gp.playerName, 'bronce', e.precio);
+      if (!doc) {
+        const st = await PlayerStats.findOne({ playerName: gp.playerName }).select('bronce').lean();
+        return res.status(400).json({ error: 'insufficient_funds', need: e.precio, have: Math.floor(Number(st && st.bronce) || 0) });
+      }
+      const billete = crypto.randomBytes(8).toString('hex');
+      _gfMapaBilletes.set(billete, { playerName: gp.playerName, precio: e.precio, hasta: Date.now() + 2 * 60 * 1000 });
+      console.log(`🗺️  ${gp.playerName} viaja por el mapa a ${id} (${estado.sala} → ${d.sala}) por ${e.precio} de bronce`);
+      return res.json({ ok: true, precio: e.precio, billete, stats: buildStatsResponse(doc),
+                        destino: { id, mundo: d.mundo, x: d.destino ? d.destino[0] : null, y: d.destino ? d.destino[1] : null } });
+    });
+  } catch (e) {
+    console.error('POST /api/viaje/mapa:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// El navegador no pudo arrancar el viaje ya pagado: se devuelve (una vez).
+app.post('/api/viaje/mapa/devolver', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const id = String((req.body && req.body.billete) || '');
+    const b = _gfMapaBilletes.get(id);
+    if (!b || b.playerName !== gp.playerName || Date.now() > b.hasta) return res.status(404).json({ error: 'billete_no_valido' });
+    _gfMapaBilletes.delete(id);
+    const doc = await gfDevolverStat(gp.playerName, 'bronce', b.precio);
+    return res.json({ ok: true, devuelto: b.precio, stats: doc ? buildStatsResponse(doc) : undefined });
+  } catch (e) {
+    console.error('POST /api/viaje/mapa/devolver:', e);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+setInterval(() => {
+  const ahora = Date.now();
+  for (const [k, b] of _gfMapaBilletes) if (ahora > b.hasta) _gfMapaBilletes.delete(k);
+}, 5 * 60 * 1000).unref();
+console.log('✅ Mapa del mundo: /api/viaje/mapa (' + GF_MAPA_MUNDO.destinos.length + ' destinos)');
+
+// ============================================================================
 // MISIONES AUTOMÁTICAS, DE CAZAR Y LISTA DE ENTREGAS              (2026-10-19)
 // ============================================================================
 // "Que el Farmer Joe tenga misiones automáticas, aunque en misiones.html yo
@@ -16644,7 +16803,7 @@ const MISIONES_AUTO_POR_DEFECTO = {
       { itemId: 'fresa_buena', nombre: 'Strawberries', min: 3, max: 8 },
       { itemId: 'madera_pinos', nombre: 'Pine Wood', min: 5, max: 15 },
       { itemId: 'mineral_piedra', nombre: 'Stone', min: 4, max: 10 },
-      { itemId: 'carbon', nombre: 'Coal', min: 2, max: 6 }
+      { itemId: 'mineral_carbon', nombre: 'Coal Ore', min: 2, max: 6 }
     ],
     presas: [
       { tipo: 'lobo_salvaje', nombre: 'Shadow Wolves', min: 2, max: 5 },
@@ -16760,7 +16919,7 @@ function gfGenerarMisiones(reglas, npcId, day) {
       const totalPeso = premios.reduce((s, p) => s + Math.max(0, Number(p.peso) || 1), 0);
       let r = azar() * totalPeso, elegido = premios[0];
       for (const p of premios) { r -= Math.max(0, Number(p.peso) || 1); if (r <= 0) { elegido = p; break; } }
-      m.rewardItemId = elegido.itemId;
+      m.rewardItemId = gfPremioJusto(elegido.itemId);
       m.rewardAmount = Math.max(1, entre(elegido.min || 1, elegido.max || elegido.min || 1));
       const nombreP = String(elegido.nombre || elegido.itemId).slice(0, 60);
       m.texts['en-US'].rewardName = nombreP;
