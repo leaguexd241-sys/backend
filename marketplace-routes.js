@@ -157,8 +157,14 @@ function escapeRegex(str) {
 
 // Session propagation is local to this module: other game queries do not
 // inherit a market transaction or any global Mongoose setting.
-function createMarketAtomic(mongoose) {
+function createMarketAtomic(mongoose, auditar) {
   const { AsyncLocalStorage } = require('node:async_hooks');
+  // (2026-10-27) Cada respuesta de error del mercado se cuenta a la auditoría de
+  // server2.js (centro de control). Fuera de la transacción y sin poder romperla.
+  const contar = (req, status, body) => {
+    if (typeof auditar !== 'function' || !(status >= 400)) return;
+    try { auditar(req, status, body); } catch (_) {}
+  };
   const scope = new AsyncLocalStorage();
   const queryMethods = new Set(['find', 'findOne', 'findById', 'findOneAndUpdate',
     'findOneAndDelete', 'updateOne', 'updateMany', 'deleteOne', 'deleteMany', 'countDocuments']);
@@ -212,10 +218,13 @@ function createMarketAtomic(mongoose) {
       } catch (error) {
         if (error !== aborted) {
           console.error('❌ Marketplace transaction rolled back:', error.code || error.name || 'database_error');
-          return res.status(503).json({ error: 'marketplace_transaction_unavailable',
-            message: 'No se completó la operación. El mercado necesita una base de datos con transacciones disponibles.' });
+          const cuerpo = { error: 'marketplace_transaction_unavailable',
+            message: 'No se completó la operación. El mercado necesita una base de datos con transacciones disponibles.' };
+          contar(req, 503, cuerpo);
+          return res.status(503).json(cuerpo);
         }
       }
+      contar(req, result.status, result.body);
       return res.status(result.status).json(result.body);
     };
   }
@@ -223,7 +232,7 @@ function createMarketAtomic(mongoose) {
 }
 
 module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
-  const atomic = createMarketAtomic(ctx.mongoose);
+  const atomic = createMarketAtomic(ctx.mongoose, ctx.auditarMercado);
   const app = { get: (...args) => rawApp.get(...args) };
   for (const method of ['post', 'patch', 'delete']) app[method] = (...args) => {
     const work = args.pop(); return rawApp[method](...args, atomic.handler(work));
@@ -249,7 +258,12 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
     // (2026-10-26) El tesoro del juego y qué parte de la comisión es del circular.
     TesoroJuego: RawTesoroJuego = null,
     TESORO_JUEGO_ID = 'juego',
-    TESORO_CIRCULAR_BPS = 150
+    TESORO_CIRCULAR_BPS = 150,
+    // (2026-10-27) El nivel de cada objeto y el del jugador (server2.js): por
+    // debajo no se compra ni se oferta. Sin ellos (servidor viejo), no se mira.
+    nivelObjeto = null,
+    nivelJugador = null,
+    alertar = null
   } = ctx;
   const GamePlayer = atomic.model(RawGamePlayer), PlayerStats = atomic.model(RawPlayerStats), Listing = atomic.model(RawListing);
   const Tesoro = RawTesoro ? atomic.model(RawTesoro) : null;
@@ -279,6 +293,21 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
   }
 
   const writeLimiter = strictLimiter || apiLimiter;
+
+  /* "Si uno de nivel 12 compra algo de nivel 11 y se lo pasa a uno de nivel 2,
+     ese no lo puede recoger" (2026-10-27): tampoco comprarlo aquí, o el mercado
+     sería el atajo. null si puede; si no, el cuerpo del 403 (y el intento queda
+     en el centro de control). */
+  async function nivelInsuficiente(gp, itemId, tipo) {
+    if (typeof nivelObjeto !== 'function' || typeof nivelJugador !== 'function' || !gp) return null;
+    const requerido = Number(nivelObjeto(itemId)) || 0;
+    if (requerido <= 1) return null;
+    const nivel = Number(await nivelJugador(gp)) || 0;
+    if (nivel >= requerido) return null;
+    if (typeof alertar === 'function') { try { alertar(tipo, gp, { itemId, nivelRequerido: requerido, nivel }); } catch (_) {} }
+    return { error: 'level_too_low', nivelRequerido: requerido, nivel,
+             message: `You need level ${requerido} to get this item (you are level ${nivel}).` };
+  }
 
   // ── Helpers internos ────────────────────────────────────────────────────
 
@@ -750,6 +779,8 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
 
       const buyerGP = await getGamePlayerByAddress(address);
       if (!buyerGP) return res.status(404).json({ error: 'player_not_found' });
+      const bajoNivel = await nivelInsuficiente(buyerGP, listing.itemId, 'p2p_nivel');
+      if (bajoNivel) return res.status(403).json(bajoNivel);
 
       const meta = catalogMeta(listing.itemId);
 
@@ -1107,6 +1138,8 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
 
       const gp = await getGamePlayerByAddress(address);
       if (!gp) return res.status(404).json({ error: 'player_not_found' });
+      const bajoNivel = await nivelInsuficiente(gp, listing.itemId, 'p2p_nivel');
+      if (bajoNivel) return res.status(403).json(bajoNivel);
 
       // Una oferta viva por publicación y comprador: si ya había una, se
       // cancela (y se devuelve su dinero) antes de crear la nueva.
@@ -1538,6 +1571,8 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
 
       const gp = await getGamePlayerByAddress(address);
       if (!gp) return res.status(404).json({ error: 'player_not_found' });
+      const bajoNivel = await nivelInsuficiente(gp, doc.itemId, 'p2p_nivel');
+      if (bajoNivel) return res.status(403).json(bajoNivel);
 
       // Tope por jugador
       if (doc.perPlayerLimit > 0) {

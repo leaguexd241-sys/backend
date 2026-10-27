@@ -13408,7 +13408,14 @@ const SUELO_SOLTABLES = new Set([
   'fresa_buena', 'fresa_corta', 'fresa_mala',
   'pes1', 'pes2', 'pes3', 'pes4', 'pes5', 'pes6', 'pes7', 'pes8',
   'pes9', 'pes10', 'pes11', 'pes12', 'pes13', 'pes14',
-  'pocion_mascota', 'pocion_mascota_grande', 'elixir_revivir'
+  'pocion_mascota', 'pocion_mascota_grande', 'elixir_revivir',
+  // (2026-10-27) "En los objetos de crafteo y de construcción también la regla de
+  // niveles y de dropeo": se sueltan, y para recogerlos hace falta su nivel
+  // (GF_NIVEL_OBJETO). Las herramientas que se gastan (hachas, picos, regadera,
+  // tijeras) no: sus usos no viajan al acuñarlas de nuevo.
+  'cofre1', 'cofre2', 'cofre3', 'cofre4', 'basura', 'espantapajaros', 'parcela',
+  'espada_madera', 'espada_cobre', 'espada_hierro', 'arco', 'baston_mago', 'cana_pescar',
+  'pocion_vida', 'pocion_antidoto', 'balde_vacio'
 ]);
 const SUELO_CADUCA_MS = 10 * 60 * 1000;
 const SUELO_MAX_POR_SALA = 150;
@@ -13416,8 +13423,9 @@ const SUELO_ALCANCE = 260;              // px desde el jugador a donde suelta o 
 const _sueloSalvaje = new Map();        // id -> montón
 
 function _montonPublico(m) {
+  // (2026-10-27) `nivel`: el que hace falta para recogerlo (si no lo soltaste tú). `de`: la cuenta que lo soltó.
   return { id: m.id, itemId: m.itemId, cantidad: m.cantidad, x: m.x, y: m.y,
-           deNombre: m.deNombre, caducaEn: m.hasta };
+           deNombre: m.deNombre, caducaEn: m.hasta, de: m.de, nivel: gfNivelDeObjeto(m.itemId) };
 }
 
 /* EL TICKET DEL SUELO (2026-10-19). El cliente nuevo manda uno al recoger o
@@ -13436,11 +13444,14 @@ function _avisarJugadorSuelo(playerName, evento, datos) {
 
 setInterval(() => {
   const ahora = Date.now();
+  const caducados = [];
   for (const [id, m] of _sueloSalvaje) {
     if (ahora <= m.hasta || m.recogiendo) continue;
     _sueloSalvaje.delete(id);
+    caducados.push(id);
     try { io.to(m.sala).emit('suelo:fuera', { id, caducado: true }); } catch (_) {}
   }
+  gfSueloCaducados(caducados);
   for (const [n, c] of _pvpEspadas) if (c.hasta < ahora) _pvpEspadas.delete(n);
 }, 30 * 1000).unref();
 
@@ -13464,6 +13475,14 @@ app.post('/api/salvaje/soltar', apiLimiter, authMiddleware, csrfProtection, gfEx
     const gp = await jugadorDeLaSesion(req);
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
     if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+    // (2026-10-27) Suspendido o bloqueado para soltar (centro de control → Auditoría). Lo de los monstruos no se toca.
+    const castigo = await gfCastigoSoltar(gp.playerName);
+    if (castigo) {
+      gfAlertar('soltar_suspendido', 'aviso', gp, { itemId: String((req.body && req.body.itemId) || '').slice(0, 60), hasta: castigo.hasta, permanente: !!castigo.permanente },
+        'soltar_suspendido:' + gp.playerName);
+      return res.status(403).json({ error: 'soltar_suspendido', permanente: !!castigo.permanente, hasta: castigo.hasta,
+        message: castigo.permanente ? 'You are blocked from dropping items.' : 'You cannot drop items until ' + new Date(castigo.hasta).toUTCString() + '.' });
+    }
     if (!relayerWallet) return res.status(503).json({ error: 'relayer_unavailable' });
     const yo = _salaYPosicion(gp.playerName);
     if (!yo || !esSalaSalvaje(yo.sala)) {
@@ -13518,6 +13537,7 @@ app.post('/api/salvaje/soltar', apiLimiter, authMiddleware, csrfProtection, gfEx
         deNombre: String(gp.Username || gp.playerName).slice(0, 40), hasta: Date.now() + SUELO_CADUCA_MS
       };
       _sueloSalvaje.set(m.id, m);
+      gfSueloSoltado(gp, m);
       try { io.to(yo.sala).emit('suelo:nuevo', _montonPublico(m)); } catch (_) {}
       console.log(`🌲 ${gp.playerName} soltó ${cantidad} ${itemId} en ${yo.sala}`);
       return { status: 200, body: { ok: true, monton: _montonPublico(m),
@@ -13551,6 +13571,19 @@ app.post('/api/salvaje/recoger', apiLimiter, authMiddleware, csrfProtection, gfE
     if (!yo || yo.sala !== m.sala) return res.json({ ok: false, motivo: 'otra_sala' });
     if (Math.hypot(m.x - yo.x, m.y - yo.y) > SUELO_ALCANCE) return res.json({ ok: false, motivo: 'lejos' });
     if (m.recogiendo) return res.json({ ok: false, motivo: 'en_curso' });
+    // (2026-10-27) EL NIVEL DEL OBJETO: lo que soltó OTRO no se recoge por debajo de su nivel (lo tuyo, siempre).
+    if (m.de !== gp.playerName) {
+      const requerido = gfNivelDeObjeto(m.itemId);
+      if (requerido > 1) {
+        const nivel = await gfNivelDeJugador(gp);
+        if (nivel < requerido) {
+          gfAlertar('recoger_nivel', 'aviso', gp, { itemId: m.itemId, cantidad: m.cantidad, nivelRequerido: requerido, nivel, de: m.de, deNombre: m.deNombre, monton: m.id, sala: m.sala },
+            'recoger_nivel:' + gp.playerName + ':' + m.id);
+          return res.json({ ok: false, motivo: 'nivel', nivelRequerido: requerido, nivel, message: 'You need level ' + requerido + ' to pick this up (you are level ' + nivel + ').' });
+        }
+      }
+      if (m.recogiendo) return res.json({ ok: false, motivo: 'en_curso' });   // otro se adelantó mientras se miraba el nivel
+    }
     m.recogiendo = gp.playerName;
     /* EN COLA Y SIN ESPERAR A LA CADENA (2026-10-19): "paso por encima y
        tarda mucho en tomarlo; quiero que lo tome y que las transacciones se
@@ -13571,6 +13604,7 @@ app.post('/api/salvaje/recoger', apiLimiter, authMiddleware, csrfProtection, gfE
         return null;
       }
       _sueloSalvaje.delete(id);
+      gfSueloRecogido(gp, m);
       try {
         const doc = await GamePlayer.findOne({ playerName: gp.playerName });
         if (doc) {
@@ -18346,13 +18380,26 @@ async function buildPlayerProfile(key) {
   if (!gp) return null;
 
   const playerName = gp.playerName;
-  const [tiempo, actividad, skills, pet, stats] = await Promise.all([
+  const [tiempo, actividad, skills, pet, stats, vipDoc] = await Promise.all([
     PlayerPlaytime.findOne({ playerName }).lean().catch(() => null),
     UserActivity.findOne({ playerName }).lean().catch(() => null),
     PlayerSkills.findOne({ playerName }).lean().catch(() => null),
     PlayerPet.findOne({ playerName }).lean().catch(() => null),
-    PlayerStats.findOne({ playerName }).lean().catch(() => null)
+    PlayerStats.findOne({ playerName }).lean().catch(() => null),
+    gp.address ? VipEstado.findOne({ address: String(gp.address).toLowerCase() }).lean().catch(() => null) : null
   ]);
+  /* (2026-10-27) "Al dar doble clic a un usuario, su perfil no muestra sus niveles
+     de skills ni si tiene VIP". Las skills son los puntos repartidos (allocations,
+     el espejo de la cadena); el VIP, el espejo vip_estado. Y el nivel sale de la
+     EXPERIENCIA (la mayor de GamePlayer y PlayerStats), no del campo `nivel`. */
+  const expTotal = Math.max(Number(gp.nivel_exp) || 0, Number(stats && stats.exp) || 0);
+  const nivelReal = nivelPorExperiencia(expTotal);
+  const skillLevels = {};
+  const asignadas = (skills && skills.allocations) || {};
+  for (const k of GF_ALLOC_KEYS) skillLevels[k] = Math.max(0, Math.floor(Number(asignadas[k]) || 0));
+  const vipFin = vipDoc && vipDoc.fin ? new Date(vipDoc.fin).getTime() : 0;
+  const vip = { activo: vipFin > Date.now(), fin: vipFin ? new Date(vipFin) : null,
+                diasRestantes: vipFin > Date.now() ? Math.ceil((vipFin - Date.now()) / 86400000) : 0 };
 
   const creado = gp.createdAt ? new Date(gp.createdAt) : null;
   const antiguedadS = creado ? Math.floor((Date.now() - creado.getTime()) / 1000) : 0;
@@ -18371,8 +18418,10 @@ async function buildPlayerProfile(key) {
     playerName,
     username:  gp.Username || '---',
     address:   gp.address || null,
-    nivel:     gp.nivel || 0,
-    exp:       gp.nivel_exp || 0,
+    nivel:     nivelReal || gp.nivel || 0,
+    exp:       expTotal,
+    vip,
+    skillLevels,
     mundo:     gp.mundo || '',
     petName:   (pet && pet.petName) || gp.petName || '---',
     petLevel:  gp.petLevel || 1,
@@ -21347,7 +21396,10 @@ const compraOroSchema = new mongoose.Schema({
   motivo:     { type: String, default: '' },
   creada:     { type: Date, default: Date.now },
   caduca:     { type: Date },
-  acreditada: { type: Date, default: null }
+  acreditada: { type: Date, default: null },
+  // (2026-10-27) Reclamada con el hash por el jugador (pagó y no le llegó) o revisada desde el panel.
+  reclamada:  { type: Boolean, default: false },
+  revisadaPor: { type: String, default: '' }
 }, { collection: 'compras_oro', versionKey: false });
 compraOroSchema.index({ txHash: 1 }, { unique: true, sparse: true });
 compraOroSchema.index({ address: 1, dia: 1 });
@@ -21386,6 +21438,9 @@ function economiaDestino(cfg) {
   const env = String(process.env.GF_TESORO_JUEGO_CARTERA || '').trim().toLowerCase();
   if (cfg && cfg.cartera) return cfg.cartera;
   if (/^0x[0-9a-f]{40}$/.test(env)) return env;
+  // (2026-10-27) "El dinero de comprar monedas debe ir a la wallet admin": la primera de ADMIN_ADDRESSES.
+  const admin = String(process.env.ADMIN_ADDRESSES || '').toLowerCase().split(',').map((s) => s.trim()).find((s) => /^0x[0-9a-f]{40}$/.test(s));
+  if (admin) return admin;
   try { if (relayerWallet && relayerWallet.address) return String(relayerWallet.address).toLowerCase(); } catch (_) {}
   return '';
 }
@@ -21509,9 +21564,14 @@ app.get('/api/currency/oro/estado', apiLimiter, authMiddleware, async (req, res)
     const comprado = await economiaCompradoHoy(address);
     const pendientes = await CompraOro.find({ address, estado: { $in: ['cotizada', 'pagada'] }, creada: { $gte: new Date(Date.now() - 2 * 86400000) } })
       .sort({ creada: -1 }).limit(10).lean();
+    // (2026-10-27) "Muestra el tx de su historial de recargas": las últimas 30, con su hash, para poder reclamar.
+    const historial = await CompraOro.find({ address, creada: { $gte: new Date(Date.now() - 90 * 86400000) } }).sort({ creada: -1 }).limit(30).lean();
+    const zkDe = (w) => { try { return Number(BigInt(w || '0') / 1000000000n) / 1e9; } catch (_) { return 0; } };
     return res.json({ ok: true, comprado, tope: pub.tope, quedan: Math.max(0, pub.tope - comprado), precioOro: pub.precioOro, compra: pub.compra,
       pendientes: pendientes.map((c) => ({ id: c._id, oro: c.oro, zkltc: Number(BigInt(c.wei) / 1000000000n) / 1e9, estado: c.estado, txHash: c.txHash || null,
-                                            destino: c.destino, caduca: c.caduca, creada: c.creada })) });
+                                            destino: c.destino, caduca: c.caduca, creada: c.creada })),
+      historial: historial.map((c) => ({ id: c._id, oro: c.oro, oroDado: c.oroDado || 0, zkltc: zkDe(c.wei), pagado: zkDe(c.pagadoWei), estado: c.estado,
+                                         txHash: c.txHash || null, motivo: c.motivo || '', creada: c.creada, reclamada: !!c.reclamada })) });
   } catch (e) { console.error('GET /api/currency/oro/estado:', e); return res.status(500).json({ error: 'internal_error' }); }
 });
 
@@ -21526,6 +21586,8 @@ app.post('/api/currency/oro/cotizar', strictLimiter, authMiddleware, csrfProtect
     if (!cfg.compraActiva || !destino) return res.status(503).json({ error: 'compra_cerrada', message: 'Gold purchases are paused right now.' });
     if (!(oro >= cfg.minimoCompra)) return res.status(400).json({ error: 'cantidad_invalida', minimo: cfg.minimoCompra });
     const address = String(gp.address || '').toLowerCase();
+    // (2026-10-27) La cartera que cobra no se compra oro a sí misma: sería oro gratis.
+    if (address === destino) return res.status(409).json({ error: 'misma_cartera', message: 'This wallet is the game wallet itself: it cannot buy Gold from itself.' });
     const pub = await economiaEstadoPublico();
     const comprado = await economiaCompradoHoy(address);
     if (comprado + oro > pub.tope) return res.status(429).json({ error: 'tope_diario', tope: pub.tope, comprado, quedan: Math.max(0, pub.tope - comprado) });
@@ -21544,13 +21606,56 @@ async function economiaLeerPago(txHash) {
   const actual = await provider.send('eth_chainId', []);
   if (BigInt(actual) !== BigInt(CHAIN_ID)) return { error: 'red_incorrecta' };
   const [tx, rc, ultimo] = await Promise.all([provider.getTransaction(txHash), provider.getTransactionReceipt(txHash), provider.getBlockNumber()]);
-  if (!tx || !rc) return { error: 'pendiente' };
+  if (!tx) return { error: 'pendiente', existe: false };
+  if (!rc) return { error: 'pendiente', existe: true };
   if (Number(rc.status) !== 1) return { error: 'revertida' };
   if (Number(ultimo) - Number(rc.blockNumber) + 1 < 1) return { error: 'pendiente' };
   if (tx.chainId !== undefined && tx.chainId !== null && BigInt(tx.chainId) !== BigInt(CHAIN_ID)) return { error: 'red_incorrecta' };
   const bloque = await provider.getBlock(rc.blockNumber);
   return { ok: true, from: String(tx.from || '').toLowerCase(), to: String(tx.to || '').toLowerCase(), valor: BigInt(tx.value || 0),
            datos: String(tx.data || '0x'), bloque: Number(rc.blockNumber), hora: bloque ? Number(bloque.timestamp) * 1000 : Date.now() };
+}
+
+/** Da el oro de un pago ya leído de la cadena. La MISMA cuenta para confirmar, reclamar y la revisión del panel.
+    Devuelve { status, body }. Quien llama va dentro de la cola del jugador (enColaDelJugador). */
+async function economiaAcreditar(gp, c, txHash, pago, extra) {
+  const address = String(gp.address || '').toLowerCase();
+  const id = c._id;
+  if (pago.from !== address) return { status: 409, body: { error: 'otra_cartera', message: 'The payment must come from your game wallet.' } };
+  if (pago.to !== c.destino) return { status: 409, body: { error: 'otro_destino', message: 'The payment went to another address.' } };
+  const pedido = BigInt(c.wei);
+  // Al precio cotizado si llegó a tiempo; si no, lo que valga lo pagado AHORA.
+  let oro = c.oro;
+  const tarde = pago.hora > new Date(c.caduca).getTime() + 5 * 60 * 1000;
+  if (tarde || pago.valor < pedido) {
+    const hoy = await economiaHoy();
+    const precioWei = BigInt(hoy.precioGwei) * 1000000000n;
+    oro = Number(pago.valor / (tarde ? precioWei : BigInt(c.precioGwei) * 1000000000n));
+    oro = Math.min(oro, c.oro * 2);
+  }
+  if (!(oro >= 1)) {
+    await CompraOro.updateOne({ _id: id }, { $set: { estado: 'fallida', txHash, pagadoWei: pago.valor.toString(), motivo: 'pago_insuficiente' } });
+    return { status: 409, body: { error: 'pago_insuficiente', message: 'The payment is too small for 1 Gold. Contact support with your transaction.' } };
+  }
+  // La reserva del hash: si dos peticiones llegan a la vez, solo una da el oro.
+  const marca = Object.assign({ estado: 'acreditada', txHash, oroDado: oro, pagadoWei: pago.valor.toString(), acreditada: new Date(), motivo: '' }, extra || {});
+  const reservada = await CompraOro.findOneAndUpdate({ _id: id, estado: { $in: ['cotizada', 'pagada', 'fallida'] }, $or: [{ txHash: { $exists: false } }, { txHash: null }, { txHash }] },
+    { $set: marca }, { new: true }).lean();
+  if (!reservada) return { status: 409, body: { error: 'ya_procesada' } };
+  const doc = await gfDevolverStat(gp.playerName, 'oro', oro);
+  if (!doc) {
+    await CompraOro.updateOne({ _id: id }, { $set: { estado: 'pagada', motivo: 'sin_stats' } });
+    return { status: 503, body: { error: 'sin_stats', message: 'Your payment is safe. Open the game once and press Check again.' } };
+  }
+  const gwei = Number(pago.valor / 1000000000n);
+  try {
+    await TesoroJuego.updateOne({ _id: TESORO_JUEGO_ID }, { $inc: { 'zkltc.gwei': gwei, 'zkltc.compras': 1, 'zkltc.oro': oro } }, { upsert: true });
+    await TesoroMov.create({ tesoro: 'juego', tipo: 'ingreso', origen: 'compra_oro', bronce: 0, playerName: gp.playerName,
+                             detalle: oro + ' oro por ' + (gwei / 1e9) + ' zkLTC · ' + txHash + (extra && extra.reclamada ? ' · reclamada' : '') });
+  } catch (e) { console.warn('⚠️  tesoro del juego (compra de oro):', e.message); }
+  economiaApuntar({ oroComprado: oro, zkltcGwei: gwei, compras: 1 });
+  console.log(`🪙 ${gp.playerName} compró ${oro} de oro por ${gwei / 1e9} zkLTC (${txHash})${extra && extra.reclamada ? ' [reclamada]' : ''}`);
+  return { status: 200, body: { ok: true, oro, pagado: gwei / 1e9, tarde, stats: buildStatsResponse(doc), settlesInMs: CHAIN_SETTLE_DELAY_MS } };
 }
 
 // POST /api/currency/oro/confirmar { id, txHash } — se mira el pago y se da el oro (una vez).
@@ -21579,43 +21684,65 @@ app.post('/api/currency/oro/confirmar', strictLimiter, authMiddleware, csrfProte
         await CompraOro.updateOne({ _id: id, txHash: { $exists: false } }, { $set: { txHash, estado: 'pagada' } }).catch(() => {});
         return res.status(202).json({ error: 'pendiente', message: 'The payment is not confirmed yet. We will check again.' });
       }
-      if (pago.error) return res.status(409).json({ error: pago.error });
-      if (pago.from !== address) return res.status(409).json({ error: 'otra_cartera', message: 'The payment must come from your game wallet.' });
-      if (pago.to !== c.destino) return res.status(409).json({ error: 'otro_destino', message: 'The payment went to another address.' });
-      const pedido = BigInt(c.wei);
-      // Al precio cotizado si llegó a tiempo; si no, lo que valga lo pagado AHORA.
-      let oro = c.oro;
-      const tarde = pago.hora > new Date(c.caduca).getTime() + 5 * 60 * 1000;
-      if (tarde || pago.valor < pedido) {
-        const hoy = await economiaHoy();
-        const precioWei = BigInt(hoy.precioGwei) * 1000000000n;
-        oro = Number(pago.valor / (tarde ? precioWei : BigInt(c.precioGwei) * 1000000000n));
-        oro = Math.min(oro, c.oro * 2);
+      if (pago.error) {
+        await CompraOro.updateOne({ _id: id, estado: { $ne: 'acreditada' } }, { $set: { motivo: pago.error } }).catch(() => {});
+        return res.status(409).json({ error: pago.error });
       }
-      if (!(oro >= 1)) {
-        await CompraOro.updateOne({ _id: id }, { $set: { estado: 'fallida', txHash, pagadoWei: pago.valor.toString(), motivo: 'pago_insuficiente' } });
-        return res.status(409).json({ error: 'pago_insuficiente', message: 'The payment is too small for 1 Gold. Contact support with your transaction.' });
+      const r = await economiaAcreditar(gp, c, txHash, pago);
+      if (r.status === 409 && (r.body.error === 'otra_cartera' || r.body.error === 'otro_destino')) {
+        await CompraOro.updateOne({ _id: id, estado: { $ne: 'acreditada' } }, { $set: { motivo: r.body.error } }).catch(() => {});
       }
-      // La reserva del hash: si dos peticiones llegan a la vez, solo una da el oro.
-      const reservada = await CompraOro.findOneAndUpdate({ _id: id, estado: { $in: ['cotizada', 'pagada'] }, $or: [{ txHash: { $exists: false } }, { txHash }] },
-        { $set: { estado: 'acreditada', txHash, oroDado: oro, pagadoWei: pago.valor.toString(), acreditada: new Date() } }, { new: true }).lean();
-      if (!reservada) return res.status(409).json({ error: 'ya_procesada' });
-      const doc = await gfDevolverStat(gp.playerName, 'oro', oro);
-      if (!doc) {
-        await CompraOro.updateOne({ _id: id }, { $set: { estado: 'pagada', motivo: 'sin_stats' } });
-        return res.status(503).json({ error: 'sin_stats', message: 'Your payment is safe. Open the game once and press Check again.' });
-      }
-      const gwei = Number(pago.valor / 1000000000n);
-      try {
-        await TesoroJuego.updateOne({ _id: TESORO_JUEGO_ID }, { $inc: { 'zkltc.gwei': gwei, 'zkltc.compras': 1, 'zkltc.oro': oro } }, { upsert: true });
-        await TesoroMov.create({ tesoro: 'juego', tipo: 'ingreso', origen: 'compra_oro', bronce: 0, playerName: gp.playerName,
-                                 detalle: oro + ' oro por ' + (gwei / 1e9) + ' zkLTC · ' + txHash });
-      } catch (e) { console.warn('⚠️  tesoro del juego (compra de oro):', e.message); }
-      economiaApuntar({ oroComprado: oro, zkltcGwei: gwei, compras: 1 });
-      console.log(`🪙 ${gp.playerName} compró ${oro} de oro por ${gwei / 1e9} zkLTC (${txHash})`);
-      return res.json({ ok: true, oro, pagado: gwei / 1e9, tarde, stats: buildStatsResponse(doc), settlesInMs: CHAIN_SETTLE_DELAY_MS });
+      return res.status(r.status).json(r.body);
     });
   } catch (e) { console.error('POST /api/currency/oro/confirmar:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// POST /api/currency/oro/reclamar { txHash } — (2026-10-27) "si un usuario recarga y se le va la luz y no le
+// caen las monedas, que pueda reclamar con el tx de su historial". Se busca el pago en la cadena: de SU
+// cartera, a la del juego; se casa con su cotización (o, si se perdió, al precio de ahora) y se da el oro una vez.
+app.post('/api/currency/oro/reclamar', strictLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const txHash = String((req.body && req.body.txHash) || '').trim().toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(txHash)) return res.status(400).json({ error: 'hash_invalido' });
+    const address = String(gp.address || '').toLowerCase();
+    return await enColaDelJugador(address, async () => {
+      const usada = await CompraOro.findOne({ txHash }).lean();
+      if (usada && usada.address !== address) {
+        gfAlertar('recarga_hash_ajeno', 'grave', gp, { txHash, de: usada.playerName }, 'recarga_hash_ajeno:' + txHash);
+        return res.status(409).json({ error: 'hash_ya_usado' });
+      }
+      if (usada && usada.estado === 'acreditada') {
+        const st = await PlayerStats.findOne({ playerName: gp.playerName }).lean();
+        return res.json({ ok: true, repetida: true, oro: usada.oroDado, stats: st ? buildStatsResponse(st) : undefined });
+      }
+      const pago = await economiaLeerPago(txHash);
+      if (pago.error === 'pendiente' && pago.existe === false) return res.status(409).json({ error: 'no_encontrada' });
+      if (pago.error === 'pendiente') return res.status(202).json({ error: 'pendiente', message: 'The payment is not confirmed yet. Try again in a minute.' });
+      if (pago.error) return res.status(409).json({ error: pago.error });
+      if (pago.from !== address) {
+        gfAlertar('recarga_cartera_ajena', 'aviso', gp, { txHash, from: pago.from }, 'recarga_cartera_ajena:' + txHash);
+        return res.status(409).json({ error: 'otra_cartera', message: 'That payment came from another wallet.' });
+      }
+      let c = usada || await CompraOro.findOne({ address, destino: pago.to, estado: { $in: ['cotizada', 'pagada', 'fallida'] },
+        $or: [{ txHash: { $exists: false } }, { txHash: null }], creada: { $lte: new Date(pago.hora + 60000) } }).sort({ creada: -1 }).lean();
+      if (!c) {
+        // Sin cotización (se perdió): vale si fue a la cartera del juego (la de ahora o la de alguna cotización suya).
+        const cfg = await economiaConfig();
+        const destinos = new Set([economiaDestino(cfg), ...(await CompraOro.distinct('destino', { address }))].filter(Boolean));
+        if (!destinos.has(pago.to)) return res.status(409).json({ error: 'otro_destino', message: 'That payment went to another address.' });
+        const hoy = await economiaHoy();
+        const precioWei = BigInt(hoy.precioGwei) * 1000000000n;
+        const oroQ = Math.max(1, Number(pago.valor / precioWei));
+        c = (await CompraOro.create({ _id: crypto.randomBytes(12).toString('hex'), playerName: gp.playerName, address, oro: oroQ,
+          wei: (precioWei * BigInt(oroQ)).toString(), precioGwei: hoy.precioGwei, destino: pago.to, dia: _diaUTC(),
+          creada: new Date(pago.hora), caduca: new Date(pago.hora + ECONOMIA_COTIZACION_MS), reclamada: true })).toObject();
+      }
+      const r = await economiaAcreditar(gp, c, txHash, pago, { reclamada: true });
+      return res.status(r.status).json(r.body);
+    });
+  } catch (e) { console.error('POST /api/currency/oro/reclamar:', e); return res.status(500).json({ error: 'internal_error' }); }
 });
 
 // ── EL CENTRO DE CONTROL: el tesoro del juego y la economía ─────────────────
@@ -21653,14 +21780,19 @@ app.get('/api/admin/economia', adminAuth, apiLimiter, async (req, res) => {
     return res.json({ ok: true, juego: tesoroJuegoPublico(tj), circular: tesoroPublico(tc), config: cfg, base: ECONOMIA_CONFIG_BASE,
       destino: economiaDestino(cfg), destinoServidor: !cfg.cartera, economia: pub, serieJuego: dias.map((d) => porDia.get(d)),
       ultimos: ultimos.map((m) => ({ t: m.t, tipo: m.tipo, origen: m.origen, bronce: m.bronce, playerName: m.playerName, detalle: m.detalle })),
-      compras: compras.map((c) => ({ id: c._id, t: c.creada, playerName: c.playerName, oro: c.oro, oroDado: c.oroDado, estado: c.estado,
+      compras: compras.map((c) => ({ id: c._id, t: c.creada, playerName: c.playerName, address: c.address || '', oro: c.oro, oroDado: c.oroDado, estado: c.estado,
                                      zkltc: Number(BigInt(c.wei) / 1000000000n) / 1e9, pagado: Number(BigInt(c.pagadoWei || '0') / 1000000000n) / 1e9,
-                                     txHash: c.txHash || null, motivo: c.motivo || '' })) });
+                                     txHash: c.txHash || null, motivo: c.motivo || '', reclamada: !!c.reclamada, revisadaPor: c.revisadaPor || '' })) });
   } catch (e) { console.error('GET /api/admin/economia:', e); return res.status(500).json({ error: 'internal_error' }); }
 });
 app.post('/api/admin/economia/config', adminAuth, strictLimiter, async (req, res) => {
   try {
     const c = economiaNormalizarConfig(req.body && req.body.config);
+    // (2026-10-27) Sin cartera escrita, el zkLTC va a la del administrador que guarda (no a la del servidor).
+    if (!c.cartera) {
+      const a = String((req.admin && req.admin.address) || '').toLowerCase();
+      if (/^0x[0-9a-f]{40}$/.test(a)) c.cartera = a;
+    }
     await TesoroJuego.updateOne({ _id: TESORO_JUEGO_ID }, { $set: { config: c } }, { upsert: true });
     _economiaCfg = c; _economiaCfgEn = Date.now(); _economiaEstado = null;
     await economiaFoto().catch(() => {});
@@ -21706,6 +21838,687 @@ app.use('/api/marketplace', (req, res, next) => {
   if (req.method !== 'POST' || !GF_MERCADO_CON_VIP.test(req.path)) return next();
   return authMiddleware(req, res, () => gfExigeNombre(req, res, () => gfExigeVip(req, res, next)));
 });
+// =============================================================================
+// AUDITORÍA: RECARGAS, TIENDA, P2P, SUELO E INTENTOS             (2026-10-27)
+// -----------------------------------------------------------------------------
+// "Quiero un panel nuevo para saber quién compró, cuánto gastó y si pagó o no;
+// ver si el gasto al comprar y al vender es el correcto; que cualquier error de
+// compra o venta aparezca en el historial para solucionarlo después (tienda del
+// juego y P2P); quién recogió un dropeo y de quién, y si se lo pasó a otro, como
+// un explorer; suspender por días o bloquear a un usuario que suelte objetos
+// (nunca lo que sueltan los enemigos); y que los intentos desesperados salgan
+// en el centro de control con carteras y nombres."
+//
+//   · TiendaOp      cada compra/venta de la tienda del juego (la orquesta el
+//                   cliente: el servidor recalcula con SU tabla TIENDA_PRECIOS lo
+//                   que debía costar y lo compara) y cada fallo del P2P.
+//   · MovMoneda     cada cambio de oro/plata/bronce que entra por
+//                   /api/stats/:p/update (el único sitio donde el cliente fija un
+//                   saldo): así se ve si el cobro llegó de verdad y qué subidas no
+//                   tienen ninguna compra o venta detrás.
+//   · SueloMov      cada montón soltado: quién, qué, dónde, quién lo recogió y de
+//                   qué montones venía (la cadena de manos).
+//   · SueloCastigo  suspendido N días o bloqueado para SOLTAR.
+//   · AlertaJuego   los intentos: recoger o comprar por debajo del nivel, soltar
+//                   estando castigado, precios que no cuadran, cobros que no
+//                   llegan… Las repetidas se suman (`veces`), no se apilan.
+// Todo esto se apunta SIN esperar y sin poder romper la jugada (catch y aviso).
+// =============================================================================
+
+/* EL NIVEL DE CADA OBJETO: "todos los objetos de la tienda tienen un nivel; si
+   uno de nivel 12 compra algo de nivel 11 y se lo suelta a uno de nivel 2, ese
+   no lo puede recoger. La cosecha tiene el nivel de su semilla; lo crafteado,
+   lo de construcción y lo que sueltan los monstruos también." La MISMA tabla que
+   gf-niveles-objetos.js (el cliente bloquea la compra y avisa al recoger); aquí
+   manda al recoger del suelo y en el P2P. Va con los mapas (GF_NIVEL_MAPA): lo
+   de la mina desde el 2, lo del salvaje desde el 4… Lo que no está es nivel 1. */
+const GF_NIVEL_OBJETO = Object.freeze({
+  // Semillas y su cosecha (la cosecha, el nivel de su semilla)
+  Semillax: 1, zanahoria_buena: 1, zanahoria_corta: 1, zanahoria_mala: 1,
+  Semillax4: 3, fresa_buena: 3, fresa_corta: 3, fresa_mala: 3,
+  Semillax1: 3, tomate_buena: 3, tomate_corta: 3, tomate_mala: 3,
+  Semillax2: 5, trigo_buena: 5, trigo_corta: 5, trigo_mala: 5,
+  Semillax3: 6, calabaza_buena: 6, calabaza_corta: 6, calabaza_mala: 6,
+  // Herramientas
+  Regaderax: 1, Tijerasx: 1, balde_vacio: 1, balde_con_agua: 1,
+  hacha_de_madera: 1, pico_de_madera: 2, hacha_de_piedra: 3, pico_de_piedra: 3,
+  hacha_de_cobre: 5, pico_de_cobre: 5, hacha_de_hierro: 7, pico_de_hierro: 7,
+  // Materiales (madera del pueblo; piedra y carbón de la mina; lingotes del horno)
+  palo: 1, madera_pinos: 1, madera_con_hojas: 1, madera_seca: 1, tablon_de_madera: 2,
+  mineral_piedra: 2, mineral_carbon: 2, carbon: 2, mineral_piedra_cobre: 3, mineral_cobre: 4,
+  mineral_piedra_hierro: 5, mineral_hierro: 6,
+  // Pociones
+  pocion_vida: 2, pocion_mascota: 2, pocion_antidoto: 3, elixir_revivir: 4, pocion_mascota_grande: 5,
+  // Peces: los comunes, nivel 1; los raros y los venenosos, más
+  pes3: 3, pes7: 3, pes8: 3, pes13: 3, pes14: 3, pes6: 4, pes12: 5,
+  // Construcción
+  antorcha: 2, parcela: 3, pala_construccion: 3, espantapajaros: 3, basura: 3,
+  cofre1: 4, cofre2: 5, cofre3: 7, cofre4: 9,
+  // Equipo
+  cana_pescar: 1, espada_madera: 2, espada_cobre: 4, arco: 4, bote: 5, baston_mago: 6, espada_hierro: 7
+});
+function gfNivelDeObjeto(itemId) {
+  const k = String(itemId || '');
+  return Object.prototype.hasOwnProperty.call(GF_NIVEL_OBJETO, k) ? GF_NIVEL_OBJETO[k] : 1;
+}
+
+const tiendaOpSchema = new mongoose.Schema({
+  _id:          { type: String },                      // ref de la operación (la pone el cliente) o 'p2p:…'
+  tienda:       { type: String, default: 'juego', index: true },   // juego | p2p
+  op:           { type: String, default: '' },         // compra | venta | p2p …
+  playerName:   { type: String, index: true },
+  address:      { type: String, lowercase: true, index: true },
+  username:     { type: String, default: '' },
+  nivel:        { type: Number, default: 0 },
+  itemId:       { type: String, default: '' },
+  cantidad:     { type: Number, default: 0 },
+  moneda:       { type: String, default: '' },          // oro | plata | bronce
+  cliente:      { type: Object, default: {} },          // lo que cuenta el cliente
+  esperado:     { type: Object, default: {} },          // lo que dice la tabla del servidor
+  verificacion: { type: Object, default: null },        // lo que vio el servidor en los saldos
+  estado:       { type: String, default: 'en_curso', index: true },
+  fase:         { type: String, default: '' },
+  error:        { type: String, default: '' },
+  avisos:       { type: [String], default: [] },
+  problema:     { type: Boolean, default: false, index: true },
+  revisada:     { type: Boolean, default: false },
+  nota:         { type: String, default: '' },
+  t:            { type: Date, default: Date.now, index: true },
+  tFin:         { type: Date, default: null }
+}, { collection: 'tienda_ops', versionKey: false, minimize: false });
+const TiendaOp = mongoose.models.TiendaOp || mongoose.model('TiendaOp', tiendaOpSchema);
+
+const movMonedaSchema = new mongoose.Schema({
+  playerName: { type: String },
+  stat:       { type: String },
+  antes:      { type: Number }, despues: { type: Number }, delta: { type: Number },
+  bronce:     { type: Number },                        // el cambio, en bronce
+  via:        { type: String, default: 'update' },
+  t:          { type: Date, default: Date.now }
+}, { collection: 'movs_moneda', versionKey: false });
+movMonedaSchema.index({ playerName: 1, t: -1 });
+movMonedaSchema.index({ t: 1 }, { expireAfterSeconds: 120 * 86400 });
+const MovMoneda = mongoose.models.MovMoneda || mongoose.model('MovMoneda', movMonedaSchema);
+
+const sueloMovSchema = new mongoose.Schema({
+  _id:       { type: String },                         // el id del montón
+  itemId:    { type: String }, cantidad: { type: Number }, nivelItem: { type: Number, default: 1 },
+  sala:      { type: String }, x: { type: Number }, y: { type: Number },
+  de:        { type: Object, default: null },          // { playerName, username, address, nivel }
+  para:      { type: Object, default: null },
+  estado:    { type: String, default: 'en_suelo' },    // en_suelo | recogido | caducado
+  viene:     { type: [String], default: [] },          // montones que el que suelta había recogido antes
+  pasadoA:   { type: [String], default: [] },
+  pasado:    { type: Boolean, default: false },
+  t:         { type: Date, default: Date.now }, tRecogido: { type: Date, default: null }, tFin: { type: Date, default: null }
+}, { collection: 'suelo_movs', versionKey: false, minimize: false });
+sueloMovSchema.index({ 'de.playerName': 1, t: -1 });
+sueloMovSchema.index({ 'para.playerName': 1, tRecogido: -1 });
+sueloMovSchema.index({ t: -1 });
+const SueloMov = mongoose.models.SueloMov || mongoose.model('SueloMov', sueloMovSchema);
+
+const sueloCastigoSchema = new mongoose.Schema({
+  _id:        { type: String },                        // playerName
+  address:    { type: String, lowercase: true }, username: { type: String, default: '' },
+  permanente: { type: Boolean, default: false },
+  hasta:      { type: Date, default: null },
+  motivo:     { type: String, default: '' }, por: { type: String, default: '' },
+  t:          { type: Date, default: Date.now }
+}, { collection: 'suelo_castigos', versionKey: false });
+const SueloCastigo = mongoose.models.SueloCastigo || mongoose.model('SueloCastigo', sueloCastigoSchema);
+
+const alertaJuegoSchema = new mongoose.Schema({
+  _id:        { type: String },                        // la clave que agrupa los repetidos
+  tipo:       { type: String, index: true },
+  gravedad:   { type: String, default: 'aviso' },      // info | aviso | grave
+  playerName: { type: String, index: true }, address: { type: String, lowercase: true }, username: { type: String, default: '' },
+  nivel:      { type: Number, default: 0 },
+  itemId:     { type: String, default: '' },
+  datos:      { type: Object, default: {} },
+  veces:      { type: Number, default: 0 },
+  t:          { type: Date, default: Date.now }, ultima: { type: Date, default: Date.now, index: true },
+  revisada:   { type: Boolean, default: false }
+}, { collection: 'alertas_juego', versionKey: false, minimize: false });
+const AlertaJuego = mongoose.models.AlertaJuego || mongoose.model('AlertaJuego', alertaJuegoSchema);
+Promise.all([TiendaOp.init(), MovMoneda.init(), SueloMov.init(), SueloCastigo.init(), AlertaJuego.init()])
+  .catch((e) => console.warn('⚠️  auditoría: índices:', e.message));
+
+const gfEscRx = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** Quién es (para las fichas): nombre, usuario, cartera y nivel. Caché de un minuto. */
+const _gfQuienCache = new Map();
+async function gfQuien(gpONombre) {
+  let gp = gpONombre && typeof gpONombre === 'object' ? gpONombre : null;
+  const nombre = gp ? gp.playerName : String(gpONombre || '');
+  if (!nombre) return null;
+  const c = _gfQuienCache.get(nombre);
+  if (c && Date.now() - c.en < 60000) return c.v;
+  if (!gp || gp.nivel_exp === undefined) gp = await GamePlayer.findOne({ playerName: nombre }).select('playerName Username address nivel_exp').lean().catch(() => null) || gp;
+  if (!gp) return { playerName: nombre, username: '', address: '', nivel: 0 };
+  const v = { playerName: gp.playerName, username: String(gp.Username || ''), address: String(gp.address || '').toLowerCase(),
+              nivel: await gfNivelDeJugador(gp).catch(() => 0) };
+  if (_gfQuienCache.size > 5000) _gfQuienCache.clear();
+  _gfQuienCache.set(nombre, { v, en: Date.now() });
+  return v;
+}
+
+/** Una alerta para el centro de control. Las repetidas (misma `clave`) suman `veces` y vuelven a salir sin revisar. */
+function gfAlertar(tipo, gravedad, gp, datos, clave) {
+  Promise.resolve().then(async () => {
+    const q = await gfQuien(gp);
+    const id = clave ? String(clave).slice(0, 200) : crypto.randomBytes(10).toString('hex');
+    await AlertaJuego.updateOne({ _id: id }, {
+      $set: { tipo, gravedad, playerName: q ? q.playerName : '', address: q ? q.address : '', username: q ? q.username : '', nivel: q ? q.nivel : 0,
+              itemId: String((datos && datos.itemId) || ''), datos: datos || {}, ultima: new Date(), revisada: false },
+      $setOnInsert: { t: new Date() }, $inc: { veces: 1 } }, { upsert: true });
+  }).catch((e) => console.warn('⚠️  auditoría: alerta:', e.message));
+}
+
+/* ── EL CASTIGO PARA SOLTAR ─────────────────────────────────────────────── */
+const _gfCastigoCache = new Map();
+function gfCastigoVivo(d) {
+  if (!d) return null;
+  if (d.permanente) return d;
+  return d.hasta && new Date(d.hasta).getTime() > Date.now() ? d : null;
+}
+async function gfCastigoSoltar(playerName) {
+  const c = _gfCastigoCache.get(playerName);
+  if (c && Date.now() - c.en < 20000) return gfCastigoVivo(c.doc);
+  const doc = await SueloCastigo.findById(String(playerName || '')).lean().catch(() => null);
+  if (_gfCastigoCache.size > 5000) _gfCastigoCache.clear();
+  _gfCastigoCache.set(playerName, { doc, en: Date.now() });
+  return gfCastigoVivo(doc);
+}
+
+/* ── EL SUELO, APUNTADO ─────────────────────────────────────────────────── */
+/** Al soltar: el montón queda apuntado y, si el que suelta lo había recogido de otro, de qué montones venía. */
+function gfSueloSoltado(gp, m) {
+  Promise.resolve().then(async () => {
+    const de = await gfQuien(gp);
+    const previos = await SueloMov.find({ 'para.playerName': gp.playerName, itemId: m.itemId, estado: 'recogido', pasado: { $ne: true },
+      tRecogido: { $gte: new Date(Date.now() - 7 * 86400000) } }).sort({ tRecogido: -1 }).limit(20).select('_id cantidad').lean();
+    const viene = [];
+    let falta = m.cantidad;
+    for (const p of previos) { if (falta <= 0) break; viene.push(p._id); falta -= Number(p.cantidad) || 0; }
+    await SueloMov.updateOne({ _id: m.id }, {
+      $set: { itemId: m.itemId, cantidad: m.cantidad, nivelItem: gfNivelDeObjeto(m.itemId), sala: m.sala, x: m.x, y: m.y, de, viene },
+      $setOnInsert: { estado: 'en_suelo', t: new Date() } }, { upsert: true });
+    if (viene.length) await SueloMov.updateMany({ _id: { $in: viene } }, { $set: { pasado: true }, $addToSet: { pasadoA: m.id } });
+  }).catch((e) => console.warn('⚠️  auditoría: suelo soltado:', e.message));
+}
+function gfSueloRecogido(gp, m) {
+  Promise.resolve().then(async () => {
+    const para = await gfQuien(gp);
+    await SueloMov.updateOne({ _id: m.id }, {
+      $set: { para, estado: 'recogido', tRecogido: new Date() },
+      $setOnInsert: { itemId: m.itemId, cantidad: m.cantidad, nivelItem: gfNivelDeObjeto(m.itemId), sala: m.sala, x: m.x, y: m.y,
+                      de: { playerName: m.de, username: m.deNombre || '', address: '', nivel: 0 }, t: new Date() } }, { upsert: true });
+  }).catch((e) => console.warn('⚠️  auditoría: suelo recogido:', e.message));
+}
+function gfSueloCaducados(ids) {
+  if (ids && ids.length) SueloMov.updateMany({ _id: { $in: ids }, estado: 'en_suelo' }, { $set: { estado: 'caducado', tFin: new Date() } })
+    .catch((e) => console.warn('⚠️  auditoría: suelo caducado:', e.message));
+}
+
+/* ── LOS SALDOS QUE FIJA EL CLIENTE ─────────────────────────────────────── */
+function gfApuntarMovMoneda(playerName, cambios) {
+  const docs = (cambios || []).filter((c) => c && c.delta).map((c) => ({ playerName, stat: c.stat, antes: c.antes, despues: c.despues, delta: c.delta,
+    bronce: c.delta * (TESORO_BRONCE_POR[c.stat] || 0), via: 'update', t: new Date() }));
+  if (docs.length) MovMoneda.insertMany(docs, { ordered: false }).catch((e) => console.warn('⚠️  auditoría: saldo:', e.message));
+}
+
+/* ── LA TIENDA DEL JUEGO ────────────────────────────────────────────────── */
+const GF_TIENDA_MONEDA = { gold: 'oro', silver: 'plata', bronze: 'bronce', oro: 'oro', plata: 'plata', bronce: 'bronce' };
+/** Lo que DEBÍA costar (o pagar) según la tabla del servidor. */
+function gfEsperadoTienda(op, itemId, cantidad, moneda) {
+  const p = Object.prototype.hasOwnProperty.call(TIENDA_PRECIOS, itemId) ? TIENDA_PRECIOS[itemId] : null;
+  if (!p) return { conocido: false, nivel: gfNivelDeObjeto(itemId) };
+  const nativa = p[2] === 'p' ? 'plata' : 'oro';
+  const unidad = Number(op === 'compra' ? p[0] : p[1]) || 0;
+  let precioUnidad = unidad, en = nativa;
+  if (op === 'compra' && moneda === 'bronce') { precioUnidad = unidad * TESORO_BRONCE_POR[nativa]; en = 'bronce'; }
+  return { conocido: true, moneda: en, nativa, precioUnidad, total: Math.round(precioUnidad * cantidad * 100) / 100,
+           fee: tesoroComisionTienda(itemId, op, cantidad), nivel: gfNivelDeObjeto(itemId), soloVenta: op === 'compra' && !(Number(p[0]) > 0) };
+}
+function gfNumero(v) { const x = Number(v); return v === null || v === undefined || v === '' || !Number.isFinite(x) ? null : Math.round(x * 100) / 100; }
+
+/** ¿Llegó el cobro (o el pago) al servidor? Lo que cambió el saldo por /update alrededor de la operación. */
+async function gfVerificarCobro(ref) {
+  const op = await TiendaOp.findById(ref).lean();
+  if (!op || op.tienda !== 'juego' || !op.playerName) return;
+  const t0 = new Date(op.t).getTime(), t1 = op.tFin ? new Date(op.tFin).getTime() : Date.now();
+  const desde = new Date(t0 - 15000), hasta = new Date(t1 + 60000);
+  const otras = await TiendaOp.countDocuments({ _id: { $ne: ref }, playerName: op.playerName, tienda: 'juego', t: { $lte: hasta },
+    $or: [{ tFin: { $gte: desde } }, { tFin: null }] });
+  const movs = await MovMoneda.find({ playerName: op.playerName, t: { $gte: desde, $lte: hasta } }).lean();
+  const visto = movs.reduce((s, m) => s + (Number(m.bronce) || 0), 0);
+  const c = op.cliente || {};
+  let esperado;
+  if (op.op === 'compra') {
+    const conf = c.confirmadas !== undefined ? c.confirmadas : op.cantidad;
+    const factor = TESORO_BRONCE_POR[op.moneda] || 0;
+    esperado = -(Number(c.precioUnidad) || 0) * conf * factor - (conf > 0 && (Number(c.fee) || 0) > 0 ? tesoroComisionTienda(op.itemId, 'compra', conf) : 0);
+  } else {
+    esperado = Number(c.pagadoBronce) || 0;
+  }
+  const verificacion = { visto, esperado, movs: movs.length, solapada: otras > 0, en: new Date() };
+  let aviso = null;
+  if (!otras) {
+    if (!movs.length && esperado !== 0) aviso = 'cobro_no_visto';
+    else if (Math.abs(visto - esperado) > Math.max(2, Math.abs(esperado) * 0.002)) aviso = 'cobro_distinto';
+  }
+  const upd = { $set: { verificacion } };
+  if (aviso) { upd.$addToSet = { avisos: aviso }; upd.$max = { problema: true }; }
+  await TiendaOp.updateOne({ _id: ref }, upd);
+  if (aviso) gfAlertar('tienda_cobro', 'grave', op.playerName, { itemId: op.itemId, ref, op: op.op, visto, esperado }, 'tienda_cobro:' + ref);
+}
+
+// POST /api/tienda/registro — el cliente cuenta cada compra y venta de la tienda del juego (inicio, fin o error).
+app.post('/api/tienda/registro', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const b = req.body || {};
+    const ref = String(b.ref || '');
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(ref)) return res.status(400).json({ error: 'ref_invalida' });
+    const fase = ['inicio', 'fin', 'error'].includes(b.fase) ? b.fase : null;
+    const op = b.op === 'venta' ? 'venta' : b.op === 'compra' ? 'compra' : null;
+    if (!fase || !op) return res.status(400).json({ error: 'datos_invalidos' });
+    const itemId = String(b.itemId || '').slice(0, 60);
+    const cantidad = Math.max(0, Math.min(100000, Math.floor(Number(b.cantidad) || 0)));
+    const moneda = GF_TIENDA_MONEDA[b.moneda] || '';
+    const cliente = {};
+    for (const k of ['precioUnidad', 'total', 'fee', 'confirmadas', 'pagadoBronce', 'reembolso', 'feeDevuelto', 'yaGastadas', 'saldoAntes', 'saldoDespues']) {
+      const v = gfNumero(b[k]); if (v !== null) cliente[k] = v;
+    }
+    if (typeof b.guardada === 'boolean') cliente.guardada = b.guardada;
+    const error = String(b.error || '').slice(0, 300), grave = b.grave === true;
+    const q = await gfQuien(gp);
+    const esp = gfEsperadoTienda(op, itemId, cantidad, moneda);
+    const avisos = [];
+    let estado = null;
+    if (fase === 'inicio') {
+      estado = 'en_curso';
+      if (!esp.conocido) avisos.push('objeto_desconocido');
+      else {
+        if (esp.soloVenta) avisos.push('compra_de_solo_venta');
+        if (cliente.precioUnidad !== undefined && Math.abs(cliente.precioUnidad - esp.precioUnidad) > 0.001) avisos.push('precio_distinto');
+        if (cliente.total !== undefined && Math.abs(cliente.total - esp.total) > 0.001) avisos.push('total_distinto');
+        if (moneda && moneda !== esp.moneda) avisos.push('moneda_distinta');
+        if (cliente.fee !== undefined && cliente.fee > 0 && Math.abs(cliente.fee - esp.fee) > 1) avisos.push('comision_distinta');
+      }
+      if (op === 'compra' && q && q.nivel < esp.nivel) avisos.push('nivel_bajo');
+    } else if (fase === 'fin') {
+      const conf = cliente.confirmadas !== undefined ? cliente.confirmadas : null;
+      if (op === 'compra') {
+        estado = conf === null || conf >= cantidad ? 'ok' : conf > 0 ? 'parcial' : 'reembolsada';
+        if (conf !== null && conf < cantidad && esp.conocido && cliente.reembolso !== undefined) {
+          const debe = Math.round((cantidad - conf) * (cliente.precioUnidad !== undefined ? cliente.precioUnidad : esp.precioUnidad) * 100) / 100;
+          if (Math.abs(cliente.reembolso - debe) > 0.001) avisos.push('reembolso_distinto');
+        }
+        if (cliente.guardada === false) avisos.push('sin_guardar');
+      } else {
+        estado = conf === null || conf >= cantidad ? 'ok' : conf > 0 ? 'parcial' : ((cliente.yaGastadas || 0) > 0 ? 'ya_gastada' : 'no_vendida');
+        if (conf > 0 && esp.conocido && cliente.pagadoBronce !== undefined) {
+          const debe = Math.max(0, esp.precioUnidad * conf * (TESORO_BRONCE_POR[esp.moneda] || 0) - tesoroComisionTienda(itemId, 'venta', conf));
+          if (Math.abs(cliente.pagadoBronce - debe) > 1) avisos.push('pago_distinto');
+        }
+      }
+    } else {
+      estado = grave ? 'error' : 'rechazada';
+    }
+    // Una compra reembolsada o una venta que no salió también son fallos de la tienda (se revisan desde el panel).
+    const problema = avisos.length > 0 || ['error', 'parcial', 'reembolsada', 'no_vendida'].includes(estado);
+    const set = { fase, estado, problema };
+    for (const k of Object.keys(cliente)) set['cliente.' + k] = cliente[k];
+    if (fase === 'inicio' || fase === 'error') set.esperado = esp;
+    if (fase !== 'inicio') set.tFin = new Date();
+    if (error) set.error = error;
+    const upd = { $set: set, $setOnInsert: { tienda: 'juego', op, playerName: gp.playerName, address: q ? q.address : String(gp.address || '').toLowerCase(),
+                                               username: q ? q.username : '', nivel: q ? q.nivel : 0, itemId, cantidad, moneda, t: new Date() } };
+    if (avisos.length) upd.$addToSet = { avisos: { $each: avisos } };
+    // Un problema no se borra con una fase posterior que vaya bien.
+    if (problema) { upd.$max = { problema: true }; delete set.problema; }
+    else { delete set.problema; upd.$setOnInsert.problema = false; }
+    await TiendaOp.updateOne({ _id: ref }, upd, { upsert: true });
+    const datos = { itemId, cantidad, ref, op, avisos, nivel: q ? q.nivel : 0, nivelRequerido: esp.nivel };
+    if (avisos.includes('nivel_bajo')) gfAlertar('compra_nivel', 'grave', gp, datos, 'compra_nivel:' + gp.playerName + ':' + itemId);
+    if (avisos.some((a) => ['precio_distinto', 'total_distinto', 'compra_de_solo_venta', 'moneda_distinta', 'pago_distinto', 'reembolso_distinto'].includes(a))) {
+      gfAlertar('tienda_precio', 'grave', gp, datos, 'tienda_precio:' + ref);
+    }
+    if (fase === 'error' && grave) gfAlertar('tienda_error', 'aviso', gp, Object.assign({ error }, datos), 'tienda_error:' + ref);
+    if (fase === 'fin') { const tm = setTimeout(() => { gfVerificarCobro(ref).catch((e) => console.warn('⚠️  auditoría: verificar cobro:', e.message)); }, 90000); if (tm.unref) tm.unref(); }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/tienda/registro:', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+/* ── EL P2P: sus fallos, desde el envoltorio de marketplace-routes.js ───── */
+function gfAuditarMercado(req, status, body) {
+  Promise.resolve().then(async () => {
+    const address = String((req.user && req.user.address) || '').toLowerCase();
+    const gp = address ? await GamePlayer.findOne({ address }).select('playerName Username address nivel_exp').lean() : null;
+    const q = gp ? await gfQuien(gp) : null;
+    const ruta = String(req.originalUrl || req.url || '').split('?')[0].replace(/^\/api\/marketplace\//, '').slice(0, 80);
+    const cuerpo = {};
+    for (const k of ['qty', 'pricePerUnit', 'currency', 'itemId', 'slotId']) if (req.body && req.body[k] !== undefined) cuerpo[k] = String(req.body[k]).slice(0, 60);
+    const codigo = String((body && body.error) || ('http_' + status));
+    const grave = status >= 500;
+    await TiendaOp.create({ _id: 'p2p:' + crypto.randomBytes(9).toString('hex'), tienda: 'p2p', op: req.method + ' ' + ruta,
+      playerName: q ? q.playerName : '', address, username: q ? q.username : '', nivel: q ? q.nivel : 0,
+      itemId: cuerpo.itemId || '', cantidad: Number(cuerpo.qty) || 0, cliente: cuerpo, estado: grave ? 'error' : 'rechazada', fase: 'error',
+      error: codigo + (body && body.message ? ': ' + String(body.message).slice(0, 160) : ''), problema: grave, t: new Date(), tFin: new Date() });
+    if (grave) gfAlertar('p2p_error', 'grave', gp ? gp : (q && q.playerName) || address, { ruta, codigo, status }, 'p2p_error:' + address + ':' + ruta + ':' + Math.floor(Date.now() / 600000));
+  }).catch((e) => console.warn('⚠️  auditoría: p2p:', e.message));
+}
+
+/* ── EL CENTRO DE CONTROL ───────────────────────────────────────────────── */
+/** Los playerName que casan con lo que se busca (cartera, nombre de cuenta o de usuario). */
+async function gfBuscarJugadores(q, limite) {
+  const s = String(q || '').trim();
+  if (!s) return null;
+  if (/^0x[0-9a-fA-F]{40}$/.test(s)) {
+    const gp = await GamePlayer.findOne({ address: s.toLowerCase() }).select('playerName').lean();
+    return gp ? [gp.playerName] : [s.toLowerCase()];
+  }
+  const exacto = new RegExp('^' + gfEscRx(s) + '$', 'i'), parte = new RegExp(gfEscRx(s), 'i');
+  let gps = await GamePlayer.find({ $or: [{ playerName: exacto }, { Username: exacto }] }).select('playerName').limit(5).lean();
+  if (!gps.length) gps = await GamePlayer.find({ $or: [{ playerName: parte }, { Username: parte }] }).select('playerName').limit(limite || 30).lean();
+  return gps.map((g) => g.playerName);
+}
+
+app.get('/api/admin/auditoria/resumen', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const hace24 = new Date(Date.now() - 86400000), hace10m = new Date(Date.now() - 600000);
+    const [ops24, problemas, enCurso, p2pErr, soltados, recogidos, castigos, alertas, porTipo] = await Promise.all([
+      TiendaOp.countDocuments({ tienda: 'juego', t: { $gte: hace24 } }),
+      TiendaOp.countDocuments({ problema: true, revisada: { $ne: true } }),
+      TiendaOp.countDocuments({ tienda: 'juego', estado: 'en_curso', t: { $lt: hace10m, $gte: new Date(Date.now() - 7 * 86400000) } }),
+      TiendaOp.countDocuments({ tienda: 'p2p', t: { $gte: hace24 } }),
+      SueloMov.countDocuments({ t: { $gte: hace24 } }),
+      SueloMov.countDocuments({ tRecogido: { $gte: hace24 } }),
+      SueloCastigo.find({}).lean(),
+      AlertaJuego.countDocuments({ revisada: { $ne: true } }),
+      AlertaJuego.aggregate([{ $match: { revisada: { $ne: true } } }, { $group: { _id: '$tipo', n: { $sum: 1 }, veces: { $sum: '$veces' } } }])
+    ]);
+    return res.json({ ok: true, tienda: { ops24h: ops24, problemas, sinTerminar: enCurso, p2pFallos24h: p2pErr },
+      suelo: { soltados24h: soltados, recogidos24h: recogidos, castigados: castigos.filter((c) => gfCastigoVivo(c)).length },
+      alertas: { sinRevisar: alertas, porTipo: porTipo.map((x) => ({ tipo: x._id, n: x.n, veces: x.veces })) } });
+  } catch (e) { console.error('GET /api/admin/auditoria/resumen:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// Las operaciones de la tienda del juego y del P2P (con sus comprobaciones).
+app.get('/api/admin/auditoria/tienda', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const tienda = req.query.tienda === 'p2p' ? 'p2p' : 'juego';
+    const solo = ['problemas', 'errores', 'todas'].includes(req.query.solo) ? req.query.solo : 'todas';
+    const limite = Math.max(10, Math.min(300, Math.floor(Number(req.query.limit) || 120)));
+    const antes = req.query.antes ? new Date(String(req.query.antes)) : null;
+    const nombres = await gfBuscarJugadores(req.query.q, 50);
+    const qTxt = String(req.query.q || '').trim();
+    const filas = [];
+    {
+      const f = { tienda };
+      if (solo === 'problemas') f.problema = true;
+      if (solo === 'errores') f.estado = { $in: ['error', 'rechazada', 'parcial', 'reembolsada', 'no_vendida', 'ya_gastada'] };
+      if (antes && !isNaN(antes)) f.t = { $lt: antes };
+      if (nombres && nombres.length) f.$or = [{ playerName: { $in: nombres } }, { itemId: qTxt }, { _id: qTxt }];
+      else if (qTxt) f.$or = [{ itemId: qTxt }, { _id: qTxt }];
+      const ops = await TiendaOp.find(f).sort({ t: -1 }).limit(limite).lean();
+      const viejo = Date.now() - 600000;
+      for (const o of ops) {
+        const avisos = (o.avisos || []).slice();
+        if (o.estado === 'en_curso' && new Date(o.t).getTime() < viejo) avisos.push('sin_terminar');
+        filas.push(Object.assign({ id: o._id }, o, { _id: undefined, avisos }));
+      }
+    }
+    // El P2P de verdad (las compras y ventas hechas): de su historial, comprobando la cuenta y la comisión del 5 %.
+    if (tienda === 'p2p' && solo !== 'errores') {
+      const H = mongoose.connection.collection('market_history');
+      const f = { type: { $in: ['buy', 'sell'] } };
+      if (antes && !isNaN(antes)) f.createdAt = { $lt: antes };
+      if (nombres && nombres.length) f.$or = [{ playerName: { $in: nombres } }, { counterpartyName: { $in: nombres } }];
+      else if (qTxt) f.itemId = qTxt;
+      const hs = await H.find(f).sort({ createdAt: -1 }).limit(limite).toArray();
+      for (const h of hs) {
+        const avisos = [];
+        const total = Math.round((Number(h.qty) || 0) * (Number(h.pricePerUnit) || 0) * 100) / 100;
+        if (Math.abs(total - (Number(h.total) || 0)) > 0.011) avisos.push('total_distinto');
+        if (h.type === 'sell' && h.counterparty) {
+          const fee = Math.round(total * 500 / 10000 * 100) / 100;
+          if (Math.abs(fee - (Number(h.fee) || 0)) > 0.011) avisos.push('comision_distinta');
+          if (Math.abs((total - fee) - (Number(h.sellerReceives) || 0)) > 0.011) avisos.push('pago_distinto');
+        }
+        if (solo === 'problemas' && !avisos.length) continue;
+        filas.push({ id: 'h:' + String(h._id), tienda: 'p2p', op: h.type === 'buy' ? 'compra' : 'venta', playerName: h.playerName, address: h.address || '',
+          itemId: h.itemId, cantidad: h.qty, moneda: h.currency, estado: 'ok', avisos, problema: avisos.length > 0, t: h.createdAt,
+          cliente: { precioUnidad: h.pricePerUnit, total: h.total, fee: h.fee, recibe: h.sellerReceives },
+          esperado: { total, fee: h.type === 'sell' && h.counterparty ? Math.round(total * 5) / 100 : 0 },
+          contraparte: h.counterpartyName || h.counterparty || '' });
+      }
+      filas.sort((a, b) => new Date(b.t) - new Date(a.t));
+    }
+    return res.json({ ok: true, tienda, filas: filas.slice(0, limite) });
+  } catch (e) { console.error('GET /api/admin/auditoria/tienda:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+app.post('/api/admin/auditoria/tienda/:id/revisada', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const id = String(req.params.id || '').slice(0, 80);
+    const revisada = !(req.body && req.body.revisada === false);
+    const nota = String((req.body && req.body.nota) || '').slice(0, 300);
+    const r = await TiendaOp.updateOne({ _id: id }, { $set: { revisada, nota } });
+    if (!r.matchedCount) return res.status(404).json({ error: 'no_encontrada' });
+    return res.json({ ok: true });
+  } catch (e) { console.error('POST /api/admin/auditoria/tienda/revisada:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// Subidas de saldo que no tienen ninguna compra ni venta de la tienda alrededor.
+app.get('/api/admin/auditoria/subidas', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const dias = Math.max(1, Math.min(60, Math.floor(Number(req.query.dias) || 7)));
+    const desde = new Date(Date.now() - dias * 86400000);
+    const nombres = await gfBuscarJugadores(req.query.q, 50);
+    const f = { bronce: { $gt: 0 }, t: { $gte: desde } };
+    if (nombres) f.playerName = { $in: nombres };
+    const movs = await MovMoneda.find(f).sort({ t: -1 }).limit(2000).lean();
+    const jugadores = [...new Set(movs.map((m) => m.playerName))];
+    const ops = await TiendaOp.find({ tienda: 'juego', playerName: { $in: jugadores }, t: { $gte: new Date(desde.getTime() - 3600000) } }).select('playerName t tFin').lean();
+    const porJugador = new Map();
+    for (const o of ops) { if (!porJugador.has(o.playerName)) porJugador.set(o.playerName, []); porJugador.get(o.playerName).push(o); }
+    const sueltas = [];
+    for (const m of movs) {
+      const t = new Date(m.t).getTime();
+      const tiene = (porJugador.get(m.playerName) || []).some((o) => t >= new Date(o.t).getTime() - 30000 && t <= (o.tFin ? new Date(o.tFin).getTime() : new Date(o.t).getTime() + 900000) + 120000);
+      if (!tiene) sueltas.push(m);
+      if (sueltas.length >= 300) break;
+    }
+    const fichas = {};
+    for (const n of [...new Set(sueltas.map((m) => m.playerName))].slice(0, 100)) fichas[n] = await gfQuien(n);
+    return res.json({ ok: true, dias, subidas: sueltas.map((m) => ({ id: String(m._id), t: m.t, playerName: m.playerName, stat: m.stat, antes: m.antes, despues: m.despues,
+      delta: m.delta, bronce: m.bronce, quien: fichas[m.playerName] || null })) });
+  } catch (e) { console.error('GET /api/admin/auditoria/subidas:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+app.get('/api/admin/auditoria/alertas', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const f = {};
+    if (req.query.solo !== 'todas') f.revisada = { $ne: true };
+    if (req.query.tipo) f.tipo = String(req.query.tipo).slice(0, 40);
+    const nombres = await gfBuscarJugadores(req.query.q, 50);
+    if (nombres) f.playerName = { $in: nombres };
+    const filas = await AlertaJuego.find(f).sort({ ultima: -1 }).limit(Math.max(10, Math.min(300, Math.floor(Number(req.query.limit) || 150)))).lean();
+    return res.json({ ok: true, alertas: filas.map((a) => Object.assign({ id: a._id }, a, { _id: undefined })) });
+  } catch (e) { console.error('GET /api/admin/auditoria/alertas:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+app.post('/api/admin/auditoria/alertas/:id/revisada', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const r = await AlertaJuego.updateOne({ _id: String(req.params.id || '').slice(0, 200) }, { $set: { revisada: !(req.body && req.body.revisada === false) } });
+    if (!r.matchedCount) return res.status(404).json({ error: 'no_encontrada' });
+    return res.json({ ok: true });
+  } catch (e) { console.error('POST /api/admin/auditoria/alertas/revisada:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+/* ── EL EXPLORADOR DEL SUELO ────────────────────────────────────────────── */
+function gfMontonPanel(d) {
+  return { id: d._id, itemId: d.itemId, cantidad: d.cantidad, nivelItem: d.nivelItem || gfNivelDeObjeto(d.itemId), sala: d.sala, x: d.x, y: d.y,
+           de: d.de || null, para: d.para || null, estado: d.estado, viene: d.viene || [], pasadoA: d.pasadoA || [],
+           t: d.t, tRecogido: d.tRecogido || null, tFin: d.tFin || null };
+}
+app.get('/api/admin/suelo/buscar', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim().slice(0, 80);
+    if (!q) return res.status(400).json({ error: 'falta_busqueda' });
+    const nombres = await gfBuscarJugadores(q, 20) || [];
+    if (nombres.length !== 1) {
+      const cands = [];
+      for (const n of nombres.slice(0, 20)) cands.push(await gfQuien(n));
+      return res.json({ ok: true, jugador: null, candidatos: cands });
+    }
+    const nombre = nombres[0];
+    const quien = await gfQuien(nombre);
+    const gp = await GamePlayer.findOne({ playerName: nombre }).select('playerName address').lean();
+    let vip = null;
+    try { const v = gp && gp.address ? await VipEstado.findOne({ address: String(gp.address).toLowerCase() }).lean() : null; vip = v && v.fin ? { activo: new Date(v.fin).getTime() > Date.now(), fin: v.fin } : { activo: false, fin: null }; } catch (_) {}
+    const [soltados, recogidos, intentos, castigo] = await Promise.all([
+      SueloMov.find({ 'de.playerName': nombre }).sort({ t: -1 }).limit(80).lean(),
+      SueloMov.find({ 'para.playerName': nombre }).sort({ tRecogido: -1 }).limit(80).lean(),
+      AlertaJuego.find({ playerName: nombre }).sort({ ultima: -1 }).limit(60).lean(),
+      SueloCastigo.findById(nombre).lean()
+    ]);
+    return res.json({ ok: true, jugador: Object.assign({}, quien, { vip, castigo: castigo ? Object.assign({ activo: !!gfCastigoVivo(castigo) }, castigo, { _id: undefined }) : null }),
+      soltados: soltados.map(gfMontonPanel), recogidos: recogidos.map(gfMontonPanel),
+      intentos: intentos.map((a) => Object.assign({ id: a._id }, a, { _id: undefined })) });
+  } catch (e) { console.error('GET /api/admin/suelo/buscar:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+app.get('/api/admin/suelo/movs', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const f = {};
+    const antes = req.query.antes ? new Date(String(req.query.antes)) : null;
+    if (antes && !isNaN(antes)) f.t = { $lt: antes };
+    if (req.query.itemId) f.itemId = String(req.query.itemId).slice(0, 60);
+    const filas = await SueloMov.find(f).sort({ t: -1 }).limit(Math.max(10, Math.min(200, Math.floor(Number(req.query.limit) || 60)))).lean();
+    return res.json({ ok: true, movs: filas.map(gfMontonPanel) });
+  } catch (e) { console.error('GET /api/admin/suelo/movs:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+// El rastro de un montón: de dónde venía (hacia atrás) y a quién pasó después (hacia delante).
+app.get('/api/admin/suelo/rastro/:id', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const id = String(req.params.id || '').slice(0, 40);
+    const base = await SueloMov.findById(id).lean();
+    if (!base) return res.status(404).json({ error: 'no_encontrado' });
+    const vistos = new Set([id]);
+    const antes = [], despues = [];
+    let ola = base.viene || [];
+    for (let n = 0; n < 12 && ola.length; n++) {
+      const docs = await SueloMov.find({ _id: { $in: ola.filter((x) => !vistos.has(x)) } }).lean();
+      docs.forEach((d) => { vistos.add(d._id); antes.push(Object.assign(gfMontonPanel(d), { paso: -(n + 1) })); });
+      ola = [].concat(...docs.map((d) => d.viene || []));
+    }
+    ola = base.pasadoA || [];
+    for (let n = 0; n < 12 && ola.length; n++) {
+      const docs = await SueloMov.find({ _id: { $in: ola.filter((x) => !vistos.has(x)) } }).lean();
+      docs.forEach((d) => { vistos.add(d._id); despues.push(Object.assign(gfMontonPanel(d), { paso: n + 1 })); });
+      ola = [].concat(...docs.map((d) => d.pasadoA || []));
+    }
+    return res.json({ ok: true, monton: gfMontonPanel(base), antes, despues });
+  } catch (e) { console.error('GET /api/admin/suelo/rastro:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+app.get('/api/admin/suelo/castigos', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const filas = await SueloCastigo.find({}).sort({ t: -1 }).limit(300).lean();
+    return res.json({ ok: true, castigos: filas.map((c) => Object.assign({ playerName: c._id, activo: !!gfCastigoVivo(c) }, c, { _id: undefined })) });
+  } catch (e) { console.error('GET /api/admin/suelo/castigos:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+// Suspender N días o bloquear (permanente) la opción de SOLTAR. Nunca toca lo que sueltan los monstruos.
+app.post('/api/admin/suelo/castigo', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const nombres = await gfBuscarJugadores(b.jugador, 2) || [];
+    if (nombres.length !== 1) return res.status(404).json({ error: 'jugador_no_encontrado' });
+    const nombre = nombres[0];
+    const permanente = b.permanente === true;
+    const dias = Math.floor(Number(b.dias) || 0);
+    if (!permanente && !(dias >= 1 && dias <= 3650)) return res.status(400).json({ error: 'dias_invalidos' });
+    const motivo = String(b.motivo || '').trim().slice(0, 200);
+    if (motivo.length < 3) return res.status(400).json({ error: 'motivo_requerido' });
+    const quien = await gfQuien(nombre);
+    const doc = { address: quien ? quien.address : '', username: quien ? quien.username : '', permanente, hasta: permanente ? null : new Date(Date.now() + dias * 86400000),
+                  motivo, por: String((req.admin && req.admin.address) || ''), t: new Date() };
+    await SueloCastigo.updateOne({ _id: nombre }, { $set: doc }, { upsert: true });
+    _gfCastigoCache.delete(nombre);
+    console.log(`🚫 suelo: ${nombre} ${permanente ? 'bloqueado' : 'suspendido ' + dias + ' días'} para soltar (${motivo}) por ${doc.por}`);
+    return res.json({ ok: true, castigo: Object.assign({ playerName: nombre, activo: true }, doc) });
+  } catch (e) { console.error('POST /api/admin/suelo/castigo:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+app.post('/api/admin/suelo/castigo/quitar', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const nombres = await gfBuscarJugadores(req.body && req.body.jugador, 2) || [];
+    if (nombres.length !== 1) return res.status(404).json({ error: 'jugador_no_encontrado' });
+    await SueloCastigo.deleteOne({ _id: nombres[0] });
+    _gfCastigoCache.delete(nombres[0]);
+    console.log(`✅ suelo: ${nombres[0]} puede volver a soltar (por ${(req.admin && req.admin.address) || 'admin'})`);
+    return res.json({ ok: true });
+  } catch (e) { console.error('POST /api/admin/suelo/castigo/quitar:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+/* ── LAS RECARGAS EN EL PANEL ───────────────────────────────────────────── */
+app.get('/api/admin/economia/compras', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim().toLowerCase().slice(0, 80);
+    const estado = ['cotizada', 'pagada', 'acreditada', 'fallida'].includes(req.query.estado) ? req.query.estado : null;
+    const f = {};
+    if (estado) f.estado = estado;
+    else if (req.query.todas !== '1') f.$or = [{ estado: { $ne: 'cotizada' } }, { txHash: { $exists: true, $ne: null } }];
+    if (q) {
+      if (/^0x[0-9a-f]{64}$/.test(q)) f.txHash = q;
+      else if (/^0x[0-9a-f]{40}$/.test(q)) f.address = q;
+      else {
+        const nombres = await gfBuscarJugadores(q, 50) || [];
+        f.playerName = { $in: nombres };
+      }
+    }
+    const filas = await CompraOro.find(f).sort({ creada: -1 }).limit(Math.max(10, Math.min(500, Math.floor(Number(req.query.limit) || 200)))).lean();
+    const [porEstado, tj, cfg] = await Promise.all([
+      CompraOro.aggregate([{ $group: { _id: '$estado', n: { $sum: 1 }, oro: { $sum: '$oroDado' }, reclamadas: { $sum: { $cond: ['$reclamada', 1, 0] } } } }]),
+      TesoroJuego.findById(TESORO_JUEGO_ID).select('zkltc').lean(), economiaConfig()
+    ]);
+    const zkDe = (w) => { try { return Number(BigInt(w || '0') / 1000000000n) / 1e9; } catch (_) { return 0; } };
+    const fichas = {};
+    for (const n of [...new Set(filas.map((c) => c.playerName))].slice(0, 200)) { const gp = await GamePlayer.findOne({ playerName: n }).select('Username').lean(); fichas[n] = gp ? String(gp.Username || '') : ''; }
+    return res.json({ ok: true, destino: economiaDestino(cfg), recibidoZk: tj && tj.zkltc ? (Number(tj.zkltc.gwei) || 0) / 1e9 : 0,
+      resumen: porEstado.map((x) => ({ estado: x._id, n: x.n, oro: x.oro, reclamadas: x.reclamadas })),
+      compras: filas.map((c) => ({ id: c._id, t: c.creada, playerName: c.playerName, username: fichas[c.playerName] || '', address: c.address, oro: c.oro, oroDado: c.oroDado || 0,
+        estado: c.estado, zkltc: zkDe(c.wei), pagado: zkDe(c.pagadoWei), destino: c.destino, txHash: c.txHash || null, motivo: c.motivo || '',
+        reclamada: !!c.reclamada, revisadaPor: c.revisadaPor || '', acreditada: c.acreditada || null })) });
+  } catch (e) { console.error('GET /api/admin/economia/compras:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+// Volver a mirar en la cadena una recarga pagada o fallida (y dar el oro si el pago es bueno).
+app.post('/api/admin/economia/compras/:id/revisar', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const id = String(req.params.id || '');
+    if (!/^[0-9a-f]{24}$/.test(id)) return res.status(400).json({ error: 'id_invalido' });
+    const c = await CompraOro.findById(id).lean();
+    if (!c) return res.status(404).json({ error: 'no_encontrada' });
+    if (c.estado === 'acreditada') return res.json({ ok: true, repetida: true, oro: c.oroDado });
+    const txHash = String((req.body && req.body.txHash) || c.txHash || '').trim().toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(txHash)) return res.status(400).json({ error: 'sin_hash' });
+    const otra = await CompraOro.findOne({ txHash, _id: { $ne: id } }).select('_id').lean();
+    if (otra) return res.status(409).json({ error: 'hash_ya_usado' });
+    const gp = await GamePlayer.findOne({ address: c.address }).lean();
+    if (!gp) return res.status(404).json({ error: 'jugador_no_encontrado' });
+    const pago = await economiaLeerPago(txHash);
+    if (pago.error === 'pendiente') return res.status(202).json({ error: 'pendiente', existe: pago.existe !== false });
+    if (pago.error) { await CompraOro.updateOne({ _id: id }, { $set: { motivo: pago.error } }).catch(() => {}); return res.status(409).json({ error: pago.error }); }
+    const r = await enColaDelJugador(String(c.address || '').toLowerCase(),
+      () => economiaAcreditar(gp, c, txHash, pago, { revisadaPor: String((req.admin && req.admin.address) || 'admin') }));
+    if (r.status !== 200 && r.body && r.body.error) await CompraOro.updateOne({ _id: id, estado: { $ne: 'acreditada' } }, { $set: { motivo: r.body.error } }).catch(() => {});
+    return res.status(r.status).json(r.body);
+  } catch (e) { console.error('POST /api/admin/economia/compras/revisar:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
 require('./marketplace-routes')(app, {
   mongoose,
   authMiddleware,
@@ -21728,7 +22541,13 @@ require('./marketplace-routes')(app, {
   // mercado la consulta en cada listado y sin caché serían lecturas on-chain
   // constantes. Si no se pasara, el marketplace trata a todo el mundo como no
   // administrador (nadie podría crear lotes, que es el fallo seguro).
-  isAdminAddress: isAdminAddressCached
+  isAdminAddress: isAdminAddressCached,
+  // (2026-10-27) La auditoría: los fallos del mercado al centro de control, y el
+  // nivel de cada objeto (no se compra por debajo, como al recoger del suelo).
+  auditarMercado: gfAuditarMercado,
+  nivelObjeto: gfNivelDeObjeto,
+  nivelJugador: gfNivelDeJugador,
+  alertar: (tipo, gp, datos) => gfAlertar(tipo, 'aviso', gp, datos, tipo + ':' + (gp && gp.playerName) + ':' + (datos && datos.itemId))
 });
 
 // ── GF WALLET SDK — login social + wallet embebida ──────────────────────────
@@ -24690,6 +25509,8 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
     // regeneración avanza aunque esta petición venga a BAJAR una vital, y los
     // stats que el cliente no toque quedan al día en la respuesta.
     applyGhostVitalRegen(doc);
+    // (2026-10-27) Para la auditoría: cómo estaban las monedas antes de este cambio.
+    const monedasAntes = { oro: Number(doc.oro) || 0, plata: Number(doc.plata) || 0, bronce: Number(doc.bronce) || 0 };
 
     const contract   = getStatsContract();
     const gasPrice   = await getSafeGasPriceStats();
@@ -24749,6 +25570,8 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
     doc.markModified('invoiceIds');
     doc.markModified('manualIds');
     await doc.save();
+    gfApuntarMovMoneda(playerName, ['oro', 'plata', 'bronce'].map((k) => ({ stat: k, antes: monedasAntes[k], despues: Number(doc[k]) || 0,
+                                                                         delta: (Number(doc[k]) || 0) - monedasAntes[k] })));
     return res.json({ stats: buildStatsResponse(doc), errors: txErrors.length ? txErrors : undefined });
 
   } catch (err) { console.error('POST /api/stats/update error:', err); return res.status(500).json({ error: 'Internal server error' }); }
