@@ -36,7 +36,9 @@
 // 1,5 % se va al tesoro." Era el 5 % y desaparecía; ahora es el 1,5 % y entra
 // en el tesoro de server2.js ("EL TESORO Y SUS INCENTIVOS") en la MISMA
 // transacción que la venta (ver ingresarAlTesoro).
-const MARKET_FEE_BPS = 150; // 1.50% de comisión → tesoro
+// (2026-10-26) "La comisión es un 5 % en los dos mercados: el 1,5 % es de la
+// economía circular y el 3,5 % del tesoro del juego."
+const MARKET_FEE_BPS = 500; // 5% de comisión → 1,5 % tesoro circular + 3,5 % tesoro del juego
 
 // ── Catálogo de ítems (nombre para mostrar, categoría, ícono, stack máximo) ─
 // Debe mantenerse en sincronía con `this.ItemDefinitions` en GameScene.js.
@@ -243,11 +245,16 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
     // y no se apunta en ningún sitio (como antes).
     Tesoro: RawTesoro = null,
     TesoroMov: RawTesoroMov = null,
-    TESORO_ID = 'principal'
+    TESORO_ID = 'principal',
+    // (2026-10-26) El tesoro del juego y qué parte de la comisión es del circular.
+    TesoroJuego: RawTesoroJuego = null,
+    TESORO_JUEGO_ID = 'juego',
+    TESORO_CIRCULAR_BPS = 150
   } = ctx;
   const GamePlayer = atomic.model(RawGamePlayer), PlayerStats = atomic.model(RawPlayerStats), Listing = atomic.model(RawListing);
   const Tesoro = RawTesoro ? atomic.model(RawTesoro) : null;
   const TesoroMov = RawTesoroMov ? atomic.model(RawTesoroMov) : null;
+  const TesoroJuego = RawTesoroJuego ? atomic.model(RawTesoroJuego) : null;
 
   /* La comisión de una venta al tesoro, EN BRONCE (1 plata = 1.000, 1 oro =
      1.000.000; el mercado cobra con dos decimales). Va dentro de la
@@ -256,10 +263,18 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
     if (!Tesoro || !(fee > 0)) return;
     const bronce = Math.round(fee * (currency === 'plata' ? 1000 : 1000000));
     if (!(bronce > 0)) return;
-    await Tesoro.updateOne({ _id: TESORO_ID }, { $inc: { saldo: bronce, 'ingresado.p2p': bronce, 'ingresos.p2p': 1 } }, { upsert: true }).exec();
-    if (TesoroMov) {
-      await TesoroMov.create({ t: new Date(), tipo: 'ingreso', origen: 'p2p', bronce,
-                               playerName: sellerName || null, detalle: 'p2p ' + itemId + ' x' + qty });
+    // (2026-10-26) Del 5 %, el 1,5 % al tesoro circular y lo demás (3,5 %) al del juego.
+    // Sin tesoro del juego (servidor viejo), todo al circular, como antes.
+    const circular = TesoroJuego ? Math.floor(bronce * TESORO_CIRCULAR_BPS / MARKET_FEE_BPS) : bronce;
+    const juego = bronce - circular;
+    const detalle = 'p2p ' + itemId + ' x' + qty;
+    if (circular > 0) {
+      await Tesoro.updateOne({ _id: TESORO_ID }, { $inc: { saldo: circular, 'ingresado.p2p': circular, 'ingresos.p2p': 1 } }, { upsert: true }).exec();
+      if (TesoroMov) await TesoroMov.create({ t: new Date(), tipo: 'ingreso', origen: 'p2p', bronce: circular, playerName: sellerName || null, detalle });
+    }
+    if (juego > 0) {
+      await TesoroJuego.updateOne({ _id: TESORO_JUEGO_ID }, { $inc: { saldo: juego, 'ingresado.p2p': juego, 'ingresos.p2p': 1 } }, { upsert: true }).exec();
+      if (TesoroMov) await TesoroMov.create({ t: new Date(), tesoro: 'juego', tipo: 'ingreso', origen: 'p2p', bronce: juego, playerName: sellerName || null, detalle });
     }
   }
 
@@ -789,7 +804,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         await Listing.deleteOne({ _id: listingUpdated._id }).exec();
       }
 
-      // 4) Pagar al vendedor (98,5 % — el 1,5 % de comisión va al tesoro)
+      // 4) Pagar al vendedor (95 % — el 5 % de comisión va a los dos tesoros)
       const sellerPaid = await PlayerStats.updateOne(
         { address: listing.owner },
         { $inc: { [field]: sellerReceives } }

@@ -16572,6 +16572,8 @@ app.post('/api/vip/comprar', apiLimiter, authMiddleware, csrfProtection, gfExige
       await VipEstado.updateOne({ address }, { $set: { playerName: gp.playerName, inicio: new Date(resumen.activo ? resumen.inicio : inicio),
                                                        fin: new Date(fin), leidoEn: new Date() } }, { upsert: true });
       _gfVipCache.set(address, { fin, at: Date.now() });
+      // (2026-10-26) "El dinero de comprar cualquier VIP va al tesoro del juego."
+      await tesoroJuegoIngresar('vip', precio * (TESORO_BRONCE_POR[moneda] || 0), gp.playerName, clave + ' con ' + precio + ' ' + moneda);
       console.log(`👑 ${gp.playerName} compró ${clave} con ${precio} ${moneda}: VIP hasta ${new Date(fin).toISOString()}`);
       let estado;
       try { estado = await gfVipEstadoDe(gp); } catch (e) { estado = { ...gfVipResumen(previas.concat([{ inicio, fin }])), facturas: [] }; }
@@ -16698,6 +16700,8 @@ app.post('/api/viaje/mapa', apiLimiter, authMiddleware, csrfProtection, async (r
       }
       const billete = crypto.randomBytes(8).toString('hex');
       _gfMapaBilletes.set(billete, { playerName: gp.playerName, precio: e.precio, hasta: Date.now() + 2 * 60 * 1000 });
+      // (2026-10-26) "El dinero de viajar en la M va al tesoro del juego, no al circular."
+      await tesoroJuegoIngresar('viajes', e.precio, gp.playerName, 'mapa ' + id);
       console.log(`🗺️  ${gp.playerName} viaja por el mapa a ${id} (${estado.sala} → ${d.sala}) por ${e.precio} de bronce`);
       return res.json({ ok: true, precio: e.precio, billete, stats: buildStatsResponse(doc),
                         destino: { id, mundo: d.mundo, x: d.destino ? d.destino[0] : null, y: d.destino ? d.destino[1] : null } });
@@ -16718,6 +16722,7 @@ app.post('/api/viaje/mapa/devolver', apiLimiter, authMiddleware, csrfProtection,
     if (!b || b.playerName !== gp.playerName || Date.now() > b.hasta) return res.status(404).json({ error: 'billete_no_valido' });
     _gfMapaBilletes.delete(id);
     const doc = await gfDevolverStat(gp.playerName, 'bronce', b.precio);
+    await tesoroJuegoIngresar('viajes', -b.precio, gp.playerName, 'devolución del billete');
     return res.json({ ok: true, devuelto: b.precio, stats: doc ? buildStatsResponse(doc) : undefined });
   } catch (e) {
     console.error('POST /api/viaje/mapa/devolver:', e);
@@ -19105,6 +19110,11 @@ app.post('/api/currency/purchase',
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
+      /* (2026-10-26) Esta compra NO cobraba nada (el txHash era opcional y no
+         se miraba): cualquiera con sesión se llevaba oro gratis. La compra de
+         verdad es /api/currency/oro/* (zkLTC verificado en la cadena). */
+      return res.status(410).json({ error: 'usa_compra_con_zkltc', message: 'Buy Gold with zkLTC from the Currency panel.' });
+      // eslint-disable-next-line no-unreachable
       const address = String(req.user.address || '').toLowerCase();
       const pack = parseInt(req.body.pack, 10);
       const cfg = CURRENCY_PACKS[pack];
@@ -19589,6 +19599,27 @@ app.get('/api/nft/coleccion', apiLimiter, async (req, res) => {
   }
 });
 
+/* (2026-10-26) LAS COLECCIONES DEL ESTUDIO (colecciones.html, el registro de
+   backend-collections). "El juego no lee la colección que creé": el panel solo
+   miraba un contrato ERC-721 externo. Ahora también las colecciones PÚBLICAS
+   del estudio —las privadas no las ve nadie más que el panel—, cada una con
+   las piezas emitidas y activas que tiene esta cartera (o ninguna). */
+async function gfNftColeccionesPublicas(address) {
+  const Col = mongoose.models.GFNftCollection, Tok = mongoose.models.GFNftToken;
+  if (!Col || !Tok) return [];
+  const scope = `${CHAIN_ID}:${String(CONTRACTS.ITEMS_CONTRACT.address || '').toLowerCase()}`;
+  const cols = await Col.find({ scope, visibility: 'public', status: 'active' }).sort({ createdAt: -1 }).limit(30).lean();
+  if (!cols.length) return [];
+  const mias = await Tok.find({ scope, collectionId: { $in: cols.map((c) => c.id) }, owner: address, chainActive: true,
+                                invoiceId: { $ne: '' }, status: 'active' }).sort({ number: 1 }).limit(500).lean();
+  return cols.map((c) => {
+    const t = mias.filter((x) => x.collectionId === c.id);
+    return { id: c.id, nombre: c.name || '', simbolo: c.symbol || '', descripcion: String(c.description || '').slice(0, 300),
+             avatarUrl: c.avatarUrl || '', portadaUrl: c.coverUrl || '', total: t.length,
+             tokens: t.map((x) => ({ id: x.id, numero: x.number, nombre: x.name || '', imagenUrl: x.imageUrl || '' })) };
+  });
+}
+
 // GET /api/nft/mios — los NFT de esa colección que tiene la cartera de la sesión.
 app.get('/api/nft/mios', apiLimiter, authMiddleware, async (req, res) => {
   try {
@@ -19596,14 +19627,20 @@ app.get('/api/nft/mios', apiLimiter, authMiddleware, async (req, res) => {
     if (!ethers.isAddress(address)) return res.status(400).json({ error: 'sin_cartera' });
     const cfg = await configColeccionNft();
     const coleccion = { nombre: cfg.nombre || '', contrato: cfg.contrato || '', chainId: Number(cfg.chainId) || CHAIN_ID };
-    if (!cfg.nombre || !cfg.contrato) return res.json({ ok: true, configurada: false, coleccion, address, tokens: [] });
+    let colecciones = [];
+    try { colecciones = await gfNftColeccionesPublicas(address); }
+    catch (e) { console.warn('GET /api/nft/mios (colecciones del estudio):', e.message); }
+    if (!cfg.nombre || !cfg.contrato) return res.json({ ok: true, configurada: false, coleccion, address, tokens: [], colecciones });
 
     const cache = _nftCacheJugador.get(address);
     const refrescar = req.query && req.query.refrescar === '1';
     if (cache && !refrescar && Date.now() - cache.at < 2 * 60 * 1000 &&
         cache.contrato === cfg.contrato && cache.chainId === cfg.chainId && cache.rpc === cfg.rpc) {
-      return res.json(cache.datos);
+      return res.json({ ...cache.datos, colecciones });
     }
+    // Si el contrato externo no contesta, las del estudio se enseñan igual.
+    let datosExternos = null;
+    try {
     const c = new ethers.Contract(cfg.contrato, NFT_ABI, proveedorNft(cfg));
     const { total, ids } = await tokensDeCartera(c, address, cfg);
     const tokens = [];
@@ -19616,7 +19653,13 @@ app.get('/api/nft/mios', apiLimiter, authMiddleware, async (req, res) => {
     if (_nftCacheJugador.size > 1000) _nftCacheJugador.clear();
     _nftCacheJugador.set(address, { at: Date.now(), contrato: cfg.contrato,
       chainId: cfg.chainId, rpc: cfg.rpc, datos });
-    return res.json(datos);
+    datosExternos = datos;
+    } catch (e) {
+      console.warn('GET /api/nft/mios (contrato externo):', e.shortMessage || e.message);
+      if (!colecciones.length) throw e;
+      datosExternos = { ok: true, configurada: true, coleccion, address, total: 0, tokens: [], errorCadena: true };
+    }
+    return res.json({ ...datosExternos, colecciones });
   } catch (e) {
     console.warn('GET /api/nft/mios:', e.shortMessage || e.message);
     return res.status(502).json({ error: 'lectura_fallida', message: 'Could not read the collection on-chain right now.' });
@@ -20760,7 +20803,10 @@ async function applyStatOnChain(contract, stat, invId, target, gasPrice) {
 const TIENDA_PRECIOS = {"Semillax":[10,5,"p"],"Semillax1":[15,7,"p"],"Semillax2":[8,3,"p"],"Semillax3":[25,12,"p"],"Semillax4":[20,10,"p"],"Regaderax":[120,60,"p"],"Tijerasx":[200,100,"p"],"hacha_de_madera":[300,150,"p"],"pico_de_madera":[400,200,"p"],"zanahoria_buena":[20,14,"p"],"tomate_buena":[28,20,"p"],"trigo_buena":[13,9,"p"],"fresa_buena":[40,28,"p"],"calabaza_buena":[48,34,"p"],"balde_con_agua":[8,3,"p"],"pes1":[0,12,"p"],"pes2":[0,22,"p"],"pes3":[0,70,"p"],"pes4":[0,10,"p"],"pes5":[0,16,"p"],"pes6":[0,95,"p"],"pes7":[0,40,"p"],"pes8":[0,75,"p"],"pes9":[0,32,"p"],"pes10":[0,24,"p"],"pes11":[0,18,"p"],"pes12":[0,160,"p"],"pes13":[0,55,"p"],"pes14":[0,85,"p"],"parcela":[200,100,"p"],"pala_construccion":[300,150,"p"],"espantapajaros":[120,60,"p"],"antorcha":[40,20,"p"],"basura":[120,60,"p"],"cofre1":[2,1,"o"],"cofre2":[0,250,"p"],"cofre3":[0,700,"p"],"cofre4":[0,2000,"p"],"espada_madera":[80,40,"p"],"espada_cobre":[250,125,"p"],"espada_hierro":[600,300,"p"],"cana_pescar":[150,75,"p"],"arco":[300,150,"p"],"baston_mago":[450,225,"p"],"bote":[500,250,"p"]};
 // </TIENDA_PRECIOS>
 const TESORO_ID = 'principal';
-const TESORO_COMISION_BPS = 150;                       // 1,5 %
+/* (2026-10-26) "La comisión es un 5 % en los dos mercados y se divide: el
+   1,5 % es de la economía circular y el 3,5 % del tesoro del juego." */
+const TESORO_COMISION_BPS = 500;                       // 5 % en total (tienda del juego y P2P)
+const TESORO_CIRCULAR_BPS = 150;                       // de ese 5 %, el 1,5 % al tesoro de la economía circular
 const TESORO_BRONCE_POR = Object.freeze({ bronce: 1, plata: 1000, oro: 1000000 });
 const TESORO_TOPE_TIENDA_DIA = 20 * 1000000;           // comisión de tienda contada por jugador y día (bronce)
 const TESORO_PROB_MAX = 0.75;
@@ -20802,8 +20848,10 @@ const tesoroSchema = new mongoose.Schema({
   _id:       { type: String, default: TESORO_ID },
   saldo:     { type: Number, default: 0 },
   reservado: { type: Number, default: 0 },
-  ingresado: { tienda: { type: Number, default: 0 }, p2p: { type: Number, default: 0 }, admin: { type: Number, default: 0 } },
-  ingresos:  { tienda: { type: Number, default: 0 }, p2p: { type: Number, default: 0 } },
+  ingresado: { tienda: { type: Number, default: 0 }, p2p: { type: Number, default: 0 }, admin: { type: Number, default: 0 },
+               // (2026-10-26) La comisión de los cambios de moneda (solo para este tesoro).
+               cambio: { type: Number, default: 0 } },
+  ingresos:  { tienda: { type: Number, default: 0 }, p2p: { type: Number, default: 0 }, cambio: { type: Number, default: 0 } },
   pagado:    { free: { type: Number, default: 0 }, vip: { type: Number, default: 0 } },
   pagos:     { free: { type: Number, default: 0 }, vip: { type: Number, default: 0 } },
   retirado:  { type: Number, default: 0 },
@@ -20815,7 +20863,9 @@ const Tesoro = mongoose.models.Tesoro || mongoose.model('Tesoro', tesoroSchema);
 const tesoroMovSchema = new mongoose.Schema({
   t:          { type: Date, default: Date.now },
   tipo:       { type: String, enum: ['ingreso', 'pago', 'ajuste'], required: true },
-  origen:     { type: String, default: '' },           // tienda | p2p | monstruo | admin
+  origen:     { type: String, default: '' },           // tienda | p2p | monstruo | admin | cambio | viajes | vip | revivir | compra_oro
+  // (2026-10-26) De qué tesoro es: 'circular' (o nada, los de antes) o 'juego'.
+  tesoro:     { type: String, default: 'circular' },
   bronce:     { type: Number, required: true },
   playerName: { type: String, default: null },
   vip:        { type: Boolean, default: null },
@@ -20827,6 +20877,74 @@ tesoroMovSchema.index({ t: 1 }, { expireAfterSeconds: 400 * 86400 });
 tesoroMovSchema.index({ ref: 1 }, { unique: true, sparse: true });
 tesoroMovSchema.index({ tipo: 1, t: -1 });
 const TesoroMov = mongoose.models.TesoroMov || mongoose.model('TesoroMov', tesoroMovSchema);
+
+// =============================================================================
+// EL TESORO DEL JUEGO                                              (2026-10-26)
+// =============================================================================
+// "Son dos tesoros: el de la economía circular (la recompensa de los jugadores,
+// el de arriba) y el tesoro del JUEGO." Al del juego van: el 3,5 % de cada
+// comisión de mercado (tienda y P2P), los viajes del mapa (M), los VIP y el
+// elixir de revivir del alquimista. Y el zkLTC de las compras de oro, que se
+// apunta aparte (en gwei): es moneda de fuera.
+const TESORO_JUEGO_ID = 'juego';
+const TESORO_JUEGO_ORIGENES = ['tienda', 'p2p', 'viajes', 'vip', 'revivir', 'admin'];
+const _cero = () => ({ type: Number, default: 0 });
+const tesoroJuegoSchema = new mongoose.Schema({
+  _id:       { type: String, default: TESORO_JUEGO_ID },
+  saldo:     _cero(),                                   // bronce
+  retirado:  _cero(),
+  ingresado: Object.fromEntries(TESORO_JUEGO_ORIGENES.map((k) => [k, _cero()])),
+  ingresos:  Object.fromEntries(TESORO_JUEGO_ORIGENES.map((k) => [k, _cero()])),
+  zkltc:     { gwei: _cero(), compras: _cero(), oro: _cero() },
+  config:    { type: mongoose.Schema.Types.Mixed, default: null }   // el precio del oro (economiaConfig)
+}, { collection: 'tesoro_juego', timestamps: true, versionKey: false, minimize: false });
+const TesoroJuego = mongoose.models.TesoroJuego || mongoose.model('TesoroJuego', tesoroJuegoSchema);
+TesoroJuego.init().catch((e) => console.warn('⚠️  tesoro del juego: índices:', e.message));
+
+/** De una comisión de mercado (el 5 %), la parte de la economía circular (el 1,5 %). */
+function tesoroParteCircular(bronce) {
+  return Math.floor(Math.max(0, Number(bronce) || 0) * TESORO_CIRCULAR_BPS / TESORO_COMISION_BPS);
+}
+/** Al tesoro del juego (bronce; en negativo, una devolución). Nunca rompe a quien llama. */
+async function tesoroJuegoIngresar(origen, bronce, playerName, detalle) {
+  const n = Math.round(Number(bronce) || 0);
+  if (!n || !TESORO_JUEGO_ORIGENES.includes(origen)) return;
+  try {
+    await TesoroJuego.updateOne({ _id: TESORO_JUEGO_ID },
+      { $inc: { saldo: n, ['ingresado.' + origen]: n, ['ingresos.' + origen]: n > 0 ? 1 : 0 } }, { upsert: true });
+    await TesoroMov.create({ tesoro: 'juego', tipo: n > 0 ? 'ingreso' : 'ajuste', origen, bronce: n,
+                             playerName: playerName || null, detalle: String(detalle || '').slice(0, 200) });
+  } catch (e) { console.warn('⚠️  tesoro del juego (' + origen + '):', e.message); }
+}
+/** Al tesoro de la economía circular, fuera de la tienda (los cambios de moneda). */
+async function tesoroCircularIngresar(origen, bronce, playerName, detalle) {
+  const n = Math.max(0, Math.floor(Number(bronce) || 0));
+  if (!n) return;
+  try {
+    await Tesoro.updateOne({ _id: TESORO_ID }, { $inc: { saldo: n, ['ingresado.' + origen]: n, ['ingresos.' + origen]: 1 } }, { upsert: true });
+    await TesoroMov.create({ tipo: 'ingreso', origen, bronce: n, playerName: playerName || null, detalle: String(detalle || '').slice(0, 200) });
+  } catch (e) { console.warn('⚠️  tesoro circular (' + origen + '):', e.message); }
+}
+
+/* LA COMISIÓN DE LOS CAMBIOS (2026-10-26): "solo para la economía circular (los
+   drops), de menor a mayor porque empezamos de oro a plata y de plata a bronce:
+   el oro menor, la plata media y el bronce algo más". Se mira la moneda que se
+   ENTREGA y se cobra en la PEQUEÑA del par, sobre el valor del cambio:
+     oro → plata   1 %   (100 de oro dan 99.000 de plata)
+     plata → oro   2 %   (1 de oro cuesta 1.020 de plata)
+     plata → bronce 2 %  (1 de plata da 980 de bronce)
+     bronce → plata 3 %  (1 de plata cuesta 1.030 de bronce)
+   `qty` en la unidad GRANDE del par, como la ruta del cambio. */
+const CAMBIO_COMISION_BPS = Object.freeze({ oro: 100, plata: 200, bronce: 300 });
+function gfComisionCambio(direction, qty) {
+  const q = Math.max(0, Math.floor(Number(qty) || 0));
+  const entrega = { goldToSilver: 'oro', silverToGold: 'plata', silverToBronze: 'plata', bronzeToSilver: 'bronce' }[direction];
+  const pequena = { goldToSilver: 'plata', silverToGold: 'plata', silverToBronze: 'bronce', bronzeToSilver: 'bronce' }[direction];
+  if (!entrega || !q) return { moneda: pequena || null, cantidad: 0, bronce: 0, bps: 0 };
+  const bps = CAMBIO_COMISION_BPS[entrega];
+  const cantidad = Math.max(1, Math.ceil(q * 1000 * bps / 10000));
+  return { moneda: pequena, cantidad, bronce: cantidad * TESORO_BRONCE_POR[pequena], bps };
+}
 // Las colecciones existen antes de la primera venta P2P: crear una colección
 // DENTRO de una transacción falla en los Mongo antiguos.
 Promise.all([Tesoro.init(), TesoroMov.init()]).catch((e) => console.warn('⚠️  tesoro: índices:', e.message));
@@ -20989,16 +21107,19 @@ app.post('/api/tesoro/comision', apiLimiter, authMiddleware, csrfProtection, asy
     const llevado = d && d.dia === hoy ? d.bronce : 0;
     const bronce = Math.max(0, Math.min(total, TESORO_TOPE_TIENDA_DIA - llevado));
     if (!bronce) return res.json({ ok: true, bronce: 0, tope: true });
+    // (2026-10-26) El 5 % se reparte: el 1,5 % a la economía circular y el 3,5 % al tesoro del juego.
+    const circular = tesoroParteCircular(bronce), juego = bronce - circular;
     try {
-      await TesoroMov.create({ tipo: 'ingreso', origen: 'tienda', bronce, playerName: gp.playerName,
+      await TesoroMov.create({ tipo: 'ingreso', origen: 'tienda', bronce: circular, playerName: gp.playerName,
                                detalle: operacion + ' ' + itemId + ' x' + cantidad, ref: 'tienda:' + gp.playerName + ':' + ref });
     } catch (e) {
       if (e && e.code === 11000) return res.json({ ok: true, bronce: 0, repetido: true });
       throw e;
     }
     _tesoroTiendaDia.set(gp.playerName, { dia: hoy, bronce: llevado + bronce });
-    await Tesoro.updateOne({ _id: TESORO_ID }, { $inc: { saldo: bronce, 'ingresado.tienda': bronce, 'ingresos.tienda': 1 } }, { upsert: true });
-    return res.json({ ok: true, bronce });
+    await Tesoro.updateOne({ _id: TESORO_ID }, { $inc: { saldo: circular, 'ingresado.tienda': circular, 'ingresos.tienda': 1 } }, { upsert: true });
+    await tesoroJuegoIngresar('tienda', juego, gp.playerName, operacion + ' ' + itemId + ' x' + cantidad);
+    return res.json({ ok: true, bronce, circular, juego });
   } catch (e) {
     console.error('POST /api/tesoro/comision:', e);
     return res.status(500).json({ error: 'internal_error' });
@@ -21011,8 +21132,8 @@ function tesoroPublico(t) {
   const sub = (o, k) => Math.max(0, Number(o && o[k]) || 0);
   return {
     saldo: Math.max(0, Number(x.saldo) || 0), reservado: Math.max(0, Number(x.reservado) || 0),
-    ingresado: { tienda: sub(x.ingresado, 'tienda'), p2p: sub(x.ingresado, 'p2p'), admin: sub(x.ingresado, 'admin') },
-    ingresos: { tienda: sub(x.ingresos, 'tienda'), p2p: sub(x.ingresos, 'p2p') },
+    ingresado: { tienda: sub(x.ingresado, 'tienda'), p2p: sub(x.ingresado, 'p2p'), admin: sub(x.ingresado, 'admin'), cambio: sub(x.ingresado, 'cambio') },
+    ingresos: { tienda: sub(x.ingresos, 'tienda'), p2p: sub(x.ingresos, 'p2p'), cambio: sub(x.ingresos, 'cambio') },
     pagado: { free: sub(x.pagado, 'free'), vip: sub(x.pagado, 'vip') },
     pagos: { free: sub(x.pagos, 'free'), vip: sub(x.pagos, 'vip') },
     retirado: Math.max(0, Number(x.retirado) || 0), caducados: Math.max(0, Number(x.caducados) || 0),
@@ -21032,11 +21153,11 @@ app.get('/api/admin/tesoro', adminAuth, apiLimiter, async (req, res) => {
       GamePlayer.countDocuments({ Username: { $exists: true, $nin: [null, '', '---'] } }),
       PlayerPlaytime.countDocuments({ ultimaVez: { $gte: hace24h } }),
       TesoroMov.aggregate([
-        { $match: { t: { $gte: hace30 } } },
+        { $match: { t: { $gte: hace30 }, tesoro: { $ne: 'juego' } } },
         { $group: { _id: { dia: { $dateToString: { format: '%Y-%m-%d', date: '$t', timezone: 'UTC' } }, tipo: '$tipo', origen: '$origen', vip: '$vip' },
                     bronce: { $sum: '$bronce' }, n: { $sum: 1 } } }
       ]),
-      TesoroMov.find({}).sort({ t: -1 }).limit(30).lean(),
+      TesoroMov.find({ tesoro: { $ne: 'juego' } }).sort({ t: -1 }).limit(30).lean(),
       TesoroMov.aggregate([
         { $match: { tipo: 'pago', t: { $gte: hace30 } } },
         { $group: { _id: '$playerName', bronce: { $sum: '$bronce' }, n: { $sum: 1 }, vip: { $last: '$vip' } } },
@@ -21054,11 +21175,11 @@ app.get('/api/admin/tesoro', adminAuth, apiLimiter, async (req, res) => {
     // La serie de los últimos 30 días (UTC), un punto por día aunque esté vacío.
     const dias = [];
     for (let i = 29; i >= 0; i--) dias.push(new Date(ahora - i * 86400000).toISOString().slice(0, 10));
-    const porDia = new Map(dias.map(d => [d, { dia: d, tienda: 0, p2p: 0, admin: 0, pagoFree: 0, pagoVip: 0, premios: 0 }]));
+    const porDia = new Map(dias.map(d => [d, { dia: d, tienda: 0, p2p: 0, cambio: 0, admin: 0, pagoFree: 0, pagoVip: 0, premios: 0 }]));
     for (const g of grupos) {
       const fila = porDia.get(g._id.dia);
       if (!fila) continue;
-      if (g._id.tipo === 'ingreso' && (g._id.origen === 'tienda' || g._id.origen === 'p2p')) fila[g._id.origen] += g.bronce;
+      if (g._id.tipo === 'ingreso' && (g._id.origen === 'tienda' || g._id.origen === 'p2p' || g._id.origen === 'cambio')) fila[g._id.origen] += g.bronce;
       else if (g._id.tipo === 'ajuste' && g.bronce > 0) fila.admin += g.bronce;
       else if (g._id.tipo === 'pago') { fila[g._id.vip ? 'pagoVip' : 'pagoFree'] += g.bronce; fila.premios += g.n; }
     }
@@ -21084,7 +21205,8 @@ app.get('/api/admin/tesoro', adminAuth, apiLimiter, async (req, res) => {
     }));
 
     return res.json({
-      ok: true, tesoro: tesoroPublico(t), config: cfg, base: TESORO_CONFIG_BASE, comisionBps: TESORO_COMISION_BPS,
+      ok: true, tesoro: tesoroPublico(t), config: cfg, base: TESORO_CONFIG_BASE, comisionBps: TESORO_CIRCULAR_BPS,
+      comisionTotalBps: TESORO_COMISION_BPS, cambioBps: CAMBIO_COMISION_BPS,
       bronce: TESORO_BRONCE_POR, probMax: TESORO_PROB_MAX, ejemplos,
       jugadores: { cuentas, vip: nombresVip.length, free: Math.max(0, cuentas - nombresVip.length), conNombre,
                    sinNombre: Math.max(0, cuentas - conNombre), activos24h, vipActivos24h },
@@ -21139,6 +21261,440 @@ app.post('/api/admin/tesoro/ajuste', adminAuth, strictLimiter, async (req, res) 
 });
 console.log('✅ Tesoro: /api/tesoro/comision y /api/admin/tesoro{,/config,/ajuste}');
 
+// =============================================================================
+// LA ECONOMÍA: LA FOTO DEL DÍA, EL PRECIO DEL ORO Y LA COMPRA CON zkLTC
+//                                                                  (2026-10-26)
+// =============================================================================
+// "Quiero que la gente tenga un precio de la moneda para comprar el oro y no
+// sea al dólar, sino algo estable que suba y baje según la inflación y los
+// datos de la economía; un gráfico para que vean si la economía de las tres
+// monedas va bien o mal; ajusta los precios de recarga según esos gráficos para
+// cuidarla; un botón con un input para elegir cuánto oro comprar, que cobre en
+// la moneda de LitVM testnet y lo compre sin errores; y quita los tres botones
+// de dar oro, plata y bronce."
+//
+// LA FOTO DEL DÍA (`economia_dias`, un documento por día UTC, se rehace cada
+// hora): cuánto oro, plata y bronce hay en todas las cuentas, la MASA (todo en
+// bronce: 1 oro = 1.000.000), los jugadores, la inflación de 1 y de 7 días
+// (lo que creció la masa), el precio del oro de ese día y los dos tesoros.
+//
+// EL PRECIO DEL ORO (en zkLTC): un índice propio, no el dólar.
+//   objetivo = precio base × (1 + inflación de 7 días × sensibilidad)
+//   y del precio de ayer al de hoy se mueve como mucho un `pasoMax` (5 %).
+// Más monedas nuevas en circulación → el oro sube y entra más despacio; si la
+// masa baja, baja. Y el TOPE de compra por jugador y día baja con la inflación
+// (estable 300, caliente la mitad, recalentada 25). Todo se ajusta en el panel
+// del centro de control (economia: precio base, sensibilidad, topes, cartera).
+//
+// LA COMPRA (zkLTC de LitVM LiteForge, chain 4441):
+//   1. POST /api/currency/oro/cotizar {oro} → precio fijado 15 min, a qué
+//      cartera pagar y cuánto (wei).
+//   2. El navegador paga (MetaMask o la cartera del juego).
+//   3. POST /api/currency/oro/confirmar {id, txHash} → el servidor lee la
+//      transacción: de TU cartera, a la del tesoro, al menos lo cotizado, con
+//      recibo bueno; un hash vale una sola vez. Solo entonces da el oro (Mongo y
+//      la factura con el liquidador) y lo apunta en el tesoro del juego.
+//   Si se paga tarde (después de la cotización), se da el oro que valga lo
+//   pagado al precio de AHORA.
+// =============================================================================
+const ECONOMIA_CONFIG_BASE = Object.freeze({
+  compraActiva: true,
+  precioBase: 0.001,        // zkLTC por 1 de oro
+  sensibilidad: 0.8,        // cuánto mueve el precio la inflación de 7 días
+  pasoMax: 0.05,            // lo más que cambia el precio de un día a otro
+  topeDiario: 300,          // oro por jugador y día con la economía estable
+  topeMin: 25,              // con la economía recalentada
+  minimoCompra: 1,          // oro
+  cartera: ''               // a dónde se paga ('' = GF_TESORO_JUEGO_CARTERA o la del servidor)
+});
+const ECONOMIA_COTIZACION_MS = 15 * 60 * 1000;
+
+const economiaDiaSchema = new mongoose.Schema({
+  _id:            { type: String },                     // 'YYYY-MM-DD' (UTC)
+  oro:            { type: Number, default: 0 },
+  plata:          { type: Number, default: 0 },
+  bronce:         { type: Number, default: 0 },
+  masa:           { type: Number, default: 0 },          // todo en bronce
+  jugadores:      { type: Number, default: 0 },
+  precioGwei:     { type: Number, default: 0 },          // 1 de oro, en zkLTC (gwei)
+  inflacion1:     { type: Number, default: null },
+  inflacion7:     { type: Number, default: null },
+  salud:          { type: String, default: 'sin_datos' },
+  tope:           { type: Number, default: 0 },
+  oroComprado:    { type: Number, default: 0 },
+  zkltcGwei:      { type: Number, default: 0 },
+  compras:        { type: Number, default: 0 },
+  comisionCambio: { type: Number, default: 0 },          // bronce
+  tesoroCircular: { type: Number, default: 0 },
+  tesoroJuego:    { type: Number, default: 0 },
+  actualizado:    { type: Date, default: Date.now }
+}, { collection: 'economia_dias', versionKey: false, minimize: false });
+const EconomiaDia = mongoose.models.EconomiaDia || mongoose.model('EconomiaDia', economiaDiaSchema);
+
+const compraOroSchema = new mongoose.Schema({
+  _id:        { type: String },                         // id de la cotización
+  playerName: { type: String, index: true },
+  address:    { type: String, lowercase: true, index: true },
+  oro:        { type: Number, required: true },
+  wei:        { type: String, required: true },
+  precioGwei: { type: Number, required: true },
+  destino:    { type: String, lowercase: true, required: true },
+  estado:     { type: String, enum: ['cotizada', 'pagada', 'acreditada', 'fallida'], default: 'cotizada', index: true },
+  txHash:     { type: String, lowercase: true },
+  oroDado:    { type: Number, default: 0 },
+  pagadoWei:  { type: String, default: '0' },
+  dia:        { type: String },
+  motivo:     { type: String, default: '' },
+  creada:     { type: Date, default: Date.now },
+  caduca:     { type: Date },
+  acreditada: { type: Date, default: null }
+}, { collection: 'compras_oro', versionKey: false });
+compraOroSchema.index({ txHash: 1 }, { unique: true, sparse: true });
+compraOroSchema.index({ address: 1, dia: 1 });
+const CompraOro = mongoose.models.CompraOro || mongoose.model('CompraOro', compraOroSchema);
+Promise.all([EconomiaDia.init(), CompraOro.init()]).catch((e) => console.warn('⚠️  economía: índices:', e.message));
+
+function economiaNormalizarConfig(c) {
+  const B = ECONOMIA_CONFIG_BASE, s = (c && typeof c === 'object') ? c : {};
+  const num = (v, def, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
+  const cartera = String(s.cartera || '').trim().toLowerCase();
+  const out = {
+    compraActiva: typeof s.compraActiva === 'boolean' ? s.compraActiva : B.compraActiva,
+    precioBase: num(s.precioBase, B.precioBase, 0.000001, 1000),
+    sensibilidad: num(s.sensibilidad, B.sensibilidad, 0, 5),
+    pasoMax: num(s.pasoMax, B.pasoMax, 0.005, 0.5),
+    topeDiario: Math.round(num(s.topeDiario, B.topeDiario, 1, 1000000)),
+    topeMin: Math.round(num(s.topeMin, B.topeMin, 1, 1000000)),
+    minimoCompra: Math.round(num(s.minimoCompra, B.minimoCompra, 1, 1000000)),
+    cartera: /^0x[0-9a-f]{40}$/.test(cartera) && cartera !== '0x0000000000000000000000000000000000000000' ? cartera : ''
+  };
+  if (out.topeMin > out.topeDiario) out.topeMin = out.topeDiario;
+  return out;
+}
+let _economiaCfg = null, _economiaCfgEn = 0;
+async function economiaConfig() {
+  if (_economiaCfg && Date.now() - _economiaCfgEn < 10000) return _economiaCfg;
+  let guardada = null;
+  try { const t = await TesoroJuego.findById(TESORO_JUEGO_ID).select('config').lean(); guardada = t && t.config; }
+  catch (e) { if (_economiaCfg) return _economiaCfg; }
+  _economiaCfg = economiaNormalizarConfig(guardada);
+  _economiaCfgEn = Date.now();
+  return _economiaCfg;
+}
+/** A dónde se paga el oro: la del panel, la del entorno o la del servidor. */
+function economiaDestino(cfg) {
+  const env = String(process.env.GF_TESORO_JUEGO_CARTERA || '').trim().toLowerCase();
+  if (cfg && cfg.cartera) return cfg.cartera;
+  if (/^0x[0-9a-f]{40}$/.test(env)) return env;
+  try { if (relayerWallet && relayerWallet.address) return String(relayerWallet.address).toLowerCase(); } catch (_) {}
+  return '';
+}
+/** ¿Cómo va? Con la inflación de 7 días (tanto por uno). */
+function economiaSalud(inf7) {
+  if (inf7 === null || inf7 === undefined || !Number.isFinite(Number(inf7))) return 'sin_datos';
+  if (inf7 < -0.05) return 'deflacion';
+  if (inf7 <= 0.08) return 'estable';
+  if (inf7 <= 0.2) return 'caliente';
+  return 'recalentada';
+}
+/** El tope de compra por jugador y día, según la salud. */
+function economiaTope(cfg, salud) {
+  if (salud === 'recalentada') return cfg.topeMin;
+  if (salud === 'caliente') return Math.max(cfg.topeMin, Math.round((cfg.topeDiario + cfg.topeMin) / 2));
+  return cfg.topeDiario;
+}
+/** El precio de hoy (gwei por 1 de oro) desde el de ayer y la inflación de 7 días. */
+function economiaPrecioGwei(cfg, precioAyerGwei, inf7) {
+  const base = cfg.precioBase * 1e9;
+  const inf = Number.isFinite(Number(inf7)) ? Math.max(-0.5, Math.min(1.5, Number(inf7))) : 0;
+  const objetivo = base * (1 + inf * cfg.sensibilidad);
+  const previo = precioAyerGwei > 0 ? precioAyerGwei : base;
+  const precio = Math.max(previo * (1 - cfg.pasoMax), Math.min(previo * (1 + cfg.pasoMax), objetivo));
+  return Math.max(1, Math.round(precio));
+}
+function _diaMenos(dia, n) { return new Date(Date.parse(dia + 'T00:00:00Z') - n * 86400000).toISOString().slice(0, 10); }
+
+let _economiaFoto = null;
+/** Rehace la foto de hoy. Una sola a la vez. */
+async function economiaFoto() {
+  if (_economiaFoto) return _economiaFoto;
+  _economiaFoto = (async () => {
+    const hoy = _diaUTC();
+    const n2 = (campo) => ({ $sum: { $convert: { input: '$' + campo, to: 'double', onError: 0, onNull: 0 } } });
+    const [suma] = await PlayerStats.aggregate([{ $group: { _id: null, oro: n2('oro'), plata: n2('plata'), bronce: n2('bronce'), n: { $sum: 1 } } }]);
+    const oro = Math.max(0, Math.floor(suma ? suma.oro : 0)), plata = Math.max(0, Math.floor(suma ? suma.plata : 0)), bronce = Math.max(0, Math.floor(suma ? suma.bronce : 0));
+    const masa = oro * TESORO_BRONCE_POR.oro + plata * TESORO_BRONCE_POR.plata + bronce;
+    const previos = await EconomiaDia.find({ _id: { $lt: hoy } }).sort({ _id: -1 }).limit(8).lean();
+    const ayer = previos[0] || null;
+    const hace7 = previos.find((d) => d._id <= _diaMenos(hoy, 7)) || previos[previos.length - 1] || null;
+    const inf1 = ayer && ayer.masa > 0 ? (masa - ayer.masa) / ayer.masa : null;
+    const inf7 = hace7 && hace7.masa > 0 ? (masa - hace7.masa) / hace7.masa : inf1;
+    const cfg = await economiaConfig();
+    const salud = economiaSalud(inf7);
+    const [tc, tj] = await Promise.all([Tesoro.findById(TESORO_ID).select('saldo').lean(), TesoroJuego.findById(TESORO_JUEGO_ID).select('saldo').lean()]);
+    const doc = await EconomiaDia.findOneAndUpdate({ _id: hoy }, { $set: {
+      oro, plata, bronce, masa, jugadores: suma ? suma.n : 0,
+      precioGwei: economiaPrecioGwei(cfg, ayer ? ayer.precioGwei : 0, inf7),
+      inflacion1: inf1, inflacion7: inf7, salud, tope: economiaTope(cfg, salud),
+      tesoroCircular: tc ? Math.max(0, Number(tc.saldo) || 0) : 0, tesoroJuego: tj ? Math.max(0, Number(tj.saldo) || 0) : 0,
+      actualizado: new Date() } }, { upsert: true, new: true }).lean();
+    _economiaEstado = null;
+    return doc;
+  })().finally(() => { _economiaFoto = null; });
+  return _economiaFoto;
+}
+/** La foto de hoy (si no hay, se hace). */
+async function economiaHoy() {
+  const d = await EconomiaDia.findById(_diaUTC()).lean();
+  return d && d.precioGwei > 0 ? d : economiaFoto();
+}
+/** Lo que pasa durante el día y no está en las cuentas: compras de oro, comisiones de cambio. */
+function economiaApuntar(inc) {
+  const $inc = {};
+  for (const [k, v] of Object.entries(inc || {})) if (Number(v)) $inc[k] = Number(v);
+  if (!Object.keys($inc).length) return;
+  EconomiaDia.updateOne({ _id: _diaUTC() }, { $inc }, { upsert: true }).catch((e) => console.warn('⚠️  economía (apunte):', e.message));
+}
+// La foto, al arrancar y cada hora.
+setTimeout(() => { if (mongoose.connection.readyState === 1) economiaFoto().catch((e) => console.warn('⚠️  economía (foto):', e.message)); }, 20000).unref();
+setInterval(() => { if (mongoose.connection.readyState === 1) economiaFoto().catch((e) => console.warn('⚠️  economía (foto):', e.message)); }, 60 * 60 * 1000).unref();
+
+const _gwei = (g) => Number(g || 0) / 1e9;
+let _economiaEstado = null;
+/** Lo que se enseña a TODOS (transparencia): precio, salud, gráficos, comisiones y tesoros. */
+async function economiaEstadoPublico() {
+  if (_economiaEstado && Date.now() - _economiaEstado.en < 60000) return _economiaEstado.datos;
+  const [hoy, cfg, serie] = await Promise.all([
+    economiaHoy(), economiaConfig(),
+    EconomiaDia.find({ _id: { $gte: _diaMenos(_diaUTC(), 29) } }).sort({ _id: 1 }).lean()
+  ]);
+  const destino = economiaDestino(cfg);
+  const datos = {
+    ok: true, dia: hoy._id, moneda: 'zkLTC', chainId: CHAIN_ID,
+    precioOro: { zkltc: _gwei(hoy.precioGwei), gwei: hoy.precioGwei, base: cfg.precioBase },
+    salud: hoy.salud, inflacion1: hoy.inflacion1, inflacion7: hoy.inflacion7,
+    masa: { oro: hoy.oro, plata: hoy.plata, bronce: hoy.bronce, total: hoy.masa, jugadores: hoy.jugadores },
+    tope: hoy.tope || economiaTope(cfg, hoy.salud),
+    compra: { activa: !!(cfg.compraActiva && destino), destino, minimo: cfg.minimoCompra },
+    comisiones: { mercadoBps: TESORO_COMISION_BPS, circularBps: TESORO_CIRCULAR_BPS, juegoBps: TESORO_COMISION_BPS - TESORO_CIRCULAR_BPS, cambioBps: CAMBIO_COMISION_BPS },
+    tesoros: { circular: hoy.tesoroCircular, juego: hoy.tesoroJuego },
+    serie: serie.map((d) => ({ dia: d._id, precio: _gwei(d.precioGwei), inflacion1: d.inflacion1, inflacion7: d.inflacion7, salud: d.salud,
+                               oro: d.oro, plata: d.plata, bronce: d.bronce, masa: d.masa, jugadores: d.jugadores,
+                               oroComprado: d.oroComprado || 0, comisionCambio: d.comisionCambio || 0,
+                               tesoroCircular: d.tesoroCircular || 0, tesoroJuego: d.tesoroJuego || 0 }))
+  };
+  _economiaEstado = { en: Date.now(), datos };
+  return datos;
+}
+
+// GET /api/economia/estado — para el panel de monedas (público: transparencia).
+app.get('/api/economia/estado', apiLimiter, async (req, res) => {
+  try { return res.json(await economiaEstadoPublico()); }
+  catch (e) { console.error('GET /api/economia/estado:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+/** El oro comprado hoy por esta cartera: lo acreditado, lo pagado y las cotizaciones aún vivas
+    (si no, abriendo muchas a la vez se pasaba del tope). */
+async function economiaCompradoHoy(address) {
+  const ahora = Date.now();
+  const filas = await CompraOro.find({ address, dia: _diaUTC(), estado: { $in: ['cotizada', 'pagada', 'acreditada'] } }).select('oro oroDado estado caduca').lean();
+  return filas.reduce((s, f) => s + (f.estado === 'acreditada' ? (f.oroDado || 0)
+    : f.estado === 'pagada' || new Date(f.caduca).getTime() > ahora ? (f.oro || 0) : 0), 0);
+}
+// GET /api/currency/oro/estado — lo mío: cuánto llevo hoy, mi tope y lo pendiente.
+app.get('/api/currency/oro/estado', apiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const address = String(req.user.address || '').toLowerCase();
+    const pub = await economiaEstadoPublico();
+    const comprado = await economiaCompradoHoy(address);
+    const pendientes = await CompraOro.find({ address, estado: { $in: ['cotizada', 'pagada'] }, creada: { $gte: new Date(Date.now() - 2 * 86400000) } })
+      .sort({ creada: -1 }).limit(10).lean();
+    return res.json({ ok: true, comprado, tope: pub.tope, quedan: Math.max(0, pub.tope - comprado), precioOro: pub.precioOro, compra: pub.compra,
+      pendientes: pendientes.map((c) => ({ id: c._id, oro: c.oro, zkltc: Number(BigInt(c.wei) / 1000000000n) / 1e9, estado: c.estado, txHash: c.txHash || null,
+                                            destino: c.destino, caduca: c.caduca, creada: c.creada })) });
+  } catch (e) { console.error('GET /api/currency/oro/estado:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// POST /api/currency/oro/cotizar { oro } — el precio, fijado 15 minutos.
+app.post('/api/currency/oro/cotizar', strictLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const oro = Math.floor(Number(req.body && req.body.oro));
+    const cfg = await economiaConfig();
+    const destino = economiaDestino(cfg);
+    if (!cfg.compraActiva || !destino) return res.status(503).json({ error: 'compra_cerrada', message: 'Gold purchases are paused right now.' });
+    if (!(oro >= cfg.minimoCompra)) return res.status(400).json({ error: 'cantidad_invalida', minimo: cfg.minimoCompra });
+    const address = String(gp.address || '').toLowerCase();
+    const pub = await economiaEstadoPublico();
+    const comprado = await economiaCompradoHoy(address);
+    if (comprado + oro > pub.tope) return res.status(429).json({ error: 'tope_diario', tope: pub.tope, comprado, quedan: Math.max(0, pub.tope - comprado) });
+    const hoy = await economiaHoy();
+    const wei = BigInt(hoy.precioGwei) * 1000000000n * BigInt(oro);
+    const id = crypto.randomBytes(12).toString('hex');
+    const c = await CompraOro.create({ _id: id, playerName: gp.playerName, address, oro, wei: wei.toString(), precioGwei: hoy.precioGwei,
+                                       destino, dia: _diaUTC(), caduca: new Date(Date.now() + ECONOMIA_COTIZACION_MS) });
+    return res.json({ ok: true, id, oro, wei: c.wei, zkltc: _gwei(hoy.precioGwei) * oro, precioOro: _gwei(hoy.precioGwei),
+                      destino, chainId: CHAIN_ID, caduca: c.caduca });
+  } catch (e) { console.error('POST /api/currency/oro/cotizar:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+/** Lee el pago en la cadena. { ok, from, to, valor (BigInt), bloque, hora } o { error }. */
+async function economiaLeerPago(txHash) {
+  const actual = await provider.send('eth_chainId', []);
+  if (BigInt(actual) !== BigInt(CHAIN_ID)) return { error: 'red_incorrecta' };
+  const [tx, rc, ultimo] = await Promise.all([provider.getTransaction(txHash), provider.getTransactionReceipt(txHash), provider.getBlockNumber()]);
+  if (!tx || !rc) return { error: 'pendiente' };
+  if (Number(rc.status) !== 1) return { error: 'revertida' };
+  if (Number(ultimo) - Number(rc.blockNumber) + 1 < 1) return { error: 'pendiente' };
+  if (tx.chainId !== undefined && tx.chainId !== null && BigInt(tx.chainId) !== BigInt(CHAIN_ID)) return { error: 'red_incorrecta' };
+  const bloque = await provider.getBlock(rc.blockNumber);
+  return { ok: true, from: String(tx.from || '').toLowerCase(), to: String(tx.to || '').toLowerCase(), valor: BigInt(tx.value || 0),
+           datos: String(tx.data || '0x'), bloque: Number(rc.blockNumber), hora: bloque ? Number(bloque.timestamp) * 1000 : Date.now() };
+}
+
+// POST /api/currency/oro/confirmar { id, txHash } — se mira el pago y se da el oro (una vez).
+app.post('/api/currency/oro/confirmar', strictLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const id = String((req.body && req.body.id) || '');
+    const txHash = String((req.body && req.body.txHash) || '').toLowerCase();
+    if (!/^[0-9a-f]{24}$/.test(id)) return res.status(400).json({ error: 'id_invalido' });
+    if (!/^0x[0-9a-f]{64}$/.test(txHash)) return res.status(400).json({ error: 'hash_invalido' });
+    const address = String(gp.address || '').toLowerCase();
+    return await enColaDelJugador(address, async () => {
+      let c = await CompraOro.findOne({ _id: id, address }).lean();
+      if (!c) return res.status(404).json({ error: 'cotizacion_no_encontrada' });
+      if (c.estado === 'acreditada') {
+        if (c.txHash !== txHash) return res.status(409).json({ error: 'ya_pagada_con_otro_hash' });
+        const st = await PlayerStats.findOne({ playerName: gp.playerName }).lean();
+        return res.json({ ok: true, repetida: true, oro: c.oroDado, stats: st ? buildStatsResponse(st) : undefined });
+      }
+      if (c.txHash && c.txHash !== txHash) return res.status(409).json({ error: 'ya_tiene_otro_hash' });
+      const otra = await CompraOro.findOne({ txHash, _id: { $ne: id } }).select('_id').lean();
+      if (otra) return res.status(409).json({ error: 'hash_ya_usado' });
+      const pago = await economiaLeerPago(txHash);
+      if (pago.error === 'pendiente') {
+        await CompraOro.updateOne({ _id: id, txHash: { $exists: false } }, { $set: { txHash, estado: 'pagada' } }).catch(() => {});
+        return res.status(202).json({ error: 'pendiente', message: 'The payment is not confirmed yet. We will check again.' });
+      }
+      if (pago.error) return res.status(409).json({ error: pago.error });
+      if (pago.from !== address) return res.status(409).json({ error: 'otra_cartera', message: 'The payment must come from your game wallet.' });
+      if (pago.to !== c.destino) return res.status(409).json({ error: 'otro_destino', message: 'The payment went to another address.' });
+      const pedido = BigInt(c.wei);
+      // Al precio cotizado si llegó a tiempo; si no, lo que valga lo pagado AHORA.
+      let oro = c.oro;
+      const tarde = pago.hora > new Date(c.caduca).getTime() + 5 * 60 * 1000;
+      if (tarde || pago.valor < pedido) {
+        const hoy = await economiaHoy();
+        const precioWei = BigInt(hoy.precioGwei) * 1000000000n;
+        oro = Number(pago.valor / (tarde ? precioWei : BigInt(c.precioGwei) * 1000000000n));
+        oro = Math.min(oro, c.oro * 2);
+      }
+      if (!(oro >= 1)) {
+        await CompraOro.updateOne({ _id: id }, { $set: { estado: 'fallida', txHash, pagadoWei: pago.valor.toString(), motivo: 'pago_insuficiente' } });
+        return res.status(409).json({ error: 'pago_insuficiente', message: 'The payment is too small for 1 Gold. Contact support with your transaction.' });
+      }
+      // La reserva del hash: si dos peticiones llegan a la vez, solo una da el oro.
+      const reservada = await CompraOro.findOneAndUpdate({ _id: id, estado: { $in: ['cotizada', 'pagada'] }, $or: [{ txHash: { $exists: false } }, { txHash }] },
+        { $set: { estado: 'acreditada', txHash, oroDado: oro, pagadoWei: pago.valor.toString(), acreditada: new Date() } }, { new: true }).lean();
+      if (!reservada) return res.status(409).json({ error: 'ya_procesada' });
+      const doc = await gfDevolverStat(gp.playerName, 'oro', oro);
+      if (!doc) {
+        await CompraOro.updateOne({ _id: id }, { $set: { estado: 'pagada', motivo: 'sin_stats' } });
+        return res.status(503).json({ error: 'sin_stats', message: 'Your payment is safe. Open the game once and press Check again.' });
+      }
+      const gwei = Number(pago.valor / 1000000000n);
+      try {
+        await TesoroJuego.updateOne({ _id: TESORO_JUEGO_ID }, { $inc: { 'zkltc.gwei': gwei, 'zkltc.compras': 1, 'zkltc.oro': oro } }, { upsert: true });
+        await TesoroMov.create({ tesoro: 'juego', tipo: 'ingreso', origen: 'compra_oro', bronce: 0, playerName: gp.playerName,
+                                 detalle: oro + ' oro por ' + (gwei / 1e9) + ' zkLTC · ' + txHash });
+      } catch (e) { console.warn('⚠️  tesoro del juego (compra de oro):', e.message); }
+      economiaApuntar({ oroComprado: oro, zkltcGwei: gwei, compras: 1 });
+      console.log(`🪙 ${gp.playerName} compró ${oro} de oro por ${gwei / 1e9} zkLTC (${txHash})`);
+      return res.json({ ok: true, oro, pagado: gwei / 1e9, tarde, stats: buildStatsResponse(doc), settlesInMs: CHAIN_SETTLE_DELAY_MS });
+    });
+  } catch (e) { console.error('POST /api/currency/oro/confirmar:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// ── EL CENTRO DE CONTROL: el tesoro del juego y la economía ─────────────────
+function tesoroJuegoPublico(t) {
+  const x = t || {}, sub = (o, k) => Number(o && o[k]) || 0;
+  return {
+    saldo: Math.max(0, Number(x.saldo) || 0), retirado: Math.max(0, Number(x.retirado) || 0),
+    ingresado: Object.fromEntries(TESORO_JUEGO_ORIGENES.map((k) => [k, sub(x.ingresado, k)])),
+    ingresos: Object.fromEntries(TESORO_JUEGO_ORIGENES.map((k) => [k, sub(x.ingresos, k)])),
+    zkltc: { recibido: sub(x.zkltc, 'gwei') / 1e9, compras: sub(x.zkltc, 'compras'), oro: sub(x.zkltc, 'oro') },
+    actualizado: x.updatedAt || null
+  };
+}
+app.get('/api/admin/economia', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const ahora = Date.now(), hace30 = new Date(ahora - 30 * 86400000);
+    const [tj, tc, cfg, pub, grupos, ultimos, compras] = await Promise.all([
+      TesoroJuego.findById(TESORO_JUEGO_ID).lean(), Tesoro.findById(TESORO_ID).lean(), economiaConfig(), economiaEstadoPublico(),
+      TesoroMov.aggregate([
+        { $match: { t: { $gte: hace30 }, tesoro: 'juego' } },
+        { $group: { _id: { dia: { $dateToString: { format: '%Y-%m-%d', date: '$t', timezone: 'UTC' } }, origen: '$origen' }, bronce: { $sum: '$bronce' }, n: { $sum: 1 } } }
+      ]),
+      TesoroMov.find({ tesoro: 'juego' }).sort({ t: -1 }).limit(40).lean(),
+      CompraOro.find({}).sort({ creada: -1 }).limit(40).lean()
+    ]);
+    const dias = [];
+    for (let i = 29; i >= 0; i--) dias.push(new Date(ahora - i * 86400000).toISOString().slice(0, 10));
+    const porDia = new Map(dias.map((d) => [d, { dia: d, tienda: 0, p2p: 0, viajes: 0, vip: 0, revivir: 0, admin: 0, compras: 0 }]));
+    for (const g of grupos) {
+      const f = porDia.get(g._id.dia);
+      if (!f) continue;
+      if (g._id.origen === 'compra_oro') f.compras += g.n;
+      else if (Object.prototype.hasOwnProperty.call(f, g._id.origen)) f[g._id.origen] += g.bronce;
+    }
+    return res.json({ ok: true, juego: tesoroJuegoPublico(tj), circular: tesoroPublico(tc), config: cfg, base: ECONOMIA_CONFIG_BASE,
+      destino: economiaDestino(cfg), destinoServidor: !cfg.cartera, economia: pub, serieJuego: dias.map((d) => porDia.get(d)),
+      ultimos: ultimos.map((m) => ({ t: m.t, tipo: m.tipo, origen: m.origen, bronce: m.bronce, playerName: m.playerName, detalle: m.detalle })),
+      compras: compras.map((c) => ({ id: c._id, t: c.creada, playerName: c.playerName, oro: c.oro, oroDado: c.oroDado, estado: c.estado,
+                                     zkltc: Number(BigInt(c.wei) / 1000000000n) / 1e9, pagado: Number(BigInt(c.pagadoWei || '0') / 1000000000n) / 1e9,
+                                     txHash: c.txHash || null, motivo: c.motivo || '' })) });
+  } catch (e) { console.error('GET /api/admin/economia:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+app.post('/api/admin/economia/config', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const c = economiaNormalizarConfig(req.body && req.body.config);
+    await TesoroJuego.updateOne({ _id: TESORO_JUEGO_ID }, { $set: { config: c } }, { upsert: true });
+    _economiaCfg = c; _economiaCfgEn = Date.now(); _economiaEstado = null;
+    await economiaFoto().catch(() => {});
+    console.log(`📈 economía: configuración cambiada por ${(req.admin && req.admin.address) || 'admin'} (oro base ${c.precioBase} zkLTC${c.compraActiva ? '' : ', compra CERRADA'})`);
+    return res.json({ ok: true, config: c });
+  } catch (e) { console.error('POST /api/admin/economia/config:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+app.post('/api/admin/economia/foto', adminAuth, strictLimiter, async (req, res) => {
+  try { const d = await economiaFoto(); return res.json({ ok: true, dia: d && d._id }); }
+  catch (e) { console.error('POST /api/admin/economia/foto:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+app.post('/api/admin/tesoro-juego/ajuste', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const tipo = String((req.body && req.body.tipo) || '');
+    const bronce = Math.floor(Number(req.body && req.body.bronce) || 0);
+    const motivo = String((req.body && req.body.motivo) || '').trim().slice(0, 120);
+    if (tipo !== 'ingreso' && tipo !== 'retiro') return res.status(400).json({ error: 'tipo_invalido' });
+    if (!(bronce >= 1 && bronce <= 1e12)) return res.status(400).json({ error: 'cantidad_invalida' });
+    if (motivo.length < 3) return res.status(400).json({ error: 'motivo_requerido' });
+    const quien = (req.admin && req.admin.address) || 'admin';
+    let t;
+    if (tipo === 'ingreso') {
+      t = await TesoroJuego.findOneAndUpdate({ _id: TESORO_JUEGO_ID }, { $inc: { saldo: bronce, 'ingresado.admin': bronce } }, { new: true, upsert: true }).lean();
+    } else {
+      t = await TesoroJuego.findOneAndUpdate({ _id: TESORO_JUEGO_ID, saldo: { $gte: bronce } }, { $inc: { saldo: -bronce, retirado: bronce } }, { new: true }).lean();
+      if (!t) return res.status(409).json({ error: 'saldo_insuficiente' });
+    }
+    await TesoroMov.create({ tesoro: 'juego', tipo: 'ajuste', origen: 'admin', bronce: tipo === 'ingreso' ? bronce : -bronce, playerName: null, detalle: motivo + ' — ' + quien });
+    console.log(`🏦 tesoro del juego: ${tipo} de ${bronce} bronce por ${quien} (${motivo})`);
+    return res.json({ ok: true, juego: tesoroJuegoPublico(t) });
+  } catch (e) { console.error('POST /api/admin/tesoro-juego/ajuste:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+console.log('✅ Economía: /api/economia/estado, /api/currency/oro/{estado,cotizar,confirmar}, /api/admin/economia{,/config,/foto}, /api/admin/tesoro-juego/ajuste');
+
 // ── MARKETPLACE ROUTES MOUNT ────────────────────────────────────────────────
 // Se monta aquí (y no más arriba) porque necesita GamePlayer, Listing (ya
 // definidos) y PlayerStats (recién definido arriba) al mismo tiempo.
@@ -21164,6 +21720,10 @@ require('./marketplace-routes')(app, {
   Tesoro,
   TesoroMov,
   TESORO_ID,
+  // (2026-10-26) Y el del juego: de la comisión del 5 %, el 3,5 % es suyo.
+  TesoroJuego,
+  TESORO_JUEGO_ID,
+  TESORO_CIRCULAR_BPS,
   // Quién puede crear lotes limitados. Se pasa la versión CACHEADA porque el
   // mercado la consulta en cada listado y sin caché serían lecturas on-chain
   // constantes. Si no se pasara, el marketplace trata a todo el mundo como no
@@ -23514,6 +24074,8 @@ async function gfAlchemistBuy(req,res) {
       const placed=ponerFacturaEnSlots(gp.inventory,gp.chest,itemId,invoice);
       gp.inventory=placed.inventory;gp.chest=placed.chest;gp.marketWriteAt=new Date();gp.markModified('inventory');gp.markModified('chest');
       let mirrorPending=false;try{await gp.save();}catch(e){mirrorPending=true;}
+      // (2026-10-26) "Lo que usan para comprar pociones de revivir en el alquimista, al tesoro del juego."
+      if(cfg.revive)await tesoroJuegoIngresar('revivir',cost*TESORO_BRONCE_POR.plata,gp.playerName,itemId+' x'+qty);
       return res.json({ok:true,itemId,qty,paid:cost,silver:stats.plata,stats:buildStatsResponse(stats),mirrorPending});
     });
   }catch(e){return res.status(503).json({error:'purchase_failed'});}
@@ -24455,8 +25017,14 @@ weeklyGiftSchema.index({ playerName: 1, kind: 1 }, { unique: true });
 
 const WeeklyGift = mongoose.models.WeeklyGift || mongoose.model('WeeklyGift', weeklyGiftSchema);
 
+/* (2026-10-26) "Quita los tres botones de dar oro, plata y bronce." Los regalos
+   semanales metían monedas de la nada en la economía (inflación pura). Las
+   rutas siguen respondiendo, para los navegadores con el juego viejo, pero ya
+   no dan nada. */
+const WEEKLY_GIFTS_ACTIVOS = false;
 // GET — cuánto falta para poder reclamar cada uno.
 app.get('/api/currency/weekly', apiLimiter, authMiddleware, async (req, res) => {
+  if (!WEEKLY_GIFTS_ACTIVOS) return res.json({ gifts: {}, periodMs: WEEKLY_GIFT_MS, disabled: true });
   try {
     const address = (req.user.address || '').toLowerCase();
     const gp = await GamePlayer.findOne({ address }).lean();
@@ -24485,6 +25053,7 @@ app.get('/api/currency/weekly', apiLimiter, authMiddleware, async (req, res) => 
 
 // POST — reclamar. body: { kind: 'gold' | 'silver' }
 app.post('/api/currency/weekly/claim', strictLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  if (!WEEKLY_GIFTS_ACTIVOS) return res.status(410).json({ error: 'gifts_disabled', message: 'Free coins were removed to protect the economy.' });
   try {
     const kind = String((req.body && req.body.kind) || '');
     const cfg = WEEKLY_GIFTS[kind];
@@ -24562,29 +25131,35 @@ app.post('/api/currency/exchange', apiLimiter, authMiddleware, csrfProtection, a
          Mongo (no se puede gastar dos veces la misma plata) y las facturas las
          pone al día el liquidador en cuanto la cadena conteste. */
       const costeX = qty * BRONZE_PER_SILVER, deBronce = direction === 'bronzeToSilver';
+      // (2026-10-26) La comisión del cambio (2 % plata→bronce, 3 % bronce→plata), en bronce,
+      // al tesoro de la economía circular.
+      const feeX = gfComisionCambio(direction, qty);
+      const pagaBronce = costeX + (deBronce ? feeX.cantidad : 0), recibeBronce = costeX - (deBronce ? 0 : feeX.cantidad);
       const hecho = await PlayerStats.findOneAndUpdate(
-        { playerName: gpB.playerName, ...(deBronce ? { bronce: { $gte: costeX } } : { plata: { $gte: qty } }) },
-        { $inc: deBronce ? { bronce: -costeX, plata: qty } : { plata: -qty, bronce: costeX },
+        { playerName: gpB.playerName, ...(deBronce ? { bronce: { $gte: pagaBronce } } : { plata: { $gte: qty } }) },
+        { $inc: deBronce ? { bronce: -pagaBronce, plata: qty } : { plata: -qty, bronce: recibeBronce },
           $addToSet: { chainPending: { $each: ['plata', 'bronce'] } } },
         { new: true });
       if (hecho) {
         if (!hecho.chainPendingSince) {
           await PlayerStats.updateOne({ _id: hecho._id, chainPendingSince: null }, { $set: { chainPendingSince: new Date() } });
         }
-        console.log(`💱 Cambio ${direction} x${qty} para ${gpB.playerName}: plata=${hecho.plata} bronce=${hecho.bronce} (la cadena, con el liquidador)`);
-        return res.json({ ok: true, rate: BRONZE_PER_SILVER, stats: buildStatsResponse(hecho), settlesInMs: CHAIN_SETTLE_DELAY_MS });
+        await tesoroCircularIngresar('cambio', feeX.bronce, gpB.playerName, direction + ' x' + qty);
+        economiaApuntar({ comisionCambio: feeX.bronce });
+        console.log(`💱 Cambio ${direction} x${qty} para ${gpB.playerName}: plata=${hecho.plata} bronce=${hecho.bronce} (comisión ${feeX.bronce} de bronce; la cadena, con el liquidador)`);
+        return res.json({ ok: true, rate: BRONZE_PER_SILVER, fee: feeX, stats: buildStatsResponse(hecho), settlesInMs: CHAIN_SETTLE_DELAY_MS });
       }
       // No había bastante (o no hay stats): la respuesta de siempre.
       const docB = await PlayerStats.findOne({ playerName: gpB.playerName });
       if (!docB) return res.status(404).json({ error: 'stats_not_found. Call /sync first' });
-      const plataB = Number(docB.plata || 0), bronceB = Number(docB.bronce || 0), costeB = qty * BRONZE_PER_SILVER;
+      const plataB = Number(docB.plata || 0), bronceB = Number(docB.bronce || 0);
       let nuevaPlata, nuevoBronce;
       if (direction === 'bronzeToSilver') {
-        if (bronceB < costeB) return res.status(400).json({ error: 'insufficient_bronze', need: costeB, have: bronceB });
-        nuevoBronce = bronceB - costeB; nuevaPlata = plataB + qty;
+        if (bronceB < pagaBronce) return res.status(400).json({ error: 'insufficient_bronze', need: pagaBronce, have: bronceB });
+        nuevoBronce = bronceB - pagaBronce; nuevaPlata = plataB + qty;
       } else {
         if (plataB < qty) return res.status(400).json({ error: 'insufficient_silver', need: qty, have: plataB });
-        nuevaPlata = plataB - qty; nuevoBronce = bronceB + costeB;
+        nuevaPlata = plataB - qty; nuevoBronce = bronceB + recibeBronce;
       }
       const contratoB = getStatsContract();
       const gasB = await getSafeGasPriceStats();
@@ -24610,8 +25185,9 @@ app.post('/api/currency/exchange', apiLimiter, authMiddleware, csrfProtection, a
         await aplicarB('bronce', nuevoBronce);
       }
       await docB.save();
+      if (!erroresB.length) { await tesoroCircularIngresar('cambio', feeX.bronce, gpB.playerName, direction + ' x' + qty); economiaApuntar({ comisionCambio: feeX.bronce }); }
       console.log(`💱 Cambio ${direction} x${qty} para ${gpB.playerName}: plata=${docB.plata} bronce=${docB.bronce}`);
-      return res.json({ ok: true, rate: BRONZE_PER_SILVER, stats: buildStatsResponse(docB), errors: erroresB.length ? erroresB : undefined });
+      return res.json({ ok: true, rate: BRONZE_PER_SILVER, fee: feeX, stats: buildStatsResponse(docB), errors: erroresB.length ? erroresB : undefined });
     }
 
     const gp = await GamePlayer.findOne({ address }).lean();
@@ -24620,62 +25196,31 @@ app.post('/api/currency/exchange', apiLimiter, authMiddleware, csrfProtection, a
     const doc = await PlayerStats.findOne({ playerName: gp.playerName });
     if (!doc) return res.status(404).json({ error: 'stats_not_found. Call /sync first' });
 
-    const oroActual   = Number(doc.oro   || 0);
-    const plataActual = Number(doc.plata || 0);
-    const silverCost  = qty * SILVER_PER_GOLD;
-
-    let newOro, newPlata;
-    if (direction === 'silverToGold') {
-      if (plataActual < silverCost) {
-        return res.status(400).json({ error: 'insufficient_silver', need: silverCost, have: plataActual });
-      }
-      newPlata = plataActual - silverCost;
-      newOro   = oroActual + qty;
-    } else {
-      if (oroActual < qty) {
-        return res.status(400).json({ error: 'insufficient_gold', need: qty, have: oroActual });
-      }
-      newOro   = oroActual - qty;
-      newPlata = plataActual + silverCost;
+    /* (2026-10-26) ORO ⇄ PLATA: un solo movimiento atómico en Mongo (no se puede
+       gastar dos veces lo mismo) y las facturas, con el liquidador, como
+       plata ⇄ bronce. Antes escribía las dos facturas en el acto y con el RPC
+       cortado fallaba. Y con su comisión (1 % oro→plata, 2 % plata→oro), en
+       plata, al tesoro de la economía circular. */
+    const fee = gfComisionCambio(direction, qty);
+    const silverCost = qty * SILVER_PER_GOLD;
+    const deOro = direction === 'goldToSilver';
+    const pagaPlata = silverCost + (deOro ? 0 : fee.cantidad), recibePlata = silverCost - (deOro ? fee.cantidad : 0);
+    const hecho = await PlayerStats.findOneAndUpdate(
+      { playerName: gp.playerName, ...(deOro ? { oro: { $gte: qty } } : { plata: { $gte: pagaPlata } }) },
+      { $inc: deOro ? { oro: -qty, plata: recibePlata } : { plata: -pagaPlata, oro: qty },
+        $addToSet: { chainPending: { $each: ['oro', 'plata'] } } },
+      { new: true });
+    if (!hecho) {
+      if (deOro) return res.status(400).json({ error: 'insufficient_gold', need: qty, have: Number(doc.oro || 0) });
+      return res.status(400).json({ error: 'insufficient_silver', need: pagaPlata, have: Number(doc.plata || 0) });
     }
-
-    const contract = getStatsContract();
-    const gasPrice = await getSafeGasPriceStats();
-    const aplicados = [];
-    const errores   = [];
-
-    // Aplica el nuevo valor de un stat a su ÚNICA factura on-chain.
-    // Mismo camino que /api/stats/update: applyStatOnChain es el único sitio
-    // que toca increase/decrease, así que las dos rutas no pueden divergir.
-    const aplicar = async (stat, oldVal, newVal) => {
-      const invId = doc.invoiceIds && doc.invoiceIds[stat];
-      if (!contract || !invId) { doc[stat] = newVal; aplicados.push(stat); return; }
-
-      const r = await applyStatOnChain(contract, stat, invId, newVal, gasPrice);
-      if (r.ok) {
-        doc[stat] = newVal;
-        aplicados.push(stat);
-      } else {
-        console.error(`❌ exchange TX [${stat}]:`, r.error);
-        if (r.chainQty !== null && r.chainQty !== undefined) doc[stat] = clampStat(stat, r.chainQty);
-        errores.push({ stat, error: r.error });
-      }
-    };
-
-    // Primero se QUITA y luego se DA: si el cobro falla, no se entrega nada.
-    if (direction === 'silverToGold') {
-      await aplicar('plata', plataActual, newPlata);
-      if (errores.length) return res.status(502).json({ error: 'exchange_failed', errors: errores });
-      await aplicar('oro', oroActual, newOro);
-    } else {
-      await aplicar('oro', oroActual, newOro);
-      if (errores.length) return res.status(502).json({ error: 'exchange_failed', errors: errores });
-      await aplicar('plata', plataActual, newPlata);
+    if (!hecho.chainPendingSince) {
+      await PlayerStats.updateOne({ _id: hecho._id, chainPendingSince: null }, { $set: { chainPendingSince: new Date() } });
     }
-
-    await doc.save();
-    console.log(`💱 Cambio ${direction} x${qty} para ${gp.playerName}: oro=${doc.oro} plata=${doc.plata}`);
-    return res.json({ ok: true, rate: SILVER_PER_GOLD, stats: buildStatsResponse(doc), errors: errores.length ? errores : undefined });
+    await tesoroCircularIngresar('cambio', fee.bronce, gp.playerName, direction + ' x' + qty);
+    economiaApuntar({ comisionCambio: fee.bronce });
+    console.log(`💱 Cambio ${direction} x${qty} para ${gp.playerName}: oro=${hecho.oro} plata=${hecho.plata} (comisión ${fee.cantidad} de plata)`);
+    return res.json({ ok: true, rate: SILVER_PER_GOLD, fee, stats: buildStatsResponse(hecho), settlesInMs: CHAIN_SETTLE_DELAY_MS });
 
   } catch (err) {
     console.error('POST /api/currency/exchange error:', err);
@@ -30232,7 +30777,7 @@ try {
 }
 
 // <COLLECTIONS_BACKEND_BUNDLE>
-// Generated by tools/build-collections-backend.cjs. SHA-256: b2f6bbd81a1ba6fd0c9c9b32c8e8ceea7f203475accc7aa263e625e01ef99143
+// Generated by tools/build-collections-backend.cjs. SHA-256: 06ed922389b78b35e05fc4fb31f1c3c838970bda243824628b19a1ca73a46aab
 function cargarColeccionesIntegrado() {
   const module = { exports: {} };
 'use strict';
@@ -30248,6 +30793,9 @@ const ABI = [
   'function setLimit(string _tipo,uint256 _limit,uint256 _perInvoiceLimit)',
   'function createInvoice(address _owner,string _tipo,uint256 _cantidad,string _manualId) returns (uint256)',
   'function transferInvoice(address _fromOwner,address _toOwner,uint256 _id,uint256 _amount,string _newManualId) returns (uint256)',
+  // (2026-10-26) Quemar una pieza emitida antes de borrarla del registro. La firma
+  // la hace la cartera admin en el navegador, como todas las demás.
+  'function deleteInvoice(uint256 _id)',
   'function getInvoice(uint256) view returns ((uint256 id,string manualId,address owner,string tipo,uint256 cantidad,bool active,uint256 createdAt))',
   'function getTipoStats(string) view returns (uint256 totalQuantity,uint256 limit,uint256 perInvoiceLimit,uint256 invoiceCount,uint256 totalBurned,bool exists)',
   'event InvoiceCreated(uint256 indexed id,string manualId,address indexed owner,string indexed tipo,uint256 cantidad,uint256 createdAt)',
@@ -30259,6 +30807,8 @@ const ABI = [
   'event TipoLimitSet(string tipo,uint256 limit,uint256 perInvoiceLimit)'
 ];
 const STATES = new Set(['active', 'suspended', 'blocked', 'deleted']);
+// (2026-10-26) Pública = el juego la enseña en el panel NFT; privada = solo el panel.
+const VISIBILITY = new Set(['public', 'private']);
 const MAX_IMAGE = 600000;
 const MAX_ATTRIBUTES = 200;
 const LIMITS = Object.freeze({ collections: 250, tokens: 1000, history: 2000, royaltyPayments: 1000, operations: 100, images: MAX_IMAGE, attributes: MAX_ATTRIBUTES, batch: 100, scanBlocks: 1500 });
@@ -30303,6 +30853,7 @@ function bps(value, nullable = false) {
   return n;
 }
 function state(value) { if (!STATES.has(value)) fail(400, 'invalid_status', 'Estado no válido.'); return value; }
+function visibility(value) { if (!VISIBILITY.has(value)) fail(400, 'invalid_visibility', 'La visibilidad debe ser pública o privada.'); return value; }
 function attributes(value = []) {
   if (!Array.isArray(value) || value.length > MAX_ATTRIBUTES) fail(400, 'invalid_attributes', `Se admiten hasta ${MAX_ATTRIBUTES} atributos por NFT.`);
   return value.map(a => {
@@ -30351,6 +30902,8 @@ async function verifyReceipt({ provider, iface, contractAddress, chainId, operat
     found = events.find(x => x.event.name === 'TipoLimitSet' && x.event.args.tipo === operation.typeKey && String(x.event.args.limit) === operation.args[1] && String(x.event.args.perInvoiceLimit) === '1');
   } else if (operation.action === 'mint') {
     found = events.find(x => x.event.name === 'InvoiceCreated' && x.event.args.manualId === operation.manualId && same(x.event.args.owner, operation.toWallet) && String(x.event.args.cantidad) === '1' && same(x.event.args.tipo.hash, iface.getEvent('InvoiceCreated') && operation.typeHash));
+  } else if (operation.action === 'burn') {
+    found = events.find(x => x.event.name === 'InvoiceDeleted' && String(x.event.args.id) === operation.invoiceId && x.event.args.manualId === operation.manualId);
   } else {
     found = events.find(x => x.event.name === 'InvoiceTransferred' && String(x.event.args.originalId) === operation.invoiceId && same(x.event.args.from, operation.fromWallet) && same(x.event.args.to, operation.toWallet) && String(x.event.args.amount) === '1');
     if (found && !events.some(x => x.event.name === 'InvoiceCreated' && String(x.event.args.id) === String(found.event.args.newId) && x.event.args.manualId === operation.manualId && same(x.event.args.owner, operation.toWallet) && String(x.event.args.cantidad) === '1' && same(x.event.args.tipo.hash, operation.typeHash))) found = null;
@@ -30392,7 +30945,10 @@ function mountCollections(deps) {
     for (const [fields, options] of indexes) schema.index(fields, options);
     return mongoose.model(name, schema);
   };
-  const Collection = model('GFNftCollection', { id: String, name: String, description: String, symbol: String, delegate: String, royaltyBps: Number, royaltyReceiver: String, status: String, typeKey: String, limit: String, configuredLimit: String, configured: Boolean, nextNumber: { type: Number, default: 0 }, createdAt: String, updatedAt: String }, [[{ scope: 1, typeKey: 1 }, { unique: true }]]);
+  const Collection = model('GFNftCollection', { id: String, name: String, description: String, symbol: String, delegate: String, royaltyBps: Number, royaltyReceiver: String, status: String, typeKey: String, limit: String, configuredLimit: String, configured: Boolean, nextNumber: { type: Number, default: 0 },
+    // (2026-10-26) Pública/privada para el panel NFT del juego, y su imagen de perfil y portada.
+    visibility: { type: String, default: 'private' }, avatarImageId: String, avatarUrl: String, coverImageId: String, coverUrl: String,
+    createdAt: String, updatedAt: String }, [[{ scope: 1, typeKey: 1 }, { unique: true }]]);
   const Token = model('GFNftToken', { id: String, number: Number, collectionId: { type: String, index: true }, name: String, description: String, imageId: String, imageUrl: String, attributes: [{ _id: false, trait_type: String, value: String }], status: String, royaltyBps: { type: Number, default: null }, royaltyReceiver: String, invoiceId: String, invoiceIds: [String], manualId: String, pendingMintOperation: String, owner: String, chainActive: Boolean, chainQuantity: String, chainWarning: String, chainAmbiguous: Boolean, lastChainBlock: { type: Number, default: 0 }, lastChainIndex: { type: Number, default: -1 }, createdAt: String, updatedAt: String }, [[{ scope: 1, collectionId: 1, number: 1 }, { unique: true }], [{ scope: 1, invoiceIds: 1 }, {}]]);
   const Image = model('GFNftImage', { id: String, data: Buffer, mime: String, digest: String, createdAt: String }, [[{ scope: 1, digest: 1 }, { unique: true }]]);
   const Operation = model('GFNftOperation', { id: String, actor: String, action: String, collectionId: String, tokenId: String, method: String, args: [String], data: String, typeKey: String, typeHash: String, manualId: String, invoiceId: String, fromWallet: String, toWallet: String, status: String, txHash: { type: String }, result: mongoose.Schema.Types.Mixed, createdAt: String, confirmedAt: String }, [[{ scope: 1, txHash: 1 }, { unique: true, partialFilterExpression: { txHash: { $type: 'string' } } }]]);
@@ -30451,8 +31007,11 @@ function mountCollections(deps) {
     if (c.status !== 'active' || t && t.status !== 'active') fail(409, 'policy_restricted', 'Activa la colección y el NFT antes de emitirlo o enviarlo.');
   };
   const collectionFields = (body, req, existing) => {
-    keys(body, ['name', 'description', 'symbol', 'delegate', 'royaltyBps', 'royaltyReceiver', 'status', 'limit']);
+    keys(body, ['name', 'description', 'symbol', 'delegate', 'royaltyBps', 'royaltyReceiver', 'status', 'limit', 'visibility', 'avatarImageId', 'coverImageId']);
     const out = {};
+    if (body.visibility !== undefined || !existing) out.visibility = visibility(body.visibility || 'private');
+    // '' quita la imagen; si no, tiene que ser una ya subida (se comprueba en collectionImages).
+    for (const k of ['avatarImageId', 'coverImageId']) if (body[k] !== undefined) out[k] = body[k] === '' || body[k] === null ? '' : id(body[k]);
     for (const [k, max] of [['name',150], ['description',5000], ['symbol',20]]) if (body[k] !== undefined || !existing) out[k] = string(body[k], max, k, k === 'name');
     if (Object.hasOwn(body, 'delegate')) {
       const value = address(body.delegate, true);
@@ -30466,6 +31025,25 @@ function mountCollections(deps) {
     const effective = { ...existing, ...out };
     if (effective.royaltyBps > 0 && !effective.royaltyReceiver) fail(400, 'royalty_receiver_required', 'Indica la cartera receptora de royalties.');
     return out;
+  };
+  /** El perfil y la portada: que la imagen exista, y su URL pública. */
+  const collectionImages = async fields => {
+    for (const [k, url] of [['avatarImageId', 'avatarUrl'], ['coverImageId', 'coverUrl']]) {
+      if (!Object.hasOwn(fields, k)) continue;
+      if (!fields[k]) { fields[url] = ''; continue; }
+      if (!await Image.exists(query({ id: fields[k] }))) fail(400, 'image_not_found', 'Primero sube la imagen de perfil o de portada.');
+      fields[url] = `/api/collections/images/${fields[k]}`;
+    }
+    return fields;
+  };
+  /** Las imágenes que nadie usa ya (ni una pieza, ni un perfil ni una portada) se borran. */
+  const dropUnusedImages = async ids => {
+    let dropped = 0;
+    for (const imageId of [...new Set(ids.filter(Boolean))]) {
+      const used = await Token.exists(query({ imageId })) || await Collection.exists(query({ $or: [{ avatarImageId: imageId }, { coverImageId: imageId }] }));
+      if (!used) { const r = await Image.deleteOne(query({ id: imageId })); dropped += r && r.deletedCount || 0; }
+    }
+    return dropped;
   };
   const tokenFields = async (body, existing, collection) => {
     keys(body, ['name', 'description', 'imageId', 'attributes', 'status', 'royaltyBps', 'royaltyReceiver']);
@@ -30491,7 +31069,9 @@ function mountCollections(deps) {
       Scan.findOne(query({id:'main'})).lean(), Promise.all([Collection.countDocuments(query()),Token.countDocuments(query()),History.countDocuments(query()),Operation.countDocuments(query({actor:req.collectionsActor,status:{$in:['prepared','applying']}})),Payment.countDocuments(query())])
     ]);
     res.json({ok:true,address:req.collectionsActor,systemOwner:req.collectionsSystemOwner,isSystemOwner:req.collectionsIsSystemOwner,chainId,contractAddress,explorerUrl,abi:ABI,
-      capabilities:{invoiceSystem:true,erc721:false,onchainRoyaltyEnforcement:false,royaltyPaymentTracking:'native_direct_receipts',royaltySaleAmount:'admin_declared',reversibleStates:'backend_policy',delegates:'admin_scoped_collection_policy',multiAccount:'sequential_wallet_transactions',confirmations,imageMaxBytes:MAX_IMAGE,attributesMax:MAX_ATTRIBUTES,limits:LIMITS},
+      capabilities:{invoiceSystem:true,erc721:false,onchainRoyaltyEnforcement:false,royaltyPaymentTracking:'native_direct_receipts',royaltySaleAmount:'admin_declared',reversibleStates:'backend_policy',delegates:'admin_scoped_collection_policy',multiAccount:'sequential_wallet_transactions',confirmations,imageMaxBytes:MAX_IMAGE,attributesMax:MAX_ATTRIBUTES,limits:LIMITS,
+        // (2026-10-26) Lo nuevo del estudio: el panel solo lo enseña si el servidor lo tiene.
+        visibility:true,collectionImages:true,deletes:true,burn:true,bulkImages:true,owners:true},
       collections:cs.map(plain),tokens:ts.map(plain),history:hs.map(plain),royaltyPayments:ps.map(plain),operations:ops.map(plain),scan:plain(scan)||{cursor:null,historicalIncomplete:true},
       totals:{collections:totals[0],tokens:totals[1],history:totals[2],operations:totals[3],royaltyPayments:totals[4]},truncated:totals[0]>cs.length||totals[1]>ts.length||totals[2]>hs.length||totals[3]>ops.length||totals[4]>ps.length});
   }));
@@ -30511,18 +31091,19 @@ function mountCollections(deps) {
     const nextOffset=offset+rows.length;res.json({ok:true,kind,items:rows.map(plain),total,hasMore:nextOffset<total,nextOffset});
   }));
   app.post(PREFIX, route(async(req,res) => {
-    const fields = collectionFields(req.body,req,null); const uid=crypto.randomUUID(); const now=new Date().toISOString();
+    const fields = await collectionImages(collectionFields(req.body,req,null)); const uid=crypto.randomUUID(); const now=new Date().toISOString();
     const c=await Collection.create({scope,id:uid,...fields,typeKey:`col:${uid}`,configured:false,configuredLimit:'0',nextNumber:0,createdAt:now,updatedAt:now});
     res.status(201).json({ok:true,collection:plain(c)});
   }));
   app.patch(`${PREFIX}/:id`,route(async(req,res) => {
-    const c=await getCollection(req.params.id);collectionWrite(req,c);const fields=collectionFields(req.body,req,c);
+    const c=await getCollection(req.params.id);collectionWrite(req,c);const fields=await collectionImages(collectionFields(req.body,req,c));
     if (fields.limit && BigInt(fields.limit)<BigInt(c.nextNumber)) fail(409,'limit_below_count','El límite no puede ser inferior al número de NFT registrados.');
     if(fields.limit)fields.configured=fields.limit===c.configuredLimit;
     if(Object.hasOwn(fields,'royaltyReceiver')&&!fields.royaltyReceiver&&await Token.exists(query({collectionId:c.id,royaltyBps:{$gt:0},royaltyReceiver:''})))fail(409,'royalty_receiver_in_use','Hay NFT con un royalty propio que dependen de la cartera receptora de esta colección. Asigna primero un receptor propio a esos NFT.');
     // Collection policy is inherited dynamically. No token status is overwritten,
     // so restoring a collection preserves previously blocked individual NFTs.
     const changed=await Collection.findOneAndUpdate(query({id:c.id}),{$set:{...fields,updatedAt:new Date().toISOString()}},{new:true}).lean();
+    if(Object.hasOwn(fields,'avatarImageId')||Object.hasOwn(fields,'coverImageId'))await dropUnusedImages([c.avatarImageId,c.coverImageId]);
     res.json({ok:true,collection:plain(changed)});
   }));
   app.post(`${PREFIX}/images`,route(async(req,res) => {
@@ -30533,7 +31114,9 @@ function mountCollections(deps) {
   app.get('/api/collections/images/:id',route(async(req,res) => {
     const image=await Image.findOne(query({id:id(req.params.id)})).lean();if(!image)fail(404,'image_not_found','Imagen no encontrada.');
     const data=Buffer.isBuffer(image.data)?image.data:Buffer.from(image.data.buffer);
-    res.set({'Content-Type':image.mime,'Content-Length':String(data.length),'X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; sandbox",'Cache-Control':'public,max-age=86400,immutable'}).send(data);
+    res.set({'Content-Type':image.mime,'Content-Length':String(data.length),'X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; sandbox",'Cache-Control':'public,max-age=86400,immutable',
+      // (2026-10-26) Imágenes públicas: el panel NFT del juego (otro origen) y las carteras las incrustan.
+      'Cross-Origin-Resource-Policy':'cross-origin'}).send(data);
   }));
   app.post(`${PREFIX}/:id/tokens`,route(async(req,res) => {
     keys(req.body,['items']);const c=await getCollection(req.params.id);collectionWrite(req,c);active(c);
@@ -30548,14 +31131,87 @@ function mountCollections(deps) {
   }));
   app.patch(`${PREFIX}/tokens/:id`,route(async(req,res) => {
     const t=await getToken(req.params.id);const c=await getCollection(t.collectionId);collectionWrite(req,c);const fields=await tokenFields(req.body,t,c);
-    const changed=await Token.findOneAndUpdate(query({id:t.id}),{$set:{...fields,updatedAt:new Date().toISOString()}},{new:true}).lean();res.json({ok:true,token:plain(changed)});
+    const changed=await Token.findOneAndUpdate(query({id:t.id}),{$set:{...fields,updatedAt:new Date().toISOString()}},{new:true}).lean();
+    if(fields.imageId&&fields.imageId!==t.imageId)await dropUnusedImages([t.imageId]);
+    res.json({ok:true,token:plain(changed)});
+  }));
+  /* ═══ BORRAR Y CAMBIAR IMÁGENES                                  (2026-10-26)
+     "No puedo eliminar la colección y todos sus NFT, ni un NFT de una colección,
+     ni cambiarle la imagen, ni cambiar las imágenes de todos según su id."
+
+     Borrar es del REGISTRO (Mongo): lo que ya se emitió sigue siendo una
+     factura en la cartera de alguien. Por eso, si hay piezas emitidas y activas,
+     se pide `force` (o quemarlas antes con la acción `burn`, que firma la
+     cartera admin). Las imágenes que quedan sin usar se borran. */
+  app.post(`${PREFIX}/tokens/:id/delete`,route(async(req,res)=>{
+    keys(req.body||{},['force']);const t=await getToken(req.params.id);const c=await getCollection(t.collectionId);collectionWrite(req,c);
+    if(t.invoiceId&&t.chainActive!==false&&(req.body||{}).force!==true)fail(409,'token_on_chain','Esta pieza está emitida en la cartera '+(t.owner||'?')+'. Quémala primero o confirma borrarla solo del registro.');
+    if(t.pendingMintOperation)await Operation.updateOne(query({id:t.pendingMintOperation,status:{$in:['prepared','applying']}}),{$set:{status:'superseded'}});
+    await Token.deleteOne(query({id:t.id}));
+    const images=await dropUnusedImages([t.imageId]);
+    res.json({ok:true,deleted:t.id,number:t.number,imagesDropped:images});
+  }));
+  app.post(`${PREFIX}/:id/delete`,route(async(req,res)=>{
+    keys(req.body||{},['confirm','force']);const c=await getCollection(req.params.id);collectionWrite(req,c);
+    if(string(req.body&&req.body.confirm,150,'confirmación',true)!==String(c.name||'').trim())fail(400,'confirm_mismatch','Escribe exactamente el nombre de la colección para borrarla.');
+    const onChain=await Token.countDocuments(query({collectionId:c.id,invoiceId:{$ne:''},chainActive:{$ne:false}}));
+    if(onChain>0&&(req.body||{}).force!==true)fail(409,'collection_on_chain',`Hay ${onChain} piezas emitidas en carteras. Quémalas primero o confirma borrar la colección solo del registro.`);
+    const images=(await Token.find(query({collectionId:c.id})).select('imageId').lean()).map(t=>t.imageId).concat([c.avatarImageId,c.coverImageId]);
+    await Operation.updateMany(query({collectionId:c.id,status:{$in:['prepared','applying']}}),{$set:{status:'superseded'}});
+    const removed=await Token.deleteMany(query({collectionId:c.id}));
+    await Collection.deleteOne(query({id:c.id}));
+    const dropped=await dropUnusedImages(images);
+    res.json({ok:true,deleted:c.id,tokens:removed&&removed.deletedCount||0,onChainLeft:onChain,imagesDropped:dropped});
+  }));
+  // Las imágenes de muchas piezas a la vez: por su número (#) o una para todas.
+  app.post(`${PREFIX}/:id/token-images`,route(async(req,res)=>{
+    keys(req.body,['items','imageId']);const c=await getCollection(req.params.id);collectionWrite(req,c);
+    const now=new Date().toISOString(),url=x=>`/api/collections/images/${x}`;
+    const exists=async x=>{if(!await Image.exists(query({id:x})))fail(400,'image_not_found','Primero sube la imagen '+x+'.');};
+    const before=(await Token.find(query({collectionId:c.id})).select('imageId').lean()).map(t=>t.imageId);
+    let updated=0;const missing=[];
+    if(req.body.imageId!==undefined){
+      const imageId=id(req.body.imageId);await exists(imageId);
+      const r=await Token.updateMany(query({collectionId:c.id}),{$set:{imageId,imageUrl:url(imageId),updatedAt:now}});updated=r&&(r.modifiedCount??r.nModified)||0;
+    } else {
+      const items=req.body.items;if(!Array.isArray(items)||!items.length||items.length>LIMITS.tokens)fail(400,'invalid_batch',`Indica de 1 a ${LIMITS.tokens} piezas.`);
+      const rows=items.map(it=>{keys(it,['number','imageId']);const n=Number(it.number);if(!Number.isSafeInteger(n)||n<1)fail(400,'invalid_number','Número de pieza inválido.');return {number:n,imageId:id(it.imageId)};});
+      if(new Set(rows.map(r=>r.number)).size!==rows.length)fail(400,'duplicate_number','Hay números de pieza repetidos.');
+      for(const x of new Set(rows.map(r=>r.imageId)))await exists(x);
+      for(const r of rows){const u=await Token.updateOne(query({collectionId:c.id,number:r.number}),{$set:{imageId:r.imageId,imageUrl:url(r.imageId),updatedAt:now}});if(u&&u.matchedCount===0)missing.push(r.number);else updated++;}
+    }
+    await dropUnusedImages(before);
+    res.json({ok:true,updated,missing});
+  }));
+  /* Quién tiene cada pieza: su cartera y su nombre en el juego (deps.resolveOwners). */
+  app.get(`${PREFIX}/:id/owners`,route(async(req,res)=>{
+    const c=await getCollection(req.params.id);
+    const ts=await Token.find(query({collectionId:c.id})).sort({number:1}).limit(LIMITS.tokens).lean();
+    const wallets=[...new Set(ts.filter(t=>t.invoiceId&&t.chainActive!==false&&t.owner).map(t=>t.owner.toLowerCase()))];
+    let names={};
+    if(wallets.length&&typeof deps.resolveOwners==='function'){try{names=await deps.resolveOwners(wallets)||{};}catch(_){names={};}}
+    const who=a=>names[String(a||'').toLowerCase()]||{};
+    const effective=t=>c.status!=='active'?c.status:(t.status||'active');
+    const tokens=ts.map(t=>({id:t.id,number:t.number,name:t.name||'',imageUrl:t.imageUrl||'',invoiceId:t.invoiceId||'',owner:t.invoiceId&&t.chainActive!==false?t.owner||'':'',
+      playerName:who(t.owner).playerName||'',username:who(t.owner).username||'',chainActive:t.chainActive!==false&&!!t.invoiceId,status:effective(t)}));
+    const owners=wallets.map(a=>({address:a,playerName:who(a).playerName||'',username:who(a).username||'',count:tokens.filter(t=>t.owner===a).length})).sort((x,y)=>y.count-x.count);
+    res.json({ok:true,collection:plain(c),tokens,owners,total:await Token.countDocuments(query({collectionId:c.id}))});
   }));
   app.post(`${PREFIX}/prepare`,route(async(req,res) => {
     keys(req.body,['action','collectionId','tokenId','to']);const action=req.body.action;
-    if(!['configure','mint','transfer'].includes(action))fail(400,'invalid_action','Acción no permitida.');
-    const t=action==='configure'?null:await getToken(req.body.tokenId);const c=await getCollection(t?t.collectionId:req.body.collectionId);collectionWrite(req,c);active(c,t);
+    if(!['configure','mint','transfer','burn'].includes(action))fail(400,'invalid_action','Acción no permitida.');
+    const t=action==='configure'?null:await getToken(req.body.tokenId);const c=await getCollection(t?t.collectionId:req.body.collectionId);collectionWrite(req,c);
+    // Quemar se puede también con la colección o la pieza suspendidas: es el paso previo a borrarlas.
+    if(action!=='burn')active(c,t);
     let method,args,toWallet='',fromWallet='',manualId='',invoiceId='';
-    if(action==='configure'){
+    if(action==='burn'){
+      if(!t.invoiceId)fail(409,'not_minted','Esta pieza no está emitida: bórrala directamente del registro.');
+      if(t.chainAmbiguous)fail(409,'ambiguous_invoice','Una modificación externa dividió o mezcló esta unidad. Revisa la factura antes de quemarla.');
+      const inv=await contract.getInvoice(t.invoiceId);
+      if(inv.active!==true||inv.tipo!==c.typeKey||inv.manualId!==t.manualId)fail(409,'invoice_changed','La factura ya no está activa o su identidad no coincide. Sincroniza el historial.');
+      invoiceId=t.invoiceId;manualId=t.manualId;fromWallet=address(inv.owner);
+      method='deleteInvoice';args=[invoiceId];
+    } else if(action==='configure'){
       const stats=await contract.getTipoStats(c.typeKey);
       if(BigInt(stats.totalQuantity)>BigInt(c.limit))fail(409,'limit_below_onchain_supply','El límite propuesto es inferior a la cantidad que ya existe en la cadena.');
       method='setLimit';args=[c.typeKey,c.limit,'1'];
@@ -30610,6 +31266,14 @@ function mountCollections(deps) {
       const c=await getCollection(op.collectionId);
       await Collection.updateOne(query({id:op.collectionId,limit:c.limit}),{$set:{configured:c.limit===op.args[1],configuredLimit:op.args[1]}});
       result.collectionId=op.collectionId;
+    } else if(op.action==='burn'){
+      // La pieza pudo borrarse del registro mientras tanto: el recibo vale igual.
+      const t=await Token.findOne(query({id:op.tokenId})).lean();
+      if(t){
+        await Token.updateOne(query({id:t.id}),{$set:{chainActive:false,chainQuantity:'0',owner:'',chainWarning:'',lastChainBlock:blockNumber,lastChainIndex:verified.logIndex,updatedAt:new Date().toISOString()}});
+        await addHistory(t,{id:`${txHash}:${verified.logIndex}:${t.id}`,kind:'burn',from:op.fromWallet||ZERO,to:ZERO,txHash,blockNumber,logIndex:verified.logIndex,timestamp:verified.timestamp,invoiceId:op.invoiceId,previousInvoiceId:op.invoiceId});
+      }
+      result={tokenId:op.tokenId,invoiceId:op.invoiceId,burned:true};
     } else {
       const t=await getToken(op.tokenId);const invoiceId=String(op.action==='mint'?verified.event.args.id:verified.event.args.newId);
       const inv=await contract.getInvoice(invoiceId);
@@ -30718,6 +31382,9 @@ try {
     chainId: CHAIN_ID,
     explorerUrl: EXPLORER_URL,
     confirmations: process.env.COLLECTIONS_CONFIRMATIONS,
+    // (2026-10-26) El nombre en el juego de cada cartera propietaria (vista de propietarios).
+    resolveOwners: async wallets => Object.fromEntries((await GamePlayer.find({ address: { $in: wallets } }).select('address playerName Username').limit(1000).lean())
+      .map(p => [String(p.address || '').toLowerCase(), { playerName: p.playerName || '', username: p.Username || '' }])),
     onError: error => console.error('[Colecciones] Consulta fallida:', String(error && (error.code || error.name) || 'unknown').slice(0, 80))
   });
   console.log('Colecciones: API administrativa y registro persistente cargados.');
