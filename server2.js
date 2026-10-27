@@ -1978,6 +1978,27 @@ async function broadcastRelayTransaction(tx, relayTx, intentos = 5) {
       return await provider.broadcastTransaction(signedTx);
     } catch (error) {
       const mensaje = String(error?.shortMessage || error?.message || '').toLowerCase();
+      /* NONCE OCUPADO EN EL PRIMER ENVÍO (2026-10-27). "Las compras de la
+         tienda nunca se hacen": el cobro de la compra lo firma
+         applyStatOnChain con un nonce leído de la cadena, y el objeto lo firma
+         el relay con relayerNonceManager. Misma clave, dos contadores: salían
+         a la vez con el MISMO nonce, ganaba el cobro y la createInvoice
+         recibía "nonce too low". Eso se tomaba por "quizá ya entró" y se
+         devolvía su hash como enviado: un hash que nunca se iba a minar. El
+         cliente lo esperaba 3 × 2 min y reembolsaba (07:33 → 07:39 en la
+         cadena). En el PRIMER intento estos bytes no habían salido nunca, así
+         que el nonce lo gastó OTRA transacción: no hay duda, se avisa para
+         firmar de nuevo con otro nonce. Tras un intento ambiguo (pudo llegar)
+         sigue valiendo lo de abajo. */
+      const nonceOcupado = ['NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(error?.code) ||
+        /nonce too low|nonce has already been used|replacement transaction underpriced/.test(mensaje);
+      if (nonceOcupado && !ambiguoPrevio) {
+        relayTx.txHash = undefined;
+        relayTx.broadcastedAt = undefined;
+        const choque = new Error('relay_nonce_collision: ' + (error.shortMessage || error.message));
+        choque.code = 'RELAY_NONCE_COLLISION';
+        throw choque;
+      }
       const ambiguo = RelayManager.esErrorTransitorioRPC(error) ||
         ['NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(error?.code) ||
         /already known|known transaction|nonce too low|nonce has already been used|replacement transaction underpriced/.test(mensaje);
@@ -4999,7 +5020,23 @@ class RelayManager {
       await relayTx.save();
 
       // Se conserva el mismo nonce y hash ante una respuesta RPC ambigua.
-      const txResponse = await broadcastRelayTransaction(tx, relayTx);
+      // Si el primer envío dice que ese nonce ya lo gastó otra transacción
+      // del relayer (ver broadcastRelayTransaction), se firma de nuevo con el
+      // siguiente: la firma anterior ya no puede minarse nunca.
+      let txResponse;
+      for (let choque = 0; ; choque++) {
+        try {
+          txResponse = await broadcastRelayTransaction(tx, relayTx);
+          break;
+        } catch (e) {
+          if (!e || e.code !== 'RELAY_NONCE_COLLISION' || choque >= 3) throw e;
+          await new Promise(r => setTimeout(r, 300 * (choque + 1)));
+          const siguiente = await relayerNonceManager.getNextNonce();
+          console.warn(`🔢 [relay] el nonce ${tx.nonce} ya lo usó otra transacción del relayer; ${functionName} se firma de nuevo con ${siguiente}`);
+          tx.nonce = siguiente;
+          relayTx.nonce = siguiente;
+        }
+      }
 
       relayTx.status = 'broadcasted';
       relayTx.txHash = txResponse.hash;
@@ -5246,7 +5283,7 @@ class RelayManager {
           // Otra lectura puede haber confirmado en Mongo con un documento
           // distinto: proteger también ese estado terminal de forma atómica.
           await RelayedTransaction.updateOne({ transactionId: relayTx.transactionId,
-            txHash, status: { $nin: ['confirmed', 'reverted'] } },
+            txHash, status: { $nin: ['confirmed', 'reverted'] }, error: { $not: /^relay_dropped/ } },
           { $set: { status: 'broadcasted', error: relayTx.error } });
         } catch (saveError) {
           console.error('❌ Error guardando confirmación pendiente:', saveError.message);
@@ -5596,6 +5633,17 @@ class RelayManager {
     };
   }
   
+  /* ¿Lo que se contestó a una clave `idem` ya no puede llegar a la cadena?
+     (2026-10-27) Solo entonces se vuelve a enviar con esa misma clave: falló
+     antes de firmarse (sin hash) o su nonce lo gastó otra transacción
+     (relay_dropped, ver getTransactionStatus). Ante cualquier duda, no. */
+  async envioDescartado(transactionId) {
+    if (typeof transactionId !== 'string' || !transactionId) return false;
+    const st = await this.getTransactionStatus(transactionId);
+    if (!st || !st.found || st.status !== 'failed') return false;
+    return !st.txHash || /^relay_dropped/.test(String(st.error || ''));
+  }
+
   async getTransactionStatus(transactionId) {
     try {
       const tx = await RelayedTransaction.findOne({ 
@@ -5630,7 +5678,38 @@ class RelayManager {
           // Ignorar errores de consulta
         }
       }
-      
+
+      /* NUNCA SE VA A MINAR (2026-10-27). Una firma sin recibo cuyo nonce ya
+         gastó OTRA transacción del relayer no entra jamás: el nodo no la
+         conoce y la cuenta ya pasó de ese nonce. Antes se quedaba
+         'broadcasted' para siempre y el cliente la esperaba hasta agotar su
+         tiempo (6 min en la tienda). Se da por fallida para que el cliente
+         lo sepa y pueda repetirla (la ruta acepta la misma clave `idem` en
+         ese caso: ver envioDescartado). 45 s de margen para que todos los
+         nodos del RPC hayan visto el bloque si es que se minó. */
+      if (tx.txHash && ['broadcasted', 'signed'].includes(tx.status) && relayerWallet &&
+          Number.isInteger(tx.nonce)) {
+        const desde = new Date(tx.broadcastedAt || tx.signedAt || tx.createdAt || 0).getTime();
+        if (Date.now() - desde > 45000) {
+          try {
+            const gastados = await provider.getTransactionCount(relayerWallet.address, 'latest');
+            if (gastados > tx.nonce &&
+                !(await provider.getTransaction(tx.txHash)) &&
+                !(await provider.getTransactionReceipt(tx.txHash))) {
+              const motivo = `relay_dropped: nonce ${tx.nonce} was used by another transaction; this one was never mined`;
+              const r = await RelayedTransaction.updateOne(
+                { _id: tx._id, status: { $in: ['broadcasted', 'signed'] } },
+                { $set: { status: 'failed', error: motivo } });
+              if (r && r.modifiedCount) {
+                tx.status = 'failed';
+                tx.error = motivo;
+                console.warn(`🗑️  [relay] ${tx.transactionId} (${tx.functionName}) descartada: ${motivo}`);
+              }
+            }
+          } catch (_) { /* el nodo no contestó: se sigue esperando */ }
+        }
+      }
+
       return {
         found: true,
         ...tx.toObject(),
@@ -10697,8 +10776,18 @@ app.post('/api/relay/transaction',
         const previa = _relayIdem.get(claveIdem);
         if (previa && Date.now() - previa.at < RELAY_IDEM_MS) {
           const r = await Promise.race([previa.promesa, new Promise(ok => setTimeout(() => ok(null), 90000))]);
-          if (r) return res.status(r.status).json(r.cuerpo);
-          return res.status(503).json({ error: 'idem_pending', message: 'The same transaction is still being processed.' });
+          if (!r) return res.status(503).json({ error: 'idem_pending', message: 'The same transaction is still being processed.' });
+          /* Si lo que se contestó entonces ya no puede llegar a la cadena
+             (2026-10-27: nonce gastado por otra transacción), devolverlo otra
+             vez solo hacía esperar al cliente un hash muerto. Se envía de
+             nuevo; si otra petición con la misma clave se adelantó, se espera
+             a esa. */
+          const descartado = await relayManager.envioDescartado(r.cuerpo && r.cuerpo.transactionId).catch(() => false);
+          if (!descartado) return res.status(r.status).json(r.cuerpo);
+          if (_relayIdem.get(claveIdem) !== previa) {
+            return res.status(503).json({ error: 'idem_pending', message: 'The same transaction is still being processed.' });
+          }
+          console.warn(`🔁 [relay] ${r.cuerpo.transactionId} nunca llegó a la cadena: se repite con la misma clave`);
         }
         let resolver = null;
         const promesa = new Promise(ok => { resolver = ok; });
@@ -20770,8 +20859,32 @@ async function applyStatOnChain(contract, stat, invId, target, gasPrice) {
     }
   }, `applyStatOnChain[${stat}]`);
 
+  /* NONCE OCUPADO (2026-10-27). Aquí el nonce se lee de la cadena y el relay
+     (/api/relay/transaction) lo saca de relayerNonceManager: con la MISMA
+     clave, una compra en la tienda manda a la vez el cobro (aquí) y el
+     objeto (allí), y los dos podían salir con el mismo nonce. El que pierde
+     recibe "nonce too low": su transacción no entró. Se relee la factura (si
+     ya tiene el valor pedido, no queda nada que hacer) y se manda de nuevo
+     con un nonce fresco. Hasta 3 veces. */
+  const runTxSinChoque = async () => {
+    for (let choque = 0; ; choque++) {
+      try { return await runTx(); } catch (err) {
+        const m = String((err && (err.shortMessage || err.message)) || '').toLowerCase();
+        const ocupado = (err && ['NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(err.code)) ||
+                        /nonce too low|nonce has already been used|replacement transaction underpriced/.test(m);
+        if (!ocupado || choque >= 3) throw err;
+        await new Promise(r => setTimeout(r, 400 * (choque + 1)));
+        const ahora = await readInvoiceQty(contract, invId);
+        if (ahora === null) throw err;
+        current = ahora;
+        if (current === desired) return;
+        console.warn(`🔢 [${stat}] nonce ocupado por otra transacción del relayer; se repite (${choque + 1}/3)`);
+      }
+    }
+  };
+
   try {
-    await runTx();
+    await runTxSinChoque();
     return { ok: true, chainQty: desired };
   } catch (err) {
     const msg = String(err.message || err);
