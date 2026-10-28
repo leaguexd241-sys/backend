@@ -3071,6 +3071,8 @@ const dailyMissionSchema = new mongoose.Schema({
     // cualquier otra moneda del juego. 0 = no da esa moneda.
     goldReward:   { type: Number, default: 0, min: 0 },
     silverReward: { type: Number, default: 0, min: 0 },
+    // (2026-10-28) Y en bronce: las misiones solo dan monedas (oro, plata y bronce).
+    bronzeReward: { type: Number, default: 0, min: 0 },
     texts: {
       'en-US': {
         title: String,
@@ -3156,7 +3158,9 @@ const userDailyProgressSchema = new mongoose.Schema({
 // lista de entregas del panel (quién cumplió qué y qué recibió).
 userDailyProgressSchema.path('completedMissions').schema.add({
   tipo: String, titulo: String, exp: Number, oro: Number, plata: Number,
-  itemId: String, itemCantidad: Number
+  itemId: String, itemCantidad: Number,
+  // (2026-10-28) El bronce entregado.
+  bronce: Number
 });
 const UserDailyProgress = mongoose.model('UserDailyProgress', userDailyProgressSchema);
 
@@ -3193,6 +3197,8 @@ const misionesAutoConfigSchema = new mongoose.Schema({
   expMin:       { type: Number, default: 40 },  expMax:   { type: Number, default: 140 },
   oroMin:       { type: Number, default: 0 },   oroMax:   { type: Number, default: 0 },
   plataMin:     { type: Number, default: 10 },  plataMax: { type: Number, default: 60 },
+  // (2026-10-28) Las misiones solo dan monedas: también bronce.
+  bronceMin:    { type: Number, default: 0 },   bronceMax: { type: Number, default: 0 },
   horaReinicio: { type: Number, default: 0 },
   semilla:      { type: Number, default: 0 },
   actualizadoPor: { type: String, default: null }
@@ -12205,6 +12211,12 @@ const REVIVIR_VIDA         = 100;
  * 30 la primera, y el doble cada vez, con tope para que no se vuelva absurdo.
  */
 function precioRevivir(muertes) {
+  /* (2026-10-28) "Cuando un personaje muere y paga, ese precio se ajusta en el
+     centro de control y sube y baja con la inflación": la base, el
+     multiplicador y el tope salen del panel (Economy & treasuries) y van por
+     el índice de precios ("LA ECONOMÍA, 2.ª PARTE"). De serie, lo de siempre:
+     30, 60, 120… hasta 480. */
+  if (typeof eco2PrecioMuerte === 'function') return eco2PrecioMuerte(eco2ConfigSync(), eco2IndiceSync(), muertes);
   const n = Math.max(0, Number(muertes) || 0);
   return Math.min(REVIVIR_BASE_PLATA * Math.pow(2, n), REVIVIR_TOPE_PLATA);
 }
@@ -12295,7 +12307,9 @@ function estadoVivo(gp) {
     player: {
       ghost: !!gp.isGhost,
       deaths: Math.max(0, Number(gp.deathCount) || 0),
-      reviveCost: precioRevivir(gp.deathCount),
+      // (2026-10-28) Muerto: lo que cuesta revivir AHORA (lo que cobra /api/player/revive, las muertes
+      // anteriores a esta). Vivo: lo que costaría la próxima. Antes enseñaba el doble de lo cobrado.
+      reviveCost: precioRevivir(gp.isGhost ? Math.max(0, (Number(gp.deathCount) || 1) - 1) : gp.deathCount),
       windowEndsAt: gp.deathWindowAt
         ? new Date(new Date(gp.deathWindowAt).getTime() + REVIVIR_VENTANA_MS).toISOString()
         : null
@@ -12566,6 +12580,9 @@ app.post('/api/player/revive', apiLimiter, authMiddleware, csrfProtection, async
     gp.isGhost = false;
     await gp.save();
     olvidarFantasma(gp.playerName, gp.address);
+    // (2026-10-28) "Ese dinero va al fondo de reserva del tesoro, no a la economía circular."
+    tesoroReservaIngresar('muerte', precio * TESORO_BRONCE_POR.plata, gp.playerName, 'revive · death #' + (Number(gp.deathCount) || 1));
+    economiaApuntar({ muerteBronce: precio * TESORO_BRONCE_POR.plata, muertes: 1 });
 
     console.log(`💖 ${gp.playerName} revive por ${precio} de plata ` +
                 `(le quedan ${stats.plata}) — vida al ${REVIVIR_VIDA}%`);
@@ -13178,7 +13195,8 @@ const MONSTRUOS_BOTIN = {
   jefe_ent: { nombre: 'Oakheart, the Elder Grove', salas: ['pradera'], enfriaMs: 30 * 60 * 1000, exp: 2600, montones: [5, 7], instancias: 1,
     botin: [['tablon_de_madera', 3, 6], ['Semillax4', 2, 4], ['Semillax3', 2, 4], ['pocion_vida', 1, 2], ['madera_con_hojas', 4, 8]] }
 };
-const BOTIN_CADUCA_MS = 10 * 60 * 1000;
+// (2026-10-28) "Si nadie las recoge en 5 minutos, elimínalas": las monedas y el botín duran 5 minutos.
+const BOTIN_CADUCA_MS = 5 * 60 * 1000;
 const _monstruoUltimo = new Map();     // 'jugador|tipo' -> hora de la última victoria
 const _botinPendiente = new Map();     // id -> { playerName, address, itemId, cantidad, hasta }
 
@@ -13195,11 +13213,13 @@ setInterval(() => {
   for (const [id, b] of _botinPendiente) {
     if (ahora <= b.hasta) continue;
     _botinPendiente.delete(id);
-    // (2026-10-22) Las monedas del tesoro que nadie recogió vuelven a él.
-    if (b.incentivo && !b.recogiendo) tesoroDevolverReserva(b.cantidad, 'caducado');
+    /* (2026-10-28) "Si matan enemigos y dejan monedas botadas y nadie las recoge
+       en 5 minutos, elimínalas y ajusta el sistema económico": las monedas del
+       tesoro que nadie recogió se QUEMAN (antes volvían al tesoro). */
+    if (b.incentivo && !b.recogiendo) tesoroQuemarCaducado(b.cantidad, b);
   }
   for (const [k, t] of _monstruoUltimo) if (ahora - t > 60 * 60 * 1000) _monstruoUltimo.delete(k);
-}, 5 * 60 * 1000).unref();
+}, 30 * 1000).unref();
 
 app.post('/api/monstruos/derrotado', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
   try {
@@ -13248,7 +13268,8 @@ app.post('/api/monstruos/derrotado', apiLimiter, authMiddleware, csrfProtection,
 
     // Los montones del suelo. (2026-10-19) Sin nombre puesto, ninguno.
     const conNombre = gfNombreValido(gp.Username);
-    const cuantos = !conNombre ? 0 : def.montones[0] + Math.floor(Math.random() * (def.montones[1] - def.montones[0] + 1));
+    // (2026-10-28) "Solo los jefes grandes de cada mapa dan ítems" (gfMonstruoDaObjetos): los demás, experiencia y monedas del tesoro.
+    const cuantos = !conNombre || !gfMonstruoDaObjetos(tipo) ? 0 : def.montones[0] + Math.floor(Math.random() * (def.montones[1] - def.montones[0] + 1));
     const botin = [];
     for (let i = 0; i < cuantos; i++) {
       const [itemId, min, max] = def.botin[Math.floor(Math.random() * def.botin.length)];
@@ -13286,7 +13307,12 @@ app.post('/api/monstruos/botin/recoger', apiLimiter, authMiddleware, csrfProtect
     const id = String((req.body && req.body.id) || '');
     const b = _botinPendiente.get(id);
     if (!b || b.playerName !== gp.playerName) return res.json({ ok: false, motivo: 'no_existe' });
-    if (Date.now() > b.hasta) { _botinPendiente.delete(id); return res.json({ ok: false, motivo: 'caducado' }); }
+    if (Date.now() > b.hasta) {
+      _botinPendiente.delete(id);
+      // (2026-10-28) Unas monedas caducadas también se queman aquí (antes su reserva se quedaba colgada).
+      if (b.incentivo && !b.recogiendo) tesoroQuemarCaducado(b.cantidad, b);
+      return res.json({ ok: false, motivo: 'caducado' });
+    }
     if (b.recogiendo) return res.json({ ok: false, motivo: 'en_curso' });
     // (2026-10-22) Monedas del tesoro: se SUMAN a las del jugador (no hay cadena que esperar).
     if (b.incentivo) {
@@ -13506,7 +13532,8 @@ const SUELO_SOLTABLES = new Set([
   'espada_madera', 'espada_cobre', 'espada_hierro', 'arco', 'baston_mago', 'cana_pescar',
   'pocion_vida', 'pocion_antidoto', 'balde_vacio'
 ]);
-const SUELO_CADUCA_MS = 10 * 60 * 1000;
+// (2026-10-28) "Los ítems que se dropean al suelo tienen 5 minutos: si nadie los toma, se eliminan."
+const SUELO_CADUCA_MS = 5 * 60 * 1000;
 const SUELO_MAX_POR_SALA = 150;
 const SUELO_ALCANCE = 260;              // px desde el jugador a donde suelta o recoge
 const _sueloSalvaje = new Map();        // id -> montón
@@ -13539,6 +13566,8 @@ setInterval(() => {
     _sueloSalvaje.delete(id);
     caducados.push(id);
     try { io.to(m.sala).emit('suelo:fuera', { id, caducado: true }); } catch (_) {}
+    // (2026-10-28) Nadie lo recogió: lo que valía cuenta como quemado (en la cadena ya se quemó al soltarlo).
+    eco2QuemarObjetos('suelo_caducado', [{ itemId: m.itemId, cantidad: m.cantidad }], m.de, 'suelo:' + id, m.sala).catch(() => {});
   }
   gfSueloCaducados(caducados);
   for (const [n, c] of _pvpEspadas) if (c.hasta < ahora) _pvpEspadas.delete(n);
@@ -15991,6 +16020,8 @@ app.post('/api/missions/daily/complete',
       const expReward = Math.max(0, parseInt(mission.expReward, 10) || 0);
       const rewardId  = mission.rewardItemId ? gfPremioJusto(mission.rewardItemId) : null;
       const rewardQty = rewardId ? Math.max(1, parseInt(mission.rewardAmount, 10) || 1) : 0;
+      // (2026-10-28) Solo monedas: una misión vieja que prometía un objeto paga lo que vale, en bronce.
+      const rewardBronceViejo = rewardId && GF_MISIONES_SOLO_MONEDAS ? eco2ValorUnidad(rewardId) * rewardQty : 0;
 
       const avisos = [];
 
@@ -16026,6 +16057,7 @@ app.post('/api/missions/daily/complete',
       // objetos de inventario.
       const oroPremio   = Math.max(0, parseInt(mission.goldReward,   10) || 0);
       const plataPremio = Math.max(0, parseInt(mission.silverReward, 10) || 0);
+      const broncePremio = Math.max(0, parseInt(mission.bronzeReward, 10) || 0) + rewardBronceViejo;
 
       // LO PROMETIDO vs LO ENTREGADO.
       // Antes la respuesta devolvía `oroPremio`/`plataPremio` —lo que la misión
@@ -16034,9 +16066,9 @@ app.post('/api/missions/daily/complete',
       // "success" y un aviso de recompensa que nunca llegó a su saldo: "me
       // quita los requisitos y no me da nada". Ahora se cuenta lo que de
       // verdad se sumó y es ESO lo que se responde.
-      let oroEntregado = 0, plataEntregado = 0;
+      let oroEntregado = 0, plataEntregado = 0, bronceEntregado = 0;
 
-      if (oroPremio > 0 || plataPremio > 0) {
+      if (oroPremio > 0 || plataPremio > 0 || broncePremio > 0) {
         try {
           // SI NO EXISTE EL DOCUMENTO, SE CREA.
           // Antes un findOne a secas: si el jugador todavía no tenía fila en
@@ -16056,7 +16088,7 @@ app.post('/api/missions/daily/complete',
             const contract = getStatsContract();
             const gasPrice = (contract) ? await getSafeGasPriceStats() : null;
 
-            for (const [clave, cantidad] of [['oro', oroPremio], ['plata', plataPremio]]) {
+            for (const [clave, cantidad] of [['oro', oroPremio], ['plata', plataPremio], ['bronce', broncePremio]]) {
               if (cantidad <= 0) continue;
 
               const total = Math.max(0, Math.round(Number(statsDoc[clave] || 0))) + cantidad;
@@ -16076,6 +16108,7 @@ app.post('/api/missions/daily/complete',
               if (subio) {
                 if (clave === 'oro')   oroEntregado   = cantidad;
                 if (clave === 'plata') plataEntregado = cantidad;
+                if (clave === 'bronce') bronceEntregado = cantidad;
               }
 
               // GamePlayer guarda una copia para el HUD; se mantiene al día.
@@ -16094,7 +16127,7 @@ app.post('/api/missions/daily/complete',
 
       // 5b. Ítem de recompensa — se ACUÑA y luego entra en el inventario.
       let entregadas = 0;
-      if (rewardId && rewardQty > 0) {
+      if (rewardId && rewardQty > 0 && !GF_MISIONES_SOLO_MONEDAS) {
         const tipoPremio = itemTipoOnChain(rewardId);
         let acunado = null;
         if (tipoPremio) {
@@ -16129,12 +16162,14 @@ app.post('/api/missions/daily/complete',
       const tituloMision = (mission.texts && mission.texts['en-US'] && mission.texts['en-US'].title) || missionId;
       progress.completedMissions.push({ missionId, completedAt: new Date(), claimedReward: true,
         tipo: esCaza ? 'cazar' : 'entregar', titulo: String(tituloMision).slice(0, 120),
-        exp: expReward, oro: oroEntregado, plata: plataEntregado,
-        itemId: rewardId || null, itemCantidad: entregadas });
+        exp: expReward, oro: oroEntregado, plata: plataEntregado, bronce: bronceEntregado,
+        itemId: GF_MISIONES_SOLO_MONEDAS ? null : (rewardId || null), itemCantidad: entregadas });
       if (esCaza) await gfGastarCazas(playerName, day, mission.monstruo, pedido);
       progress.completedCount  = progress.completedMissions.length;
       progress.lastInteraction = new Date();
       await progress.save();
+      // (2026-10-28) Lo que pagan las misiones, día a día, para los gráficos del centro de control.
+      economiaApuntar({ misionesOro: oroEntregado, misionesPlata: plataEntregado, misionesBronce: bronceEntregado, misiones: 1 });
 
       console.log(`🎯 ${playerName} entregó '${missionId}' (${npcId}/${day}): -${pedido} ${itemId}, +${expReward} exp` +
                   (rewardId ? `, +${entregadas} ${rewardId}` : ''));
@@ -16145,7 +16180,7 @@ app.post('/api/missions/daily/complete',
         completedCount: progress.completedCount,
         rewards: {
           exp: expReward,
-          item: rewardId ? { id: rewardId, amount: entregadas } : null,
+          item: rewardId && !GF_MISIONES_SOLO_MONEDAS ? { id: rewardId, amount: entregadas } : null,
           // Monedas entregadas (0 si la misión no pagaba en esa moneda). El
           // cliente las usa para el aviso de "has recibido…" y para refrescar
           // el HUD sin tener que volver a pedir las estadísticas.
@@ -16154,7 +16189,10 @@ app.post('/api/missions/daily/complete',
           // Lo que la misión prometía, para que el cliente pueda avisar de la
           // diferencia en vez de callársela.
           goldPrometido:   oroPremio,
-          silverPrometido: plataPremio
+          silverPrometido: plataPremio,
+          // (2026-10-28) Y el bronce.
+          bronze:          bronceEntregado,
+          bronzePrometido: broncePremio
         },
         warnings: avisos.length ? avisos : undefined
       });
@@ -16215,10 +16253,13 @@ function sanearMisionesDelDia(missions) {
     // aquí, en el servidor, no solo en el formulario.
     const goldReward   = Math.max(0, Math.min(1000,   parseInt(m.goldReward,   10) || 0));
     const silverReward = Math.max(0, Math.min(100000, parseInt(m.silverReward, 10) || 0));
+    // (2026-10-28) Y el bronce (1 plata = 1.000): hasta 10 de oro en bronce.
+    const bronzeReward = Math.max(0, Math.min(10000000, parseInt(m.bronzeReward, 10) || 0));
 
-    const salida = { missionId, tipo, monstruo, itemId, requiredAmount, expReward, goldReward, silverReward, texts: {} };
+    const salida = { missionId, tipo, monstruo, itemId, requiredAmount, expReward, goldReward, silverReward, bronzeReward, texts: {} };
 
-    const rewardItemId = limpiarTexto(m.rewardItemId, 60);
+    // (2026-10-28) "En misiones no podemos dar ítems, solo monedas de los tres tipos."
+    const rewardItemId = GF_MISIONES_SOLO_MONEDAS ? '' : limpiarTexto(m.rewardItemId, 60);
     if (rewardItemId) {
       salida.rewardItemId = gfPremioJusto(rewardItemId);
       salida.rewardAmount = Math.max(1, Math.min(9999, parseInt(m.rewardAmount, 10) || 1));
@@ -16950,12 +16991,14 @@ const MISIONES_AUTO_POR_DEFECTO = {
       { itemId: 'antorcha', nombre: 'Torches', min: 1, max: 3, peso: 1 }
     ],
     probPremio: 75, expMin: 40, expMax: 140, oroMin: 0, oroMax: 0, plataMin: 10, plataMax: 60,
+    bronceMin: 200, bronceMax: 900,
     horaReinicio: 0, semilla: 0
   },
   guardian: {
     activo: false, cuantas: 3, pesoEntregar: 30, pesoCazar: 70,
     pedidos: [], presas: [{ tipo: '*', nombre: 'monsters', min: 5, max: 12 }], premios: [],
     probPremio: 60, expMin: 60, expMax: 180, oroMin: 0, oroMax: 0, plataMin: 10, plataMax: 80,
+    bronceMin: 300, bronceMax: 1200,
     horaReinicio: 0, semilla: 0
   }
 };
@@ -17010,7 +17053,8 @@ function gfGenerarMisiones(reglas, npcId, day) {
   const uno = (l) => l[Math.floor(azar() * l.length) % l.length];
   const pedidos = (reglas.pedidos || []).filter((p) => p && p.itemId);
   const presas  = (reglas.presas  || []).filter((p) => p && p.tipo);
-  const premios = (reglas.premios || []).filter((p) => p && p.itemId && itemTipoOnChain(p.itemId));
+  // (2026-10-28) Las misiones solo dan monedas: la lista de premios en objetos ya no se usa.
+  const premios = GF_MISIONES_SOLO_MONEDAS ? [] : (reglas.premios || []).filter((p) => p && p.itemId && itemTipoOnChain(p.itemId));
   const cuantas = Math.max(1, Math.min(10, parseInt(reglas.cuantas, 10) || 3));
   const pe = pedidos.length ? Math.max(0, Number(reglas.pesoEntregar) || 0) : 0;
   const pc = presas.length  ? Math.max(0, Number(reglas.pesoCazar)    || 0) : 0;
@@ -17043,6 +17087,7 @@ function gfGenerarMisiones(reglas, npcId, day) {
     m.expReward    = entre(reglas.expMin, reglas.expMax);
     m.goldReward   = entre(reglas.oroMin, reglas.oroMax);
     m.silverReward = entre(reglas.plataMin, reglas.plataMax);
+    m.bronzeReward = entre(reglas.bronceMin, reglas.bronceMax);
     if (premios.length && azar() * 100 < Math.max(0, Math.min(100, Number(reglas.probPremio ?? 75)))) {
       const totalPeso = premios.reduce((s, p) => s + Math.max(0, Number(p.peso) || 1), 0);
       let r = azar() * totalPeso, elegido = premios[0];
@@ -17100,7 +17145,8 @@ function gfSanearReglas(b) {
       if (!tipo || (tipo !== '*' && tipo !== 'jugador' && !Object.prototype.hasOwnProperty.call(MONSTRUOS_BOTIN, tipo))) return null;
       return Object.assign({ tipo, nombre: txt(p.nombre, 60) }, rango(p));
     }),
-    premios: lista(b.premios, (p) => {
+    // (2026-10-28) Las misiones solo dan monedas: no se guardan premios en objetos.
+    premios: GF_MISIONES_SOLO_MONEDAS ? [] : lista(b.premios, (p) => {
       const itemId = txt(p && p.itemId, 60);
       if (!itemId || !itemTipoOnChain(itemId)) return null;      // solo lo que se puede acuñar
       return Object.assign({ itemId, nombre: txt(p.nombre, 60), peso: num(p.peso, 1, 100, 1) }, rango(p));
@@ -17110,6 +17156,7 @@ function gfSanearReglas(b) {
     expMin: num(b.expMin, 0, 100000, 40), expMax: num(b.expMax, 0, 100000, 140),
     oroMin: num(b.oroMin, 0, 1000, 0), oroMax: num(b.oroMax, 0, 1000, 0),
     plataMin: num(b.plataMin, 0, 100000, 0), plataMax: num(b.plataMax, 0, 100000, 0),
+    bronceMin: num(b.bronceMin, 0, 10000000, 0), bronceMax: num(b.bronceMax, 0, 10000000, 0),
     horaReinicio: num(b.horaReinicio, 0, 23, 0)
   };
 }
@@ -17205,7 +17252,7 @@ app.get('/api/admin/missions/entregas', adminAuth, apiLimiter, async (req, res) 
     const misiones = ((daily && daily.missions) || []).map((m) => ({
       missionId: m.missionId, tipo: m.tipo || 'entregar', monstruo: m.monstruo || '', itemId: m.itemId || '',
       requiredAmount: m.requiredAmount, titulo: (m.texts && m.texts['en-US'] && m.texts['en-US'].title) || m.missionId,
-      expReward: m.expReward || 0, goldReward: m.goldReward || 0, silverReward: m.silverReward || 0,
+      expReward: m.expReward || 0, goldReward: m.goldReward || 0, silverReward: m.silverReward || 0, bronzeReward: m.bronzeReward || 0,
       rewardItemId: m.rewardItemId || null, rewardAmount: m.rewardAmount || 0
     }));
     const hayCaza = misiones.some((m) => m.tipo === 'cazar');
@@ -17229,9 +17276,9 @@ app.get('/api/admin/missions/entregas', adminAuth, apiLimiter, async (req, res) 
       const p = progPor.get(n);
       const hechas = (p && p.completedMissions) || [];
       const c = cazaPor.get(n);
-      const tot = { exp: 0, oro: 0, plata: 0, items: {} };
+      const tot = { exp: 0, oro: 0, plata: 0, bronce: 0, items: {} };
       hechas.forEach((h) => {
-        tot.exp += Number(h.exp) || 0; tot.oro += Number(h.oro) || 0; tot.plata += Number(h.plata) || 0;
+        tot.exp += Number(h.exp) || 0; tot.oro += Number(h.oro) || 0; tot.plata += Number(h.plata) || 0; tot.bronce += Number(h.bronce) || 0;
         if (h.itemId && h.itemCantidad) tot.items[h.itemId] = (tot.items[h.itemId] || 0) + Number(h.itemCantidad);
       });
       return {
@@ -17240,7 +17287,7 @@ app.get('/api/admin/missions/entregas', adminAuth, apiLimiter, async (req, res) 
         address: f.address || null,
         nivel: Number(f.nivel || 0),
         completadas: hechas.map((h) => ({ missionId: h.missionId, completedAt: h.completedAt, tipo: h.tipo || null,
-          titulo: h.titulo || null, exp: h.exp ?? null, oro: h.oro ?? null, plata: h.plata ?? null,
+          titulo: h.titulo || null, exp: h.exp ?? null, oro: h.oro ?? null, plata: h.plata ?? null, bronce: h.bronce ?? null,
           itemId: h.itemId || null, itemCantidad: h.itemCantidad ?? null })),
         pendientes: misiones.filter((m) => !hechas.some((h) => h.missionId === m.missionId)).map((m) => m.missionId),
         cazas: c ? { total: c.total || 0, porTipo: c.porTipo || {} } : null,
@@ -21018,6 +21065,8 @@ const tesoroSchema = new mongoose.Schema({
   pagos:     { free: { type: Number, default: 0 }, vip: { type: Number, default: 0 } },
   retirado:  { type: Number, default: 0 },
   caducados: { type: Number, default: 0 },
+  // (2026-10-28) Lo destruido: quemas del panel y monedas de monstruos que nadie recogió.
+  quemado:   { type: Number, default: 0 },
   config:    { type: mongoose.Schema.Types.Mixed, default: null }
 }, { collection: 'tesoro', timestamps: true, versionKey: false, minimize: false });
 const Tesoro = mongoose.models.Tesoro || mongoose.model('Tesoro', tesoroSchema);
@@ -21049,12 +21098,14 @@ const TesoroMov = mongoose.models.TesoroMov || mongoose.model('TesoroMov', tesor
 // elixir de revivir del alquimista. Y el zkLTC de las compras de oro, que se
 // apunta aparte (en gwei): es moneda de fuera.
 const TESORO_JUEGO_ID = 'juego';
-const TESORO_JUEGO_ORIGENES = ['tienda', 'p2p', 'viajes', 'vip', 'revivir', 'admin'];
+// (2026-10-28) + 'servicios': lo que se cobra por fundir y craftear (ver "LA ECONOMÍA, 2.ª PARTE").
+const TESORO_JUEGO_ORIGENES = ['tienda', 'p2p', 'viajes', 'vip', 'revivir', 'admin', 'servicios'];
 const _cero = () => ({ type: Number, default: 0 });
 const tesoroJuegoSchema = new mongoose.Schema({
   _id:       { type: String, default: TESORO_JUEGO_ID },
   saldo:     _cero(),                                   // bronce
   retirado:  _cero(),
+  quemado:   _cero(),                                   // (2026-10-28) lo quemado desde el panel
   ingresado: Object.fromEntries(TESORO_JUEGO_ORIGENES.map((k) => [k, _cero()])),
   ingresos:  Object.fromEntries(TESORO_JUEGO_ORIGENES.map((k) => [k, _cero()])),
   zkltc:     { gwei: _cero(), compras: _cero(), oro: _cero() },
@@ -21246,10 +21297,13 @@ async function tesoroPagar(gp, b) {
 
 /** La comisión de la tienda del juego (bronce). La MISMA cuenta que tienda_sistema.js (_comisionBronce). */
 function tesoroComisionTienda(itemId, operacion, cantidad) {
-  const p = Object.prototype.hasOwnProperty.call(TIENDA_PRECIOS, itemId) ? TIENDA_PRECIOS[itemId] : null;
+  // (2026-10-28) Con el precio de HOY (el índice de precios y lo que cambie el panel: "LA ECONOMÍA, 2.ª PARTE").
+  const p = typeof eco2PrecioTienda === 'function' ? eco2PrecioTienda(itemId)
+    : (Object.prototype.hasOwnProperty.call(TIENDA_PRECIOS, itemId) ? TIENDA_PRECIOS[itemId] : null);
   if (!p) return 0;
   const unidad = Number(operacion === 'compra' ? p[0] : p[1]) || 0;
-  const bruto = unidad * (p[2] === 'p' ? TESORO_BRONCE_POR.plata : TESORO_BRONCE_POR.oro) * (Math.floor(Number(cantidad)) || 0);
+  const bruto = unidad * (p[2] === 'p' ? TESORO_BRONCE_POR.plata : p[2] === 'b' ? TESORO_BRONCE_POR.bronce : TESORO_BRONCE_POR.oro) *
+    (Math.floor(Number(cantidad)) || 0);
   return bruto > 0 ? Math.max(1, Math.round(bruto * TESORO_COMISION_BPS / 10000)) : 0;
 }
 
@@ -21299,6 +21353,7 @@ function tesoroPublico(t) {
     pagado: { free: sub(x.pagado, 'free'), vip: sub(x.pagado, 'vip') },
     pagos: { free: sub(x.pagos, 'free'), vip: sub(x.pagos, 'vip') },
     retirado: Math.max(0, Number(x.retirado) || 0), caducados: Math.max(0, Number(x.caducados) || 0),
+    quemado: Math.max(0, Number(x.quemado) || 0),
     actualizado: x.updatedAt || null
   };
 }
@@ -21315,11 +21370,11 @@ app.get('/api/admin/tesoro', adminAuth, apiLimiter, async (req, res) => {
       GamePlayer.countDocuments({ Username: { $exists: true, $nin: [null, '', '---'] } }),
       PlayerPlaytime.countDocuments({ ultimaVez: { $gte: hace24h } }),
       TesoroMov.aggregate([
-        { $match: { t: { $gte: hace30 }, tesoro: { $ne: 'juego' } } },
+        { $match: { t: { $gte: hace30 }, tesoro: { $nin: ['juego', 'reserva'] } } },
         { $group: { _id: { dia: { $dateToString: { format: '%Y-%m-%d', date: '$t', timezone: 'UTC' } }, tipo: '$tipo', origen: '$origen', vip: '$vip' },
                     bronce: { $sum: '$bronce' }, n: { $sum: 1 } } }
       ]),
-      TesoroMov.find({ tesoro: { $ne: 'juego' } }).sort({ t: -1 }).limit(30).lean(),
+      TesoroMov.find({ tesoro: { $nin: ['juego', 'reserva'] } }).sort({ t: -1 }).limit(30).lean(),
       TesoroMov.aggregate([
         { $match: { tipo: 'pago', t: { $gte: hace30 } } },
         { $group: { _id: '$playerName', bronce: { $sum: '$bronce' }, n: { $sum: 1 }, vip: { $last: '$vip' } } },
@@ -21489,6 +21544,29 @@ const economiaDiaSchema = new mongoose.Schema({
   comisionCambio: { type: Number, default: 0 },          // bronce
   tesoroCircular: { type: Number, default: 0 },
   tesoroJuego:    { type: Number, default: 0 },
+  // (2026-10-28) LA ECONOMÍA, 2.ª PARTE: el dinero activo y el total, la inflación neta, el índice de
+  // precios, el fondo de reserva y lo que se quemó, cobró y pagó cada día.
+  tesoroReservado:  { type: Number, default: 0 },
+  tesoroReserva:    { type: Number, default: 0 },
+  masaActiva:       { type: Number, default: null },
+  masaTotal:        { type: Number, default: null },
+  inflacionActiva1: { type: Number, default: null },
+  inflacionActiva7: { type: Number, default: null },
+  inflacionTotal7:  { type: Number, default: null },
+  inflacionNeta7:   { type: Number, default: null },
+  quemadoObjetos7:  { type: Number, default: 0 },
+  indice:           { type: Number, default: null },
+  quemadoMonedas:   { type: Number, default: 0 },
+  quemadoObjetos:   { type: Number, default: 0 },
+  quemasObjetos:    { type: Number, default: 0 },
+  muerteBronce:     { type: Number, default: 0 },
+  muertes:          { type: Number, default: 0 },
+  serviciosBronce:  { type: Number, default: 0 },
+  servicios:        { type: Number, default: 0 },
+  misionesOro:      { type: Number, default: 0 },
+  misionesPlata:    { type: Number, default: 0 },
+  misionesBronce:   { type: Number, default: 0 },
+  misiones:         { type: Number, default: 0 },
   actualizado:    { type: Date, default: Date.now }
 }, { collection: 'economia_dias', versionKey: false, minimize: false });
 const EconomiaDia = mongoose.models.EconomiaDia || mongoose.model('EconomiaDia', economiaDiaSchema);
@@ -21584,7 +21662,7 @@ function _diaMenos(dia, n) { return new Date(Date.parse(dia + 'T00:00:00Z') - n 
 
 let _economiaFoto = null;
 /** Rehace la foto de hoy. Una sola a la vez. */
-async function economiaFoto() {
+async function economiaFoto(forzarIndice) {
   if (_economiaFoto) return _economiaFoto;
   _economiaFoto = (async () => {
     const hoy = _diaUTC();
@@ -21598,15 +21676,34 @@ async function economiaFoto() {
     const inf1 = ayer && ayer.masa > 0 ? (masa - ayer.masa) / ayer.masa : null;
     const inf7 = hace7 && hace7.masa > 0 ? (masa - hace7.masa) / hace7.masa : inf1;
     const cfg = await economiaConfig();
-    const salud = economiaSalud(inf7);
-    const [tc, tj] = await Promise.all([Tesoro.findById(TESORO_ID).select('saldo').lean(), TesoroJuego.findById(TESORO_JUEGO_ID).select('saldo').lean()]);
-    const doc = await EconomiaDia.findOneAndUpdate({ _id: hoy }, { $set: {
+    /* (2026-10-28) LOS TRES TESOROS, LO RESERVADO Y LA INFLACIÓN NETA (ver "LA
+       ECONOMÍA, 2.ª PARTE"). El precio del oro y la salud siguen la inflación
+       NETA del dinero activo; sin datos todavía, la de siempre. */
+    const [tc, tj, tr, actual, cfg2] = await Promise.all([
+      Tesoro.findById(TESORO_ID).select('saldo reservado').lean(), TesoroJuego.findById(TESORO_JUEGO_ID).select('saldo').lean(),
+      TesoroReserva.findById(TESORO_RESERVA_ID).select('saldo').lean(), EconomiaDia.findById(hoy).lean(), eco2Config()]);
+    const tesoroCircular = tc ? Math.max(0, Number(tc.saldo) || 0) : 0, tesoroReservado = tc ? Math.max(0, Number(tc.reservado) || 0) : 0;
+    const tesoroJuego = tj ? Math.max(0, Number(tj.saldo) || 0) : 0, tesoroReserva = tr ? Math.max(0, Number(tr.saldo) || 0) : 0;
+    const objetos7 = [actual].concat(previos.filter((d) => d._id > _diaMenos(hoy, 7)))
+      .reduce((s, d) => s + Math.max(0, Number(d && d.quemadoObjetos) || 0), 0);
+    const inf = eco2Inflaciones({ masa, tesoroCircular, tesoroReservado, tesoroJuego, tesoroReserva }, ayer, hace7, objetos7, cfg2.pesoObjetos);
+    const infPrecio = inf.neta7 !== null && inf.neta7 !== undefined ? inf.neta7 : inf7;
+    const salud = economiaSalud(infPrecio);
+    const set = {
       oro, plata, bronce, masa, jugadores: suma ? suma.n : 0,
-      precioGwei: economiaPrecioGwei(cfg, ayer ? ayer.precioGwei : 0, inf7),
+      precioGwei: economiaPrecioGwei(cfg, ayer ? ayer.precioGwei : 0, infPrecio),
       inflacion1: inf1, inflacion7: inf7, salud, tope: economiaTope(cfg, salud),
-      tesoroCircular: tc ? Math.max(0, Number(tc.saldo) || 0) : 0, tesoroJuego: tj ? Math.max(0, Number(tj.saldo) || 0) : 0,
-      actualizado: new Date() } }, { upsert: true, new: true }).lean();
+      tesoroCircular, tesoroJuego, tesoroReservado, tesoroReserva,
+      masaActiva: inf.A, masaTotal: inf.S, inflacionActiva1: inf.activa1, inflacionActiva7: inf.activa7,
+      inflacionTotal7: inf.total7, inflacionNeta7: inf.neta7, quemadoObjetos7: objetos7,
+      actualizado: new Date() };
+    // El índice de precios se fija con la primera foto del día (o cuando el panel lo pide): nada cambia a media partida.
+    if (forzarIndice === true || !actual || !(Number(actual.indice) > 0)) {
+      set.indice = cfg2.indiceActivo ? eco2IndiceObjetivo(cfg2, ayer && Number(ayer.indice) > 0 ? ayer.indice : 1, inf.neta7) : 1;
+    }
+    const doc = await EconomiaDia.findOneAndUpdate({ _id: hoy }, { $set: set }, { upsert: true, new: true }).lean();
     _economiaEstado = null;
+    eco2TrasFoto(doc, set.indice !== undefined).catch((e) => console.warn('⚠️  economía (precios del día):', e.message));
     return doc;
   })().finally(() => { _economiaFoto = null; });
   return _economiaFoto;
@@ -21634,7 +21731,8 @@ async function economiaEstadoPublico() {
   if (_economiaEstado && Date.now() - _economiaEstado.en < 60000) return _economiaEstado.datos;
   const [hoy, cfg, serie] = await Promise.all([
     economiaHoy(), economiaConfig(),
-    EconomiaDia.find({ _id: { $gte: _diaMenos(_diaUTC(), 29) } }).sort({ _id: 1 }).lean()
+    // (2026-10-28) 120 días: los gráficos se pueden mover y acercar.
+    EconomiaDia.find({ _id: { $gte: _diaMenos(_diaUTC(), 119) } }).sort({ _id: 1 }).lean()
   ]);
   const destino = economiaDestino(cfg);
   const datos = {
@@ -21645,11 +21743,18 @@ async function economiaEstadoPublico() {
     tope: hoy.tope || economiaTope(cfg, hoy.salud),
     compra: { activa: !!(cfg.compraActiva && destino), destino, minimo: cfg.minimoCompra },
     comisiones: { mercadoBps: TESORO_COMISION_BPS, circularBps: TESORO_CIRCULAR_BPS, juegoBps: TESORO_COMISION_BPS - TESORO_CIRCULAR_BPS, cambioBps: CAMBIO_COMISION_BPS },
-    tesoros: { circular: hoy.tesoroCircular, juego: hoy.tesoroJuego },
+    tesoros: { circular: hoy.tesoroCircular, juego: hoy.tesoroJuego, reserva: hoy.tesoroReserva || 0 },
+    // (2026-10-28) La 2.ª parte: dinero activo y total, inflación neta, índice de precios y lo quemado.
+    indice: hoy.indice || 1, inflacionNeta7: hoy.inflacionNeta7 ?? null, inflacionActiva7: hoy.inflacionActiva7 ?? null,
+    inflacionTotal7: hoy.inflacionTotal7 ?? null, masaActiva: hoy.masaActiva || null, masaTotal: hoy.masaTotal || null,
+    actualizado: hoy.actualizado || null,
     serie: serie.map((d) => ({ dia: d._id, precio: _gwei(d.precioGwei), inflacion1: d.inflacion1, inflacion7: d.inflacion7, salud: d.salud,
                                oro: d.oro, plata: d.plata, bronce: d.bronce, masa: d.masa, jugadores: d.jugadores,
                                oroComprado: d.oroComprado || 0, comisionCambio: d.comisionCambio || 0,
-                               tesoroCircular: d.tesoroCircular || 0, tesoroJuego: d.tesoroJuego || 0 }))
+                               tesoroCircular: d.tesoroCircular || 0, tesoroJuego: d.tesoroJuego || 0,
+                               tesoroReserva: d.tesoroReserva || 0, indice: d.indice || null, inflacionNeta7: d.inflacionNeta7 ?? null,
+                               masaActiva: d.masaActiva || null, masaTotal: d.masaTotal || null,
+                               quemadoMonedas: d.quemadoMonedas || 0, quemadoObjetos: d.quemadoObjetos || 0, actualizado: d.actualizado || null }))
   };
   _economiaEstado = { en: Date.now(), datos };
   return datos;
@@ -21657,7 +21762,8 @@ async function economiaEstadoPublico() {
 
 // GET /api/economia/estado — para el panel de monedas (público: transparencia).
 app.get('/api/economia/estado', apiLimiter, async (req, res) => {
-  try { return res.json(await economiaEstadoPublico()); }
+  // (2026-10-28) `ahora`: la hora del servidor, la que usan los gráficos (no la del equipo del jugador).
+  try { return res.json(Object.assign({}, await economiaEstadoPublico(), { ahora: Date.now() })); }
   catch (e) { console.error('GET /api/economia/estado:', e); return res.status(500).json({ error: 'internal_error' }); }
 });
 
@@ -21862,7 +21968,7 @@ app.post('/api/currency/oro/reclamar', strictLimiter, authMiddleware, csrfProtec
 function tesoroJuegoPublico(t) {
   const x = t || {}, sub = (o, k) => Number(o && o[k]) || 0;
   return {
-    saldo: Math.max(0, Number(x.saldo) || 0), retirado: Math.max(0, Number(x.retirado) || 0),
+    saldo: Math.max(0, Number(x.saldo) || 0), retirado: Math.max(0, Number(x.retirado) || 0), quemado: Math.max(0, Number(x.quemado) || 0),
     ingresado: Object.fromEntries(TESORO_JUEGO_ORIGENES.map((k) => [k, sub(x.ingresado, k)])),
     ingresos: Object.fromEntries(TESORO_JUEGO_ORIGENES.map((k) => [k, sub(x.ingresos, k)])),
     zkltc: { recibido: sub(x.zkltc, 'gwei') / 1e9, compras: sub(x.zkltc, 'compras'), oro: sub(x.zkltc, 'oro') },
@@ -21883,7 +21989,7 @@ app.get('/api/admin/economia', adminAuth, apiLimiter, async (req, res) => {
     ]);
     const dias = [];
     for (let i = 29; i >= 0; i--) dias.push(new Date(ahora - i * 86400000).toISOString().slice(0, 10));
-    const porDia = new Map(dias.map((d) => [d, { dia: d, tienda: 0, p2p: 0, viajes: 0, vip: 0, revivir: 0, admin: 0, compras: 0 }]));
+    const porDia = new Map(dias.map((d) => [d, { dia: d, tienda: 0, p2p: 0, viajes: 0, vip: 0, revivir: 0, admin: 0, servicios: 0, compras: 0 }]));
     for (const g of grupos) {
       const f = porDia.get(g._id.dia);
       if (!f) continue;
@@ -22184,9 +22290,11 @@ function gfApuntarMovMoneda(playerName, cambios) {
 const GF_TIENDA_MONEDA = { gold: 'oro', silver: 'plata', bronze: 'bronce', oro: 'oro', plata: 'plata', bronce: 'bronce' };
 /** Lo que DEBÍA costar (o pagar) según la tabla del servidor. */
 function gfEsperadoTienda(op, itemId, cantidad, moneda) {
-  const p = Object.prototype.hasOwnProperty.call(TIENDA_PRECIOS, itemId) ? TIENDA_PRECIOS[itemId] : null;
+  // (2026-10-28) El precio de HOY (índice y panel), no el de por defecto.
+  const p = typeof eco2PrecioTienda === 'function' ? eco2PrecioTienda(itemId)
+    : (Object.prototype.hasOwnProperty.call(TIENDA_PRECIOS, itemId) ? TIENDA_PRECIOS[itemId] : null);
   if (!p) return { conocido: false, nivel: gfNivelDeObjeto(itemId) };
-  const nativa = p[2] === 'p' ? 'plata' : 'oro';
+  const nativa = p[2] === 'p' ? 'plata' : p[2] === 'b' ? 'bronce' : 'oro';
   const unidad = Number(op === 'compra' ? p[0] : p[1]) || 0;
   let precioUnidad = unidad, en = nativa;
   if (op === 'compra' && moneda === 'bronce') { precioUnidad = unidad * TESORO_BRONCE_POR[nativa]; en = 'bronce'; }
@@ -22255,8 +22363,12 @@ app.post('/api/tienda/registro', apiLimiter, authMiddleware, csrfProtection, asy
       if (!esp.conocido) avisos.push('objeto_desconocido');
       else {
         if (esp.soloVenta) avisos.push('compra_de_solo_venta');
-        if (cliente.precioUnidad !== undefined && Math.abs(cliente.precioUnidad - esp.precioUnidad) > 0.001) avisos.push('precio_distinto');
-        if (cliente.total !== undefined && Math.abs(cliente.total - esp.total) > 0.001) avisos.push('total_distinto');
+        // (2026-10-28) El precio pudo cambiar con la compra ya en marcha (índice del día, panel): vale el de los últimos 30 minutos.
+        const precioDeAntes = cliente.precioUnidad !== undefined && typeof eco2PrecioAnteriorValido === 'function' &&
+          eco2PrecioAnteriorValido(op, itemId, cliente.precioUnidad, moneda);
+        if (cliente.precioUnidad !== undefined && Math.abs(cliente.precioUnidad - esp.precioUnidad) > 0.001 && !precioDeAntes) avisos.push('precio_distinto');
+        if (cliente.total !== undefined && Math.abs(cliente.total - esp.total) > 0.001 &&
+            !(precioDeAntes && Math.abs(cliente.total - cliente.precioUnidad * cantidad) <= 0.01)) avisos.push('total_distinto');
         if (moneda && moneda !== esp.moneda) avisos.push('moneda_distinta');
         if (cliente.fee !== undefined && cliente.fee > 0 && Math.abs(cliente.fee - esp.fee) > 1) avisos.push('comision_distinta');
       }
@@ -22684,6 +22796,928 @@ try {
 } catch (e) {
   console.warn('⚠️  [gf-wallet] no se pudieron montar las rutas:', e.message);
 }
+
+
+// =============================================================================
+// LA ECONOMÍA, 2.ª PARTE: QUEMAS, FONDO DE RESERVA, ÍNDICE DE PRECIOS, LA
+// TIENDA, LA MUERTE, FUNDIR Y CRAFTEAR                             (2026-10-28)
+// -----------------------------------------------------------------------------
+// "En economía y tesoros debería haber opciones para quemar tokens según el
+// token, su cantidad y de qué tesorería, y que me refleje en tiempo real el
+// porcentaje de inflación que bajaría y en cuánto valdrá el token de recarga.
+// Cuando un personaje muere y paga, ese precio se ajusta en el centro de
+// control, sube y baja con la inflación y ese dinero va al fondo de reserva,
+// no a la economía circular. Lo que se bota a la basura es una quema de
+// tokens: baja la inflación. Fundir y craftear tienen un precio justo que corre
+// con la economía. Lo que se suelta al suelo y las monedas de los monstruos
+// duran 5 minutos: lo que nadie recoge se borra y se ajusta la economía."
+//
+// LAS CUENTAS (todo en bronce: 1 plata = 1.000, 1 oro = 1.000.000)
+//   · C = el dinero de los jugadores (todas las cuentas, PlayerStats).
+//   · A = DINERO ACTIVO = C + el tesoro circular (vuelve a los jugadores como
+//     premio). Su crecimiento es LA inflación que mueve los precios.
+//   · F = FUERA DE CIRCULACIÓN = tesoro del juego + FONDO DE RESERVA. Lo que
+//     entra ahí (comisiones, viajes, VIP, muertes, fundir, craftear) sale de
+//     las manos de los jugadores: frena la inflación.
+//   · S = OFERTA TOTAL = A + F (todas las monedas que existen).
+//   · QUEMAR = destruir: baja S (y A si sale del tesoro circular).
+//   · INFLACIÓN NETA (7 días) = la de A − el valor de los objetos destruidos
+//     (basura, suelo caducado) / A. Un objeto destruido ya no se puede vender
+//     a la tienda, que paga con monedas nuevas: es dinero latente que se va.
+//
+// EL ÍNDICE DE PRECIOS (1 = los precios por defecto). Una vez al día:
+//   objetivo = 1 + inflación neta × sensibilidad, como mucho ±pasoMax sobre
+//   el de ayer. Lo siguen la tienda del juego (precio por defecto × índice ×
+//   demanda del objeto), la muerte, fundir y craftear. El precio del oro de
+//   recarga usa la misma inflación neta (economiaFoto).
+//
+// LOS PRECIOS DE LA TIENDA: el "por defecto" es TIENDA_PRECIOS, salvo que el
+// panel lo cambie (precios_base: oro, plata o bronce). Cada día queda un punto
+// en `precios_historial` (y otro cada vez que el panel cambia uno): de ahí
+// salen los gráficos del centro de control y el panel "Price history" de la
+// tienda y del P2P. Los precios no cambian a media partida: el índice se fija
+// con la primera foto del día. La auditoría acepta durante 30 minutos el
+// precio anterior a un cambio (una compra que ya estaba en marcha).
+// =============================================================================
+// (2026-10-28) "En misiones no podemos dar ítems, solo monedas de los tres tipos."
+const GF_MISIONES_SOLO_MONEDAS = true;
+
+/** (2026-10-28) "Solo los jefes grandes de cada mapa dan ítems." La serpiente de magma es el jefe de la mina. */
+function gfMonstruoDaObjetos(tipo) {
+  const t = String(tipo || '');
+  return /^jefe_/.test(t) || t === 'serpiente_mina';
+}
+
+// ── EL FONDO DE RESERVA ──────────────────────────────────────────────────────
+const TESORO_RESERVA_ID = 'reserva';
+const TESORO_RESERVA_ORIGENES = ['muerte', 'admin'];
+const tesoroReservaSchema = new mongoose.Schema({
+  _id:       { type: String, default: TESORO_RESERVA_ID },
+  saldo:     _cero(),                                   // bronce
+  retirado:  _cero(),
+  quemado:   _cero(),
+  ingresado: Object.fromEntries(TESORO_RESERVA_ORIGENES.map((k) => [k, _cero()])),
+  ingresos:  Object.fromEntries(TESORO_RESERVA_ORIGENES.map((k) => [k, _cero()])),
+  config:    { type: mongoose.Schema.Types.Mixed, default: null }   // la de esta parte (eco2NormalizarConfig)
+}, { collection: 'tesoro_reserva', timestamps: true, versionKey: false, minimize: false });
+const TesoroReserva = mongoose.models.TesoroReserva || mongoose.model('TesoroReserva', tesoroReservaSchema);
+
+/** Al fondo de reserva (bronce; en negativo, una devolución). Nunca rompe a quien llama. */
+async function tesoroReservaIngresar(origen, bronce, playerName, detalle) {
+  const n = Math.round(Number(bronce) || 0);
+  if (!n || !TESORO_RESERVA_ORIGENES.includes(origen)) return;
+  try {
+    await TesoroReserva.updateOne({ _id: TESORO_RESERVA_ID },
+      { $inc: { saldo: n, ['ingresado.' + origen]: n, ['ingresos.' + origen]: n > 0 ? 1 : 0 } }, { upsert: true });
+    await TesoroMov.create({ tesoro: 'reserva', tipo: n > 0 ? 'ingreso' : 'ajuste', origen, bronce: n,
+                             playerName: playerName || null, detalle: String(detalle || '').slice(0, 200) });
+  } catch (e) { console.warn('⚠️  fondo de reserva (' + origen + '):', e.message); }
+}
+function tesoroReservaPublico(t) {
+  const x = t || {}, sub = (o, k) => Number(o && o[k]) || 0;
+  return {
+    saldo: Math.max(0, Number(x.saldo) || 0), retirado: Math.max(0, Number(x.retirado) || 0), quemado: Math.max(0, Number(x.quemado) || 0),
+    ingresado: Object.fromEntries(TESORO_RESERVA_ORIGENES.map((k) => [k, sub(x.ingresado, k)])),
+    ingresos: Object.fromEntries(TESORO_RESERVA_ORIGENES.map((k) => [k, sub(x.ingresos, k)])),
+    actualizado: x.updatedAt || null
+  };
+}
+
+// ── LAS QUEMAS ───────────────────────────────────────────────────────────────
+const quemaSchema = new mongoose.Schema({
+  t:          { type: Date, default: Date.now },
+  tipo:       { type: String, enum: ['monedas', 'objetos'], required: true },
+  origen:     { type: String, required: true },       // admin | monedas_caducadas | basura | suelo_caducado
+  tesoro:     { type: String, default: null },        // circular | juego | reserva (las de monedas)
+  moneda:     { type: String, default: null },        // oro | plata | bronce (lo que se tecleó)
+  cantidad:   { type: Number, default: 0 },           // en esa moneda, o unidades del objeto
+  bronce:     { type: Number, required: true },       // lo que vale, en bronce
+  itemId:     { type: String, default: null },
+  playerName: { type: String, default: null },
+  detalle:    { type: String, default: '' },
+  ref:        { type: String }                        // cuenta una vez
+}, { collection: 'economia_quemas', versionKey: false });
+quemaSchema.index({ t: 1 }, { expireAfterSeconds: 800 * 86400 });
+quemaSchema.index({ ref: 1 }, { unique: true, sparse: true });
+quemaSchema.index({ tipo: 1, t: -1 });
+const EconomiaQuema = mongoose.models.EconomiaQuema || mongoose.model('EconomiaQuema', quemaSchema);
+
+// ── LOS PRECIOS ──────────────────────────────────────────────────────────────
+const precioBaseSchema = new mongoose.Schema({
+  _id:         { type: String },                      // itemId
+  compra:      { type: Number, default: 0 },
+  venta:       { type: Number, default: 0 },
+  moneda:      { type: String, enum: ['oro', 'plata', 'bronce'], default: 'plata' },
+  sigueIndice: { type: Boolean, default: true },
+  por:         { type: String, default: '' },
+  t:           { type: Date, default: Date.now }
+}, { collection: 'precios_base', versionKey: false });
+const PrecioBase = mongoose.models.PrecioBase || mongoose.model('PrecioBase', precioBaseSchema);
+
+const precioHistSchema = new mongoose.Schema({
+  t:       { type: Date, default: Date.now },
+  dia:     { type: String },
+  itemId:  { type: String, required: true },
+  compra:  { type: Number, default: 0 },
+  venta:   { type: Number, default: 0 },
+  moneda:  { type: String },
+  indice:  { type: Number, default: 1 },
+  demanda: { type: Number, default: 1 },
+  motivo:  { type: String, default: 'diario' }        // diario | admin | recalculo
+}, { collection: 'precios_historial', versionKey: false });
+precioHistSchema.index({ itemId: 1, t: 1 });
+precioHistSchema.index({ dia: 1, motivo: 1 });
+precioHistSchema.index({ t: 1 }, { expireAfterSeconds: 800 * 86400 });
+const PrecioHist = mongoose.models.PrecioHist || mongoose.model('PrecioHist', precioHistSchema);
+
+// ── FUNDIR Y CRAFTEAR: LO COBRADO ────────────────────────────────────────────
+const servicioCobroSchema = new mongoose.Schema({
+  _id:        { type: String },                       // playerName:ref
+  playerName: { type: String, index: true },
+  tipo:       { type: String },                       // fundir | craftear
+  itemId:     { type: String },
+  cantidad:   { type: Number, default: 1 },
+  bronce:     { type: Number, default: 0 },
+  t:          { type: Date, default: Date.now },
+  devuelto:   { type: Boolean, default: false },
+  tDevuelto:  { type: Date, default: null }
+}, { collection: 'servicios_cobros', versionKey: false });
+servicioCobroSchema.index({ t: 1 }, { expireAfterSeconds: 400 * 86400 });
+servicioCobroSchema.index({ tipo: 1, t: -1 });
+const ServicioCobro = mongoose.models.ServicioCobro || mongoose.model('ServicioCobro', servicioCobroSchema);
+Promise.all([TesoroReserva.init(), EconomiaQuema.init(), PrecioBase.init(), PrecioHist.init(), ServicioCobro.init()])
+  .catch((e) => console.warn('⚠️  economía (2.ª parte): índices:', e.message));
+
+// ── LA CONFIGURACIÓN ─────────────────────────────────────────────────────────
+const ECO2_CONFIG_BASE = Object.freeze({
+  indiceActivo: true,       // ¿los precios siguen la economía? (no = los precios por defecto)
+  sensibilidad: 0.6,        // cuánto mueve la inflación neta el índice
+  pasoMax: 0.03,            // lo más que cambia el índice de un día a otro
+  demanda: 0.10,            // ± por la demanda de cada objeto en la tienda (compras frente a ventas, 7 días)
+  pesoObjetos: 1,           // cuánto cuenta el valor de los objetos destruidos en la inflación neta (0..1)
+  muerteBase: 30,           // plata: la primera muerte de la ventana de 24 h
+  muerteMultiplicador: 2,   // cada muerte de la ventana, × esto
+  muerteTope: 480,          // plata
+  fundirTasa: 0.05,         // del valor del lingote
+  fundirMin: 50,            // bronce
+  craftearTasa: 0.04,       // del valor de lo crafteado
+  craftearMin: 50           // bronce
+});
+function eco2NormalizarConfig(c) {
+  const B = ECO2_CONFIG_BASE, s = (c && typeof c === 'object') ? c : {};
+  const num = (v, def, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
+  const out = {
+    indiceActivo: typeof s.indiceActivo === 'boolean' ? s.indiceActivo : B.indiceActivo,
+    sensibilidad: num(s.sensibilidad, B.sensibilidad, 0, 5),
+    pasoMax: num(s.pasoMax, B.pasoMax, 0.001, 0.25),
+    demanda: num(s.demanda, B.demanda, 0, 0.5),
+    pesoObjetos: num(s.pesoObjetos, B.pesoObjetos, 0, 1),
+    muerteBase: Math.round(num(s.muerteBase, B.muerteBase, 1, 100000)),
+    muerteMultiplicador: num(s.muerteMultiplicador, B.muerteMultiplicador, 1, 5),
+    muerteTope: Math.round(num(s.muerteTope, B.muerteTope, 1, 1000000)),
+    fundirTasa: num(s.fundirTasa, B.fundirTasa, 0, 0.5),
+    fundirMin: Math.round(num(s.fundirMin, B.fundirMin, 0, 10000000)),
+    craftearTasa: num(s.craftearTasa, B.craftearTasa, 0, 0.5),
+    craftearMin: Math.round(num(s.craftearMin, B.craftearMin, 0, 10000000))
+  };
+  if (out.muerteTope < out.muerteBase) out.muerteTope = out.muerteBase;
+  return out;
+}
+let _eco2Cfg = null, _eco2CfgEn = 0;
+async function eco2Config() {
+  if (_eco2Cfg && Date.now() - _eco2CfgEn < 10000) return _eco2Cfg;
+  let guardada = null;
+  try { const t = await TesoroReserva.findById(TESORO_RESERVA_ID).select('config').lean(); guardada = t && t.config; }
+  catch (e) { if (_eco2Cfg) return _eco2Cfg; }
+  _eco2Cfg = eco2NormalizarConfig(guardada);
+  _eco2CfgEn = Date.now();
+  return _eco2Cfg;
+}
+/** La de ahora sin esperar (para quien no puede: precioRevivir). */
+function eco2ConfigSync() { return _eco2Cfg || eco2NormalizarConfig(null); }
+
+// ── EL ÍNDICE ────────────────────────────────────────────────────────────────
+let _eco2Indice = { valor: 1, dia: null };
+/** El índice de hoy (1 si el panel lo apagó). */
+function eco2IndiceSync() {
+  const c = eco2ConfigSync();
+  const v = Number(_eco2Indice.valor);
+  return c.indiceActivo && v > 0 ? v : 1;
+}
+/** El índice de hoy desde el de ayer y la inflación neta de 7 días. */
+function eco2IndiceObjetivo(cfg, indiceAyer, infNeta7) {
+  const previo = Number(indiceAyer) > 0 ? Number(indiceAyer) : 1;
+  const inf = Number.isFinite(Number(infNeta7)) && infNeta7 !== null ? Math.max(-0.5, Math.min(1.5, Number(infNeta7))) : 0;
+  const objetivo = Math.min(5, Math.max(0.2, 1 + inf * cfg.sensibilidad));
+  const v = Math.max(previo * (1 - cfg.pasoMax), Math.min(previo * (1 + cfg.pasoMax), objetivo));
+  return Math.round(v * 10000) / 10000;
+}
+/** C, A, F y S de una foto del día (los días de antes no tienen reserva: cuenta 0). */
+function eco2Masas(d) {
+  const x = d || {};
+  const C = Math.max(0, Number(x.masa) || 0);
+  const circular = Math.max(0, Number(x.tesoroCircular) || 0) + Math.max(0, Number(x.tesoroReservado) || 0);
+  const F = Math.max(0, Number(x.tesoroJuego) || 0) + Math.max(0, Number(x.tesoroReserva) || 0);
+  return { C, A: C + circular, F, S: C + circular + F };
+}
+/** Las inflaciones de hoy (tanto por uno). `objetos7` = valor (bronce) de lo destruido en 7 días. */
+function eco2Inflaciones(hoy, ayer, hace7, objetos7, peso) {
+  const m = eco2Masas(hoy), m1 = ayer ? eco2Masas(ayer) : null, m7 = hace7 ? eco2Masas(hace7) : null;
+  const crece = (a, b) => (b > 0 ? (a - b) / b : null);
+  const activa1 = m1 ? crece(m.A, m1.A) : null;
+  const activa7 = m7 ? crece(m.A, m7.A) : activa1;
+  const total7 = m7 ? crece(m.S, m7.S) : (m1 ? crece(m.S, m1.S) : null);
+  const base = m7 ? m7.A : (m1 ? m1.A : m.A);
+  const quema = base > 0 ? Math.max(0, Number(objetos7) || 0) * Math.max(0, Math.min(1, Number(peso) || 0)) / base : 0;
+  const neta7 = activa7 === null ? null : activa7 - quema;
+  return { C: m.C, A: m.A, F: m.F, S: m.S, A7: m7 ? m7.A : (m1 ? m1.A : null), S7: m7 ? m7.S : (m1 ? m1.S : null),
+           activa1, activa7, total7, neta7, quemaObjetos7: quema };
+}
+
+// ── EL CATÁLOGO Y LO QUE VALE CADA COSA ──────────────────────────────────────
+const ECO2_MONEDA_DE = Object.freeze({ p: 'plata', o: 'oro', b: 'bronce' });
+const ECO2_LETRA_DE = Object.freeze({ plata: 'p', oro: 'o', bronce: 'b' });
+/* Lo que vale (en bronce, por unidad) lo que la tienda NO vende: minerales,
+   madera, lingotes, herramientas crafteadas, pociones, cosechas cortas o
+   podridas. Sirve para la quema de objetos (basura, suelo), fundir, craftear y
+   convertir en bronce los premios de misión viejos. Se cambia en el panel
+   (Shop & P2P economy) como cualquier precio. */
+const ECO2_VALOR_REFERENCIA = Object.freeze({
+  mineral_piedra: 3000, mineral_piedra_cobre: 8000, mineral_piedra_hierro: 15000, mineral_carbon: 5000, carbon: 5000,
+  mineral_cobre: 25000, mineral_hierro: 45000,
+  palo: 1000, tablon_de_madera: 6000, madera_pinos: 3000, madera_seca: 3000, madera_con_hojas: 2500,
+  balde_vacio: 2000,
+  hacha_de_piedra: 200000, hacha_de_cobre: 320000, hacha_de_hierro: 500000,
+  pico_de_piedra: 250000, pico_de_cobre: 380000, pico_de_hierro: 600000,
+  pocion_vida: 30000, pocion_antidoto: 25000, pocion_mascota: 25000, pocion_mascota_grande: 60000, elixir_revivir: 150000,
+  zanahoria_corta: 4000, tomate_corta: 4000, trigo_corta: 4000, calabaza_corta: 4000, fresa_corta: 4000,
+  zanahoria_mala: 1000, tomate_mala: 1000, trigo_mala: 1000, calabaza_mala: 1000, fresa_mala: 1000
+});
+const _eco2Tiene = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+let _eco2CatalogoLista = null;
+function eco2Catalogo() {
+  if (!_eco2CatalogoLista) _eco2CatalogoLista = Array.from(new Set(Object.keys(TIENDA_PRECIOS).concat(Object.keys(ECO2_VALOR_REFERENCIA))));
+  return _eco2CatalogoLista;
+}
+/** El precio POR DEFECTO de un objeto (el del panel si lo cambió). */
+function eco2BaseDe(itemId, ov) {
+  const tienda = _eco2Tiene(TIENDA_PRECIOS, itemId);
+  if (ov) {
+    return { compra: tienda ? Math.max(0, Number(ov.compra) || 0) : 0, venta: Math.max(0, Number(ov.venta) || 0),
+             moneda: ECO2_LETRA_DE[ov.moneda] ? ov.moneda : 'plata', sigueIndice: ov.sigueIndice !== false, tienda, cambiado: true };
+  }
+  if (tienda) {
+    const p = TIENDA_PRECIOS[itemId];
+    return { compra: Number(p[0]) || 0, venta: Number(p[1]) || 0, moneda: ECO2_MONEDA_DE[p[2]] || 'oro', sigueIndice: true, tienda: true, cambiado: false };
+  }
+  return { compra: 0, venta: Number(ECO2_VALOR_REFERENCIA[itemId]) || 1000, moneda: 'bronce', sigueIndice: true, tienda: false, cambiado: false };
+}
+/** El precio de hoy: el de por defecto × índice × demanda, en enteros de su moneda. */
+function eco2PrecioDinamico(base, indice, demanda) {
+  const f = base.sigueIndice === false ? 1 : Math.max(0.05, (Number(indice) || 1) * (Number(demanda) || 1));
+  const compra = base.compra > 0 ? Math.max(1, Math.round(base.compra * f)) : 0;
+  let venta = base.venta > 0 ? Math.max(1, Math.round(base.venta * f)) : 0;
+  // Comprar y vender lo mismo nunca da dinero.
+  if (compra > 0 && venta >= compra) venta = Math.max(0, compra - 1);
+  return { compra, venta };
+}
+/** La demanda de un objeto en la tienda: más compras que ventas lo encarece (±cfg.demanda). */
+function eco2FactorDemanda(cfg, d) {
+  if (!d || !(cfg.demanda > 0)) return 1;
+  const c = Math.max(0, Number(d.compras) || 0), v = Math.max(0, Number(d.ventas) || 0);
+  const r = (c - v) / (c + v + 10);
+  return Math.max(1 - cfg.demanda, Math.min(1 + cfg.demanda, 1 + cfg.demanda * r));
+}
+async function eco2DemandaTienda() {
+  const desde = new Date(Date.now() - 7 * 86400000);
+  const g = await TiendaOp.aggregate([
+    { $match: { tienda: 'juego', t: { $gte: desde }, estado: { $in: ['ok', 'parcial'] } } },
+    { $group: { _id: { item: '$itemId', op: '$op' }, n: { $sum: { $ifNull: ['$cliente.confirmadas', '$cantidad'] } } } }
+  ]);
+  const m = new Map();
+  for (const x of g) {
+    const e = m.get(x._id.item) || { compras: 0, ventas: 0 };
+    if (x._id.op === 'compra') e.compras += Number(x.n) || 0; else if (x._id.op === 'venta') e.ventas += Number(x.n) || 0;
+    m.set(x._id.item, e);
+  }
+  return m;
+}
+
+/* LA TABLA DE PRECIOS DE HOY, en memoria. `previas`: las anteriores (30 min),
+   para que la auditoría no marque como "precio distinto" una compra que ya
+   iba de camino cuando cambió el precio. */
+let _eco2Precios = { version: 0, dia: null, indice: 1, items: {}, previas: [] };
+function eco2TablaPorDefecto() {
+  const items = {};
+  for (const id of eco2Catalogo()) {
+    const base = eco2BaseDe(id, null);
+    const p = eco2PrecioDinamico(base, 1, 1);
+    items[id] = { compra: p.compra, venta: p.venta, moneda: base.moneda, tienda: base.tienda, sigueIndice: true, demanda: 1,
+                  base: { compra: base.compra, venta: base.venta, moneda: base.moneda }, cambiado: false };
+  }
+  return items;
+}
+function eco2PreciosActuales() {
+  if (!_eco2Precios.version) _eco2Precios = { version: 1, dia: null, indice: 1, items: eco2TablaPorDefecto(), previas: [] };
+  return _eco2Precios;
+}
+/** [compra, venta, letra] de hoy para la tienda del juego (como TIENDA_PRECIOS), o null. */
+function eco2PrecioTienda(itemId) {
+  if (!_eco2Tiene(TIENDA_PRECIOS, itemId)) return null;
+  const p = eco2PreciosActuales().items[itemId];
+  if (!p) return TIENDA_PRECIOS[itemId];
+  return [p.compra, p.venta, ECO2_LETRA_DE[p.moneda] || 'p'];
+}
+/** ¿Ese precio por unidad fue el de la tienda en los últimos 30 minutos? (cambió con la compra en marcha) */
+function eco2PrecioAnteriorValido(op, itemId, precioUnidad, moneda) {
+  const ahora = Date.now();
+  for (const prev of (_eco2Precios.previas || [])) {
+    if (!prev || !prev.items || ahora - (prev.hasta || 0) > 30 * 60 * 1000) continue;
+    const p = prev.items[itemId];
+    if (!p) continue;
+    let unidad = Number(op === 'compra' ? p.compra : p.venta) || 0;
+    if (op === 'compra' && moneda === 'bronce' && p.moneda !== 'bronce') unidad *= TESORO_BRONCE_POR[p.moneda] || 1;
+    if (Math.abs(unidad - Number(precioUnidad)) <= 0.001) return true;
+  }
+  return false;
+}
+
+/* LO QUE PAGAN EN EL P2P (14 días), cada 10 minutos: la mediana por unidad en
+   bronce, para el "valor de mercado" y el panel de estadísticas. */
+const _eco2P2P = new Map();
+let _eco2P2PEn = 0;
+async function eco2P2PRefrescar() {
+  if (mongoose.connection.readyState !== 1 || !mongoose.connection.db) return;
+  const desde = new Date(Date.now() - 14 * 86400000);
+  const filas = await mongoose.connection.db.collection('market_history')
+    .find({ type: 'buy', createdAt: { $gte: desde } }, { projection: { itemId: 1, qty: 1, pricePerUnit: 1, currency: 1 } })
+    .limit(20000).toArray();
+  const por = new Map();
+  for (const f of filas) {
+    const u = (Number(f.pricePerUnit) || 0) * (TESORO_BRONCE_POR[f.currency] || 0);
+    if (!(u > 0) || !f.itemId) continue;
+    if (!por.has(f.itemId)) por.set(f.itemId, []);
+    por.get(f.itemId).push({ u, q: Math.max(1, Number(f.qty) || 1) });
+  }
+  _eco2P2P.clear();
+  for (const [id, l] of por) {
+    const us = l.map((x) => x.u).sort((a, b) => a - b);
+    _eco2P2P.set(id, { n: l.length, mediana: us[Math.floor(us.length / 2)], min: us[0], max: us[us.length - 1],
+                       media: us.reduce((s, x) => s + x, 0) / us.length, volumen: l.reduce((s, x) => s + x.q, 0) });
+  }
+  _eco2P2PEn = Date.now();
+}
+/** Lo que vale UNA unidad hoy, en bronce: la venta de la tienda (o su valor de referencia), y el P2P si hay datos (con tope). */
+function eco2ValorUnidad(itemId) {
+  const p = eco2PreciosActuales().items[itemId];
+  let v = 0;
+  if (p) {
+    const f = TESORO_BRONCE_POR[p.moneda] || 1;
+    v = p.venta > 0 ? p.venta * f : (p.compra > 0 ? Math.round(p.compra * f / 2) : 0);
+  }
+  if (!(v > 0)) v = Math.round(1000 * eco2IndiceSync());      // lo desconocido: una plata
+  const x = _eco2P2P.get(itemId);
+  if (x && x.n >= 3 && x.mediana > 0) v = Math.max(v, Math.min(Math.round(x.mediana), v * 3));
+  return Math.max(1, Math.round(v));
+}
+
+/* RECALCULAR. 'diario': una vez al día con el índice nuevo (y la demanda);
+   con `soloItem` (el panel cambió uno) solo se rehace ese, para que los demás
+   no cambien a media partida. */
+let _eco2Recalculando = null;
+async function eco2RecalcularPrecios(motivo, soloItem, sinHistoria) {
+  const cfg = await eco2Config();
+  const indice = eco2IndiceSync();
+  const ovs = await PrecioBase.find({}).lean();
+  const ov = new Map(ovs.map((o) => [o._id, o]));
+  const anterior = eco2PreciosActuales();
+  const items = Object.assign({}, anterior.items);
+  let demanda = null;
+  if (!soloItem) { try { demanda = await eco2DemandaTienda(); } catch (e) { demanda = new Map(); } }
+  for (const id of (soloItem ? [soloItem] : eco2Catalogo())) {
+    const base = eco2BaseDe(id, ov.get(id));
+    let dem = 1;
+    if (base.tienda && cfg.indiceActivo) {
+      dem = demanda ? eco2FactorDemanda(cfg, demanda.get(id)) : (anterior.items[id] && anterior.items[id].demanda) || 1;
+      // La demanda tampoco salta más que el índice en un día.
+      const previa = anterior.items[id] && anterior.items[id].demanda;
+      if (demanda && previa > 0 && anterior.dia) dem = Math.max(previa * (1 - cfg.pasoMax), Math.min(previa * (1 + cfg.pasoMax), dem));
+    }
+    const p = eco2PrecioDinamico(base, cfg.indiceActivo ? indice : 1, dem);
+    items[id] = { compra: p.compra, venta: p.venta, moneda: base.moneda, tienda: base.tienda, sigueIndice: base.sigueIndice !== false,
+                  demanda: Math.round(dem * 10000) / 10000, base: { compra: base.compra, venta: base.venta, moneda: base.moneda },
+                  cambiado: !!base.cambiado };
+  }
+  const version = Date.now();
+  _eco2Precios = { version, dia: soloItem ? (anterior.dia || _diaUTC()) : _diaUTC(), indice, items,
+                   previas: [{ version: anterior.version, hasta: version, items: anterior.items }].concat(anterior.previas || []).slice(0, 4) };
+  const hoy = _diaUTC();
+  let escribir = sinHistoria ? [] : soloItem ? [soloItem] : eco2Catalogo();
+  if (escribir.length && !soloItem && motivo === 'diario' && await PrecioHist.exists({ dia: hoy, motivo: 'diario' })) escribir = [];
+  if (escribir.length) {
+    await PrecioHist.insertMany(escribir.map((id) => ({ t: new Date(), dia: hoy, itemId: id, compra: items[id].compra, venta: items[id].venta,
+      moneda: items[id].moneda, indice, demanda: items[id].demanda, motivo: motivo || 'recalculo' })), { ordered: false })
+      .catch((e) => console.warn('⚠️  precios: historial:', e.message));
+  }
+  return _eco2Precios;
+}
+/** Tras cada foto del día: el índice de hoy y, si es nuevo (o el primero), los precios. */
+async function eco2TrasFoto(doc, indiceNuevo) {
+  if (!doc) return;
+  if (Number(doc.indice) > 0) _eco2Indice = { valor: Number(doc.indice), dia: doc._id };
+  const p = eco2PreciosActuales();
+  if (indiceNuevo || p.dia !== doc._id) {
+    if (_eco2Recalculando) return _eco2Recalculando;
+    _eco2Recalculando = eco2RecalcularPrecios('diario').finally(() => { _eco2Recalculando = null; });
+    await _eco2Recalculando;
+  }
+}
+/* AL ARRANCAR: los precios de hoy salen del historial de hoy (los mismos que
+   había antes de reiniciar); si no hay, se calculan con el índice de la última
+   foto. */
+async function eco2Iniciar() {
+  await eco2Config();
+  const ultima = await EconomiaDia.findOne({ indice: { $gt: 0 } }).sort({ _id: -1 }).lean();
+  if (ultima) _eco2Indice = { valor: Number(ultima.indice) || 1, dia: ultima._id };
+  eco2P2PRefrescar().catch((e) => console.warn('⚠️  precios: P2P:', e.message));
+  const hoy = _diaUTC();
+  const puntos = await PrecioHist.aggregate([{ $match: { dia: hoy } }, { $sort: { t: 1 } },
+    { $group: { _id: '$itemId', compra: { $last: '$compra' }, venta: { $last: '$venta' }, moneda: { $last: '$moneda' }, demanda: { $last: '$demanda' } } }]);
+  // Sin la foto de hoy todavía: en memoria y sin historial (la primera foto del día pone el índice y escribe el punto).
+  if (!ultima || ultima._id !== hoy) { await eco2RecalcularPrecios('arranque', null, true); return; }
+  if (!puntos.length) { await eco2RecalcularPrecios('diario'); return; }
+  const ovs = new Map((await PrecioBase.find({}).lean()).map((o) => [o._id, o]));
+  const items = eco2TablaPorDefecto();
+  for (const id of Object.keys(items)) {
+    const base = eco2BaseDe(id, ovs.get(id));
+    const pt = puntos.find((x) => x._id === id);
+    const p = pt ? { compra: pt.compra, venta: pt.venta } : eco2PrecioDinamico(base, eco2IndiceSync(), 1);
+    items[id] = { compra: p.compra, venta: p.venta, moneda: pt ? pt.moneda : base.moneda, tienda: base.tienda, sigueIndice: base.sigueIndice !== false,
+                  demanda: pt ? pt.demanda : 1, base: { compra: base.compra, venta: base.venta, moneda: base.moneda }, cambiado: !!base.cambiado };
+  }
+  _eco2Precios = { version: Date.now(), dia: hoy, indice: eco2IndiceSync(), items, previas: [] };
+}
+setTimeout(() => {
+  if (mongoose.connection.readyState === 1) eco2Iniciar().catch((e) => console.warn('⚠️  economía (2.ª parte): arranque:', e.message));
+}, 8000).unref();
+setInterval(() => {
+  if (mongoose.connection.readyState !== 1) return;
+  eco2Config().catch(() => {});
+  if (Date.now() - _eco2P2PEn > 10 * 60 * 1000) eco2P2PRefrescar().catch((e) => console.warn('⚠️  precios: P2P:', e.message));
+}, 60 * 1000).unref();
+
+// ── LA MUERTE ────────────────────────────────────────────────────────────────
+/** Plata por revivir tras `muertes` muertes anteriores en la ventana (con el índice). */
+function eco2PrecioMuerte(cfg, indice, muertes) {
+  const n = Math.max(0, Math.floor(Number(muertes) || 0));
+  const f = Number(indice) > 0 ? Number(indice) : 1;
+  const tope = cfg.muerteTope * f;
+  return Math.max(1, Math.round(Math.min(cfg.muerteBase * f * Math.pow(cfg.muerteMultiplicador, n), tope)));
+}
+
+// ── QUEMAR ───────────────────────────────────────────────────────────────────
+/** Objetos destruidos (basura, suelo caducado): se apunta lo que valían. Devuelve el bronce. */
+async function eco2QuemarObjetos(origen, lista, playerName, ref, detalle) {
+  let total = 0;
+  for (const it of (lista || [])) {
+    const itemId = String((it && it.itemId) || '').slice(0, 60);
+    const cantidad = Math.max(0, Math.floor(Number(it && it.cantidad) || 0));
+    if (!itemId || !cantidad) continue;
+    const bronce = eco2ValorUnidad(itemId) * cantidad;
+    try {
+      await EconomiaQuema.create({ tipo: 'objetos', origen, itemId, cantidad, bronce, playerName: playerName || null,
+                                   detalle: String(detalle || '').slice(0, 200), ref: ref ? String(ref).slice(0, 150) + ':' + itemId : undefined });
+      total += bronce;
+    } catch (e) {
+      if (!(e && e.code === 11000)) console.warn('⚠️  quema de objetos (' + origen + '):', e.message);
+    }
+  }
+  if (total) economiaApuntar({ quemadoObjetos: total, quemasObjetos: 1 });
+  return total;
+}
+/** Las monedas de un monstruo que nadie recogió: salen de la reserva del tesoro circular y se destruyen. */
+async function tesoroQuemarCaducado(cantidad, b) {
+  const n = Math.max(0, Math.floor(Number(cantidad) || 0));
+  if (!n) return;
+  try {
+    await Tesoro.updateOne({ _id: TESORO_ID }, { $inc: { reservado: -n, quemado: n, caducados: 1 } });
+    await EconomiaQuema.create({ tipo: 'monedas', origen: 'monedas_caducadas', tesoro: 'circular', moneda: 'bronce', cantidad: n, bronce: n,
+                                 playerName: (b && b.playerName) || null, detalle: (b && b.incentivo && b.incentivo.monstruo) || '' });
+    economiaApuntar({ quemadoMonedas: n });
+  } catch (e) { console.warn('⚠️  tesoro: quemar monedas caducadas:', e.message); }
+}
+const ECO2_TESOROS = Object.freeze({
+  circular: () => ({ modelo: Tesoro, id: TESORO_ID }),
+  juego:    () => ({ modelo: TesoroJuego, id: TESORO_JUEGO_ID }),
+  reserva:  () => ({ modelo: TesoroReserva, id: TESORO_RESERVA_ID })
+});
+
+// ── COBRAR EN BRONCE (FUNDIR, CRAFTEAR) ──────────────────────────────────────
+/** Cómo se pagan `cuanto` de bronce: primero bronce; si no llega se rompe plata (y oro) y el cambio vuelve. null si no alcanza. */
+function eco2PlanPago(cuanto, s) {
+  let oro = Math.max(0, Math.floor(Number(s.oro) || 0)), plata = Math.max(0, Math.floor(Number(s.plata) || 0));
+  let bronce = Math.max(0, Math.floor(Number(s.bronce) || 0)), falta = Math.max(0, Math.floor(Number(cuanto) || 0));
+  if (oro * 1000000 + plata * 1000 + bronce < falta) return null;
+  const b = Math.min(bronce, falta); bronce -= b; falta -= b;
+  if (falta > 0 && plata > 0) {
+    const p = Math.min(plata, Math.ceil(falta / 1000));
+    plata -= p;
+    const recibido = p * 1000;
+    if (recibido >= falta) { bronce += recibido - falta; falta = 0; } else falta -= recibido;
+  }
+  if (falta > 0 && oro > 0) {
+    const o = Math.min(oro, Math.ceil(falta / 1000000));
+    oro -= o;
+    const cambio = o * 1000000 - falta;
+    falta = 0;
+    plata += Math.floor(cambio / 1000);
+    bronce += cambio % 1000;
+  }
+  return falta > 0 ? null : { oro, plata, bronce };
+}
+/** Cobra en el servidor (comparar y cambiar, sin pisar otro cobro). { ok, doc } o { ok:false, motivo, tiene }. */
+async function eco2CobrarBronce(playerName, cuanto) {
+  for (let i = 0; i < 4; i++) {
+    const st = await PlayerStats.findOne({ playerName }).select('oro plata bronce').lean();
+    if (!st) return { ok: false, motivo: 'sin_stats' };
+    const antes = { oro: Math.max(0, Math.floor(Number(st.oro) || 0)), plata: Math.max(0, Math.floor(Number(st.plata) || 0)),
+                    bronce: Math.max(0, Math.floor(Number(st.bronce) || 0)) };
+    const plan = eco2PlanPago(cuanto, antes);
+    if (!plan) return { ok: false, motivo: 'saldo', tiene: antes.oro * 1000000 + antes.plata * 1000 + antes.bronce };
+    const cambian = ['oro', 'plata', 'bronce'].filter((k) => plan[k] !== antes[k]);
+    const doc = await PlayerStats.findOneAndUpdate({ _id: st._id, oro: st.oro, plata: st.plata, bronce: st.bronce },
+      { $set: { oro: plan.oro, plata: plan.plata, bronce: plan.bronce }, $addToSet: { chainPending: { $each: cambian } } }, { new: true });
+    if (doc) {
+      if (!doc.chainPendingSince) await PlayerStats.updateOne({ _id: doc._id, chainPendingSince: null }, { $set: { chainPendingSince: new Date() } });
+      return { ok: true, doc };
+    }
+  }
+  return { ok: false, motivo: 'ocupado' };
+}
+/** Lo que cuesta fundir o craftear `cantidad` de `itemId` (bronce), con el índice. */
+function eco2PrecioServicio(tipo, itemId, cantidad) {
+  const c = eco2ConfigSync();
+  const tasa = tipo === 'fundir' ? c.fundirTasa : c.craftearTasa;
+  const minimo = Math.round((tipo === 'fundir' ? c.fundirMin : c.craftearMin) * eco2IndiceSync());
+  const q = Math.max(1, Math.floor(Number(cantidad) || 1));
+  return Math.max(minimo, Math.round(eco2ValorUnidad(itemId) * q * tasa));
+}
+
+// ── RUTAS PÚBLICAS ───────────────────────────────────────────────────────────
+// GET /api/tiempo — la hora del servidor (los gráficos usan esta, no la del equipo).
+app.get('/api/tiempo', apiLimiter, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  return res.json({ ok: true, ahora: Date.now() });
+});
+
+// GET /api/economia/precios — la tabla de la tienda de hoy (la carga tienda_sistema.js al abrir).
+app.get('/api/economia/precios', apiLimiter, (req, res) => {
+  try {
+    const p = eco2PreciosActuales();
+    const items = {};
+    for (const [id, x] of Object.entries(p.items)) {
+      if (!x.tienda) continue;
+      items[id] = { compra: x.compra, venta: x.venta, moneda: x.moneda, base: x.base, demanda: x.demanda, cambiado: x.cambiado };
+    }
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, version: p.version, dia: p.dia, indice: p.indice, ahora: Date.now(), items });
+  } catch (e) { console.error('GET /api/economia/precios:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// GET /api/economia/precio/:itemId — el panel "Price history" (tienda y P2P): historia, P2P y lo de hoy.
+app.get('/api/economia/precio/:itemId', apiLimiter, async (req, res) => {
+  try {
+    const itemId = String(req.params.itemId || '').slice(0, 60);
+    if (!/^[A-Za-z0-9_]{1,60}$/.test(itemId)) return res.status(400).json({ error: 'objeto_invalido' });
+    const p = eco2PreciosActuales();
+    const actual = p.items[itemId] || null;
+    const dias = Math.max(7, Math.min(400, parseInt(req.query.dias, 10) || 120));
+    const desde = new Date(Date.now() - dias * 86400000);
+    const [hist, trades, ops] = await Promise.all([
+      PrecioHist.find({ itemId, t: { $gte: desde } }).sort({ t: 1 }).limit(2000).select('t compra venta moneda indice demanda motivo -_id').lean(),
+      mongoose.connection.db ? mongoose.connection.db.collection('market_history')
+        .find({ type: 'buy', itemId, createdAt: { $gte: new Date(Date.now() - 90 * 86400000) } }, { projection: { _id: 0, createdAt: 1, qty: 1, pricePerUnit: 1, currency: 1 } })
+        .sort({ createdAt: 1 }).limit(1000).toArray() : [],
+      TiendaOp.aggregate([
+        { $match: { tienda: 'juego', itemId, t: { $gte: new Date(Date.now() - 30 * 86400000) }, estado: { $in: ['ok', 'parcial'] } } },
+        { $group: { _id: { dia: { $dateToString: { format: '%Y-%m-%d', date: '$t', timezone: 'UTC' } }, op: '$op' },
+                    n: { $sum: { $ifNull: ['$cliente.confirmadas', '$cantidad'] } } } }
+      ])
+    ]);
+    const tienda = {};
+    for (const g of ops) {
+      const f = tienda[g._id.dia] || (tienda[g._id.dia] = { dia: g._id.dia, compras: 0, ventas: 0 });
+      if (g._id.op === 'compra') f.compras += Number(g.n) || 0; else if (g._id.op === 'venta') f.ventas += Number(g.n) || 0;
+    }
+    const x = _eco2P2P.get(itemId) || null;
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, itemId, ahora: Date.now(), indice: p.indice, version: p.version,
+      actual: actual ? { compra: actual.compra, venta: actual.venta, moneda: actual.moneda, base: actual.base, demanda: actual.demanda,
+                          tienda: actual.tienda, cambiado: actual.cambiado, sigueIndice: actual.sigueIndice } : null,
+      valorBronce: eco2ValorUnidad(itemId),
+      historial: hist.map((h) => ({ t: h.t, compra: h.compra, venta: h.venta, moneda: h.moneda, indice: h.indice, demanda: h.demanda, motivo: h.motivo })),
+      p2p: { resumen: x, ventas: trades.map((tr) => ({ t: tr.createdAt, precio: tr.pricePerUnit, cantidad: tr.qty, moneda: tr.currency })) },
+      tienda: Object.values(tienda).sort((a, b) => a.dia.localeCompare(b.dia)) });
+  } catch (e) { console.error('GET /api/economia/precio:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// GET /api/economia/servicio/precio?tipo=fundir|craftear&itemId=&cantidad= — para enseñarlo antes de pagar.
+app.get('/api/economia/servicio/precio', apiLimiter, (req, res) => {
+  const tipo = req.query.tipo === 'fundir' ? 'fundir' : req.query.tipo === 'craftear' ? 'craftear' : null;
+  const itemId = String(req.query.itemId || '').slice(0, 60);
+  if (!tipo || !/^[A-Za-z0-9_]{1,60}$/.test(itemId)) return res.status(400).json({ error: 'datos_invalidos' });
+  const cantidad = Math.max(1, Math.min(999, Math.floor(Number(req.query.cantidad) || 1)));
+  return res.json({ ok: true, tipo, itemId, cantidad, bronce: eco2PrecioServicio(tipo, itemId, cantidad), indice: eco2IndiceSync() });
+});
+
+// POST /api/economia/servicio { tipo, itemId, cantidad, ref } — cobra fundir o craftear (al tesoro del juego).
+app.post('/api/economia/servicio', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const b = req.body || {};
+    const tipo = b.tipo === 'fundir' ? 'fundir' : b.tipo === 'craftear' ? 'craftear' : null;
+    const itemId = String(b.itemId || '').slice(0, 60);
+    const cantidad = Math.max(1, Math.min(999, Math.floor(Number(b.cantidad) || 1)));
+    const ref = String(b.ref || '');
+    if (!tipo || !/^[A-Za-z0-9_]{1,60}$/.test(itemId)) return res.status(400).json({ error: 'datos_invalidos' });
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(ref)) return res.status(400).json({ error: 'ref_invalida' });
+    const id = gp.playerName + ':' + ref;
+    return await enColaDelJugador('economia:' + gp.playerName, async () => {
+      const ya = await ServicioCobro.findById(id).lean();
+      if (ya) {
+        const st = await PlayerStats.findOne({ playerName: gp.playerName }).lean();
+        return res.json({ ok: true, repetido: true, bronce: ya.bronce, devuelto: !!ya.devuelto, stats: st ? buildStatsResponse(st) : undefined });
+      }
+      const bronce = eco2PrecioServicio(tipo, itemId, cantidad);
+      if (!(bronce > 0)) return res.json({ ok: true, bronce: 0 });
+      const r = await eco2CobrarBronce(gp.playerName, bronce);
+      if (!r.ok) {
+        return res.status(409).json({ error: r.motivo === 'saldo' ? 'saldo_insuficiente' : r.motivo, bronce, tiene: r.tiene || 0,
+          message: r.motivo === 'saldo' ? 'You need ' + bronce.toLocaleString('en-US') + ' Bronze to ' + (tipo === 'fundir' ? 'smelt' : 'craft') + ' this.'
+                                         : 'The payment could not be made right now. Try again.' });
+      }
+      await ServicioCobro.create({ _id: id, playerName: gp.playerName, tipo, itemId, cantidad, bronce });
+      await tesoroJuegoIngresar('servicios', bronce, gp.playerName, tipo + ' ' + itemId + ' x' + cantidad);
+      economiaApuntar({ serviciosBronce: bronce, servicios: 1 });
+      return res.json({ ok: true, bronce, stats: buildStatsResponse(r.doc) });
+    });
+  } catch (e) { console.error('POST /api/economia/servicio:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// POST /api/economia/servicio/devolver { ref } — el fundido o el crafteo no salió: se devuelve lo cobrado (una vez, 2 h).
+app.post('/api/economia/servicio/devolver', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const ref = String((req.body && req.body.ref) || '');
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(ref)) return res.status(400).json({ error: 'ref_invalida' });
+    const c = await ServicioCobro.findOneAndUpdate({ _id: gp.playerName + ':' + ref, devuelto: false, t: { $gte: new Date(Date.now() - 2 * 3600000) } },
+      { $set: { devuelto: true, tDevuelto: new Date() } }, { new: true }).lean();
+    if (!c) return res.json({ ok: false, motivo: 'nada_que_devolver' });
+    const doc = await gfDevolverStat(gp.playerName, 'bronce', c.bronce);
+    await tesoroJuegoIngresar('servicios', -c.bronce, gp.playerName, 'devuelto: ' + c.tipo + ' ' + c.itemId);
+    economiaApuntar({ serviciosBronce: -c.bronce });
+    return res.json({ ok: true, bronce: c.bronce, stats: doc ? buildStatsResponse(doc) : undefined });
+  } catch (e) { console.error('POST /api/economia/servicio/devolver:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// POST /api/economia/quema/basura { items: [{ itemId, cantidad }], ref } — lo tirado al bote de basura (ya quemado en la cadena).
+const _eco2BasuraDia = new Map();      // playerName -> { dia, n }
+app.post('/api/economia/quema/basura', apiLimiter, authMiddleware, csrfProtection, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'no_autorizado' });
+    const b = req.body || {};
+    const ref = String(b.ref || '');
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(ref)) return res.status(400).json({ error: 'ref_invalida' });
+    const lista = (Array.isArray(b.items) ? b.items : []).slice(0, 20)
+      .map((x) => ({ itemId: String((x && x.itemId) || '').slice(0, 60), cantidad: Math.max(0, Math.min(9999, Math.floor(Number(x && x.cantidad) || 0))) }))
+      .filter((x) => x.cantidad > 0 && _eco2Tiene(ITEM_TIPO_MAP, x.itemId));
+    if (!lista.length) return res.status(400).json({ error: 'nada_que_quemar' });
+    // Es estadística (lo quemó el navegador en la cadena): con tope por jugador y día.
+    const hoy = _diaUTC(), d = _eco2BasuraDia.get(gp.playerName);
+    const llevado = d && d.dia === hoy ? d.n : 0;
+    let cabe = Math.max(0, 3000 - llevado);
+    const dentro = [];
+    for (const x of lista) { const q = Math.min(x.cantidad, cabe); if (q > 0) { dentro.push({ itemId: x.itemId, cantidad: q }); cabe -= q; } }
+    if (!dentro.length) return res.json({ ok: true, bronce: 0, tope: true });
+    _eco2BasuraDia.set(gp.playerName, { dia: hoy, n: llevado + dentro.reduce((s, x) => s + x.cantidad, 0) });
+    if (_eco2BasuraDia.size > 20000) _eco2BasuraDia.clear();
+    const bronce = await eco2QuemarObjetos('basura', dentro, gp.playerName, 'basura:' + gp.playerName + ':' + ref, 'trash bin');
+    return res.json({ ok: true, bronce });
+  } catch (e) { console.error('POST /api/economia/quema/basura:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// ── EL CENTRO DE CONTROL ─────────────────────────────────────────────────────
+app.get('/api/admin/economia/v2', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const ahora = Date.now(), hace30 = new Date(ahora - 30 * 86400000);
+    const [cfg, cfgOro, tc, tj, tr, serie, ultimas, porOrigen, servicios, muertes30] = await Promise.all([
+      eco2Config(), economiaConfig(),
+      Tesoro.findById(TESORO_ID).lean(), TesoroJuego.findById(TESORO_JUEGO_ID).lean(), TesoroReserva.findById(TESORO_RESERVA_ID).lean(),
+      EconomiaDia.find({ _id: { $gte: _diaMenos(_diaUTC(), 119) } }).sort({ _id: 1 }).lean(),
+      EconomiaQuema.find({}).sort({ t: -1 }).limit(60).lean(),
+      EconomiaQuema.aggregate([{ $match: { t: { $gte: hace30 } } }, { $group: { _id: { tipo: '$tipo', origen: '$origen' }, bronce: { $sum: '$bronce' }, n: { $sum: 1 } } }]),
+      ServicioCobro.aggregate([{ $match: { t: { $gte: hace30 }, devuelto: false } }, { $group: { _id: '$tipo', bronce: { $sum: '$bronce' }, n: { $sum: 1 } } }]),
+      TesoroMov.aggregate([{ $match: { tesoro: 'reserva', origen: 'muerte', t: { $gte: hace30 } } }, { $group: { _id: null, bronce: { $sum: '$bronce' }, n: { $sum: 1 } } }])
+    ]);
+    const hoy = serie.length ? serie[serie.length - 1] : null;
+    const indice = eco2IndiceSync();
+    const ayer = serie.length > 1 ? serie[serie.length - 2] : null;
+    return res.json({
+      ok: true, ahora, config: cfg, base: ECO2_CONFIG_BASE,
+      tesoros: {
+        circular: { saldo: Math.max(0, Number(tc && tc.saldo) || 0), reservado: Math.max(0, Number(tc && tc.reservado) || 0), quemado: Math.max(0, Number(tc && tc.quemado) || 0) },
+        juego: { saldo: Math.max(0, Number(tj && tj.saldo) || 0), quemado: Math.max(0, Number(tj && tj.quemado) || 0) },
+        reserva: tesoroReservaPublico(tr)
+      },
+      indice, indiceAyer: ayer && ayer.indice > 0 ? ayer.indice : null,
+      hoy: hoy ? { dia: hoy._id, masa: hoy.masa, masaActiva: hoy.masaActiva || null, masaTotal: hoy.masaTotal || null,
+                   inflacionActiva7: hoy.inflacionActiva7 ?? null, inflacionTotal7: hoy.inflacionTotal7 ?? null, inflacionNeta7: hoy.inflacionNeta7 ?? null,
+                   quemadoObjetos7: hoy.quemadoObjetos7 || 0, precioOro: _gwei(hoy.precioGwei), precioGwei: hoy.precioGwei, salud: hoy.salud } : null,
+      // Lo necesario para que el panel calcule EN VIVO qué pasaría al quemar (las mismas fórmulas que el servidor).
+      proyeccion: { cfgOro: { precioBase: cfgOro.precioBase, sensibilidad: cfgOro.sensibilidad, pasoMax: cfgOro.pasoMax } },
+      muerte: { tabla: [0, 1, 2, 3, 4, 5, 6].map((n) => ({ muertes: n, plata: eco2PrecioMuerte(cfg, indice, n) })),
+                cobrado30: muertes30[0] ? muertes30[0].bronce : 0, cobros30: muertes30[0] ? muertes30[0].n : 0 },
+      servicios: Object.fromEntries(['fundir', 'craftear'].map((k) => { const x = servicios.find((s) => s._id === k); return [k, { bronce: x ? x.bronce : 0, n: x ? x.n : 0 }]; })),
+      ejemplosServicio: [['fundir', 'mineral_cobre'], ['fundir', 'mineral_hierro'], ['craftear', 'tablon_de_madera'], ['craftear', 'hacha_de_piedra'], ['craftear', 'cofre2']]
+        .map(([tipo, itemId]) => ({ tipo, itemId, bronce: eco2PrecioServicio(tipo, itemId, 1) })),
+      serie: serie.map((d) => ({ dia: d._id, masa: d.masa || 0, masaActiva: d.masaActiva || null, masaTotal: d.masaTotal || null,
+        inflacion1: d.inflacion1 ?? null, inflacionActiva7: d.inflacionActiva7 ?? null, inflacionNeta7: d.inflacionNeta7 ?? null, inflacionTotal7: d.inflacionTotal7 ?? null,
+        indice: d.indice || null, precioOro: _gwei(d.precioGwei), quemadoMonedas: d.quemadoMonedas || 0, quemadoObjetos: d.quemadoObjetos || 0,
+        muerteBronce: d.muerteBronce || 0, muertes: d.muertes || 0, serviciosBronce: d.serviciosBronce || 0, servicios: d.servicios || 0,
+        misionesOro: d.misionesOro || 0, misionesPlata: d.misionesPlata || 0, misionesBronce: d.misionesBronce || 0, misiones: d.misiones || 0,
+        tesoroCircular: d.tesoroCircular || 0, tesoroJuego: d.tesoroJuego || 0, tesoroReserva: d.tesoroReserva || 0, tesoroReservado: d.tesoroReservado || 0 })),
+      quemas: {
+        porOrigen: porOrigen.map((g) => ({ tipo: g._id.tipo, origen: g._id.origen, bronce: g.bronce, n: g.n })),
+        ultimas: ultimas.map((q) => ({ t: q.t, tipo: q.tipo, origen: q.origen, tesoro: q.tesoro, moneda: q.moneda, cantidad: q.cantidad, bronce: q.bronce,
+                                       itemId: q.itemId, playerName: q.playerName, detalle: q.detalle }))
+      }
+    });
+  } catch (e) { console.error('GET /api/admin/economia/v2:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+app.post('/api/admin/economia/v2/config', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const c = eco2NormalizarConfig(req.body && req.body.config);
+    await TesoroReserva.updateOne({ _id: TESORO_RESERVA_ID }, { $set: { config: c } }, { upsert: true });
+    _eco2Cfg = c; _eco2CfgEn = Date.now();
+    console.log(`📈 economía (2.ª parte): configuración cambiada por ${(req.admin && req.admin.address) || 'admin'}`);
+    return res.json({ ok: true, config: c });
+  } catch (e) { console.error('POST /api/admin/economia/v2/config:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// POST /api/admin/economia/v2/recalcular — rehace la foto, el índice de hoy y los precios.
+app.post('/api/admin/economia/v2/recalcular', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const d = await economiaFoto(true);
+    if (d && Number(d.indice) > 0) _eco2Indice = { valor: Number(d.indice), dia: d._id };
+    await eco2RecalcularPrecios('recalculo');
+    return res.json({ ok: true, indice: eco2IndiceSync(), version: _eco2Precios.version });
+  } catch (e) { console.error('POST /api/admin/economia/v2/recalcular:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// POST /api/admin/economia/quemar { tesoro, moneda, cantidad, motivo } — destruye monedas de un tesoro.
+app.post('/api/admin/economia/quemar', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const tesoro = Object.prototype.hasOwnProperty.call(ECO2_TESOROS, b.tesoro) ? b.tesoro : null;
+    const moneda = ['oro', 'plata', 'bronce'].includes(b.moneda) ? b.moneda : null;
+    const cantidad = Math.floor(Number(b.cantidad) || 0);
+    const motivo = String(b.motivo || '').trim().slice(0, 120);
+    if (!tesoro || !moneda) return res.status(400).json({ error: 'datos_invalidos' });
+    if (!(cantidad >= 1 && cantidad <= 1e12)) return res.status(400).json({ error: 'cantidad_invalida' });
+    if (motivo.length < 3) return res.status(400).json({ error: 'motivo_requerido' });
+    const bronce = cantidad * TESORO_BRONCE_POR[moneda];
+    if (!Number.isSafeInteger(bronce)) return res.status(400).json({ error: 'cantidad_invalida' });
+    const { modelo, id } = ECO2_TESOROS[tesoro]();
+    const t = await modelo.findOneAndUpdate({ _id: id, saldo: { $gte: bronce } }, { $inc: { saldo: -bronce, quemado: bronce } }, { new: true }).lean();
+    if (!t) return res.status(409).json({ error: 'saldo_insuficiente' });
+    const quien = (req.admin && req.admin.address) || 'admin';
+    await EconomiaQuema.create({ tipo: 'monedas', origen: 'admin', tesoro, moneda, cantidad, bronce, detalle: motivo + ' — ' + quien });
+    await TesoroMov.create({ tesoro, tipo: 'ajuste', origen: 'quema', bronce: -bronce, playerName: null, detalle: 'burn ' + cantidad + ' ' + moneda + ' — ' + motivo + ' — ' + quien })
+      .catch((e) => console.warn('⚠️  quema: movimiento:', e.message));
+    economiaApuntar({ quemadoMonedas: bronce });
+    _economiaEstado = null;
+    await economiaFoto().catch(() => {});
+    console.log(`🔥 quema: ${cantidad} ${moneda} (${bronce} bronce) del tesoro ${tesoro} por ${quien} (${motivo})`);
+    return res.json({ ok: true, tesoro, bronce, saldo: Math.max(0, Number(t.saldo) || 0) });
+  } catch (e) { console.error('POST /api/admin/economia/quemar:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+app.post('/api/admin/tesoro-reserva/ajuste', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const tipo = String((req.body && req.body.tipo) || '');
+    const bronce = Math.floor(Number(req.body && req.body.bronce) || 0);
+    const motivo = String((req.body && req.body.motivo) || '').trim().slice(0, 120);
+    if (tipo !== 'ingreso' && tipo !== 'retiro') return res.status(400).json({ error: 'tipo_invalido' });
+    if (!(bronce >= 1 && bronce <= 1e12)) return res.status(400).json({ error: 'cantidad_invalida' });
+    if (motivo.length < 3) return res.status(400).json({ error: 'motivo_requerido' });
+    const quien = (req.admin && req.admin.address) || 'admin';
+    let t;
+    if (tipo === 'ingreso') {
+      t = await TesoroReserva.findOneAndUpdate({ _id: TESORO_RESERVA_ID }, { $inc: { saldo: bronce, 'ingresado.admin': bronce, 'ingresos.admin': 1 } }, { new: true, upsert: true }).lean();
+    } else {
+      t = await TesoroReserva.findOneAndUpdate({ _id: TESORO_RESERVA_ID, saldo: { $gte: bronce } }, { $inc: { saldo: -bronce, retirado: bronce } }, { new: true }).lean();
+      if (!t) return res.status(409).json({ error: 'saldo_insuficiente' });
+    }
+    await TesoroMov.create({ tesoro: 'reserva', tipo: 'ajuste', origen: 'admin', bronce: tipo === 'ingreso' ? bronce : -bronce, playerName: null, detalle: motivo + ' — ' + quien });
+    console.log(`🏦 fondo de reserva: ${tipo} de ${bronce} bronce por ${quien} (${motivo})`);
+    return res.json({ ok: true, reserva: tesoroReservaPublico(t) });
+  } catch (e) { console.error('POST /api/admin/tesoro-reserva/ajuste:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// GET /api/admin/precios — todos los objetos: por defecto, de hoy, cambios, últimos 30 días y P2P.
+app.get('/api/admin/precios', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const p = eco2PreciosActuales();
+    const desde = new Date(Date.now() - 31 * 86400000);
+    const [hist, demanda] = await Promise.all([
+      PrecioHist.find({ t: { $gte: desde } }).sort({ t: 1 }).select('t itemId compra venta moneda -_id').lean(),
+      eco2DemandaTienda().catch(() => new Map())
+    ]);
+    const por = new Map();
+    for (const h of hist) { if (!por.has(h.itemId)) por.set(h.itemId, []); por.get(h.itemId).push(h); }
+    const cambio = (l, dias, campo, ahora) => {
+      const limite = Date.now() - dias * 86400000;
+      let ref = null;
+      for (const h of l) { if (new Date(h.t).getTime() <= limite) ref = h; else break; }
+      if (!ref) ref = l[0];
+      const a = ref && Number(ref[campo]), b = Number(ahora);
+      return a > 0 && b > 0 ? (b - a) / a : null;
+    };
+    const items = eco2Catalogo().map((id) => {
+      const x = p.items[id];
+      const l = por.get(id) || [];
+      const campo = x && x.compra > 0 ? 'compra' : 'venta';
+      const def = eco2BaseDe(id, null);
+      return { itemId: id, nivel: gfNivelDeObjeto(id), tienda: !!(x && x.tienda), compra: x ? x.compra : 0, venta: x ? x.venta : 0, moneda: x ? x.moneda : def.moneda,
+               base: x ? x.base : { compra: def.compra, venta: def.venta, moneda: def.moneda }, defecto: { compra: def.compra, venta: def.venta, moneda: def.moneda },
+               cambiado: !!(x && x.cambiado), sigueIndice: !x || x.sigueIndice !== false, demanda: x ? x.demanda : 1,
+               cambio1: cambio(l, 1, campo, x && x[campo]), cambio7: cambio(l, 7, campo, x && x[campo]), cambio30: cambio(l, 30, campo, x && x[campo]),
+               spark: l.slice(-60).map((h) => ({ t: h.t, v: h[campo] })), valorBronce: eco2ValorUnidad(id),
+               p2p: _eco2P2P.get(id) || null, tienda7: demanda.get(id) || { compras: 0, ventas: 0 } };
+    });
+    return res.json({ ok: true, ahora: Date.now(), version: p.version, dia: p.dia, indice: p.indice, items });
+  } catch (e) { console.error('GET /api/admin/precios:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// POST /api/admin/precios/item { itemId, compra, venta, moneda, sigueIndice } | { itemId, quitar: true }
+app.post('/api/admin/precios/item', adminAuth, strictLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const itemId = String(b.itemId || '').slice(0, 60);
+    if (!eco2Catalogo().includes(itemId)) return res.status(400).json({ error: 'objeto_desconocido' });
+    const quien = (req.admin && req.admin.address) || 'admin';
+    if (b.quitar === true) {
+      await PrecioBase.deleteOne({ _id: itemId });
+    } else {
+      const moneda = ['oro', 'plata', 'bronce'].includes(b.moneda) ? b.moneda : null;
+      const enTienda = _eco2Tiene(TIENDA_PRECIOS, itemId);
+      const compra = enTienda ? Math.floor(Number(b.compra) || 0) : 0;
+      const venta = Math.floor(Number(b.venta) || 0);
+      if (!moneda) return res.status(400).json({ error: 'moneda_invalida' });
+      if (!(compra >= 0 && compra <= 1e9 && venta >= 0 && venta <= 1e9)) return res.status(400).json({ error: 'precio_invalido' });
+      if (!compra && !venta) return res.status(400).json({ error: 'precio_cero' });
+      if (enTienda && TIENDA_PRECIOS[itemId][0] > 0 && !compra) return res.status(400).json({ error: 'falta_compra' });
+      if (compra > 0 && venta >= compra) return res.status(400).json({ error: 'venta_mayor', message: 'The sell price must be lower than the buy price.' });
+      await PrecioBase.updateOne({ _id: itemId }, { $set: { compra, venta, moneda, sigueIndice: b.sigueIndice !== false, por: quien, t: new Date() } }, { upsert: true });
+    }
+    await eco2RecalcularPrecios('admin', itemId);
+    console.log(`🏷️  precio de ${itemId} ${b.quitar === true ? 'vuelto al de por defecto' : 'cambiado'} por ${quien}`);
+    return res.json({ ok: true, version: _eco2Precios.version, item: _eco2Precios.items[itemId] || null });
+  } catch (e) { console.error('POST /api/admin/precios/item:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+
+// GET /api/admin/misiones/economia — lo que pagan las misiones por día y moneda (UserDailyProgress), 90 días.
+app.get('/api/admin/misiones/economia', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    const desde = _diaMenos(_diaUTC(), 89);
+    const [g, top] = await Promise.all([
+      UserDailyProgress.aggregate([
+        { $match: { day: { $gte: desde } } }, { $unwind: '$completedMissions' },
+        { $group: { _id: '$day', oro: { $sum: { $ifNull: ['$completedMissions.oro', 0] } }, plata: { $sum: { $ifNull: ['$completedMissions.plata', 0] } },
+                    bronce: { $sum: { $ifNull: ['$completedMissions.bronce', 0] } }, exp: { $sum: { $ifNull: ['$completedMissions.exp', 0] } },
+                    n: { $sum: 1 }, jugadores: { $addToSet: '$playerName' } } },
+        { $project: { oro: 1, plata: 1, bronce: 1, exp: 1, n: 1, jugadores: { $size: '$jugadores' } } }
+      ]),
+      UserDailyProgress.aggregate([
+        { $match: { day: { $gte: _diaMenos(_diaUTC(), 29) } } }, { $unwind: '$completedMissions' },
+        { $group: { _id: '$playerName', n: { $sum: 1 }, oro: { $sum: { $ifNull: ['$completedMissions.oro', 0] } },
+                    plata: { $sum: { $ifNull: ['$completedMissions.plata', 0] } }, bronce: { $sum: { $ifNull: ['$completedMissions.bronce', 0] } } } },
+        { $sort: { n: -1 } }, { $limit: 10 }
+      ])
+    ]);
+    const dias = [];
+    for (let i = 89; i >= 0; i--) dias.push(_diaMenos(_diaUTC(), i));
+    const por = new Map(g.map((x) => [x._id, x]));
+    return res.json({ ok: true, ahora: Date.now(), soloMonedas: GF_MISIONES_SOLO_MONEDAS,
+      serie: dias.map((d) => { const x = por.get(d); return { dia: d, oro: x ? x.oro : 0, plata: x ? x.plata : 0, bronce: x ? x.bronce : 0, exp: x ? x.exp : 0, misiones: x ? x.n : 0, jugadores: x ? x.jugadores : 0 }; }),
+      top: top.map((x) => ({ playerName: x._id, misiones: x.n, oro: x.oro, plata: x.plata, bronce: x.bronce })) });
+  } catch (e) { console.error('GET /api/admin/misiones/economia:', e); return res.status(500).json({ error: 'internal_error' }); }
+});
+console.log('✅ Economía (2.ª parte): /api/tiempo, /api/economia/{precios,precio/:id,servicio,quema/basura}, /api/admin/{economia/v2,economia/quemar,precios,tesoro-reserva/ajuste,misiones/economia}');
 
 
 // =============================================================================
