@@ -45,6 +45,7 @@ const MARKET_FEE_BPS = 500; // 5% de comisión → 1,5 % tesoro circular + 3,5 %
 // Los paths de ícono son relativos a la raíz del juego (ver ASSET BASE en
 // market.html) — por eso empiezan con "/Game/...".
 const ITEM_CATALOG = {
+  ...Object.fromEntries(Object.entries(require('./gf-crop-catalog').items).map(([id,d])=>[id,{name:d.name,category:d.kind==='seed'?'semillas':'cultivos',icon:d.src.replace(/^\./,''),maxStack:d.maxStack}])),
   Semillax:  { name: 'Semillas de Zanahoria', category: 'semillas', icon: '/Game/Objetos/Plantas/planta_zanahorias/item_saco.png', maxStack: 50 },
   Semillax1: { name: 'Semillas de Tomate',    category: 'semillas', icon: '/Game/Objetos/Plantas/planta_tomates/semillas_tomate.png', maxStack: 50 },
   Semillax4: { name: 'Strawberry Seed',      category: 'semillas', icon: '/Game/Objetos/Plantas/planta_fresa/item_semilla_fresa.png', maxStack: 50 },

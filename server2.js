@@ -10,6 +10,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { ethers } = require('ethers');
 const crypto = require('crypto');
+const GF_CROP_CATALOG=require('./gf-crop-catalog');
 const { v4: uuidv4 } = require('uuid');
 const { body, param, validationResult } = require('express-validator');
 const useragent = require('express-useragent');
@@ -1629,19 +1630,9 @@ let RELAYER_PRIVATE_KEY = null;
 
 // Función para rotación de claves (ejemplo básico)
 async function rotateRelayerKey() {
-  try {
-    if (process.env.KEY_ROTATION_ENABLED === 'true') {
-      const newKey = ethers.Wallet.createRandom().privateKey;
-      console.log('🔄 Rotando clave del relayer...');
-      RELAYER_PRIVATE_KEY = newKey;
-      if (provider) {
-        relayerWallet = new ethers.Wallet(RELAYER_PRIVATE_KEY, provider);
-        console.log(`🔄 Nueva dirección: ${relayerWallet.address}`);
-      }
-    }
-  } catch (error) {
-    console.error('❌ Error rotando clave:', error);
-  }
+  // A different address needs funded gas and contract permissions first.
+  // Never discard the configured signing identity or its recoverable key.
+  if (process.env.KEY_ROTATION_ENABLED === 'true') console.warn('Relayer rotation requires a provisioned key and an explicit deployment; the active wallet was preserved.');
 }
 
 // Configuración de Provider
@@ -1657,26 +1648,11 @@ const _RPC_NOISE = [
   'retry in 1s',
   'perhaps the URL is wrong',
 ];
-const _RPC_ERROR_NOISE = [
-  '502 Bad Gateway',
-  'SERVER_ERROR',
-  'shortMessage',
-  'responseStatus',
-  'requestUrl',
-  'responseBody',
-  'at makeError',
-  'at assert',
-  'at FetchResponse',
-  'at JsonRpcProvider',
-  'at process.processTicks',
-  'node_modules/ethers',
-  'Error obteniendo nonce',
-  'Error verificando saldo',
-];
+const _RPC_ERROR_NOISE = []; // Generic errors are never suppressed.
 
 function _isRpcNoise(chunk) {
   const s = chunk.toString();
-  return _RPC_NOISE.some(p => s.includes(p)) || _RPC_ERROR_NOISE.some(p => s.includes(p));
+  return s.includes('JsonRpcProvider failed to detect network') && s.includes('retry in 1s');
 }
 
 const _origStderrWrite = process.stderr.write.bind(process.stderr);
@@ -1691,7 +1667,7 @@ function _filteredWrite(orig, chunk, encoding, cb) {
       const mins = Math.floor((now - _rpcDownSince) / 60000);
       _origStderrWrite('⚠️  [RPC] Red LitVM no disponible' + (mins > 0 ? ' (' + mins + 'm)' : '') + '. Reintentando cada 60s...\n');
     }
-    if (typeof cb === 'function') cb();
+    if (typeof encoding === 'function') encoding(); else if (typeof cb === 'function') cb();
     return true;
   }
   // Red vuelve: si el chunk tiene algo exitoso y estábamos caídos, avisar
@@ -1705,7 +1681,7 @@ function _filteredWrite(orig, chunk, encoding, cb) {
 }
 
 process.stderr.write = (chunk, encoding, cb) => _filteredWrite(_origStderrWrite, chunk, encoding, cb);
-process.stdout.write = (chunk, encoding, cb) => _filteredWrite(_origStdoutWrite, chunk, encoding, cb);
+// stdout retains its original behavior; unrelated application logs are preserved.
 
 // También filtrar console.error/warn por si acaso
 const _origCE = console.error.bind(console);
@@ -1897,68 +1873,66 @@ Object.values(CONTRACTS).forEach(contract => {
 // --- Sistema de Nonce del Relayer (Thread-safe) ---
 class RelayerNonceManager {
   constructor() {
-    this.currentNonce = null;
-    this.lock = false;
-    this.queue = [];
-    if (relayerWallet) {
-      this.init();
-    }
+    this.currentNonce = null; this.lock = false; this.pending = 0;
+    this._tail = Promise.resolve();
+    if (relayerWallet) this.init();
+  }
+  _serialize(work) {
+    if (this.pending >= 512) return Promise.reject(Object.assign(new Error('Relayer nonce queue is full'), {code:'RELAY_QUEUE_CAPACITY'}));
+    this.pending++;
+    const run = this._tail.then(async()=>{this.lock=true;try{return await work();}finally{this.lock=false;}});
+    this._tail = run.catch(()=>{});
+    return run.finally(()=>{this.pending--;});
   }
   async init() {
-    if (!relayerWallet) return;
-    try {
-      const networkNonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
-      this.currentNonce = Math.max(this.currentNonce ?? 0, networkNonce);
-      console.log(`🔢 Initial relayer nonce: ${this.currentNonce}`);
-    } catch (error) {
-      console.error('❌ Error obteniendo nonce inicial:', error);
-      // Una lectura fallida no significa nonce cero. El siguiente envío relee.
-    }
+    try { await this._serialize(async()=>{
+      if (!relayerWallet) return;
+      const networkNonce = await provider.getTransactionCount(relayerWallet.address,'pending');
+      this.currentNonce = Math.max(this.currentNonce ?? 0,networkNonce);
+    }); } catch (e) { console.warn('Relayer nonce initialization unavailable:', e.code || e.message); }
   }
-  async getNextNonce() {
-    if (!relayerWallet) return 0;
-    return new Promise((resolve, reject) => {
-      const requestId = uuidv4();
-      const processQueue = async () => {
-        if (this.lock) {
-          setTimeout(processQueue, 10);
-          return;
-        }
-        this.lock = true;
-        try {
-          const networkNonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
-          if (this.currentNonce === null || networkNonce > this.currentNonce) {
-            this.currentNonce = networkNonce;
-          }
-          const nonceToUse = this.currentNonce;
-          this.currentNonce++;
-          resolve(nonceToUse);
-        } catch (error) {
-          console.error('❌ Error obteniendo nonce:', error);
-          if (this.currentNonce === null) { reject(error); return; }
-          const nonceToUse = this.currentNonce;
-          this.currentNonce++;
-          resolve(nonceToUse);
-        } finally {
-          this.lock = false;
-          if (this.queue.length > 0) {
-            setTimeout(processQueue, 0);
-          }
-        }
-      };
-      processQueue();
+  getNextNonce(ticket) {
+    return this._serialize(async()=>{
+      if (!relayerWallet) throw new Error('relayer_not_configured');
+      const remote = await provider.getTransactionCount(relayerWallet.address,'pending');
+      if(!Number.isSafeInteger(remote)||remote<0)throw new Error('invalid_remote_nonce');
+      if(typeof mongoose!=='undefined'){
+        if(mongoose.connection.readyState!==1)throw new Error('nonce_store_unavailable');
+        const key=String(CHAIN_ID)+':'+String(relayerWallet.address).toLowerCase();
+        const request=String(ticket || crypto.randomUUID());
+        if(request.length>240)throw new Error('nonce_ticket_too_long');
+        const requestId=key+':'+crypto.createHash('sha256').update(request).digest('hex');
+        const counters=mongoose.connection.collection('relayer_nonce_counters'),requests=mongoose.connection.collection('relayer_nonce_reservations');
+        const session=await mongoose.connection.startSession();let allocated;
+        try{await session.withTransaction(async()=>{
+          const previous=await requests.findOne({_id:requestId},{session});
+          if(previous){allocated=previous.nonce;return;}
+          const floor=Math.max(this.currentNonce??0,remote);
+          const result=await counters.findOneAndUpdate({_id:key},[{$set:{next:{$add:[{$max:[{$ifNull:['$next',floor]},floor]},1]},updatedAt:new Date()}}],{upsert:true,returnDocument:'after',session});
+          const row=result?.value || result;
+          if(!Number.isSafeInteger(row?.next)||row.next<1)throw new Error('invalid_persisted_nonce');
+          allocated=row.next-1;
+          await requests.insertOne({_id:requestId,counter:key,source:ticket?request:null,nonce:allocated,createdAt:new Date()},{session});
+        },{readConcern:{level:'snapshot'},writeConcern:{w:'majority'}});}finally{await session.endSession();}
+        if(!Number.isSafeInteger(allocated)||allocated<0)throw new Error('invalid_nonce_reservation');
+        this.currentNonce=Math.max(this.currentNonce??0,allocated+1);return allocated;
+      }
+      // Pure isolated fixtures have no mongoose binding; production requires it.
+      this.currentNonce = Math.max(this.currentNonce ?? 0,remote);
+      return this.currentNonce++;
     });
   }
-  async resetNonce() {
-    if (!relayerWallet) return;
-    try {
-      this.currentNonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
-      console.log(`🔄 Nonce del relayer reseteado a: ${this.currentNonce}`);
-    } catch (error) {
-      console.error('❌ Error reseteando nonce:', error);
-    }
+  resetNonce() {
+    return this._serialize(async()=>{
+      if (!relayerWallet) throw new Error('relayer_not_configured');
+      const remote = await provider.getTransactionCount(relayerWallet.address,'pending');
+      // Outstanding reservations may already be signed. Never recycle them.
+      this.currentNonce = Math.max(this.currentNonce ?? 0,remote);
+      return this.currentNonce;
+    });
   }
 }
+
 const relayerNonceManager = new RelayerNonceManager();
 
 // Un fallo HTTP después de enviar NO prueba que el nodo rechazó la transacción.
@@ -1968,6 +1942,7 @@ async function broadcastRelayTransaction(tx, relayTx, intentos = 5) {
   const signedTx = await relayerWallet.signTransaction(tx);
   const hash = ethers.keccak256(signedTx);
   relayTx.txHash = hash;
+  relayTx.rawTransaction = signedTx;
   relayTx.status = 'signed';
   await relayTx.save();
   let espera = 800;
@@ -2744,6 +2719,7 @@ const relayedTransactionSchema = new mongoose.Schema({
   // Información de blockchain
   txHash: { type: String, index: true },
   nonce: { type: Number },
+  rawTransaction: { type: String, select: false },
   gasLimit: { type: String },
   gasPrice: { type: String },
   gasUsed: { type: String },
@@ -3031,7 +3007,9 @@ const toolUsesSchema = new mongoose.Schema({
   invoiceId: { type: Number, required: true, unique: true }, // ID de la factura en el contrato
   usos: { type: Number, required: true, min: 0 },
   maxUsos: { type: Number, required: true },
-  rota: { type: Boolean, default: false }
+  rota: { type: Boolean, default: false },
+  nativeOperation:{type:String,default:null},
+  issuedQuantity: { type: Number, default: null }
 }, { timestamps: true });
 const ToolUses = mongoose.model('ToolUses', toolUsesSchema);
 
@@ -3286,6 +3264,7 @@ if (!ERROR_PASSWORD) {
 const MINUTOS_PARA_REGAR = [20, 30, 40];
 
 const UserCropSchema = new mongoose.Schema({
+  nativeFarm:{type:Boolean,default:false},nativeLocked:{type:Boolean,default:false},nativeWateredAt:Date,nativeReadyAt:Date,
   userId: { type: String, required: true, index: true },
   plotId: { type: String, required: true },
   cropType: { type: String, required: true },
@@ -3342,6 +3321,7 @@ const UserCropSchema = new mongoose.Schema({
 UserCropSchema.index({ isCompleted: 1, isHarvested: 1, isDead: 1, expiresAt: 1 });
 // Índice para el barrido de plantas sin regar.
 UserCropSchema.index({ isWatered: 1, isHarvested: 1, isDead: 1, sedientaHasta: 1 });
+UserCropSchema.index({nativeFarm:1,isWatered:1,isCompleted:1,isDead:1,nativeReadyAt:1});
 const UserCrop = mongoose.model('UserCrop', UserCropSchema);
 
 const CropHistorySchema = new mongoose.Schema({
@@ -3449,42 +3429,23 @@ class SecurityController {
       tor: geo.tor || false
     };
     
+    if (this.geoCache.size >= 10000 && !this.geoCache.has(ip)) this.geoCache.delete(this.geoCache.keys().next().value);
     this.geoCache.set(ip, { data: geoInfo, timestamp: Date.now() });
     return geoInfo;
   }
 
   isIPInSubnet(ip, subnet) {
     try {
-      if (!ip || ip === 'undefined' || ip === '::1' || ip === '::ffff:127.0.0.1') return false;
-      
-      // En desarrollo, permitir todas las IPs locales
-      if (NODE_ENV === 'development') {
-        if (ip.startsWith('127.') || ip.startsWith('192.168.') || ip.startsWith('10.') || 
-            ip === 'localhost' || ip === '::1' || ip === '::ffff:127.0.0.1') {
-          return false;
-        }
-      }
-      
-      if (subnet.includes('/')) {
-        const [subnetIP, mask] = subnet.split('/');
-        const subnetBits = parseInt(mask);
-        
-        const ipToBinary = (ip) => {
-          return ip.split('.').reduce((acc, octet) => {
-            return acc + parseInt(octet).toString(2).padStart(8, '0');
-          }, '');
-        };
-        
-        const ipBinary = ipToBinary(ip);
-        const subnetBinary = ipToBinary(subnetIP);
-        
-        return ipBinary.substring(0, subnetBits) === subnetBinary.substring(0, subnetBits);
-      }
-      
-      return ip === subnet;
-    } catch (error) {
-      return false;
-    }
+      const net = require('node:net');
+      const normalize = value => String(value || '').replace(/^::ffff:(?=\d+\.)/i, '').split('%')[0];
+      const address = normalize(ip), [base, bits] = String(subnet || '').split('/'), network = normalize(base);
+      const family = net.isIP(network), actual = net.isIP(address);
+      if (!family || !actual || family !== actual) return false;
+      if (bits === undefined) { const block = new net.BlockList(); block.addAddress(network, family === 6 ? 'ipv6' : 'ipv4'); return block.check(address, actual === 6 ? 'ipv6' : 'ipv4'); }
+      if (!/^\d{1,3}$/.test(bits) || Number(bits) > (family === 6 ? 128 : 32)) return false;
+      const block = new net.BlockList(); block.addSubnet(network, Number(bits), family === 6 ? 'ipv6' : 'ipv4');
+      return block.check(address, actual === 6 ? 'ipv6' : 'ipv4');
+    } catch (_) { return false; }
   }
 
   isIPBlacklisted(ip) {
@@ -3584,7 +3545,7 @@ class SecurityController {
       console.log(`🚫 IP ${ip} bloqueada - Razón: ${reason}`);
       
       if (global.io) {
-        global.io.emit('ip_blocked', {
+        global.io.to('authenticated-admin-security').emit('ip_blocked', {
           ip,
           reason,
           blockedUntil,
@@ -4446,7 +4407,7 @@ class RelayManager {
       const pendingTxs = await RelayedTransaction.find({
         status: { $in: ['pending', 'processing', 'signed', 'broadcasted'] },
         createdAt: { $gt: new Date(Date.now() - 24 * 60 * 60 * 1000) } // Últimas 24h
-      }).limit(100);
+      }).select('+rawTransaction').limit(100);
       
       if (pendingTxs.length > 0) {
         console.log(`🔄 Recuperando ${pendingTxs.length} transacciones pendientes`);
@@ -4470,6 +4431,11 @@ class RelayManager {
                 }
                 await tx.save();
               } else {
+                if(tx.rawTransaction){
+                  const signed=ethers.Transaction.from(tx.rawTransaction);
+                  if(ethers.keccak256(tx.rawTransaction)!==tx.txHash || signed.from?.toLowerCase()!==String(relayerWallet.address).toLowerCase() || signed.to?.toLowerCase()!==String(tx.contractAddress).toLowerCase() || signed.nonce!==tx.nonce || signed.chainId!==BigInt(CHAIN_ID))throw new Error('stored_relay_intent_mismatch');
+                  try{await provider.broadcastTransaction(tx.rawTransaction);}catch(e){if(!/already known|nonce too low/i.test(String(e.shortMessage||e.message)))throw e;}
+                }
                 // Una ausencia de receipt no autoriza repetir la operación con
                 // otro nonce: la original aún puede minarse. Se consulta su hash.
                 if (tx.status !== 'broadcasted') {
@@ -4953,9 +4919,13 @@ class RelayManager {
       // Es la causa del "al minar carbón fallan las transacciones".
       await ensureItemTipoParaTransaccion(contract, functionName, parameters);
 
+      if(functionName==='transferQuantityBetweenInvoices'){
+        const values=Object.values(parameters),pairKey=mergePairKey(playerAddress,String(values[0])+'_'+String(values[1])),now=new Date();
+        try{await MergeCooldown.findOneAndUpdate({pairKey,$or:[{cooldownUntil:{$lte:now}},{cooldownUntil:null}]},{$set:{cooldownUntil:new Date(now.getTime()+7*60000)}},{upsert:true,new:true});}
+        catch(e){if(e.code===11000)throw new Error('merge_cooldown_active');throw e;}
+      }
       // 4. Obtener nonce
-      const nonce = await relayerNonceManager.getNextNonce();
-      relayTx.nonce = nonce;
+      // Allocate only when the transaction is ready to be signed.
       
       // 5. Estimar gas
       let gasLimit;
@@ -5011,7 +4981,6 @@ class RelayManager {
       const args = Object.values(parameters);
       const tx = await contract[functionName].populateTransaction(...args);
       
-      tx.nonce = nonce;
       tx.gasLimit = gasLimit;
       tx.gasPrice = gasPrice;
       tx.chainId = CHAIN_ID;
@@ -5036,6 +5005,8 @@ class RelayManager {
         await multiSigManager.requireTimeLock(relayTx, 20); // 5 minutos de delay
       }
       
+      const nonce = await relayerNonceManager.getNextNonce('relay:'+relayTx.transactionId+':initial');
+      tx.nonce = nonce; relayTx.nonce = nonce;
       relayTx.status = 'signed';
       relayTx.signedAt = new Date();
       await relayTx.save();
@@ -5052,7 +5023,7 @@ class RelayManager {
         } catch (e) {
           if (!e || e.code !== 'RELAY_NONCE_COLLISION' || choque >= 3) throw e;
           await new Promise(r => setTimeout(r, 300 * (choque + 1)));
-          const siguiente = await relayerNonceManager.getNextNonce();
+          const siguiente = await relayerNonceManager.getNextNonce('relay:'+relayTx.transactionId+':collision:'+choque);
           console.warn(`🔢 [relay] el nonce ${tx.nonce} ya lo usó otra transacción del relayer; ${functionName} se firma de nuevo con ${siguiente}`);
           tx.nonce = siguiente;
           relayTx.nonce = siguiente;
@@ -5363,8 +5334,8 @@ class RelayManager {
       // "nonce has already been used" (la cadena ya pasó ese nonce), reusar el
       // MISMO nonce la hace fallar en bucle infinito. Un nonce nuevo del manager
       // rompe ese bucle.
-      let nonce = await relayerNonceManager.getNextNonce();
-      console.log(`🔢 Nonce fresco para reproceso: ${nonce}`);
+
+
       
       // ========== CONFIGURACIÓN DE GAS MEJORADA ==========
       let gasLimit;
@@ -5478,6 +5449,7 @@ class RelayManager {
       console.log(`🔨 Construyendo transacción...`);
       const tx = await contract[relayTx.functionName].populateTransaction(...args);
       
+      const nonce=await relayerNonceManager.getNextNonce('relay:'+relayTx.transactionId+':initial');
       tx.nonce = nonce;
       tx.gasLimit = gasLimit;
       tx.gasPrice = gasPrice;
@@ -5762,231 +5734,27 @@ setTimeout(async () => {
 
 // --- CONTROLADORES ESPECIALIZADOS ---
 class WaterCollectionController {
-  constructor(io) {
-    this.io = io;
-    this.startDailyResetTimer();
-  }
-
-  startDailyResetTimer() {
-    setIntervalAsync(async () => {
-      /* CON try/catch, y no es cosmetico.
-
-         Este callback es `async` y no lo capturaba nadie: si Mongo estaba
-         reconectando en el momento del tic --y pasa-- el `await` rechazaba,
-         nadie recogia el rechazo y, en Node 15 o superior, una promesa
-         rechazada sin capturar TERMINA EL PROCESO. O sea que un hipo de la base
-         de datos a las 00:00 tiraba el servidor entero con todos los jugadores
-         dentro. Ver tambien el guardian de `unhandledRejection` al final del
-         archivo. */
-      try {
-        const now = new Date();
-        const currentHour = now.getHours();
-      
-        if (currentHour === 0) {
-          await WaterCollection.updateMany(
-            {},
-            {
-              collectionCount: 0,
-              totalCollectionsToday: 0,
-              isDailyLimitReached: false,
-              dailyResetTime: now,
-              collectionCycle: 0
-            }
-          );
-          console.log('🔄 Reset diario de recolección de agua ejecutado');
-        }
-      } catch (e) {
-        console.error('❌ Reset diario de recoleccion de agua:', e && e.message);
-      }
-    }, 3600000);
-  }
-
-  async canCollectWater(playerName) {
-    try {
-      let record = await WaterCollection.findOne({ playerName });
-      
-      if (!record) {
-        record = new WaterCollection({
-          playerName,
-          dailyResetTime: new Date()
-        });
-        await record.save();
-      }
-
-      const now = new Date();
-      
-      if (record.dailyResetTime) {
-        const lastReset = new Date(record.dailyResetTime);
-        const daysDiff = Math.floor((now - lastReset) / (1000 * 60 * 60 * 4));
-        
-        if (daysDiff >= 1) {
-          record.collectionCount = 0;
-          record.totalCollectionsToday = 0;
-          record.isDailyLimitReached = false;
-          record.collectionCycle = 0;
-          record.dailyResetTime = now;
-          await record.save();
-        }
-      }
-
-      if (record.totalCollectionsToday >= 5) {
-        return {
-          canCollect: false,
-          reason: 'Límite diario alcanzado.',
-          nextAvailable: record.dailyResetTime ? 
-            new Date(record.dailyResetTime.getTime() + 4 * 60 * 60 * 1000) : 
-            new Date(now.getTime() + 4 * 60 * 60 * 1000),
-          collectionCycle: record.collectionCycle,
-          collectionsToday: record.totalCollectionsToday
-        };
-      }
-
-      if (record.nextAvailableTime && now < record.nextAvailableTime) {
-        const remainingMs = record.nextAvailableTime - now;
-        const remainingMinutes = Math.ceil(remainingMs / (1000 * 60));
-        
-        return {
-          canCollect: false,
-          reason: `Debes esperar ${remainingMinutes} minutos para la siguiente recolección`,
-          nextAvailable: record.nextAvailableTime,
-          collectionCycle: record.collectionCycle,
-          collectionsToday: record.totalCollectionsToday
-        };
-      }
-
-      return {
-        canCollect: true,
-        reason: 'Puedes recolectar agua',
-        collectionCycle: record.collectionCycle,
-        collectionsToday: record.totalCollectionsToday
-      };
-    } catch (error) {
-      throw error;
-    }
-  }
-
-  async collectWater(playerName) {
-    try {
-      const check = await this.canCollectWater(playerName);
-      
-      if (!check.canCollect) {
-        throw new Error(check.reason);
-      }
-
-      let record = await WaterCollection.findOne({ playerName });
-      if (!record) {
-        record = new WaterCollection({ playerName });
-      }
-
-      const now = new Date();
-      const nextCollection = new Date(now.getTime() + 10 * 60 * 1000);
-      
-      record.collectionCount += 1;
-      record.totalCollectionsToday += 1;
-      record.lastCollectionTime = now;
-      record.nextAvailableTime = nextCollection;
-      record.collectionCycle = (record.collectionCycle + 1) % 5;
-      
-      if (record.totalCollectionsToday >= 5) {
-        record.isDailyLimitReached = true;
-        record.nextAvailableTime = new Date(now.getTime() + 4 * 60 * 60 * 1000);
-      }
-      
-      await record.save();
-
-      if (this.io) {
-        this.io.emit('waterCollected', {
-          playerName,
-          collectionCycle: record.collectionCycle,
-          collectionsToday: record.totalCollectionsToday,
-          nextAvailableTime: record.nextAvailableTime,
-          isDailyLimitReached: record.isDailyLimitReached,
-          timestamp: now
-        });
-      }
-
-      return {
-        success: true,
-        message: 'Agua recolectada exitosamente',
-        collectionCycle: record.collectionCycle,
-        collectionsToday: record.totalCollectionsToday,
-        nextAvailableTime: record.nextAvailableTime,
-        isDailyLimitReached: record.isDailyLimitReached,
-        waterAmount: 10
-      };
-    } catch (error) {
-      throw error;
-    }
-  }
-
-  /**
-   * DESHACE una recolección ya apuntada.                        (2026-08-05)
-   *
-   * El pozo funciona en dos pasos: primero se APUNTA aquí (que es lo que
-   * impide sacar agua diez veces seguidas) y después el cliente cambia el balde
-   * vacío por el lleno con transacciones on-chain. Si esas transacciones no
-   * salen, el jugador se quedaba sin balde Y sin el turno del pozo: perdía una
-   * de las 5 recolecciones del día y encima tenía que esperar 10 minutos.
-   *
-   * Con esto, el cliente avisa del fallo y el turno se devuelve tal cual estaba.
-   */
-  async refundCollection(playerName) {
-    const record = await WaterCollection.findOne({ playerName });
-    if (!record) return { success: false, error: 'no_record' };
-
-    record.collectionCount       = Math.max(0, (record.collectionCount || 0) - 1);
-    record.totalCollectionsToday = Math.max(0, (record.totalCollectionsToday || 0) - 1);
-    record.collectionCycle       = ((record.collectionCycle || 0) + 4) % 5; // -1 en módulo 5
-    record.isDailyLimitReached   = record.totalCollectionsToday >= 5;
-    // Se puede volver a intentar de inmediato: el intento anterior no llegó a
-    // entregar nada.
-    record.nextAvailableTime     = null;
-    record.lastCollectionTime    = null;
-    await record.save();
-
-    console.log(`💧 Recolección devuelta a ${playerName} (quedan ${5 - record.totalCollectionsToday} hoy)`);
-    return {
-      success: true,
-      collectionsToday: record.totalCollectionsToday,
-      collectionCycle: record.collectionCycle
-    };
-  }
-
-  async getWaterCollectionStatus(playerName) {
-    try {
-      let record = await WaterCollection.findOne({ playerName });
-
-      if (!record) {
-        record = new WaterCollection({
-          playerName,
-          dailyResetTime: new Date()
-        });
-        await record.save();
-      }
-
-      const now = new Date();
-      let nextAvailable = record.nextAvailableTime;
-      let remainingMinutes = 0;
-      
-      if (nextAvailable && now < nextAvailable) {
-        remainingMinutes = Math.ceil((nextAvailable - now) / (1000 * 60));
-      }
-
-      return {
-        playerName,
-        collectionCycle: record.collectionCycle,
-        collectionsToday: record.totalCollectionsToday,
-        lastCollectionTime: record.lastCollectionTime,
-        nextAvailableTime: record.nextAvailableTime,
-        isDailyLimitReached: record.isDailyLimitReached,
-        dailyResetTime: record.dailyResetTime,
-        remainingMinutes: remainingMinutes,
-        canCollect: !record.isDailyLimitReached && (!nextAvailable || now >= nextAvailable)
-      };
-    } catch (error) {
-      throw error;
-    }
-  }
+ constructor(io){this.io=io;this.windowMs=Math.max(1,Number(process.env.WATER_WINDOW_HOURS)||4)*3600000;}
+ async record(playerName){
+  const now=new Date();try{await WaterCollection.updateOne({playerName},{$setOnInsert:{playerName,dailyResetTime:now,collectionCount:0,totalCollectionsToday:0,collectionCycle:0,isDailyLimitReached:false}},{upsert:true});}catch(e){if(e.code!==11000)throw e;}
+  await WaterCollection.updateOne({playerName,$or:[{dailyResetTime:{$lte:new Date(now-this.windowMs)}},{dailyResetTime:null}]},{$set:{dailyResetTime:now,collectionCount:0,totalCollectionsToday:0,collectionCycle:0,isDailyLimitReached:false,nextAvailableTime:null}});
+  return WaterCollection.findOne({playerName}).lean();
+ }
+ async canCollectWater(playerName){const r=await this.record(playerName),now=Date.now(),can=r.totalCollectionsToday<5&&(!r.nextAvailableTime||+r.nextAvailableTime<=now);
+  return {canCollect:can,reason:can?'Puedes recolectar agua':'Debes esperar al siguiente turno',nextAvailable:r.nextAvailableTime,collectionCycle:r.collectionCycle,collectionsToday:r.totalCollectionsToday};}
+ async collectWater(playerName){
+  await this.record(playerName);const now=new Date();
+  const r=await WaterCollection.findOneAndUpdate({playerName,totalCollectionsToday:{$lt:5},$or:[{nextAvailableTime:{$lte:now}},{nextAvailableTime:null}]},[{$set:{
+   collectionCount:{$add:['$collectionCount',1]},totalCollectionsToday:{$add:['$totalCollectionsToday',1]},lastCollectionTime:now,
+   collectionCycle:{$mod:[{$add:['$collectionCycle',1]},5]},isDailyLimitReached:{$gte:['$totalCollectionsToday',4]},
+   nextAvailableTime:{$cond:[{$gte:['$totalCollectionsToday',4]},{$add:['$dailyResetTime',this.windowMs]},new Date(+now+600000)]}
+  }}],{new:true}).lean();if(!r)throw new Error('Debes esperar al siguiente turno');
+  const result={success:true,waterAmount:10,collectionCycle:r.collectionCycle,collectionsToday:r.totalCollectionsToday,nextAvailableTime:r.nextAvailableTime,isDailyLimitReached:r.isDailyLimitReached};
+  if(this.io)this.io.to('wallet:'+String((await GamePlayer.findOne({playerName}).select('address').lean())?.address||'').toLowerCase()).emit('waterCollected',{...result,playerName,timestamp:now});
+  return result;
+ }
+ async refundCollection(){return {success:false,requiresReview:true,error:'chain_failure_requires_verification'};}
+ async getWaterCollectionStatus(playerName){const r=await this.record(playerName),now=Date.now();return {playerName,collectionCycle:r.collectionCycle,collectionsToday:r.totalCollectionsToday,lastCollectionTime:r.lastCollectionTime,nextAvailableTime:r.nextAvailableTime,isDailyLimitReached:r.isDailyLimitReached,dailyResetTime:r.dailyResetTime,remainingMinutes:Math.max(0,Math.ceil((+r.nextAvailableTime-now)/60000)),canCollect:r.totalCollectionsToday<5&&(!r.nextAvailableTime||+r.nextAvailableTime<=now),windowHours:this.windowMs/3600000};}
 }
 
 // =============================================================================
@@ -6021,6 +5789,7 @@ class CropController {
     this.io = io;
 
     this.cropTypes = {
+      ...GF_CROP_CATALOG.crops,
       Semillax: {
         id: 'Semillax',
         name: 'Zanahoria',
@@ -6186,6 +5955,8 @@ class CropController {
         throw new Error('Este cuadro ya tiene un cultivo');
       }
 
+      if(GF_CROP_CATALOG.crops[seedType])throw new Error('Use the authoritative planting operation.');
+      if(await authoritativeFarm.isReserved(userId,plotId))throw new Error('This plot has a pending operation.');
       const cropConfig = this.cropTypes[seedType];
       if (!cropConfig) {
         throw new Error('Tipo de semilla no válido');
@@ -6265,6 +6036,7 @@ class CropController {
   async waterCrop(userId, plotId) {
     try {
       const crop = await UserCrop.findOne({ userId, plotId, isHarvested: false });
+      if(crop?.nativeFarm || crop?.nativeLocked)throw new Error('Use the authoritative crop operation.');
       if (!crop) {
         throw new Error('Cultivo no encontrado');
       }
@@ -6281,7 +6053,7 @@ class CropController {
 
       const cropConfig = this.cropTypes[crop.cropType];
       const cropWithConfig = {
-        ...crop.toObject(),
+        ...(crop.nativeFarm?authoritativeFarm.dto(crop):crop.toObject()),
         cropConfig: cropConfig
       };
 
@@ -6303,6 +6075,7 @@ class CropController {
   async harvestCrop(userId, plotId) {
     try {
       const crop = await UserCrop.findOne({ userId, plotId, isHarvested: false });
+      if(crop?.nativeFarm || crop?.nativeLocked)throw new Error('Use the authoritative crop operation.');
       if (!crop) {
         throw new Error('Cultivo no encontrado');
       }
@@ -6360,6 +6133,7 @@ class CropController {
   async cutCrop(userId, plotId) {
     try {
       const crop = await UserCrop.findOne({ userId, plotId, isHarvested: false });
+      if(crop?.nativeFarm || crop?.nativeLocked)throw new Error('Use the authoritative crop operation.');
       if (!crop) {
         throw new Error('Cultivo no encontrado');
       }
@@ -6424,7 +6198,7 @@ class CropController {
     return crops.map(crop => {
       const cropConfig = this.cropTypes[crop.cropType];
       return {
-        ...crop.toObject(),
+        ...(crop.nativeFarm?authoritativeFarm.dto(crop):crop.toObject()),
         cropConfig: cropConfig
       };
     });
@@ -6453,6 +6227,7 @@ class CropController {
 
         // .select('+expiresAt') porque el campo es select:false (oculto al jugador).
         const caducadas = await UserCrop.find({
+          nativeLocked:{$ne:true},
           isCompleted: true,
           isHarvested: false,
           isDead:      false,
@@ -6513,6 +6288,7 @@ class CropController {
 
         // .select('+sedientaHasta') porque el campo es select:false.
         const secas = await UserCrop.find({
+          nativeLocked:{$ne:true},
           isWatered:     false,
           isHarvested:   false,
           isDead:        false,
@@ -6555,6 +6331,7 @@ class CropController {
     setIntervalAsync(async () => {
       try {
         const activeCrops = await UserCrop.find({ 
+          nativeFarm:{$ne:true},nativeLocked:{$ne:true},
           isWatered: true, 
           isCompleted: false, 
           isHarvested: false,
@@ -7506,6 +7283,7 @@ io.on("connection", (socket) => {
       }
 
       const crop = await cropController.plantSeed(userId, plotId, seedType, userStats, successChance);
+      if(socket.authenticatedPlayer)await awardVerifiedProgress(socket.authenticatedPlayer,'plant:'+String(crop._id || crypto.randomUUID()),20,null,0).catch(e=>console.warn('plant progress:',e.code||e.message));
       socket.emit('plantSuccess', { plotId, crop });
     } catch (error) {
       socket.emit('plantError', { plotId: data.plotId, error: error.message });
@@ -7534,6 +7312,7 @@ io.on("connection", (socket) => {
         return socket.emit('harvestError', { plotId, error: 'You are a ghost — revive first.', fantasma: true });
       }
       const result = await cropController.harvestCrop(userId, plotId);
+      if(socket.authenticatedPlayer)await awardVerifiedProgress(socket.authenticatedPlayer,'harvest:'+plotId+':'+(result.harvestId || crypto.randomUUID()),0,'agricultura',25).catch(e=>console.warn('harvest progress:',e.code||e.message));
       socket.emit('harvestSuccess', { plotId, rewards: result.rewards });
     } catch (error) {
       // FIX: se incluye plotId en el error para que el cliente pueda saber
@@ -7565,7 +7344,8 @@ io.on("connection", (socket) => {
 
   socket.on('getUserCrops', async (data) => {
     try {
-      const { userId } = data;
+      const userId = data?.userId;
+      if (!assertCropOwner(userId, 'cropsError')) return;
       const crops = await cropController.getUserCrops(userId);
       socket.emit('userCropsData', { crops });
     } catch (error) {
@@ -7681,6 +7461,14 @@ io.on("connection", (socket) => {
        nuevo" a los demás, porque nuevo no eres. */
     // Otra petición o una desconexión durante las lecturas invalida este join.
     if (socket.connected === false || socket._versionJoin !== versionJoin) return;
+    const minimum=gfNivelMinimoSala(baseSala),isIsland=baseSala==='isla'||baseSala.startsWith('isla@');
+    if(minimum || isIsland){
+      if(!socket.authenticatedPlayer)return socket.emit('error',{message:'Authentication required for this area.'});
+      const gpAccess=await GamePlayer.findOne({playerName:socket.authenticatedPlayer,address:String(socket.authenticatedAddress).toLowerCase()}).lean();
+      if(!gpAccess || minimum && await gfNivelDeJugador(gpAccess)<minimum)return socket.emit('error',{message:'This area requires a higher character level.'});
+      if(isIsland && !await gfTieneVipPorDireccion(socket.authenticatedAddress))return socket.emit('error',{message:'An active VIP pass is required for the island.'});
+      if(socket.connected===false || socket._versionJoin!==versionJoin)return;
+    }
     const yaEstaba = !!(rooms[room] && rooms[room][socket.id]);
     const mismoSitio = socket.playerData.room === room && socket.playerData.lastScene === lastScene;
 
@@ -7838,7 +7626,19 @@ io.on("connection", (socket) => {
     }
   });
 
+  if (socket.authenticatedAddress) socket.join("wallet:" + String(socket.authenticatedAddress).toLowerCase());
+  socket.once('disconnect',()=>{clearTimeout(socket._moveBroadcastTimer);socket._moveBroadcastTimer=null;});
   socket.on("playerMove", (data) => {
+    if(!data || typeof data!=='object' || !Number.isFinite(Number(data.x)) || !Number.isFinite(Number(data.y)) || Number(data.x)<0 || Number(data.y)<0 || Number(data.x)>20000 || Number(data.y)>20000)return;
+    const clean={x:Number(data.x),y:Number(data.y)};
+    for(const key of ['direction','directionx','dogDirection','dogName','usernamex','soulbound'])if(typeof data[key]==='string')clean[key]=data[key].slice(0,60);
+    for(const key of ['isMoving','dogEquipped','ghost'])if(typeof data[key]==='boolean')clean[key]=data[key];
+    for(const key of ['dogX','dogY','nivel','petLevel'])if(Number.isFinite(Number(data[key])))clean[key]=Math.max(0,Math.min(20000,Number(data[key])));
+    if(data.pesca===null)clean.pesca=null;
+    else if(data.pesca && typeof data.pesca==='object'){
+      clean.pesca={};for(const [key,value]of Object.entries(data.pesca).slice(0,12))if(/^[a-zA-Z][a-zA-Z0-9_]{0,19}$/.test(key) && (typeof value==='number'&&Number.isFinite(value)||typeof value==='boolean'||typeof value==='string'&&value.length<=60))clean.pesca[key]=value;
+    }
+    data=clean;
     const room = socket.playerData && socket.playerData.room;
     /* Igual que en el chat: si el socket se movió pero el servidor no le conoce
        sala, es que hay que rehacer el join. Con un freno para no soltar un
@@ -7887,7 +7687,10 @@ io.on("connection", (socket) => {
       else rooms[room][socket.id].soulbound = socket._soulbound || antesMov.soulbound || null;
     }
 
-    socket.to(room).emit("playerMoved", rooms[room][socket.id]);
+    const emitMovement=()=>{socket._moveBroadcastTimer=null;const currentRoom=socket.playerData?.room,position=rooms[currentRoom]?.[socket.id];if(socket.connected!==false && position){socket._moveBroadcastAt=Date.now();socket.to(currentRoom).emit('playerMoved',position);}};
+    const wait=33-(Date.now()-(socket._moveBroadcastAt||0));
+    if(wait<=0){clearTimeout(socket._moveBroadcastTimer);emitMovement();}
+    else if(!socket._moveBroadcastTimer)socket._moveBroadcastTimer=setTimeout(emitMovement,wait);
   });
 
   // Cambio de personaje Soulbound en caliente.
@@ -8399,6 +8202,19 @@ app.use(cors((req, callback) => callback(null,
    disfrazarse de problema de CORS. La proteccion es la misma: sigue sin dejar
    pasar una peticion que no venga por HTTPS. */
 app.use(requireSecureTransport);
+app.use((req,res,next)=>{
+ if(!['POST','PUT','PATCH','DELETE'].includes(req.method) || !(req.cookies?.session || req.cookies?.refresh))return next();
+ const origin=req.get('origin');
+ if(origin && !isAllowedBrowserOrigin(origin))return res.status(403).json({error:'browser_origin_forbidden'});
+ const bootstrap=['/api/auth/login','/api/auth/nonce','/api/auth/refresh','/api/auth/csrf-token'];
+ if(bootstrap.includes(req.path)){
+  if(origin && isAllowedBrowserOrigin(origin) || verifyCSRFToken(req))return next();
+  return res.status(403).json({error:'csrf_token_invalid'});
+ }
+ if(req.path==='/api/relay/call-view')return next();
+ if(!verifyCSRFToken(req))return res.status(403).json({error:'csrf_token_invalid',code:'CSRF_ERROR'});
+ next();
+});
 
 // FIX: '*' como string ya no es válido en Express 5 / path-to-regexp 8+ (tira
 // "PathError: Missing parameter name at index 1: *" y el servidor no arranca).
@@ -8732,7 +8548,7 @@ mongoose.connect(MONGO, {
     // solo entra en la lista quien de verdad escanee.
     // Poner SECURITY_WIPE_BLOCKS=0 en el entorno para conservarla.
     try {
-      const vaciar = process.env.SECURITY_WIPE_BLOCKS !== '0';
+      const vaciar = process.env.SECURITY_WIPE_BLOCKS === '1';
 
       if (vaciar) {
         const borradas = await BlockedIP.deleteMany({});
@@ -8860,8 +8676,7 @@ app.post('/api/relay/call-view',
       // Verificar que es una función view o pure (stateMutability)
       const isViewOrPure = ['view', 'pure'].includes(abiFunction.stateMutability);
       if (!isViewOrPure) {
-        console.warn(`⚠️  Función ${functionName} no es view/pure: ${abiFunction.stateMutability}`);
-        // Podemos continuar pero con advertencia
+        return res.status(403).json({ success: false, error: 'read_only_function_required' });
       }
       
       // Llamar a la función
@@ -8956,20 +8771,8 @@ app.post('/api/relay/call-view',
     } catch (error) {
       console.error('❌ Error en call-view:', error);
       
-      const errorDetails = {
-        message: error.message,
-        code: error.code,
-        reason: error.reason,
-        transaction: error.transaction,
-        receipt: error.receipt,
-        stack: error.stack
-      };
-      
-      res.status(500).json({
-        success: false,
-        error: error.message || 'Failed to call view function',
-        details: errorDetails
-      });
+      res.status(503).json({ success: false, error: 'rpc_read_unavailable',
+        message: 'The requested contract read could not be completed.' });
     }
   }
 );
@@ -9501,7 +9304,7 @@ app.post('/api/auth/login', loginLimiter, csrfProtection, async (req, res) => {
       { expiresIn: `${REFRESH_TOKEN_TTL_DAYS}d` }
     );
     
-    const refreshHash = await bcrypt.hash(rawRefresh, 12);
+    const refreshHash = crypto.createHash('sha256').update(rawRefresh).digest('hex');
     const accessToken = jwt.sign(
       { 
         address: lcAddress, 
@@ -9667,7 +9470,7 @@ app.post('/api/auth/refresh', apiLimiter, async (req, res) => {
       type: 'refresh' 
     }, JWT_SECRET, { expiresIn: `${REFRESH_TOKEN_TTL_DAYS}d` });
     
-    const newRefreshHash = await bcrypt.hash(newRawRefresh, 12);
+    const newRefreshHash = crypto.createHash('sha256').update(newRawRefresh).digest('hex');
     const accessToken = jwt.sign({ 
       address: payload.address, 
       type: 'access', 
@@ -10109,6 +9912,7 @@ app.post('/api/tree/lock',
   ],
   async (req, res) => {
     try {
+      if(GATHER_ENFORCE)return res.status(409).json({error:'use_authoritative_gather'});
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
@@ -10226,6 +10030,7 @@ app.post(
   ],
   async (req, res) => {
     try {
+      if(GATHER_ENFORCE)return res.status(409).json({error:'use_authoritative_gather'});
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
@@ -10483,15 +10288,18 @@ async function mintGatherReward(address, tipo, quantity) {
     }
   } catch (e) { console.warn('⚠️ gather: no se pudo leer inventario on-chain:', e.message); }
 
-  const nonce = await relayerNonceManager.getNextNonce();
   try {
     if (target) {
-      const tx = await c.increaseInvoiceQuantity(target.id, quantity, { gasPrice, nonce });
+      const gasLimit=(await c.increaseInvoiceQuantity.estimateGas(target.id,quantity,{gasPrice}))*120n/100n;
+      const nonce=await relayerNonceManager.getNextNonce('gather-increase:'+target.id+':'+crypto.randomUUID());
+      const tx = await c.increaseInvoiceQuantity(target.id, quantity, { gasPrice, gasLimit, nonce });
       await tx.wait(1, 120000);
       return { id: target.id, manualId: target.manualId, cantidad: target.cantidad + quantity };
     } else {
-      const manualId = ('g' + tipo.replace(/[^a-z0-9]/gi, '').slice(0, 10) + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)).slice(0, 60);
-      const tx = await c.createInvoice(address, tipo, quantity, manualId, { gasPrice, nonce });
+      const manualId=('g'+tipo.replace(/[^a-z0-9]/gi,'').slice(0,10)+crypto.randomBytes(12).toString('hex')).slice(0,60);
+      const gasLimit=(await c.createInvoice.estimateGas(address,tipo,quantity,manualId,{gasPrice}))*120n/100n;
+      const nonce=await relayerNonceManager.getNextNonce('gather-create:'+manualId);
+      const tx = await c.createInvoice(address, tipo, quantity, manualId, { gasPrice, gasLimit, nonce });
       const receipt = await tx.wait(1, 120000);
       let newId = null;
       try {
@@ -10579,6 +10387,7 @@ app.post('/api/gather/claim', apiLimiter, authMiddleware, csrfProtection,
   async (req, res) => {
     try {
       if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'invalid_gather_request' });
+      const gp=await jugadorDeLaSesion(req);if(!gp)return res.status(403).json({error:'no_autorizado'});
       const address = String(req.user.address).toLowerCase(), { nodeKey, toolId, ref } = req.body;
       if (await esFantasma({ address })) return responderFantasma(res);
       const node = gatherNodeTypeFromKey(nodeKey);
@@ -10612,6 +10421,7 @@ app.post('/api/gather/claim', apiLimiter, authMiddleware, csrfProtection,
         }
         let inventoryLoadedAt = null;
         if (confirmed.length) { try { inventoryLoadedAt = await resourcePersistInventory(address); } catch (_) { revision = true; } }
+        await awardVerifiedProgress(gp.playerName,'gather:'+receiptKey,50,node.kind==='tree'?'deforestacion':'mineria',25).catch(e=>console.warn('gather progress:',e.code||e.message));
         const result = { ok: true, locked: true, lockedUntil, table, rewards: confirmed, inventoryLoadedAt,
           revision, message: revision ? 'Some deliveries need inventory reconciliation. Only confirmed items are shown.' : undefined };
         await GatherReceipt.updateOne({ _id: receiptKey }, { $set: { result, status: revision ? 'review' : 'confirmed' } });
@@ -10949,7 +10759,7 @@ app.post('/api/relay/transaction',
 
       // Emitir evento de Socket.io si está disponible
       if (global.io) {
-        global.io.emit('relay_transaction_sent', {
+        global.io.to('wallet:' + String(playerAddress).toLowerCase()).emit('relay_transaction_sent', {
           playerAddress,
           playerName,
           contractName,
@@ -10997,8 +10807,8 @@ app.post('/api/relay/send-message',
       const playerAddress = req.user.address.toLowerCase();
       
       // Verificar que tenemos contrato de mensajes configurado
-      const messageContract = CONTRACTS.MESSAGE_CONTRACT;
-      if (!messageContract.address || messageContract.address === '0x...') {
+      const messageContract = CONTRACTS.SIMPLE_MESSAGE_LOGGER;
+      if (!messageContract?.address || messageContract.address === '0x...') {
         return res.status(501).json({
           error: 'message_contract_not_configured',
           message: 'El contrato de mensajes no está configurado'
@@ -11267,20 +11077,9 @@ app.get('/api/relay/limits',
 // 8. Estadísticas del sistema (admin)
 app.get('/api/relay/stats',
   apiLimiter,
-  authMiddleware,
+  (req,res,next) => adminAuth(req,res,next),
   async (req, res) => {
     try {
-      // Verificar que el usuario es admin (simplificado)
-      // En producción, usar un sistema de roles real
-      const address = req.user.address.toLowerCase();
-      const isAdmin = process.env.ADMIN_ADDRESSES 
-        ? process.env.ADMIN_ADDRESSES.split(',').includes(address)
-        : false;
-      
-      if (!isAdmin) {
-        return res.status(403).json({ error: 'Admin access required' });
-      }
-      
       const stats = await relayManager.getStats();
       
       res.json({
@@ -11643,7 +11442,13 @@ app.post('/api/save/:playerName',
         return res.status(403).json({ error: 'not_authorized_for_player' });
       }
 
-      const update = Object.assign({}, req.body, { address });
+      const SAVE_FIELDS=['posicionplayerx','posicionplayery','mundo','lenguaje','Username','petName','nameColor','petNameColor','tutorial','inventory','chest'];
+      const update={address};for(const key of SAVE_FIELDS)if(Object.prototype.hasOwnProperty.call(req.body,key))update[key]=req.body[key];
+      for(const key of ['posicionplayerx','posicionplayery'])if(key in update && (!Number.isFinite(Number(update[key])) || Number(update[key])<0 || Number(update[key])>100000))delete update[key];
+      const savedProgress=await GamePlayer.findOne({playerName}).select('nivel_exp').lean();
+      const savedStats=await PlayerStats.findOne({playerName}).select('exp').lean();
+      update.nivel_exp=Math.max(0,Number(savedProgress?.nivel_exp)||0,Number(savedStats?.exp)||0);
+
 
       // ── PROTECCIÓN CONTRA BORRAR UNA COMPRA DEL MARKET ────────────────────
       // El juego manda SIEMPRE el inventario entero, así que un guardado con
@@ -11951,13 +11756,6 @@ app.post('/api/save/:playerName',
         if (update.inventory || update.chest) programarCasillasEnCadena(playerName);
       } catch (e) { console.warn('⚠️  save: programar escritura en cadena:', e.message); }
 
-      if (missionsData && typeof missionsData === 'object') {
-        await MissionsPlayer.findOneAndUpdate(
-          { playerName },
-          { $set: missionsData },
-          { upsert: true, new: true, runValidators: false }
-        );
-      }
 
       // Registrar actividad (geolocalización, etc.)
       const geoInfo = await securityController.getGeoInfo(req.ip);
@@ -12708,6 +12506,7 @@ app.post('/api/crops/crow', apiLimiter, authMiddleware, csrfProtection, async (r
     const nueva = Math.min(tope, Math.round(crop.growthDuration * (1 + CUERVO_RETRASO_PCT)));
     const retrasado = nueva > crop.growthDuration;
     crop.growthDuration = nueva;
+    if(crop.nativeFarm && crop.nativeWateredAt)crop.nativeReadyAt=new Date(new Date(crop.nativeWateredAt).getTime()+nueva*1000);
     await crop.save();
     console.log(`🐦 Un cuervo pisoteó el cultivo de ${gp.playerName} en ${plotId}` +
                 (retrasado ? ` (crece en ${nueva} en vez de ${original})` : ' (ya al tope)'));
@@ -13093,6 +12892,7 @@ app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, gfExi
     } catch (e) { console.warn('⚠️  pesca: casilla en Mongo:', e.message); }
     console.log(`🎣 ${gp.playerName} pescó ${itemId} (factura ${factura.id})`);
     anotarPesca(gp.playerName, 0, true);
+    await awardVerifiedProgress(gp.playerName,'fishing:'+s.id,0,'pesca',exp).catch(e=>console.warn('fishing progress:',e.code||e.message));
     const veneno = PESCA_VENENO[itemId] || null;
     if (veneno) envenenar(gp.playerName, veneno);
     return res.json({ ok: true, itemId, exp,
@@ -13543,6 +13343,7 @@ function _herirJugador(playerName, dano) {
 
 // ── EL SUELO ──────────────────────────────────────────────────────────────────
 const SUELO_SOLTABLES = new Set([
+  ...Object.keys(GF_CROP_CATALOG.items),
   'Semillax', 'Semillax1', 'Semillax2', 'Semillax3', 'Semillax4',
   'mineral_piedra', 'mineral_cobre', 'mineral_hierro', 'carbon',
   'mineral_piedra_cobre', 'mineral_piedra_hierro', 'mineral_carbon',
@@ -13669,7 +13470,8 @@ app.post('/api/salvaje/soltar', apiLimiter, authMiddleware, csrfProtection, gfEx
       if (!f) return { status: 400, body: { error: 'no_tienes', message: 'You do not have that item anymore.' } };
       const cantidad = Math.min(pedida, f.cantidad);
       await txRelayer('suelo: soltar ' + tipo, (o) => cantidad >= f.cantidad
-        ? c.deleteInvoice(f.id, o) : c.decreaseInvoiceQuantity(f.id, cantidad, o));
+        ? c.deleteInvoice(f.id, o) : c.decreaseInvoiceQuantity(f.id, cantidad, o), (o) => cantidad >= f.cantidad
+        ? c.deleteInvoice.estimateGas(f.id, o) : c.decreaseInvoiceQuantity.estimateGas(f.id, cantidad, o));
       const quedan = f.cantidad - cantidad;
       try {
         const doc = await GamePlayer.findOne({ playerName: gp.playerName });
@@ -13807,12 +13609,7 @@ io.on('connection', (socket) => {
       const filas = rooms[sala] || {};
       const lista = {};
       const ids = Object.keys(filas).filter(id => id !== socket.id && _enZonaPvp(filas[id], salaBase(sala))).slice(0, 30);
-      for (const id of ids) {
-        const n = filas[id] && filas[id].playerName;
-        if (!n) continue;
-        const v = await _vidaPvp(n);
-        if (v !== null) lista[id] = v;
-      }
+      let cursor=0;await Promise.all(Array.from({length:Math.min(4,ids.length)},async()=>{for(;;){const index=cursor++;if(index>=ids.length)return;const id=ids[index],n=filas[id]?.playerName;if(!n)continue;const v=await _vidaPvp(n);if(v!==null)lista[id]=v;}}));
       socket.emit('pvp:vidas', { lista });
     } catch (_) {}
   });
@@ -14083,7 +13880,7 @@ app.post('/api/espantapajaros/colocar', apiLimiter, authMiddleware, csrfProtecti
       const del = facturas.filter(f => f.tipo === 'espantapajaros' && f.cantidad > 0)
         .sort((a, b) => a.cantidad - b.cantidad)[0];
       if (!del) return { status: 400, body: { error: 'no_tienes', message: 'You have no scarecrow.' } };
-      await txRelayer('espantapajaros: quemar', (o) => c.decreaseInvoiceQuantity(del.id, 1, o));
+      await txRelayer('espantapajaros: quemar', (o) => c.decreaseInvoiceQuantity(del.id, 1, o), (o) => c.decreaseInvoiceQuantity.estimateGas(del.id, 1, o));
       const quedan = del.cantidad - 1;
       const hasta = new Date(Date.now() + ESPANTAPAJAROS_MS);
       await Espantapajaros.updateOne({ playerName: gp.playerName, plotId },
@@ -14204,7 +14001,7 @@ app.post('/api/antorchas/poner', apiLimiter, authMiddleware, csrfProtection, asy
       const del = facturas.filter(f => f.tipo === 'antorcha' && f.cantidad > 0)
         .sort((a, b) => a.cantidad - b.cantidad)[0];
       if (!del) return { status: 400, body: { error: 'no_tienes', message: 'You have no torch.' } };
-      await txRelayer('antorcha: quemar', (o) => c.decreaseInvoiceQuantity(del.id, 1, o));
+      await txRelayer('antorcha: quemar', (o) => c.decreaseInvoiceQuantity(del.id, 1, o), (o) => c.decreaseInvoiceQuantity.estimateGas(del.id, 1, o));
       const quedan = del.cantidad - 1;
       const doc = await Antorcha.create({
         zona, playerName: gp.playerName, deNombre: String(gp.Username || gp.playerName).slice(0, 40),
@@ -14325,7 +14122,7 @@ app.post('/api/botes/poner', apiLimiter, authMiddleware, csrfProtection, gfExige
       const facturas = await facturasLibresDeCadena(address);
       const del = facturas.filter(f => f.tipo === 'bote' && f.cantidad > 0).sort((a, b) => a.cantidad - b.cantidad)[0];
       if (!del) return { status: 400, body: { error: 'no_tienes', message: 'You have no boat.' } };
-      await txRelayer('bote: poner', (o) => c.decreaseInvoiceQuantity(del.id, 1, o));
+      await txRelayer('bote: poner', (o) => c.decreaseInvoiceQuantity(del.id, 1, o), (o) => c.decreaseInvoiceQuantity.estimateGas(del.id, 1, o));
       const quedan = del.cantidad - 1;
       const doc = await Bote.create({ zona, playerName: gp.playerName, deNombre: String(gp.Username || gp.playerName).slice(0, 40),
                                       x: Math.round(x), y: Math.round(y) });
@@ -15474,6 +15271,7 @@ app.get('/api/missions/daily/:npcId/:date', apiLimiter, authMiddleware, getDaily
 // 'madera pinos', el servidor buscaría facturas que no existen y creería que el
 // jugador no tiene nada.
 const ITEM_TIPO_MAP = {
+  ...(typeof GF_CROP_CATALOG==='undefined'?{}:GF_CROP_CATALOG.itemTypes),
   Semillax: 'bolsa zanahorias', Semillax1: 'bolsa de tomates',
   Semillax2: 'bolsa de trigo',  Semillax3: 'bolsa de calabazas',
   Semillax4: 'bolsa_de_fresas',
@@ -15561,6 +15359,7 @@ function itemTipoOnChain(itemId) {
 // Tope de stack por ítem (mismo criterio que ItemDefinitions.maxStack). Se usa
 // para repartir la recompensa entre casillas del inventario guardado.
 const ITEM_MAX_STACK = {
+  ...(typeof GF_CROP_CATALOG==='undefined'?{}:GF_CROP_CATALOG.maxStacks),
   Semillax: 50, Semillax1: 50, Semillax2: 50, Semillax3: 50, Semillax4: 50,
 
   // Pociones del alquimista: se apilan poco, son consumibles caros.
@@ -15610,14 +15409,14 @@ const TABLAS_MANUALES = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_PARCELAS, TABL
    bastaría una llamada al relay para ponerse nivel 150 en la cadena o
    "colocar" parcelas sin haberlas comprado. */
 const GF_ALLOC_KEYS = ['strength','defense','wisdom','patience','farming','woodcutting','fishing','combat'];
-const TABLAS_SOLO_SERVIDOR = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_CONS_PARCELAS, 'vip', 'oro', 'plata', 'bronce', ...GF_ALLOC_KEYS.map(k => 'player_' + k)]);
+const TABLAS_SOLO_SERVIDOR = new Set([TABLA_NIVEL, TABLA_NOMBRE, TABLA_CONS_PARCELAS, 'vip', 'oro', 'plata', 'bronce', 'exp', 'vida', 'agua', 'comida', ...GF_ALLOC_KEYS.map(k => 'player_' + k)]);
 /* Tablas que SOLO ACUÑA el servidor, pero que el cliente sí puede GASTAR
    (2026-10-05): los peces. Se pescan (POST /api/pesca/recoger, que acuña con
    el relayer) y se comen o se venden (el cliente baja la factura por el
    relay). Lo que el cliente no puede es crearlos ni aumentarlos: si pudiera,
    bastaría una llamada al relay para llenarse el inventario de truchas
    doradas. Siempre activo, sin bandera, como TABLAS_SOLO_SERVIDOR. */
-const TABLAS_SOLO_ACUNA_SERVIDOR = new Set(['pes1', 'pes2', 'pes3', 'pes4', 'pes5', 'pes6', 'pes7', 'pes8',
+const TABLAS_SOLO_ACUNA_SERVIDOR = new Set([...Object.keys(GF_CROP_CATALOG.items), 'pes1', 'pes2', 'pes3', 'pes4', 'pes5', 'pes6', 'pes7', 'pes8',
   'pes9', 'pes10', 'pes11', 'pes12', 'pes13', 'pes14']);
 
 // =============================================================================
@@ -15649,7 +15448,8 @@ async function ensureItemTipoOnChain(contract, tipo, cantidad) {
   // Limits configured by the owner are immutable during gameplay, including
   // per-invoice limits. The contract remains the final atomic supply guard.
   if (!tipo || TABLAS_MANUALES.has(tipo) || !tiposDeItemPermitidos().has(tipo)) return;
-  const stats = await contract.getTipoStats(tipo);
+  let stats = await contract.getTipoStats(tipo);
+  if(!(stats.exists ?? stats[5]) && GF_CROP_CATALOG.items[tipo]){if(!await crearTablaSiFalta(tipo))throw new Error('crop_table_unavailable');stats=await contract.getTipoStats(tipo);}
   const exists = Boolean(stats.exists ?? stats[5]);
   const quantity = BigInt(stats.totalQuantity ?? stats[0]);
   const limit = BigInt(stats.limit ?? stats[1]);
@@ -16648,47 +16448,17 @@ app.post('/api/vip/comprar', apiLimiter, authMiddleware, csrfProtection, gfExige
     const gp = await jugadorDeLaSesion(req);
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
     const address = String(gp.address || '').toLowerCase();
-    return await enColaDelJugador(address, async () => {
-      const precio = plan.precio[moneda];
-      // 1) La tabla y el contrato, ANTES de cobrar nada.
-      const lista = await crearTablaSiFalta('vip');
-      const c = contratoItemsServidor();
-      if (!lista || !c) return res.status(503).json({ error: 'chain_unavailable', message: 'The VIP table is not ready on the chain. Try again later.' });
-      const previas = gfVipLeerFacturas(await facturasDeCadena(address), address);
-      const resumen = gfVipResumen(previas);
-      // 2) El cobro (atómico: no se puede gastar dos veces lo mismo).
-      const cobrado = await gfCobrarStat(gp.playerName, moneda, precio);
-      if (!cobrado) {
-        const st = await PlayerStats.findOne({ playerName: gp.playerName }).select(moneda).lean();
-        return res.status(400).json({ error: 'insufficient_funds', moneda, need: precio, have: Math.floor(Number(st && st[moneda]) || 0) });
-      }
-      // 3) La factura en la cadena: empieza ahora o donde acaba el VIP que hay.
-      const inicio = Math.max(Date.now(), resumen.activo ? resumen.fin : 0);
-      const fin = inicio + plan.dias * 86400000;
-      const manualId = ['vip', address.slice(2, 10), Math.floor(inicio / 1000), Math.floor(fin / 1000), clave, moneda, precio].join(':');
-      let receipt = null;
-      try { receipt = await txRelayer('vip ' + clave, o => c.createInvoice(address, 'vip', plan.dias, manualId, o)); }
-      catch (e) { receipt = null; }
-      if (!receipt || !(receipt.status === 1 || receipt.status === 1n)) {
-        await gfDevolverStat(gp.playerName, moneda, precio);
-        return res.status(502).json({ error: 'mint_failed', message: 'The chain did not confirm the VIP. Your coins were returned.' });
-      }
-      const facturaId = idDeFacturaCreada(c, receipt);
-      // 4) El espejo y la respuesta.
-      await VipEstado.updateOne({ address }, { $set: { playerName: gp.playerName, inicio: new Date(resumen.activo ? resumen.inicio : inicio),
-                                                       fin: new Date(fin), leidoEn: new Date() } }, { upsert: true });
-      _gfVipCache.set(address, { fin, at: Date.now() });
-      // (2026-10-26) "El dinero de comprar cualquier VIP va al tesoro del juego."
-      await tesoroJuegoIngresar('vip', precio * (TESORO_BRONCE_POR[moneda] || 0), gp.playerName, clave + ' con ' + precio + ' ' + moneda);
-      console.log(`👑 ${gp.playerName} compró ${clave} con ${precio} ${moneda}: VIP hasta ${new Date(fin).toISOString()}`);
-      let estado;
-      try { estado = await gfVipEstadoDe(gp); } catch (e) { estado = { ...gfVipResumen(previas.concat([{ inicio, fin }])), facturas: [] }; }
-      return res.json({ ok: true, plan: clave, moneda, precio, facturaId, transactionHash: receipt.hash || receipt.transactionHash,
-                        ...estado, stats: buildStatsResponse(cobrado), planes: VIP_PLANES, ahora: Date.now() });
-    });
+    // The authoritative job owns the charge, signed bytes and receipt. A slow
+    // RPC remains pending; it cannot trigger a refund or another VIP mint.
+    const prepared=await enColaDelJugador('inventory:'+address,()=>authoritativeCrafts.create(gp,{
+      recipeId:'vip_'+clave+'_'+moneda,quantity:1,ref:req.body.ref
+    }));
+    const done=prepared.status==='completed'?prepared:await authoritativeCrafts.execute(prepared._id);
+    res.set('Cache-Control','no-store');
+    return res.status(done.status==='completed'?200:202).json(await authoritativeCrafts.describe(done));
   } catch (e) {
     console.error('POST /api/vip/comprar:', e);
-    return res.status(500).json({ error: 'internal_server_error' });
+    return res.status(e.status || 503).json({error:e.code || 'vip_unavailable',message:'Check pending operations before submitting another purchase.'});
   }
 });
 console.log('✅ VIP: /api/vip/{estado,de,comprar}');
@@ -18299,7 +18069,7 @@ async function executeMarketAssetClaim(id) {
           if(locked.matchedCount!==1)throw marketTransferError('market_escrow_changed');
         }
       });
-      const nonce = await relayerNonceManager.getNextNonce();
+      const nonce = await relayerNonceManager.getNextNonce('market-claim:'+id);
       const rawTx=await relayerWallet.signTransaction({...unsigned,nonce});
       const txHash=ethers.keccak256(rawTx);
       await MarketAssetClaim.updateOne({_id:id},{$set:{nonce,txHash,rawTx,updatedAt:new Date()}});
@@ -18490,6 +18260,12 @@ const resourceEconomy = createResourceEconomy({
 async function resourceState(tipo) { return resourceEconomy.state(tipo); }
 async function resourcePurchaseBatch(itemId, quantity) {
   const tipo=itemTipoOnChain(itemId);
+  if(GF_CROP_CATALOG.items[itemId]){
+    const t=await contratoItemsServidor().getTipoStats(tipo),free=BigInt(t.limit)-BigInt(t.totalQuantity),per=BigInt(t.perInvoiceLimit);
+    if(!t.exists || per<1n)throw ecoError('crop_table_unavailable',409);
+    if(free<BigInt(quantity))throw ecoError('resource_capacity_exhausted',409);
+    return Number(per<BigInt(quantity)?per:BigInt(quantity));
+  }
   if(!Object.prototype.hasOwnProperty.call(RESOURCE_ITEM_IDS,tipo))return null;
   const table=await resourceState(tipo);
   if(!table.configured)throw ecoError('resource_not_configured',409);
@@ -20289,6 +20065,15 @@ async function gfNftColeccionesPublicas(address) {
   });
 }
 
+async function boundedNftMetadata(contract,ids,maxMs=10000){
+ const tokens=new Array(ids.length),deadline=Date.now()+Math.max(1,Math.min(10000,Number(maxMs)||10000));let cursor=0,partial=false;
+ await Promise.all(Array.from({length:Math.min(4,ids.length)},async()=>{for(;;){const index=cursor++;if(index>=ids.length)return;const id=ids[index];let uri='',timer;
+  const remaining=deadline-Date.now();
+  if(remaining<=0)partial=true;
+  else try{uri=uriNftLegible(await Promise.race([contract.tokenURI(id),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('metadata_timeout')),Math.min(8000,remaining));})]));}catch(_){partial=true;}finally{clearTimeout(timer);}
+  tokens[index]={id,uri:uri.slice(0,4096)};
+ }}));return {tokens,partial};
+}
 // GET /api/nft/mios — los NFT de esa colección que tiene la cartera de la sesión.
 app.get('/api/nft/mios', apiLimiter, authMiddleware, async (req, res) => {
   try {
@@ -20312,13 +20097,8 @@ app.get('/api/nft/mios', apiLimiter, authMiddleware, async (req, res) => {
     try {
     const c = new ethers.Contract(cfg.contrato, NFT_ABI, proveedorNft(cfg));
     const { total, ids } = await tokensDeCartera(c, address, cfg);
-    const tokens = [];
-    for (const id of ids) {
-      let uri = '';
-      try { uri = uriNftLegible(await c.tokenURI(id)); } catch (_) {}
-      tokens.push({ id, uri: uri.slice(0, 4096) });
-    }
-    const datos = { ok: true, configurada: true, coleccion, address, total, truncado: total > tokens.length, tokens };
+    const metadata=await boundedNftMetadata(c,ids),tokens=metadata.tokens;
+    const datos = { ok: true, configurada: true, coleccion, address, total, truncado: total > tokens.length, tokens, metadataPartial:metadata.partial };
     if (_nftCacheJugador.size > 1000) _nftCacheJugador.clear();
     _nftCacheJugador.set(address, { at: Date.now(), contrato: cfg.contrato,
       chainId: cfg.chainId, rpc: cfg.rpc, datos });
@@ -20637,115 +20417,60 @@ setIntervalAsync(async () => {
 // TOOL USES — desgaste de herramientas
 // =============================================================================
 
-// GET /api/tool/uses/:invoiceId — consultar usos restantes de una herramienta
-app.get('/api/tool/uses/:invoiceId',
-  apiLimiter,
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const invoiceId = parseInt(req.params.invoiceId, 10);
-      if (isNaN(invoiceId)) return res.status(400).json({ error: 'invoiceId inválido' });
-      const doc = await ToolUses.findOne({ invoiceId });
-      if (!doc) {
-        // No existe aún: la herramienta no ha sido usada, tiene todos los usos
-        return res.json({ invoiceId, usos: null, rota: false });
-      }
-      return res.json({ invoiceId, usos: doc.usos, maxUsos: doc.maxUsos, rota: doc.rota });
-    } catch (err) {
-      console.error('Error en GET /api/tool/uses:', err);
-      return res.status(500).json({ error: 'Internal server error' });
-    }
-  }
-);
+// Ownership and durability come from the authoritative invoice and fixed game catalog.
+const TOOL_DURABILITY = Object.freeze({Regaderax:20,Tijerasx:20,balde_con_agua:1,
+ hacha_de_madera:5,hacha_de_piedra:10,hacha_de_cobre:15,hacha_de_hierro:20,
+ pico_de_madera:5,pico_de_piedra:10,pico_de_cobre:15,pico_de_hierro:20});
+async function ownedTool(req,id,allowInactive=false){
+ if(!Number.isSafeInteger(id)||id<1)throw Object.assign(new Error('invalid_invoice'),{status:400});
+ const invoice=await contratoItemsServidor().getInvoice(id);
+ if(String(invoice.owner).toLowerCase()!==String(req.user.address).toLowerCase() || !allowInactive && !invoice.active)
+  throw Object.assign(new Error('tool_not_owned'),{status:403});
+ const item=Object.keys(TOOL_DURABILITY).find(k=>itemTipoOnChain(k)===invoice.tipo);
+ if(!item)throw Object.assign(new Error('not_a_tool'),{status:400});
+ return {invoice,max:TOOL_DURABILITY[item]};
+}
+function toolError(res,e){return res.status(e.status || 503).json({error:e.status?e.message:'tool_verification_unavailable'});}
+app.get('/api/tool/uses/:invoiceId',apiLimiter,authMiddleware,async(req,res)=>{
+ try{const id=Number(req.params.invoiceId);await ownedTool(req,id,true);const doc=await ToolUses.findOne({invoiceId:id}).lean();
+ res.json(doc?{invoiceId:id,usos:doc.usos,maxUsos:doc.maxUsos,rota:doc.rota}:{invoiceId:id,usos:null,rota:false});}catch(e){toolError(res,e);}
+});
+app.post('/api/tool/uses/decrease',apiLimiter,authMiddleware,csrfProtection,async(req,res)=>{
+ try{const id=Number(req.body.invoiceId),{invoice,max}=await ownedTool(req,id);
+  try{await ToolUses.updateOne({invoiceId:id},{$setOnInsert:{invoiceId:id,usos:max,maxUsos:max,rota:false,issuedQuantity:Number(invoice.cantidad)}},{upsert:true});}catch(e){if(e.code!==11000)throw e;}
+  const doc=await ToolUses.findOneAndUpdate({invoiceId:id,nativeOperation:null},[{$set:{
+   usos:{$max:[0,{$subtract:[{$min:['$usos',max]},1]}]},maxUsos:max,
+   rota:{$lte:['$usos',1]},issuedQuantity:{$ifNull:['$issuedQuantity',Number(invoice.cantidad)]}
+  }}],{new:true}).lean();
+  if(!doc)return res.status(409).json({error:'tool_reserved_for_pending_operation'});
+  res.json({invoiceId:id,usos:doc.usos,maxUsos:doc.maxUsos,rota:doc.rota});
+ }catch(e){toolError(res,e);}
+});
+app.post('/api/tool/uses/bulk',apiLimiter,authMiddleware,csrfProtection,async(req,res)=>{
+ try{const ids=req.body.invoiceIds;if(!Array.isArray(ids)||ids.length>50||ids.some(id=>!Number.isSafeInteger(Number(id))||Number(id)<1))return res.status(400).json({error:'invalid_invoice_list'});
+  const owned=await facturasLibresDeCadena(String(req.user.address).toLowerCase());const allowed=new Set(owned.map(x=>Number(x.id)));
+  if(ids.some(id=>!allowed.has(Number(id))))return res.status(403).json({error:'tool_not_owned'});
+  const docs=await ToolUses.find({invoiceId:{$in:ids.map(Number)}}).lean(),uses={};for(const d of docs)uses[d.invoiceId]={usos:d.usos,maxUsos:d.maxUsos,rota:d.rota};res.json({uses});
+ }catch(e){toolError(res,e);}
+});
+app.delete('/api/tool/uses/:invoiceId',apiLimiter,authMiddleware,csrfProtection,async(req,res)=>{
+ try{const id=Number(req.params.invoiceId),{invoice,max}=await ownedTool(req,id,true),doc=await ToolUses.findOne({invoiceId:id}).lean();
+  if(!doc)return res.json({success:true,invoiceId:id});
+  if(doc.nativeOperation)return res.status(409).json({error:'tool_reserved_for_pending_operation'});
+  // A client cannot restore an unbroken tool. A fresh unit needs proof that
+  // the worn unit has actually left the original on-chain stack.
+  if(!doc.rota || doc.issuedQuantity==null || BigInt(invoice.cantidad)>=BigInt(doc.issuedQuantity))return res.status(409).json({error:'tool_break_not_confirmed'});
+  const changed=!invoice.active?await ToolUses.deleteOne({_id:doc._id,nativeOperation:null,rota:true,usos:doc.usos}):await ToolUses.updateOne({_id:doc._id,nativeOperation:null,rota:true,usos:doc.usos},{$set:{usos:max,maxUsos:max,rota:false,issuedQuantity:Number(invoice.cantidad)}});
+  if(!(changed.deletedCount || changed.matchedCount))return res.status(409).json({error:'tool_state_changed'});
+  res.json({success:true,invoiceId:id});
+ }catch(e){toolError(res,e);}
+});
 
-// POST /api/tool/uses/decrease — descontar 1 uso a una herramienta
-app.post('/api/tool/uses/decrease',
-  apiLimiter,
-  authMiddleware,
-  csrfProtection,
-  [
-    body('invoiceId').isInt({ min: 1 }),
-    body('maxUsos').isInt({ min: 1 })
-  ],
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
-      const { invoiceId, maxUsos } = req.body;
-
-      // Buscar o crear el registro
-      let doc = await ToolUses.findOne({ invoiceId });
-      if (!doc) {
-        // Primera vez que se usa: inicializar con maxUsos - 1
-        const usosInicial = Math.max(0, maxUsos - 1);
-        doc = await ToolUses.create({
-          invoiceId,
-          usos: usosInicial,
-          maxUsos,
-          rota: usosInicial <= 0
-        });
-        console.log(`🔨 Herramienta ${invoiceId} inicializada con ${usosInicial}/${maxUsos} usos restantes`);
-      } else {
-        const nuevosUsos = Math.max(0, doc.usos - 1);
-        doc.usos = nuevosUsos;
-        doc.rota = nuevosUsos <= 0;
-        await doc.save();
-        console.log(`🔨 Herramienta ${invoiceId}: ${nuevosUsos}/${doc.maxUsos} usos restantes${doc.rota ? ' — ROTA' : ''}`);
-      }
-
-      return res.json({ invoiceId, usos: doc.usos, maxUsos: doc.maxUsos, rota: doc.rota });
-    } catch (err) {
-      console.error('Error en POST /api/tool/uses/decrease:', err);
-      return res.status(500).json({ error: 'Internal server error' });
-    }
-  }
-);
-
-// =============================================================================
-// MERGE COOLDOWN — cooldown de 7 minutos por par de facturas (anti-abuse)
-// =============================================================================
-
-// POST /api/tool/uses/bulk — consultar usos de múltiples invoiceIds de una vez
-app.post('/api/tool/uses/bulk',
-  apiLimiter,
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const { invoiceIds } = req.body;
-      if (!Array.isArray(invoiceIds) || invoiceIds.length === 0)
-        return res.json({ uses: {} });
-      const docs = await ToolUses.find({ invoiceId: { $in: invoiceIds.map(Number) } });
-      const uses = {};
-      docs.forEach(d => {
-        uses[d.invoiceId] = { usos: d.usos, maxUsos: d.maxUsos, rota: d.rota };
-      });
-      return res.json({ uses });
-    } catch (err) {
-      console.error('Error en POST /api/tool/uses/bulk:', err);
-      return res.status(500).json({ error: 'Internal server error' });
-    }
-  }
-);
-
-// DELETE /api/tool/uses/:invoiceId — borrar registro de usos (para resetear al romperse 1 item del stack)
-app.delete('/api/tool/uses/:invoiceId',
-  apiLimiter,
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const invoiceId = parseInt(req.params.invoiceId, 10);
-      if (isNaN(invoiceId)) return res.status(400).json({ error: 'invoiceId inválido' });
-      await ToolUses.deleteOne({ invoiceId });
-      console.log(`🗑️ Registro de usos eliminado para invoiceId ${invoiceId} (stack fresco)`);
-      return res.json({ success: true, invoiceId });
-    } catch (err) {
-      console.error('Error en DELETE /api/tool/uses:', err);
-      return res.status(500).json({ error: 'Internal server error' });
-    }
-  }
-);
-
+function mergePairKey(wallet,key){
+ if(!/^\d{1,20}_\d{1,20}$/.test(String(key)))throw Object.assign(new Error('invalid_pair'),{status:400});
+ const ids=String(key).split('_').map(BigInt);if(ids.some(x=>x<1n)||ids[0]===ids[1])throw Object.assign(new Error('invalid_pair'),{status:400});
+ ids.sort((a,b)=>a<b?-1:1);return String(wallet).toLowerCase()+':'+ids.join('_');
+}
 // POST /api/merge/cooldown/check — verificar si un par de facturas tiene cooldown activo
 app.post('/api/merge/cooldown/check',
   apiLimiter,
@@ -20759,7 +20484,7 @@ app.post('/api/merge/cooldown/check',
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-      const { pairKey } = req.body;
+      const pairKey = mergePairKey(req.user.address,req.body.pairKey);
       const now = new Date();
       const doc = await MergeCooldown.findOne({ pairKey });
 
@@ -20792,7 +20517,7 @@ app.post('/api/merge/cooldown/set',
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-      const { pairKey, cooldownMinutes } = req.body;
+      const pairKey=mergePairKey(req.user.address,req.body.pairKey),cooldownMinutes=7;
       const cooldownUntil = new Date(Date.now() + cooldownMinutes * 60 * 1000);
 
       await MergeCooldown.findOneAndUpdate(
@@ -21123,26 +20848,25 @@ async function liquidarPendientesDeCadena(doc) {
   for (const stat of pendientes) {
     const invId = doc.invoiceIds && doc.invoiceIds[stat];
     if (!invId) {
-      // Todavía no hay factura: la creará /sync con el valor de Mongo, así que
-      // esta deuda ya está cubierta y deja de estar pendiente.
-      liquidados.push(stat);
+      // Without a confirmed invoice this debt has not settled. /sync may
+      // create it later, but that is not evidence of a completed write.
+      fallidos.push(stat);
       continue;
     }
     const objetivo = clampStat(stat, doc[stat]);
     const r = await applyStatOnChain(contract, stat, invId, objetivo, gasPrice);
     if (r.ok) {
-      liquidados.push(stat);
+      const cleared=await PlayerStats.updateOne({_id:doc._id,[stat]:doc[stat],['invoiceIds.'+stat]:invId},{$pull:{chainPending:stat}});
+      if(cleared.matchedCount===1)liquidados.push(stat);else fallidos.push(stat);
     } else {
       console.error(`❌ liquidación [${stat}] de ${doc.playerName}:`, r.error);
       fallidos.push(stat);
     }
   }
 
-  doc.chainPending      = fallidos;
-  doc.chainPendingSince = fallidos.length ? (doc.chainPendingSince || new Date()) : null;
-  doc.markModified('chainPending');
-  try { await doc.save(); }
-  catch (e) { console.warn('⚠️  No se pudo guardar tras liquidar:', e.message); }
+  // Clear the timestamp only while there are still no pending fields. A
+  // concurrent debit/credit adds its own flag and cannot be erased here.
+  await PlayerStats.updateOne({_id:doc._id,'chainPending.0':{$exists:false}},{$set:{chainPendingSince:null}});
 
   if (liquidados.length) {
     console.log(`⛓️  Liquidado [${liquidados.join(', ')}] de ${doc.playerName} ` +
@@ -21309,13 +21033,15 @@ async function ensureStatTipo(contract, stat, gasPrice, { force = false, minPerI
   const newLimit      = Math.max(info.limit, info.totalQuantity + cfg.headroom * TIPO_RAISE_FACTOR, newPerInvoice);
 
   try {
-    const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+    const estimate=await contract.setLimit.estimateGas(stat,newLimit,newPerInvoice,{gasPrice});
+    const gasLimit=BigInt(estimate)*120n/100n;
+    const nonce = await relayerNonceManager.getNextNonce();
     console.log(
       `🧾 setLimit[${stat}]: limit ${info.limit}→${newLimit}, ` +
       `perInvoice ${info.perInvoiceLimit}→${newPerInvoice}` +
       (info.exists ? '' : ' (tabla nueva)')
     );
-    const tx = await contract.setLimit(stat, newLimit, newPerInvoice, { gasPrice, nonce });
+    const tx = await contract.setLimit(stat, newLimit, newPerInvoice, { gasPrice, gasLimit, nonce });
     await tx.wait();
     info = {
       exists: true,
@@ -21356,83 +21082,17 @@ async function readInvoiceQty(contract, invId) {
  * @returns {{ok:boolean, chainQty:number, error?:string}} chainQty = cantidad
  *          que quedó realmente en la factura (con el piso de 1 aplicado).
  */
+const authoritativeStatJournal=require('./stat-chain-journal')({mongoose,ethers,crypto,wallet:()=>relayerWallet,nonce:key=>relayerNonceManager.getNextNonce(key)});
 async function applyStatOnChain(contract, stat, invId, target, gasPrice) {
-  const desired = Math.max(STAT_CHAIN_FLOOR, Math.round(clampStat(stat, target)));
-
-  let current = await readInvoiceQty(contract, invId);
-  if (current === null) return { ok: false, chainQty: null, error: 'invoice_not_found_or_inactive' };
-  if (current === desired) return { ok: true, chainQty: current };
-
-  // Envuelto en reintento por caída del nodo: es la misma protección que tiene
-  // el relay. Un revert del contrato NO se reintenta aquí (se trata abajo).
-  const runTx = () => reintentarRPC(async () => {
-    const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
-    if (desired > current) {
-      const delta = desired - current;
-      console.log(`⬆️  [${stat}] id=${invId} ${current}→${desired} (+${delta}, nonce=${nonce})`);
-      const tx = await contract.increaseInvoiceQuantity(invId, delta, { gasPrice, nonce });
-      await tx.wait();
-    } else {
-      const delta = current - desired;
-      console.log(`⬇️  [${stat}] id=${invId} ${current}→${desired} (-${delta}, nonce=${nonce})`);
-      const tx = await contract.decreaseInvoiceQuantity(invId, delta, { gasPrice, nonce });
-      await tx.wait();
-    }
-  }, `applyStatOnChain[${stat}]`);
-
-  /* NONCE OCUPADO (2026-10-27). Aquí el nonce se lee de la cadena y el relay
-     (/api/relay/transaction) lo saca de relayerNonceManager: con la MISMA
-     clave, una compra en la tienda manda a la vez el cobro (aquí) y el
-     objeto (allí), y los dos podían salir con el mismo nonce. El que pierde
-     recibe "nonce too low": su transacción no entró. Se relee la factura (si
-     ya tiene el valor pedido, no queda nada que hacer) y se manda de nuevo
-     con un nonce fresco. Hasta 3 veces. */
-  const runTxSinChoque = async () => {
-    for (let choque = 0; ; choque++) {
-      try { return await runTx(); } catch (err) {
-        const m = String((err && (err.shortMessage || err.message)) || '').toLowerCase();
-        const ocupado = (err && ['NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(err.code)) ||
-                        /nonce too low|nonce has already been used|replacement transaction underpriced/.test(m);
-        if (!ocupado || choque >= 3) throw err;
-        await new Promise(r => setTimeout(r, 400 * (choque + 1)));
-        const ahora = await readInvoiceQty(contract, invId);
-        if (ahora === null) throw err;
-        current = ahora;
-        if (current === desired) return;
-        console.warn(`🔢 [${stat}] nonce ocupado por otra transacción del relayer; se repite (${choque + 1}/3)`);
-      }
-    }
-  };
-
-  try {
-    await runTxSinChoque();
-    return { ok: true, chainQty: desired };
-  } catch (err) {
-    const msg = String(err.message || err);
-    // ExceedsTipoLimit / InvoiceWouldExceedPerInvoiceLimit: la tabla se quedó
-    // sin cupo. Esto era exactamente lo que hacía que "recargo a 30 y al
-    // refrescar tengo 12": la TX revertía y nadie lo notaba. Se amplía el cupo
-    // y se reintenta UNA vez.
-    if (/ExceedsTipoLimit|PerInvoiceLimit/i.test(msg)) {
-      console.warn(`⚠️  [${stat}] sin cupo en la tabla — ampliando y reintentando`);
-      // `desired` va como techo mínimo por factura: si el jugador acumuló más
-      // oro/plata/exp del que admitía una sola factura, la tabla se amplía lo
-      // suficiente para que quepa en vez de quedarse atascada para siempre.
-      await ensureStatTipo(contract, stat, gasPrice, { force: true, minPerInvoice: desired });
-      try {
-        current = await readInvoiceQty(contract, invId);
-        if (current === null) return { ok: false, chainQty: null, error: 'invoice_not_found_or_inactive' };
-        if (current === desired) return { ok: true, chainQty: current };
-        await runTx();
-        return { ok: true, chainQty: desired };
-      } catch (err2) {
-        const after = await readInvoiceQty(contract, invId);
-        return { ok: false, chainQty: after, error: String(err2.message || err2) };
-      }
-    }
-    const after = await readInvoiceQty(contract, invId);
-    return { ok: false, chainQty: after, error: msg };
+  const desired=Math.max(STAT_CHAIN_FLOOR,Math.round(clampStat(stat,target)));
+  let result=await authoritativeStatJournal.apply(contract,stat,Number(invId),desired,gasPrice);
+  // Only a rejected preflight can expand a monetary/vital table. A signed
+  // intent must settle with its original nonce and bytes before a new delta.
+  if(!result.ok && !result.pending && /ExceedsTipoLimit|PerInvoiceLimit/i.test(result.error || '')){
+    await ensureStatTipo(contract,stat,gasPrice,{force:true,minPerInvoice:desired});
+    result=await authoritativeStatJournal.apply(contract,stat,Number(invId),desired,gasPrice);
   }
+  return result;
 }
 
 // =============================================================================
@@ -21483,7 +21143,7 @@ async function applyStatOnChain(contract, stat, invId, target, gasPrice) {
 // POST /api/admin/tesoro/config y POST /api/admin/tesoro/ajuste.
 // =============================================================================
 // <TIENDA_PRECIOS>
-const TIENDA_PRECIOS = {"Semillax":[10,5,"p"],"Semillax1":[15,7,"p"],"Semillax2":[8,3,"p"],"Semillax3":[25,12,"p"],"Semillax4":[20,10,"p"],"Regaderax":[120,60,"p"],"Tijerasx":[200,100,"p"],"hacha_de_madera":[300,150,"p"],"pico_de_madera":[400,200,"p"],"zanahoria_buena":[20,14,"p"],"tomate_buena":[28,20,"p"],"trigo_buena":[13,9,"p"],"fresa_buena":[40,28,"p"],"calabaza_buena":[48,34,"p"],"balde_con_agua":[8,3,"p"],"pes1":[0,12,"p"],"pes2":[0,22,"p"],"pes3":[0,70,"p"],"pes4":[0,10,"p"],"pes5":[0,16,"p"],"pes6":[0,95,"p"],"pes7":[0,40,"p"],"pes8":[0,75,"p"],"pes9":[0,32,"p"],"pes10":[0,24,"p"],"pes11":[0,18,"p"],"pes12":[0,160,"p"],"pes13":[0,55,"p"],"pes14":[0,85,"p"],"parcela":[200,100,"p"],"pala_construccion":[300,150,"p"],"espantapajaros":[120,60,"p"],"antorcha":[40,20,"p"],"basura":[120,60,"p"],"cofre1":[2,1,"o"],"cofre2":[0,250,"p"],"cofre3":[0,700,"p"],"cofre4":[0,2000,"p"],"espada_madera":[80,40,"p"],"espada_cobre":[250,125,"p"],"espada_hierro":[600,300,"p"],"cana_pescar":[150,75,"p"],"arco":[300,150,"p"],"baston_mago":[450,225,"p"],"bote":[500,250,"p"]};
+const TIENDA_PRECIOS = {...GF_CROP_CATALOG.shopPrices,"Semillax":[10,5,"p"],"Semillax1":[15,7,"p"],"Semillax2":[8,3,"p"],"Semillax3":[25,12,"p"],"Semillax4":[20,10,"p"],"Regaderax":[120,60,"p"],"Tijerasx":[200,100,"p"],"hacha_de_madera":[300,150,"p"],"pico_de_madera":[400,200,"p"],"zanahoria_buena":[20,14,"p"],"tomate_buena":[28,20,"p"],"trigo_buena":[13,9,"p"],"fresa_buena":[40,28,"p"],"calabaza_buena":[48,34,"p"],"balde_con_agua":[8,3,"p"],"pes1":[0,12,"p"],"pes2":[0,22,"p"],"pes3":[0,70,"p"],"pes4":[0,10,"p"],"pes5":[0,16,"p"],"pes6":[0,95,"p"],"pes7":[0,40,"p"],"pes8":[0,75,"p"],"pes9":[0,32,"p"],"pes10":[0,24,"p"],"pes11":[0,18,"p"],"pes12":[0,160,"p"],"pes13":[0,55,"p"],"pes14":[0,85,"p"],"parcela":[200,100,"p"],"pala_construccion":[300,150,"p"],"espantapajaros":[120,60,"p"],"antorcha":[40,20,"p"],"basura":[120,60,"p"],"cofre1":[2,1,"o"],"cofre2":[0,250,"p"],"cofre3":[0,700,"p"],"cofre4":[0,2000,"p"],"espada_madera":[80,40,"p"],"espada_cobre":[250,125,"p"],"espada_hierro":[600,300,"p"],"cana_pescar":[150,75,"p"],"arco":[300,150,"p"],"baston_mago":[450,225,"p"],"bote":[500,250,"p"]};
 // </TIENDA_PRECIOS>
 const TESORO_ID = 'principal';
 /* (2026-10-26) "La comisión es un 5 % en los dos mercados y se divide: el
@@ -22608,6 +22268,7 @@ app.use('/api/marketplace', (req, res, next) => {
    manda al recoger del suelo y en el P2P. Va con los mapas (GF_NIVEL_MAPA): lo
    de la mina desde el 2, lo del salvaje desde el 4… Lo que no está es nivel 1. */
 const GF_NIVEL_OBJETO = Object.freeze({
+  ...(typeof GF_CROP_CATALOG==='undefined'?{}:GF_CROP_CATALOG.levels),
   // Semillas y su cosecha (la cosecha, el nivel de su semilla)
   Semillax: 1, zanahoria_buena: 1, zanahoria_corta: 1, zanahoria_mala: 1,
   Semillax4: 3, fresa_buena: 3, fresa_corta: 3, fresa_mala: 3,
@@ -22722,6 +22383,14 @@ const gfEscRx = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** Quién es (para las fichas): nombre, usuario, cartera y nivel. Caché de un minuto. */
 const _gfQuienCache = new Map();
+async function gfQuienLote(nombres){
+ const names=[...new Set(nombres)].slice(0,100),[players,stats]=await Promise.all([
+  GamePlayer.find({playerName:{$in:names}}).select('playerName Username address nivel_exp').lean(),
+  PlayerStats.find({playerName:{$in:names}}).select('playerName exp').lean()
+ ]),byName=new Map(players.map(p=>[p.playerName,p])),byStats=new Map(stats.map(p=>[p.playerName,p])),result={};
+ for(const name of names){const p=byName.get(name);result[name]=p?{playerName:name,username:String(p.Username||''),address:String(p.address||'').toLowerCase(),nivel:nivelPorExperiencia(Math.max(0,Number(p.nivel_exp)||0,Number(byStats.get(name)?.exp)||0))}:{playerName:name,username:'',address:'',nivel:0};}
+ return result;
+}
 async function gfQuien(gpONombre) {
   let gp = gpONombre && typeof gpONombre === 'object' ? gpONombre : null;
   const nombre = gp ? gp.playerName : String(gpONombre || '');
@@ -23077,7 +22746,7 @@ app.get('/api/admin/auditoria/subidas', adminAuth, apiLimiter, async (req, res) 
       if (sueltas.length >= 300) break;
     }
     const fichas = {};
-    for (const n of [...new Set(sueltas.map((m) => m.playerName))].slice(0, 100)) fichas[n] = await gfQuien(n);
+    Object.assign(fichas,await gfQuienLote(sueltas.map(m=>m.playerName)));
     return res.json({ ok: true, dias, subidas: sueltas.map((m) => ({ id: String(m._id), t: m.t, playerName: m.playerName, stat: m.stat, antes: m.antes, despues: m.despues,
       delta: m.delta, bronce: m.bronce, quien: fichas[m.playerName] || null })) });
   } catch (e) { console.error('GET /api/admin/auditoria/subidas:', e); return res.status(500).json({ error: 'internal_error' }); }
@@ -23228,7 +22897,9 @@ app.get('/api/admin/economia/compras', adminAuth, apiLimiter, async (req, res) =
     ]);
     const zkDe = (w) => { try { return Number(BigInt(w || '0') / 1000000000n) / 1e9; } catch (_) { return 0; } };
     const fichas = {};
-    for (const n of [...new Set(filas.map((c) => c.playerName))].slice(0, 200)) { const gp = await GamePlayer.findOne({ playerName: n }).select('Username').lean(); fichas[n] = gp ? String(gp.Username || '') : ''; }
+    const names=[...new Set(filas.map(c=>c.playerName))].slice(0,200);
+    const identities=await GamePlayer.find({playerName:{$in:names}}).select('playerName Username').lean();
+    for(const gp of identities)fichas[gp.playerName]=String(gp.Username||'');
     return res.json({ ok: true, destino: economiaDestino(cfg), recibidoZk: tj && tj.zkltc ? (Number(tj.zkltc.gwei) || 0) / 1e9 : 0,
       resumen: porEstado.map((x) => ({ estado: x._id, n: x.n, oro: x.oro, reclamadas: x.reclamadas })),
       compras: filas.map((c) => ({ id: c._id, t: c.creada, playerName: c.playerName, username: fichas[c.playerName] || '', address: c.address, oro: c.oro, oroDado: c.oroDado || 0,
@@ -23452,6 +23123,7 @@ const servicioCobroSchema = new mongoose.Schema({
   bronce:     { type: Number, default: 0 },
   t:          { type: Date, default: Date.now },
   devuelto:   { type: Boolean, default: false },
+  serverOwned: { type: Boolean, default: false },
   precioBronce: { type: Number, default: 0 },
   confirmadas: { type: Number, default: 0 },
   estado: { type: String, enum: ['cobrado', 'completado', 'revision', 'devuelto'], default: 'cobrado', index: true },
@@ -23559,6 +23231,7 @@ const ECO2_LETRA_DE = Object.freeze({ plata: 'p', oro: 'o', bronce: 'b' });
    convertir en bronce los premios de misión viejos. Se cambia en el panel
    (Shop & P2P economy) como cualquier precio. */
 const ECO2_VALOR_REFERENCIA = Object.freeze({
+  ...(typeof GF_CROP_CATALOG==='undefined'?{}:GF_CROP_CATALOG.referenceValues),
   mineral_piedra: 3000, mineral_piedra_cobre: 8000, mineral_piedra_hierro: 15000, mineral_carbon: 5000, carbon: 5000,
   mineral_cobre: 25000, mineral_hierro: 45000,
   palo: 1000, tablon_de_madera: 6000, madera_pinos: 3000, madera_seca: 3000, madera_con_hojas: 2500,
@@ -24014,7 +23687,7 @@ app.post('/api/economia/servicio/confirmar', apiLimiter, authMiddleware, csrfPro
     const ref = String(req.body && req.body.ref || '');
     if (!/^[A-Za-z0-9_-]{8,64}$/.test(ref)) return res.status(400).json({ error: 'ref_invalida' });
     await ecoTransaccion(async session => {
-      const c = await ServicioCobro.findOneAndUpdate({ _id: gp.playerName + ':' + ref, estado: 'cobrado', devuelto: false },
+      const c = await ServicioCobro.findOneAndUpdate({ _id: gp.playerName + ':' + ref, estado: 'cobrado', devuelto: false, serverOwned: { $ne:true } },
         { $set: { estado: 'completado' } }, { new: true, session }).lean();
       if (c) await TesoroJuego.updateOne({ _id: TESORO_JUEGO_ID, retenidoServicios: { $gte: c.bronce } }, { $inc: { retenidoServicios: -c.bronce } }, { session });
     });
@@ -24028,7 +23701,7 @@ app.post('/api/economia/servicio/devolver', apiLimiter, authMiddleware, csrfProt
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
     const ref = String(req.body && req.body.ref || '');
     if (!/^[A-Za-z0-9_-]{8,64}$/.test(ref)) return res.status(400).json({ error: 'ref_invalida' });
-    const c = await ServicioCobro.findOneAndUpdate({ _id: gp.playerName + ':' + ref, estado: { $in: ['cobrado', 'revision'] }, devuelto: false },
+    const c = await ServicioCobro.findOneAndUpdate({ _id: gp.playerName + ':' + ref, estado: { $in: ['cobrado', 'revision'] }, devuelto: false, serverOwned: { $ne:true } },
       { $set: { estado: 'revision' } }, { new: true }).lean();
     // A client cannot prove that an on-chain result was not delivered.
     return res.status(c ? 202 : 409).json({ ok: false, revision: !!c, motivo: c ? 'revision_pendiente' : 'nada_que_devolver' });
@@ -24037,7 +23710,7 @@ app.post('/api/economia/servicio/devolver', apiLimiter, authMiddleware, csrfProt
 
 app.get('/api/admin/economia/servicios/revisar', adminAuth, apiLimiter, async (req, res) => {
   try {
-    const filas = await ServicioCobro.find({ estado: { $in: ['revision', 'cobrado'] } }).sort({ t: 1 }).limit(100).lean();
+    const filas = await ServicioCobro.find({ serverOwned: { $ne: true }, estado: { $in: ['revision', 'cobrado'] } }).sort({ t: 1 }).limit(100).lean();
     res.json({ ok: true, filas });
   } catch (e) { ecoResponderError(res, e); }
 });
@@ -24048,7 +23721,7 @@ app.post('/api/admin/economia/servicios/revisar', adminAuth, strictLimiter, asyn
     if (typeof b.id !== 'string' || b.id.length > 160 || !['devolver', 'completado'].includes(b.accion) || motivo.length < 5)
       return res.status(400).json({ error: 'datos_invalidos' });
     const c = await ecoTransaccion(async session => {
-      const row = await ServicioCobro.findOneAndUpdate({ _id: b.id, tipo: { $in: ['craftear', 'fundir'] }, estado: { $in: ['cobrado', 'revision'] }, devuelto: false },
+      const row = await ServicioCobro.findOneAndUpdate({ _id: b.id, serverOwned: { $ne: true }, tipo: { $in: ['craftear', 'fundir'] }, estado: { $in: ['cobrado', 'revision'] }, devuelto: false },
         { $set: { estado: b.accion === 'devolver' ? 'devuelto' : 'completado', devuelto: b.accion === 'devolver',
           tDevuelto: b.accion === 'devolver' ? new Date() : null, revisionMotivo: motivo } }, { new: true, session }).lean();
       if (!row) throw ecoError('ya_procesada', 409);
@@ -24340,6 +24013,7 @@ app.post('/api/economia/tienda', strictLimiter, authMiddleware, csrfProtection, 
         return res.status(previous.estado === 'completado' ? 200 : 202).json({ ok: previous.estado === 'completado', revision: previous.estado !== 'completado',
           confirmadas: previous.confirmadas || 0, stats: st && buildStatsResponse(st), ref: id });
       }
+      if(op==='compra' && GF_CROP_CATALOG.items[b.itemId] && !await crearTablaSiFalta(itemTipoOnChain(b.itemId)))throw ecoError('crop_table_unavailable',503);
       const resourceBatch = op === 'compra' ? await resourcePurchaseBatch(b.itemId,q) : null;
       await ecoTransaccion(async session => {
         const st = await PlayerStats.findOne({ playerName: gp.playerName }).session(session).lean();
@@ -24611,10 +24285,12 @@ async function burnItemOnChain(address, tipo, quantity) {
     if (restante <= 0) break;
     const aQuitar = Math.min(restante, f.cantidad);
     try {
+      const estimate=aQuitar>=f.cantidad?await c.deleteInvoice.estimateGas(f.id,{gasPrice}):await c.decreaseInvoiceQuantity.estimateGas(f.id,aQuitar,{gasPrice});
+      const gasLimit=BigInt(estimate)*120n/100n;
       const nonce = await relayerNonceManager.getNextNonce();
       const tx = (aQuitar >= f.cantidad)
-        ? await c.deleteInvoice(f.id, { gasPrice, nonce })
-        : await c.decreaseInvoiceQuantity(f.id, aQuitar, { gasPrice, nonce });
+        ? await c.deleteInvoice(f.id, { gasPrice, gasLimit, nonce })
+        : await c.decreaseInvoiceQuantity(f.id, aQuitar, { gasPrice, gasLimit, nonce });
       await tx.wait();
       restante -= aQuitar;
       quemadas += aQuitar;
@@ -24663,6 +24339,7 @@ async function burnItemOnChain(address, tipo, quantity) {
    el servidor la CREA con estos valores (crearTablaSiFalta); si ya existe, no
    la cambia: solo compara y avisa si se queda corta. */
 const TABLAS_RECOMENDADAS = [
+  ...GF_CROP_CATALOG.tables,
   ...GF_ALLOC_KEYS.map(k => ({ tipo: 'player_' + k, limit: 1_000_000_000, perInvoiceLimit: 150, para: 'Character allocation: ' + k })),
   ...['pocion_vida','pocion_antidoto'].map(tipo => ({ tipo, limit: 1_000_000_000, perInvoiceLimit: 20, para: 'Player potion' })),
   { tipo: TABLA_NIVEL,         limit: 1_000_000_000, perInvoiceLimit: 150, para: 'Nivel del personaje y de la mascota (2 facturas por jugador)' },
@@ -24894,8 +24571,10 @@ function crearTablaSiFalta(tipo) {
     if (antes.exists) { _motivoTabla.delete(tipo); return true; }
     try {
       console.log(`🧾 La tabla [${tipo}] no existe: se crea (límite ${rec.limit}, ${rec.perInvoiceLimit} por factura)`);
+      const gasPrice=gatherGasPrice(),estimate=await c.setLimit.estimateGas(tipo,rec.limit,rec.perInvoiceLimit,{gasPrice});
+      const gasLimit=BigInt(estimate)*120n/100n;
       const nonce = await relayerNonceManager.getNextNonce();
-      const tx = await c.setLimit(tipo, rec.limit, rec.perInvoiceLimit, { gasPrice: gatherGasPrice(), nonce });
+      const tx = await c.setLimit(tipo, rec.limit, rec.perInvoiceLimit, { gasPrice, gasLimit, nonce });
       await tx.wait();
       _infoTablaCache.delete(tipo);
       try { if (typeof _itemTipoCache !== 'undefined') _itemTipoCache.delete(tipo); } catch (_) {}
@@ -24939,6 +24618,7 @@ async function asegurarTablasDelJuego() {
     }
   }
   for (const t of TABLAS_RECOMENDADAS) {
+    if(t.plantKey)continue; // Expanded crop tables initialize before their first use.
     const antes = await infoTablaCadena(t.tipo);
     if (antes && antes.exists) continue;
     const ok = await tablaExiste(t.tipo);
@@ -25029,16 +24709,18 @@ async function facturasLibresDeCadena(address) {
 }
 
 /** Envía una transacción del relayer y espera el recibo (nonce del gestor). */
-async function txRelayer(nombre, fn) {
-  const nonce = await relayerNonceManager.getNextNonce();
-  try {
-    const tx = await fn({ gasPrice: gatherGasPrice(), nonce });
-    return await tx.wait();
-  } catch (e) {
-    console.error(`❌ ${nombre}:`, e.shortMessage || e.message);
-    try { await relayerNonceManager.resetNonce(); } catch (_) {}
-    throw e;
-  }
+async function txRelayer(nombre, fn, preflight) {
+  if(typeof preflight!=='function')throw new Error('native_preflight_required');
+  const gasPrice=gatherGasPrice();
+  // An invalid action must fail before reserving a nonce. Passing gasLimit
+  // also prevents ethers from estimating again after the reservation.
+  const estimate=await preflight({gasPrice});
+  const gasLimit=BigInt(estimate)*120n/100n;
+  if(gasLimit<1n)throw new Error('invalid_native_gas_estimate');
+  const nonce=await relayerNonceManager.getNextNonce();
+  let tx;
+  try {tx=await fn({gasPrice,gasLimit,nonce});return await tx.wait(1,120000);}
+  catch(e){e.nativeSubmissionUncertain=!(e.receipt && Number(e.receipt.status)===0);if(tx?.hash)e.transactionHash=tx.hash;console.error('Native transaction '+nombre+':',e.shortMessage||e.message);throw e;}
 }
 
 function idDeFacturaCreada(c, receipt) {
@@ -25124,15 +24806,15 @@ async function sincronizarIdentidadEnCadena(playerName, opciones) {
       const f = facturas.find(x => x.tipo === TABLA_NIVEL && x.manualId === manualId);
       try {
         if (!f) {
-          await txRelayer(`nivel ${quien} (crear)`, (o) => c.createInvoice(address, TABLA_NIVEL, quiero, manualId, o));
+          await txRelayer(`nivel ${quien} (crear)`, (o) => c.createInvoice(address, TABLA_NIVEL, quiero, manualId, o), (o) => c.createInvoice.estimateGas(address, TABLA_NIVEL, quiero, manualId, o));
           console.log(`🏷️  ${playerName}: nivel ${quien} = ${quiero} guardado en la cadena`);
         } else if (f.cantidad < quiero) {
-          await txRelayer(`nivel ${quien} (subir)`, (o) => c.increaseInvoiceQuantity(f.id, quiero - f.cantidad, o));
+          await txRelayer(`nivel ${quien} (subir)`, (o) => c.increaseInvoiceQuantity(f.id, quiero - f.cantidad, o), (o) => c.increaseInvoiceQuantity.estimateGas(f.id, quiero - f.cantidad, o));
           console.log(`🏷️  ${playerName}: nivel ${quien} ${f.cantidad} → ${quiero} en la cadena`);
         } else if (f.cantidad > quiero && exactoDe(quien)) {
           // Nunca por debajo de 1: una factura a 0 deja de estar activa.
           if (quiero >= 1) {
-            await txRelayer(`nivel ${quien} (bajar)`, (o) => c.decreaseInvoiceQuantity(f.id, f.cantidad - quiero, o));
+            await txRelayer(`nivel ${quien} (bajar)`, (o) => c.decreaseInvoiceQuantity(f.id, f.cantidad - quiero, o), (o) => c.decreaseInvoiceQuantity.estimateGas(f.id, f.cantidad - quiero, o));
             console.log(`🏷️  ${playerName}: nivel ${quien} ${f.cantidad} → ${quiero} en la cadena (administrador)`);
           }
         } else if (f.cantidad > quiero && quien === 'pet') {
@@ -25158,7 +24840,7 @@ async function sincronizarIdentidadEnCadena(playerName, opciones) {
         if (nombre && !enCadena) {
           const manualId = manualIdNombre(quien, nombre);
           if (Buffer.byteLength(manualId, 'utf8') > 64) { console.warn(`⚠️  nombre demasiado largo para la cadena: ${manualId}`); continue; }
-          await txRelayer(`nombre ${quien}`, (o) => c.createInvoice(address, TABLA_NOMBRE, 1, manualId, o));
+          await txRelayer(`nombre ${quien}`, (o) => c.createInvoice(address, TABLA_NOMBRE, 1, manualId, o), (o) => c.createInvoice.estimateGas(address, TABLA_NOMBRE, 1, manualId, o));
           console.log(`🏷️  ${playerName}: nombre ${quien} '${nombre}' registrado en la cadena`);
         } else if (!nombre && enCadena) {
           // Mongo lo perdió: se recupera de la cadena si nadie más lo usa.
@@ -25291,7 +24973,7 @@ async function sincronizarCasillasEnCadena(playerName) {
   for (let i = 0; i < ids.length; i += 200) {
     const loteIds = ids.slice(i, i + 200);
     const loteCod = codigos.slice(i, i + 200);
-    await txRelayer('setInvoiceSlotsBatch', (o) => c.setInvoiceSlotsBatch(address, loteIds, loteCod, o));
+    await txRelayer('setInvoiceSlotsBatch', (o) => c.setInvoiceSlotsBatch(address, loteIds, loteCod, o), (o) => c.setInvoiceSlotsBatch.estimateGas(address, loteIds, loteCod, o));
   }
   console.log(`🗂️  ${playerName}: ${ids.length} casilla(s) guardadas en la cadena`);
   return { ok: true, cambios: ids.length };
@@ -25886,7 +25568,7 @@ app.post('/api/lands/colocar', apiLimiter, authMiddleware, csrfProtection, gfExi
       if (!delItem) return { status: 400, body: { error: 'no_tienes', itemId: def.itemId } };
 
       // 3) Primero se QUEMA la parcela del inventario...
-      await txRelayer('colocar: quemar ' + def.tablaItem, (o) => c.decreaseInvoiceQuantity(delItem.id, 1, o));
+      await txRelayer('colocar: quemar ' + def.tablaItem, (o) => c.decreaseInvoiceQuantity(delItem.id, 1, o), (o) => c.decreaseInvoiceQuantity.estimateGas(delItem.id, 1, o));
       const quedan = delItem.cantidad - 1;
 
       // 4) ...y después se acuña la construcción. Si esto falla, la parcela
@@ -25894,7 +25576,7 @@ app.post('/api/lands/colocar', apiLimiter, authMiddleware, csrfProtection, gfExi
       //    (El bote y los cofres no tienen factura de construcción: Mongo.)
       const devolverQuemada = async () => {
         try {
-          if (quedan > 0) await txRelayer('colocar: devolver', (o) => c.increaseInvoiceQuantity(delItem.id, 1, o));
+          if (quedan > 0) await txRelayer('colocar: devolver', (o) => c.increaseInvoiceQuantity(delItem.id, 1, o), (o) => c.increaseInvoiceQuantity.estimateGas(delItem.id, 1, o));
           else await mintGatherReward(address, def.tablaItem, 1);
         } catch (e2) { console.error('❌ colocar: NO se pudo devolver el objeto quemado a ' + address + ':', e2.message); }
       };
@@ -25902,8 +25584,9 @@ app.post('/api/lands/colocar', apiLimiter, authMiddleware, csrfProtection, gfExi
       if (def.tablaConstruccion) {
         try {
           receipt = await txRelayer('colocar: crear ' + def.tablaConstruccion,
-            (o) => c.createInvoice(address, def.tablaConstruccion, 1, manualId, o));
+            (o) => c.createInvoice(address, def.tablaConstruccion, 1, manualId, o), (o) => c.createInvoice.estimateGas(address, def.tablaConstruccion, 1, manualId, o));
         } catch (e) {
+          if(e.nativeSubmissionUncertain)return {status:202,body:{ok:false,error:'construction_confirmation_pending',transactionHash:e.transactionHash || null,message:'The construction transaction may still confirm. No automatic refund was issued; check the island before placing again.'}};
           await devolverQuemada();
           return { status: 502, body: { error: 'cadena_fallo', message: 'Could not save the plot on-chain. Your plot was returned.' } };
         }
@@ -25920,8 +25603,9 @@ app.post('/api/lands/colocar', apiLimiter, authMiddleware, csrfProtection, gfExi
         // Lo que solo vive en Mongo, si Mongo falla, se pierde: se devuelve.
         // (Una parcela se recupera de la cadena en la siguiente lectura.)
         if (!def.tablaConstruccion) {
-          await devolverQuemada();
-          return { status: 500, body: { error: 'internal_error', message: 'Could not save it. Your item was returned.' } };
+          // A lost MongoDB acknowledgement does not prove the write failed.
+          // Refunding here could leave both a chest/boat and its original item.
+          return {status:202,body:{ok:false,error:'construction_save_pending',message:'The save could not be verified. No automatic refund was issued; refresh the island to check its state.'}};
         }
         throw e;
       }
@@ -26001,7 +25685,7 @@ app.post('/api/lands/quitar', apiLimiter, authMiddleware, csrfProtection, async 
       if (def.tablaConstruccion) {
         const f = facturas.find(x => x.tipo === def.tablaConstruccion && x.manualId === doc.manualId) ||
                   facturas.find(x => x.tipo === def.tablaConstruccion && x.id === doc.invoiceId);
-        if (f) await txRelayer('quitar: ' + def.tablaConstruccion, (o) => c.decreaseInvoiceQuantity(f.id, 1, o));
+        if (f) await txRelayer('quitar: ' + def.tablaConstruccion, (o) => c.decreaseInvoiceQuantity(f.id, 1, o), (o) => c.decreaseInvoiceQuantity.estimateGas(f.id, 1, o));
       }
 
       // 2) Se devuelve el objeto. Si falla, queda apuntado y se reintenta.
@@ -26184,6 +25868,7 @@ app.get('/api/admin/tablas', adminAuth, apiLimiter, async (req, res) => {
     _soporteCasillas.at = 0;
     const filas = [];
     for (const t of TABLAS_RECOMENDADAS) {
+      if(t.plantKey){filas.push({...t,cadena:null,existe:null,lecturaDiferida:true,creadaAhora:false,avisos:['Consultar en Cultivos y tablas']});continue;}
       let info = await infoTablaCadena(t.tipo);
       // La que falte se crea aquí mismo (ver crearTablaSiFalta).
       let creada = false;
@@ -26335,15 +26020,17 @@ async function consolidateDuplicateStatInvoices(contract, stat, canonical, dupli
   for (const dup of duplicates) {
     if (dup.cantidad <= 0) continue;
     try {
-      const nonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+      const estimate=fungible?await contract.transferQuantityBetweenInvoices.estimateGas(dup.id,canonical.id,dup.cantidad,{gasPrice}):await contract.decreaseInvoiceQuantity.estimateGas(dup.id,dup.cantidad,{gasPrice});
+      const gasLimit=BigInt(estimate)*120n/100n;
+      const nonce = await relayerNonceManager.getNextNonce();
       if (fungible) {
         console.log(`🔗 Consolidando [${stat}]: id=${dup.id} (${dup.cantidad}) → id=${canonical.id}`);
-        const tx = await contract.transferQuantityBetweenInvoices(dup.id, canonical.id, dup.cantidad, { gasPrice, nonce });
+        const tx = await contract.transferQuantityBetweenInvoices(dup.id, canonical.id, dup.cantidad, { gasPrice, gasLimit, nonce });
         await tx.wait();
         total += dup.cantidad;
       } else {
         console.log(`🔥 Quemando factura duplicada de [${stat}]: id=${dup.id} (${dup.cantidad})`);
-        const tx = await contract.decreaseInvoiceQuantity(dup.id, dup.cantidad, { gasPrice, nonce });
+        const tx = await contract.decreaseInvoiceQuantity(dup.id, dup.cantidad, { gasPrice, gasLimit, nonce });
         await tx.wait();
       }
     } catch (e) {
@@ -26504,42 +26191,8 @@ app.post('/api/skills/:playerName', authMiddleware, csrfProtection, async (req, 
     // cuando el GamePlayer no existía todavía, y con `upsert:true` permitía
     // crear habilidades sobre nombres ajenos aún no registrados.
     if (!await requireOwner(req, res, playerName)) return;
-    const { skillPoints } = req.body;
-    const skills = sinNivelDelPersonaje(req.body.skills);
-    if (!skills || typeof skills !== 'object') return res.status(400).json({ error: 'Invalid' });
-
-    // LAS HABILIDADES SOLO SUBEN. Este endpoint es un ESPEJO del panel, y el
-    // panel puede mandar una foto vieja (se abre, el jugador sigue jugando y
-    // pulsa "Save" cinco minutos después). Si se guardara tal cual, esa foto
-    // borraría el progreso hecho mientras tanto. Se conserva el mayor de los
-    // dos, igual que en /api/save.
-    const previo  = await PlayerSkills.findOne({ playerName }).lean();
-    const anterior = sinNivelDelPersonaje((previo && previo.skills) || {});
-
-    const mayor = (a, b) => {
-      const x = Number(a), y = Number(b);
-      if (!Number.isFinite(x)) return Number.isFinite(y) ? y : 0;
-      if (!Number.isFinite(y)) return x;
-      return Math.max(x, y);
-    };
-
-    const fusion = { exp: {} };
-    const claves = new Set([...Object.keys(anterior), ...Object.keys(skills)]);
-    claves.delete('exp');
-    claves.forEach(k => { fusion[k] = mayor(skills[k], anterior[k]); });
-
-    const expNueva = (skills.exp && typeof skills.exp === 'object') ? skills.exp : {};
-    const expVieja = (anterior.exp && typeof anterior.exp === 'object') ? anterior.exp : {};
-    new Set([...Object.keys(expVieja), ...Object.keys(expNueva)]).forEach(k => {
-      fusion.exp[k] = mayor(expNueva[k], expVieja[k]);
-    });
-
-    await PlayerSkills.findOneAndUpdate(
-      { playerName },
-      { skills: fusion, skillPoints: skillPoints || 0, updatedAt: new Date() },
-      { upsert: true, new: true }
-    );
-    return res.json({ success: true, skills: fusion });
+    const doc=await PlayerSkills.findOne({playerName}).lean();
+    return res.json({success:true,serverAuthoritative:true,skills:sinNivelDelPersonaje(doc?.skills || {}),skillPoints:doc?.skillPoints || 0});
   } catch (err) { return res.status(500).json({ error: 'Internal server error' }); }
 });
 console.log('✅ Skills routes loaded');
@@ -26583,7 +26236,9 @@ app.post('/api/player/skills/allocate', apiLimiter, authMiddleware, csrfProtecti
       const invoice = rows.find(f => f.tipo === tipo && f.owner === String(gp.address).toLowerCase());
       const receipt = await txRelayer('character skill ' + key, o => invoice
         ? c.increaseInvoiceQuantity(invoice.id, 1, o)
-        : c.createInvoice(gp.address, tipo, 1, 'skill:' + key + ':' + String(gp.address).toLowerCase(), o));
+        : c.createInvoice(gp.address, tipo, 1, 'skill:' + key + ':' + String(gp.address).toLowerCase(), o), o => invoice
+        ? c.increaseInvoiceQuantity.estimateGas(invoice.id, 1, o)
+        : c.createInvoice.estimateGas(gp.address, tipo, 1, 'skill:' + key + ':' + String(gp.address).toLowerCase(), o));
       if (receipt.status !== 1 && receipt.status !== 1n) throw new Error('unconfirmed');
       // Return the confirmed result even if the subsequent RPC/mirror read is unavailable.
       state.allocations[key]++; state.available--;
@@ -26615,7 +26270,7 @@ app.post('/api/player/skills/reset', apiLimiter, authMiddleware, csrfProtection,
       let devueltos = 0, fallos = 0;
       for (const f of mias) {
         try {
-          const receipt = await txRelayer('reset skill ' + f.tipo, o => c.deleteInvoice(f.id, o));
+          const receipt = await txRelayer('reset skill ' + f.tipo, o => c.deleteInvoice(f.id, o), o => c.deleteInvoice.estimateGas(f.id, o));
           if (receipt && (receipt.status === 1 || receipt.status === 1n)) devueltos += f.cantidad; else fallos++;
         } catch (_) { fallos++; }
       }
@@ -26699,7 +26354,7 @@ app.post('/api/alchemist/use', apiLimiter, authMiddleware, csrfProtection, async
       const f = rows.find(f => f.tipo === ITEM_TIPO_MAP[itemId] && f.cantidad > 0);
       if (!f) return res.status(409).json({ error: 'missing_potion' });
       const c = contratoItemsServidor();
-      await txRelayer('use player potion', o => f.cantidad === 1 ? c.deleteInvoice(f.id, o) : c.decreaseInvoiceQuantity(f.id, 1, o));
+      await txRelayer('use player potion', o => f.cantidad === 1 ? c.deleteInvoice(f.id, o) : c.decreaseInvoiceQuantity(f.id, 1, o), o => f.cantidad === 1 ? c.deleteInvoice.estimateGas(f.id, o) : c.decreaseInvoiceQuantity.estimateGas(f.id, 1, o));
       if (itemId === 'pocion_vida') { doc.vida = clampStat('vida', Number(doc.vida) + 50); marcarPendienteDeCadena(doc, ['vida']); }
       else { const v = _venenos.get(gp.playerName); if (v) clearTimeout(v.reloj); _venenos.delete(gp.playerName); }
       await doc.save();
@@ -26870,70 +26525,36 @@ console.log('✅ Soulbound routes loaded: /api/soulbound/:playerName');
 //
 //   Ahora toda ruta exige ser el dueño (requireOwner), así que solo se crean
 //   buzones de jugadores reales, y el remitente lo pone el SERVIDOR.
-if (!global._mailStore) global._mailStore = Object.create(null);
-
-// Tope de mensajes guardados por jugador: el buzón es un array en memoria, sin
-// límite crecía para siempre en cuentas muy activas.
 const MAIL_MAX_POR_JUGADOR = 100;
-
-function getPlayerMail(player) {
-  if (!Object.prototype.hasOwnProperty.call(global._mailStore, player)) global._mailStore[player] = [];
-  return global._mailStore[player];
+const Mailbox = mongoose.models.GameMailbox || mongoose.model('GameMailbox',new mongoose.Schema({
+ playerName:{type:String,unique:true,required:true},mails:{type:[mongoose.Schema.Types.Mixed],default:[]}
+},{collection:'game_mailboxes',timestamps:true}));
+async function getPlayerMail(player){
+ // A rolling-process upgrade can migrate its old in-memory mailbox once.
+ const old=global._mailStore && global._mailStore[player];
+ if(old?.length){await Mailbox.updateOne({playerName:player},{$setOnInsert:{mails:old.slice(0,MAIL_MAX_POR_JUGADOR)}},{upsert:true});delete global._mailStore[player];}
+ return (await Mailbox.findOne({playerName:player}).lean())?.mails || [];
 }
-
-// GET /api/mail/:playerName — list mails
-app.get('/api/mail/:playerName', authMiddleware, asyncRoute(async (req, res) => {
-  if (!await requireOwner(req, res, req.params.playerName)) return;
-  res.json({ mails: getPlayerMail(req.params.playerName) });
+app.get('/api/mail/:playerName',authMiddleware,asyncRoute(async(req,res)=>{
+ if(!await requireOwner(req,res,req.params.playerName))return;res.set('Cache-Control','no-store');res.json({mails:await getPlayerMail(req.params.playerName)});
 }));
-
-// POST /api/mail/:playerName/read-all — mark all read
-app.post('/api/mail/:playerName/read-all', authMiddleware, csrfProtection, asyncRoute(async (req, res) => {
-  if (!await requireOwner(req, res, req.params.playerName)) return;
-  getPlayerMail(req.params.playerName).forEach(m => { m.read = true; });
-  res.json({ ok: true });
+app.post('/api/mail/:playerName/read-all',authMiddleware,csrfProtection,asyncRoute(async(req,res)=>{
+ if(!await requireOwner(req,res,req.params.playerName))return;await getPlayerMail(req.params.playerName);
+ await Mailbox.updateOne({playerName:req.params.playerName},{$set:{'mails.$[].read':true}});res.json({ok:true});
 }));
-
-// DELETE /api/mail/:playerName/clear — delete all
-app.delete('/api/mail/:playerName/clear', authMiddleware, csrfProtection, asyncRoute(async (req, res) => {
-  if (!await requireOwner(req, res, req.params.playerName)) return;
-  global._mailStore[req.params.playerName] = [];
-  res.json({ ok: true });
+app.delete('/api/mail/:playerName/clear',authMiddleware,csrfProtection,asyncRoute(async(req,res)=>{
+ if(!await requireOwner(req,res,req.params.playerName))return;await getPlayerMail(req.params.playerName);
+ await Mailbox.updateOne({playerName:req.params.playerName},{$set:{mails:[]}});res.json({ok:true});
 }));
-
-// DELETE /api/mail/:playerName/:mailId — delete one
-app.delete('/api/mail/:playerName/:mailId', authMiddleware, csrfProtection, asyncRoute(async (req, res) => {
-  if (!await requireOwner(req, res, req.params.playerName)) return;
-  const store = getPlayerMail(req.params.playerName);
-  const idx = store.findIndex(m => String(m.id) === String(req.params.mailId));
-  if (idx !== -1) store.splice(idx, 1);
-  res.json({ ok: true });
+app.delete('/api/mail/:playerName/:mailId',authMiddleware,csrfProtection,asyncRoute(async(req,res)=>{
+ if(!await requireOwner(req,res,req.params.playerName))return;await getPlayerMail(req.params.playerName);
+ await Mailbox.updateOne({playerName:req.params.playerName},{$pull:{mails:{id:String(req.params.mailId)}}});res.json({ok:true});
 }));
-
-// POST /api/mail/:playerName — send a mail (internal use or admin)
-app.post('/api/mail/:playerName', authMiddleware, csrfProtection, asyncRoute(async (req, res) => {
-  if (!await requireOwner(req, res, req.params.playerName)) return;
-
-  const { subject, body } = req.body || {};
-  // El remitente lo decide el SERVIDOR a partir de la sesión. Antes venía del
-  // cuerpo de la petición, así que se podía firmar como cualquiera.
-  const from = (req.user && req.user.address) || 'system';
-
-  const mail = {
-    id: Date.now().toString(),
-    // Longitudes acotadas: sin esto un solo mensaje podía ocupar megas.
-    subject: String(subject == null ? '' : subject).slice(0, 120),
-    body:    String(body    == null ? '' : body).slice(0, 2000),
-    from,
-    date: new Date().toISOString(),
-    read: false
-  };
-
-  const store = getPlayerMail(req.params.playerName);
-  store.unshift(mail);
-  if (store.length > MAIL_MAX_POR_JUGADOR) store.length = MAIL_MAX_POR_JUGADOR;
-
-  res.json({ ok: true, mail });
+app.post('/api/mail/:playerName',authMiddleware,csrfProtection,asyncRoute(async(req,res)=>{
+ if(!await requireOwner(req,res,req.params.playerName))return;await getPlayerMail(req.params.playerName);
+ const {subject,body}=req.body || {},mail={id:crypto.randomUUID(),subject:String(subject??'').slice(0,120),body:String(body??'').slice(0,2000),
+ from:req.user.address,date:new Date().toISOString(),read:false};
+ await Mailbox.updateOne({playerName:req.params.playerName},{$push:{mails:{$each:[mail],$position:0,$slice:MAIL_MAX_POR_JUGADOR}}},{upsert:true});res.json({ok:true,mail});
 }));
 
 // =============================================================================
@@ -27041,6 +26662,34 @@ console.log('✅ Furnace + Notifications routes loaded');
 const _syncLocks = new Map();
 
 // ── GET /api/stats/:playerName ────────────────────────────────────────────────
+// Every stats sub-route, including sync, binds its player to the signed-in
+// wallet. A missing player is not permission to create or mutate that name.
+async function statsSessionOwner(req,res,next){
+  try{
+    const playerName=await resolvePlayerName(req.params.playerName),address=String(req.user?.address || '').toLowerCase();
+    const gp=await GamePlayer.findOne({playerName}).select('address').lean();
+    if(!gp || !address || String(gp.address || '').toLowerCase()!==address)return res.status(403).json({error:'Forbidden'});
+    req.authorizedStatsName=playerName;return next();
+  }catch(_){return res.status(503).json({error:'stats_owner_unavailable'});}
+}
+app.use('/api/stats/:playerName',authMiddleware,statsSessionOwner);
+
+// A chain sync can wait for minutes while play continues. Persist only if the
+// values used by that sync have not changed. Otherwise return the live row and
+// let its pending flags drive the next reconciliation.
+async function persistStatsSync(doc,baseline){
+  if(doc.isNew){try{await doc.save();return doc;}catch(e){if(e.code!==11000)throw e;return PlayerStats.findOne({playerName:doc.playerName});}}
+  const changes=doc.getChanges();
+  if(Object.keys(changes).length){
+    const paths=new Set([...STAT_TYPES_LIST,'chainPending','chainPendingSince','invoiceIds','manualIds','lastUpdated']);
+    for(const fields of Object.values(changes))for(const path of Object.keys(fields))paths.add(path);
+    const filter={_id:doc._id};
+    for(const path of paths){const value=path.split('.').reduce((v,k)=>v==null?undefined:v[k],baseline);filter[path]=value===undefined?{$exists:false}:value;}
+    await PlayerStats.updateOne(filter,changes);
+  }
+  return PlayerStats.findOne({playerName:doc.playerName});
+}
+
 app.get('/api/stats/:playerName', authMiddleware, async (req, res) => {
   try {
     const playerName = await resolvePlayerName(req.params.playerName);
@@ -27113,6 +26762,8 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
       STAT_TYPES_LIST.forEach(s => { statsDoc[s] = STAT_DEFAULTS_MAP[s]; });
     }
 
+    const syncBaseline=statsDoc.toObject();
+
     // Semilla de `exp`: la experiencia venía viviendo solo en
     // GamePlayer.nivel_exp. La primera vez que se sincroniza se arrastra ese
     // valor para que la factura nazca con la exp real y no en 0.
@@ -27132,13 +26783,13 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
     applyGhostVitalRegen(statsDoc);
 
     if (!contract) {
-      await statsDoc.save();
+      statsDoc=await persistStatsSync(statsDoc,syncBaseline);
       return res.json({ stats: buildStatsResponse(statsDoc), source: 'db' });
     }
 
     const chainMap = await getOnChainStats(contract, address);
     if (!chainMap) {
-      await statsDoc.save();
+      statsDoc=await persistStatsSync(statsDoc,syncBaseline);
       return res.json({ stats: buildStatsResponse(statsDoc), source: 'db_fallback' });
     }
 
@@ -27271,9 +26922,11 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
       }
 
       try {
-        const freshNonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+        const estimate=await contract.createInvoice.estimateGas(address,stat,createVal,manualId,{gasPrice});
+        const gasLimit=BigInt(estimate)*120n/100n;
+        const freshNonce = await relayerNonceManager.getNextNonce();
         console.log(`🆕 Creando la factura de [${stat}] para ${address} = ${createVal} (nonce=${freshNonce})`);
-        const tx = await contract.createInvoice(address, stat, createVal, manualId, { gasPrice, nonce: freshNonce });
+        const tx = await contract.createInvoice(address, stat, createVal, manualId, { gasPrice, gasLimit, nonce: freshNonce });
         const receipt = await tx.wait();
         let newId = null;
         for (const log of receipt.logs) {
@@ -27314,7 +26967,7 @@ app.post('/api/stats/:playerName/sync', authMiddleware, csrfProtection, async (r
     statsDoc.markModified('invoiceIds');
     statsDoc.markModified('manualIds');
     statsDoc.lastSync = new Date();
-    await statsDoc.save();
+    statsDoc=await persistStatsSync(statsDoc,syncBaseline);
     return res.json({
       stats: buildStatsResponse(statsDoc),
       source: 'chain',
@@ -27341,7 +26994,7 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
     }
     if (!updates || typeof updates !== 'object') return res.status(400).json({ error: 'Invalid stats payload' });
 
-    const currencyKeys = ['oro', 'plata', 'bronce'];
+    const currencyKeys = ['oro', 'plata', 'bronce', 'exp'];
     const validKeys = STAT_TYPES_LIST.filter(k => updates[k] !== undefined && !currencyKeys.includes(k));
     if (!validKeys.length && currencyKeys.some(k => updates[k] !== undefined)) {
       const actual = await PlayerStats.findOne({ playerName }).lean();
@@ -27367,7 +27020,9 @@ app.post('/api/stats/:playerName/update', authMiddleware, csrfProtection, async 
     for (const stat of validKeys) {
       // clampStat acota las vitales a 0..100 (escala real del juego). Sin esto,
       // un cliente podía escribir 100000 y la barra mostraba "100000%".
-      const newVal  = clampStat(stat, Math.round(Number(updates[stat])));
+      const requested = Number(updates[stat]);
+      if(!Number.isFinite(requested))continue;
+      const newVal = Math.min(Number(doc[stat]) || 0,clampStat(stat,Math.round(requested)));
       const oldVal  = doc[stat] || 0;
       const invId   = doc.invoiceIds[stat];
       if (newVal === oldVal) continue;
@@ -28367,7 +28022,9 @@ function purgarMapasEnMemoria() {
   stats.plantSpamTracker = n;
 
   // ── Enfriamientos (valor = marca de tiempo) ───────────────────────────────
-  stats._gatherLastByPlayer = purgarMapaDeTiempos(_gatherLastByPlayer, ahora, PURGA_EDAD_MS);
+  stats._gfResetPuntos = purgarMapaDeTiempos(_gfResetPuntos, ahora, PURGA_EDAD_MS);
+  // Gather cooldowns belong to the durable gather records; the former
+  // process-local _gatherLastByPlayer map no longer exists.
   stats._verifierCooldown   = purgarMapaDeTiempos(_verifierCooldown,   ahora, PURGA_EDAD_MS);
   // Se quedó fuera del barrido original y crece igual que los otros: una
   // entrada por jugador que espante un cuervo, para siempre.
@@ -28386,6 +28043,8 @@ function purgarMapasEnMemoria() {
   stats._pvpEspadas = caducadas(_pvpEspadas, c => c.hasta <= ahora);
   stats._cacheFantasma = caducadas(_cacheFantasma, c => ahora - c.t >= FANTASMA_CACHE_MS);
   stats._tradUso = caducadas(_tradUso, u => ahora - u.desde > 60000);
+  stats._infoTablaCache = caducadas(_infoTablaCache,c=>ahora-c.at>60000);
+  for(const [tipo,t] of _falloTabla)if(ahora-t>PURGA_EDAD_MS){_falloTabla.delete(tipo);_motivoTabla.delete(tipo);}
   stats._nftCacheJugador = caducadas(_nftCacheJugador, c => ahora - c.at > 2 * 60 * 1000);
 
   // ── Historial de chat de salas que ya no tiene nadie ──────────────────────
@@ -28437,7 +28096,7 @@ function purgarMapasEnMemoria() {
   const total = Object.values(stats).reduce((a, b) => a + b, 0);
   if (total > 0) {
     console.log('🧹 Purga de memoria:', JSON.stringify(stats),
-                `| vivos: siembra=${plantSpamTracker.size} recolecta=${_gatherLastByPlayer.size} ` +
+                `| vivos: siembra=${plantSpamTracker.size} ` +
                 `verificador=${_verifierCooldown.size} admin=${_adminAddrCache.size} ` +
                 `combates=${battleMatches.size} sockets=${socketMatch.size}`);
   }
@@ -34076,6 +33735,121 @@ try {
 // devolvía su 404 HTML por defecto en vez de pasar por el handler. La forma
 // que sí probé y funciona igual en Express 4 y 5 es no usar un patrón de ruta
 // en absoluto: un middleware normal que revisa req.path a mano.
+
+const ProgressAward=mongoose.models.ProgressAward || mongoose.model('ProgressAward',new mongoose.Schema({_id:String,playerName:String,createdAt:{type:Date,default:Date.now}},{collection:'verified_progress_awards'}));
+async function awardVerifiedProgress(playerName,ref,experience,profession,amount,existingSession){
+ const run=async session=>{
+  const id=crypto.createHash('sha256').update(playerName+':'+ref).digest('hex');if(await ProgressAward.exists({_id:id}).session(session))return;
+  const [gp,stats]=await Promise.all([GamePlayer.findOne({playerName}).session(session).lean(),PlayerStats.findOne({playerName}).session(session).lean()]);if(!gp||!stats)throw new Error('progress_player_missing');
+  const total=Math.max(0,Number(gp.nivel_exp)||0,Number(stats.exp)||0)+Math.max(0,Number(experience)||0),set={nivel_exp:total,nivel:nivelPorExperiencia(total)};
+  if(['agricultura','mineria','deforestacion','pesca','cocina','fuerza'].includes(profession)&&amount>0){set[profession+'_exp']=Math.max(0,Number(gp[profession+'_exp'])||0)+amount;set[profession]=Math.max(1,Number(gp[profession])||0,nivelPorExperiencia(set[profession+'_exp']));}
+  await GamePlayer.updateOne({playerName},{$set:set},{session});
+  await PlayerStats.updateOne({playerName},{$set:{exp:total,chainPendingSince:new Date()},$addToSet:{chainPending:'exp'}},{session});
+  await ProgressAward.create([{_id:id,playerName}],{session});
+ };
+ return existingSession?run(existingSession):ecoTransaccion(run);
+}
+// CRAFT_AUTHORITY_START
+const authoritativeFarm=require('./native-farm')({
+  mongoose,catalog:GF_CROP_CATALOG,Crop:UserCrop,History:CropHistory,Stats:PlayerStats,Tools:ToolUses,
+  itemType:itemTipoOnChain,freeInvoices:facturasLibresDeCadena,table:crearTablaSiFalta,
+  townPlots:new Set(require('./town-plots.json')),settings:getFarmingConfig,chance:successChanceParaSemilla,
+  island:async(gp,plot)=>await gfTieneVipPorDireccion(gp.address) && await parcelaIslaDeJugador(gp.address,plot),
+  thirstMs:()=>MINUTOS_PARA_REGAR[Math.floor(Math.random()*MINUTOS_PARA_REGAR.length)]*60000,
+  expiry:nuevaFechaDeCaducidad,award:awardVerifiedProgress,
+  room:async(gp,itemId,count)=>{
+    const who=await GamePlayer.findOne({playerName:gp.playerName}).select('inventory chest').lean();if(!who)return false;
+    const used=(rows,max)=>new Set((rows || []).filter(s=>s && Number(s.cantidad)>0 && Number.isInteger(s.id) && s.id>=0 && s.id<max).map(s=>s.id)).size;
+    // A native mint makes a new invoice. Reserve enough canonical slots even
+    // when existing stacks could theoretically accept additional quantities.
+    return INV_SLOTS-used(who.inventory,INV_SLOTS)+CHEST_SLOTS-used(who.chest,CHEST_SLOTS)>=Math.ceil(count/ITEM_MAX_STACK[itemId]);
+  },
+  progress:async(playerName)=>{const gp=await GamePlayer.findOne({playerName}).select('nivel_exp agricultura agricultura_exp').lean();return gp?{nivel_exp:Number(gp.nivel_exp)||0,agricultura:Number(gp.agricultura)||0,agricultura_exp:Number(gp.agricultura_exp)||0}:{};},
+  notify:(wallet,event,data)=>io.to('wallet:'+String(wallet).toLowerCase()).emit(event,data)
+});
+const authoritativeCrafts = require('./crafting-authority')({
+  mongoose, ethers, crypto, recipes: require('./craft-recipes.json'), consumables:[...require('./consumables.json'),...GF_CROP_CATALOG.consumables], app, authMiddleware,
+  adminAuth, csrfProtection, strictLimiter, apiLimiter,
+  services:[...authoritativeFarm.recipes,...Object.entries(VIP_PLANES).flatMap(([plan,r])=>VIP_MONEDAS.map(stat=>({
+    id:'vip_'+plan+'_'+stat,kind:'vip',plan,level:0,allowGhost:true,resources:[],itemId:'vip',outputType:'vip',
+    quantity:r.dias,outputMax:r.dias,singleInvoice:true,maxQuantity:1,
+    payment:{stat,amount:r.precio[stat],bronze:r.precio[stat]*TESORO_BRONCE_POR[stat]}
+  })))],
+  afterService:async(job)=>{if(job.kind==='farm')io.to('wallet:'+job.wallet).emit('nativeFarmResult',await authoritativeCrafts.describe(job));},
+  planService:authoritativeFarm.plan,
+  serviceFingerprint:authoritativeFarm.fingerprint,
+  reserveService:authoritativeFarm.reserve,
+  cancelService:authoritativeFarm.cancel,
+  prepareService:async(gp,recipe,key,body)=>{
+    if(recipe.farm)return authoritativeFarm.prepare(gp,recipe,key,body);
+    if(recipe.kind!=='vip' || !await crearTablaSiFalta('vip'))throw new Error('vip_table_unavailable');
+    const address=String(gp.address).toLowerCase(),previas=gfVipLeerFacturas(await facturasDeCadena(address),address),resumen=gfVipResumen(previas);
+    const inicio=Math.floor(Math.max(Date.now(),resumen.activo?resumen.fin:0)/1000)*1000,fin=inicio+recipe.quantity*86400000;
+    const base=['vip',address.slice(2,10),inicio/1000,fin/1000,recipe.plan,recipe.payment.stat,recipe.payment.amount].join(':');
+    return {plan:recipe.plan,moneda:recipe.payment.stat,precio:recipe.payment.amount,inicio:resumen.activo?resumen.inicio:inicio,fin,
+      manualId:base+':'+key.slice(0,Math.min(16,63-base.length))};
+  },
+  completeService:async(job,session)=>{
+    if(job.kind==='farm')return authoritativeFarm.complete(job,session);
+    if(job.kind!=='vip' || !job.metadata?.fin)throw new Error('vip_metadata_missing');
+    await VipEstado.updateOne({address:job.wallet},{$set:{playerName:job.playerName,inicio:new Date(job.metadata.inicio),fin:new Date(job.metadata.fin),leidoEn:new Date()}},{upsert:true,session});
+    _gfVipCache.delete(job.wallet);
+  },
+  describeService:async(job)=>{
+    if(job.kind==='farm')return authoritativeFarm.describe(job);
+    const f=await authoritativeCrafts.Job.findById(job._id).select('+privateSteps').lean(),m=job.metadata;
+    return {plan:m.plan,moneda:m.moneda,precio:m.precio,...gfVipResumen([{inicio:m.inicio,fin:m.fin}]),
+      facturaId:f.privateSteps.find(s=>s.kind==='mint')?.invoiceId,transactionHash:f.privateSteps.find(s=>s.kind==='mint')?.txHash,
+      planes:VIP_PLANES,ahora:Date.now()};
+  },
+  itemType:itemTipoOnChain,maxStack:id=>Math.max(1,Number(ITEM_MAX_STACK[id]) || 1),
+  items:contratoItemsServidor,wallet:()=>relayerWallet,nonce:key=>relayerNonceManager.getNextNonce(key),gasPrice:gatherGasPrice,
+  freeInvoices:facturasLibresDeCadena,player:jugadorDeLaSesion,ghost:esFantasma,level:gfNivelDeJugador,
+  transaction:ecoTransaccion,queue:enColaDelJugador,loadEconomy:eco2Config,price:eco2PrecioServicio,planPayment:eco2PlanPago,
+  Stats:PlayerStats,Player:GamePlayer,Treasury:TesoroJuego,treasuryId:TESORO_JUEGO_ID,Service:ServicioCobro,Mov:TesoroMov,
+  persistInventory:resourcePersistInventory,statsResponse:buildStatsResponse,
+  award:awardVerifiedProgress,
+  gain:async(playerName,stat,amount,session)=>{
+    if(!['agua','comida'].includes(stat)||!Number.isSafeInteger(amount)||amount<1)throw new Error('invalid_consumption');
+    const result=await PlayerStats.updateOne({playerName},[{$set:{[stat]:{$min:[100,{$add:[{$ifNull:['$'+stat,0]},amount]}]},chainPendingSince:new Date(),chainPending:{$setUnion:[{$ifNull:['$chainPending',[]]},[stat]]}}}],{session});
+    if(result.matchedCount!==1)throw new Error('consumption_player_missing');
+  }
+});
+// Crafted output issuance is server-only, including direct legacy relay calls.
+for(const recipe of require('./craft-recipes.json')) TABLAS_SOLO_ACUNA_SERVIDOR.add(itemTipoOnChain(recipe.itemId));
+setInterval(()=>authoritativeCrafts.sweep().catch(e=>console.warn('craft sweep:',e.code || e.message)),60000).unref();
+
+app.post('/api/farm/execute',strictLimiter,authMiddleware,csrfProtection,async(req,res)=>{
+ try{
+  const gp=await jugadorDeLaSesion(req);if(!gp)return res.status(403).json({error:'not_authorized'});
+  const body=req.body || {},action=String(body.action || '');let recipeId,quantity;
+  const plots=authoritativeFarm.fingerprint(null,body),wallet=String(gp.address).toLowerCase(),ref=String(body.ref || '');
+  if(!/^[A-Za-z0-9_-]{8,64}$/.test(ref))return res.status(400).json({error:'invalid_reference'});
+  const previous=await authoritativeCrafts.Job.findById('craft_'+crypto.createHash('sha256').update(wallet+':'+ref).digest('hex')).lean();
+  if(previous){
+    const m=previous.metadata;
+    if(previous.kind!=='farm'||m.action!==action||JSON.stringify(m.plots)!==JSON.stringify(plots)||(action==='plant'&&m.seedType!==body.seedType)||(action==='water'&&m.mode!==body.mode))return res.status(409).json({error:'farm_reference_conflict'});
+    const done=previous.status==='completed'?previous:await authoritativeCrafts.execute(previous._id);res.set('Cache-Control','no-store');return res.status(done.status==='completed'?200:202).json(await authoritativeCrafts.describe(done));
+  }
+  await authoritativeFarm.refresh(gp,plots);
+  if(action==='plant'){const seed=String(body.seedType || ''),cfg=GF_CROP_CATALOG.crops[seed];if(!cfg)return res.status(400).json({error:'unknown_seed'});recipeId='farm_plant_'+GF_CROP_CATALOG.items[seed].plantKey;quantity=plots.length;}
+  else if(action==='water'){const mode=body.mode==='bucket'?'bucket':body.mode==='can'?'can':null;if(!mode)return res.status(400).json({error:'invalid_watering_mode'});recipeId='farm_water_'+mode;quantity=mode==='bucket'?Math.ceil(plots.length/2):plots.length;}
+  else if(action==='harvest'){
+   // The recipe and result are selected from the current server crop, never
+   // from a client item id, quantity or claimed growth stage.
+   const crop=await UserCrop.findOne({userId:{$in:[String(gp.address).toLowerCase(),gp.playerName]},plotId:plots[0],isHarvested:false}).lean();
+   const cfg=crop && GF_CROP_CATALOG.crops[crop.cropType];if(!cfg)return res.status(409).json({error:'crop_missing'});
+   recipeId='farm_harvest_'+GF_CROP_CATALOG.items[cfg.id].plantKey+'_'+(crop.isDead?'rotten':crop.isCompleted?'fresh':'unripe');quantity=plots.length;
+  }else return res.status(400).json({error:'invalid_farm_action'});
+  const prepared=await enColaDelJugador('inventory:'+String(gp.address).toLowerCase(),()=>authoritativeCrafts.create(gp,{recipeId,quantity,plotIds:plots,ref:body.ref}));
+  const done=prepared.status==='completed'?prepared:await authoritativeCrafts.execute(prepared._id);res.set('Cache-Control','no-store');return res.status(done.status==='completed'?200:202).json(await authoritativeCrafts.describe(done));
+ }catch(e){return res.status(e.status||503).json({error:e.code || 'farm_unavailable',message:'The farm operation could not be confirmed. Check pending operations before retrying.'});}
+});
+setInterval(()=>authoritativeFarm.sweep().catch(e=>console.warn('native farm sweep:',e.code || e.message)),15000).unref();
+require('./crop-admin')({app,catalog:GF_CROP_CATALOG,adminAuth,apiLimiter,strictLimiter,csrfProtection,
+ contract:contratoItemsServidor,prices:eco2PreciosActuales,Services:ServicioCobro,Players:GamePlayer,Burns:EconomiaQuema,Jobs:authoritativeCrafts.Job,chainId:CHAIN_ID,ensure:crearTablaSiFalta});
+// CRAFT_AUTHORITY_END
+
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) {
     return res.status(404).json({ error: 'not_found' });
