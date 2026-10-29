@@ -1,0 +1,354 @@
+[
+  {
+    "id": "consume_zanahoria_buena",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "zanahoria_buena",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 2
+    }
+  },
+  {
+    "id": "consume_tomate_buena",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "tomate_buena",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 5
+    }
+  },
+  {
+    "id": "consume_trigo_buena",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "trigo_buena",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 5
+    }
+  },
+  {
+    "id": "consume_calabaza_buena",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "calabaza_buena",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 5
+    }
+  },
+  {
+    "id": "consume_fresa_buena",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "fresa_buena",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 5
+    }
+  },
+  {
+    "id": "consume_zanahoria_mala",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "zanahoria_mala",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 1
+    }
+  },
+  {
+    "id": "consume_tomate_mala",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "tomate_mala",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 2
+    }
+  },
+  {
+    "id": "consume_trigo_mala",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "trigo_mala",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 2
+    }
+  },
+  {
+    "id": "consume_calabaza_mala",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "calabaza_mala",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 2
+    }
+  },
+  {
+    "id": "consume_fresa_mala",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "fresa_mala",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 2
+    }
+  },
+  {
+    "id": "consume_pes1",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes1",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 6
+    }
+  },
+  {
+    "id": "consume_pes2",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes2",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 10
+    }
+  },
+  {
+    "id": "consume_pes3",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes3",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 18
+    }
+  },
+  {
+    "id": "consume_pes4",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes4",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 7
+    }
+  },
+  {
+    "id": "consume_pes5",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes5",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 9
+    }
+  },
+  {
+    "id": "consume_pes6",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes6",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 25
+    }
+  },
+  {
+    "id": "consume_pes9",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes9",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 14
+    }
+  },
+  {
+    "id": "consume_pes10",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes10",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 12
+    }
+  },
+  {
+    "id": "consume_pes11",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes11",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 10
+    }
+  },
+  {
+    "id": "consume_pes12",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes12",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 30
+    }
+  },
+  {
+    "id": "consume_pes13",
+    "itemId": null,
+    "quantity": 0,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "pes13",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "comida",
+      "gain": 20
+    }
+  },
+  {
+    "id": "consume_balde_con_agua",
+    "itemId": "balde_vacio",
+    "quantity": 1,
+    "level": 0,
+    "resources": [
+      {
+        "itemId": "balde_con_agua",
+        "quantity": 1
+      }
+    ],
+    "consume": {
+      "stat": "agua",
+      "gain": 20
+    }
+  }
+]

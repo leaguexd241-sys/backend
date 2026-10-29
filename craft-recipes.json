@@ -1,0 +1,274 @@
+[
+  {
+    "id": "balde_vacio",
+    "itemId": "balde_vacio",
+    "quantity": 1,
+    "level": 1,
+    "resources": [
+      {
+        "itemId": "madera_pinos",
+        "quantity": 3
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "tablon_de_madera",
+    "itemId": "tablon_de_madera",
+    "quantity": 1,
+    "level": 2,
+    "resources": [],
+    "options": [
+      [
+        {
+          "itemId": "madera_pinos",
+          "quantity": 2
+        },
+        {
+          "itemId": "madera_seca",
+          "quantity": 2
+        },
+        {
+          "itemId": "madera_con_hojas",
+          "quantity": 2
+        }
+      ]
+    ]
+  },
+  {
+    "id": "palo",
+    "itemId": "palo",
+    "quantity": 3,
+    "level": 3,
+    "resources": [
+      {
+        "itemId": "tablon_de_madera",
+        "quantity": 2
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "hacha_de_madera",
+    "itemId": "hacha_de_madera",
+    "quantity": 1,
+    "level": 3,
+    "resources": [
+      {
+        "itemId": "tablon_de_madera",
+        "quantity": 1
+      },
+      {
+        "itemId": "palo",
+        "quantity": 1
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "hacha_piedra",
+    "itemId": "hacha_de_piedra",
+    "quantity": 1,
+    "level": 4,
+    "resources": [
+      {
+        "itemId": "mineral_piedra",
+        "quantity": 3
+      },
+      {
+        "itemId": "palo",
+        "quantity": 1
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "hacha_de_cobre",
+    "itemId": "hacha_de_cobre",
+    "quantity": 1,
+    "level": 5,
+    "resources": [
+      {
+        "itemId": "mineral_cobre",
+        "quantity": 3
+      },
+      {
+        "itemId": "palo",
+        "quantity": 1
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "hacha_de_hierro",
+    "itemId": "hacha_de_hierro",
+    "quantity": 1,
+    "level": 6,
+    "resources": [
+      {
+        "itemId": "mineral_hierro",
+        "quantity": 3
+      },
+      {
+        "itemId": "palo",
+        "quantity": 1
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "pico_madera",
+    "itemId": "pico_de_madera",
+    "quantity": 1,
+    "level": 3,
+    "resources": [
+      {
+        "itemId": "tablon_de_madera",
+        "quantity": 1
+      },
+      {
+        "itemId": "palo",
+        "quantity": 1
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "pico_de_piedra",
+    "itemId": "pico_de_piedra",
+    "quantity": 1,
+    "level": 4,
+    "resources": [
+      {
+        "itemId": "mineral_piedra",
+        "quantity": 3
+      },
+      {
+        "itemId": "palo",
+        "quantity": 1
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "pico_de_cobre",
+    "itemId": "pico_de_cobre",
+    "quantity": 1,
+    "level": 5,
+    "resources": [
+      {
+        "itemId": "mineral_cobre",
+        "quantity": 3
+      },
+      {
+        "itemId": "palo",
+        "quantity": 1
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "pico_de_hierro",
+    "itemId": "pico_de_hierro",
+    "quantity": 1,
+    "level": 6,
+    "resources": [
+      {
+        "itemId": "mineral_hierro",
+        "quantity": 3
+      },
+      {
+        "itemId": "palo",
+        "quantity": 1
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "cofre2",
+    "itemId": "cofre2",
+    "quantity": 1,
+    "level": 10,
+    "resources": [
+      {
+        "itemId": "cofre1",
+        "quantity": 1
+      },
+      {
+        "itemId": "tablon_de_madera",
+        "quantity": 20
+      },
+      {
+        "itemId": "mineral_hierro",
+        "quantity": 8
+      },
+      {
+        "itemId": "palo",
+        "quantity": 10
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "cofre3",
+    "itemId": "cofre3",
+    "quantity": 1,
+    "level": 15,
+    "resources": [
+      {
+        "itemId": "cofre2",
+        "quantity": 1
+      },
+      {
+        "itemId": "mineral_hierro",
+        "quantity": 25
+      },
+      {
+        "itemId": "mineral_cobre",
+        "quantity": 25
+      },
+      {
+        "itemId": "pocion_mascota_grande",
+        "quantity": 3
+      },
+      {
+        "itemId": "pes3",
+        "quantity": 2
+      }
+    ],
+    "options": null
+  },
+  {
+    "id": "cofre4",
+    "itemId": "cofre4",
+    "quantity": 1,
+    "level": 20,
+    "resources": [
+      {
+        "itemId": "cofre3",
+        "quantity": 1
+      },
+      {
+        "itemId": "mineral_hierro",
+        "quantity": 60
+      },
+      {
+        "itemId": "mineral_cobre",
+        "quantity": 60
+      },
+      {
+        "itemId": "elixir_revivir",
+        "quantity": 3
+      },
+      {
+        "itemId": "pes3",
+        "quantity": 6
+      },
+      {
+        "itemId": "espada_hierro",
+        "quantity": 1
+      }
+    ],
+    "options": null
+  }
+]
