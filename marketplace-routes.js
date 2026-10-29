@@ -228,7 +228,7 @@ function createMarketAtomic(mongoose, auditar) {
       return res.status(result.status).json(result.body);
     };
   }
-  return { transaction, model, handler };
+  return { transaction, model, handler, session: () => scope.getStore() };
 }
 
 module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
@@ -377,6 +377,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
     // parecía que se había vendido todo. Con estos dos eventos el historial
     // cuenta la historia completa y no hay forma de confundirse.
     type:             { type: String, enum: ['buy', 'sell', 'list', 'cancel'], required: true },
+    listingId:        { type: String, index: true },
     itemId:           String,
     name:             String,
     category:         String,
@@ -571,8 +572,15 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
       if (sort === 'price_asc') sortOpt = { pricePerUnit: 1 };
       if (sort === 'price_desc') sortOpt = { pricePerUnit: -1 };
 
-      const listings = await Listing.find(filter).sort(sortOpt).limit(300).exec();
-      return res.json({ listings: listings.map(l => serializeListing(l, address)) });
+      const page=Math.min(10000,Math.max(1,parseInt(req.query.page,10)||1)), pageSize=48;
+      let listings;
+      if(sort==='price_asc' || sort==='price_desc'){
+        listings=await RawListing.aggregate([{$match:filter},{$addFields:{_sortPrice:{$multiply:['$pricePerUnit',{$cond:[{$eq:['$currency','oro']},1000,1]}]}}},
+          {$sort:{_sortPrice:sort==='price_asc'?1:-1,_id:1}},{$skip:(page-1)*pageSize},{$limit:pageSize+1}]).option({maxTimeMS:5000});
+      }else listings=await Listing.find(filter).sort({...sortOpt,_id:-1}).skip((page-1)*pageSize).limit(pageSize+1).maxTimeMS(5000).exec();
+      const hasMore=listings.length>pageSize;if(hasMore)listings.pop();
+      const serialized=listings.map(l=>serializeListing(l,address));
+      return res.json({page,hasMore,listings:ctx.assetTransfer ? await ctx.assetTransfer.describe(serialized) : serialized});
     } catch (err) {
       console.error('❌ GET /api/marketplace/listings:', err);
       return res.status(500).json({ error: 'internal_server_error' });
@@ -584,7 +592,8 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
     try {
       const address = (req.user.address || '').toLowerCase();
       const listings = await Listing.find({ owner: address }).sort({ createdAt: -1 }).exec();
-      return res.json({ listings: listings.map(l => serializeListing(l, address)) });
+      const serialized=listings.map(l=>serializeListing(l,address));
+      return res.json({listings:ctx.assetTransfer ? await ctx.assetTransfer.describe(serialized) : serialized});
     } catch (err) {
       console.error('❌ GET /api/marketplace/my-listings:', err);
       return res.status(500).json({ error: 'internal_server_error' });
@@ -664,6 +673,9 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         imageUrl: meta.icon
       });
 
+      if (ctx.assetTransfer) await ctx.assetTransfer.prepareListing({ listing, owner:address, itemId, qty,
+        slot:(gp[srcField] || []).find(slot=>slot.id===slotId && slot.objeto===itemId) }, atomic.session());
+
       // Se anota la PUBLICACIÓN en el historial. No mueve dinero, pero es lo
       // que permite leer después "publiqué 10 → me compraron 3 → cancelé 7"
       // en vez de ver solo la venta parcial y pensar que se vendió todo.
@@ -692,6 +704,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         inventory: serializeInventory(fresh)
       });
     } catch (err) {
+      if(err.status===409 && err.code)return res.status(409).json({error:err.code});
       console.error('❌ POST /api/marketplace/list:', err);
       return res.status(500).json({ error: 'internal_server_error' });
     }
@@ -707,6 +720,10 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         return res.status(400).json({ error: 'invalid_listing_id' });
       }
 
+      if (ctx.assetTransfer) {
+        const previous=await ctx.assetTransfer.replay({ listingId:id,wallet:address,op:'refund',ref:'cancel' },atomic.session());
+        if(previous)return res.json({...previous,inventory:serializeInventory(await getGamePlayerByAddress(address))});
+      }
       const listing = await Listing.findById(id).exec();
       if (!listing) return res.status(404).json({ error: 'listing_not_found' });
       if (listing.owner !== address) return res.status(403).json({ error: 'not_your_listing' });
@@ -723,6 +740,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         });
       }
 
+      const receiptId=ctx.assetTransfer ? await ctx.assetTransfer.claim({listing,wallet:address,qty:listing.qty,op:'refund',ref:'cancel'},atomic.session()) : null;
       await Listing.deleteOne({ _id: listing._id }).exec();
       await applyInsertPlan(address, listing.itemId, plan);
 
@@ -748,8 +766,9 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
       }
 
       const fresh = await getGamePlayerByAddress(address);
-      return res.json({ success: true, inventory: serializeInventory(fresh) });
+      return res.json({ success: true, receiptId, inventory: serializeInventory(fresh) });
     } catch (err) {
+      if(err.status===409 && err.code)return res.status(409).json({error:err.code});
       console.error('❌ POST /api/marketplace/cancel/:id:', err);
       return res.status(500).json({ error: 'internal_server_error' });
     }
@@ -766,12 +785,19 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         return res.status(400).json({ error: 'invalid_listing_id' });
       }
 
+      const buyRef=String(req.body?.ref || '');
+      if(ctx.assetTransfer){
+        if(!/^[A-Za-z0-9_-]{8,64}$/.test(buyRef))return res.status(400).json({error:'market_reference_required'});
+        const previous=await ctx.assetTransfer.replay({listingId:id,wallet:address,op:'deliver',ref:buyRef},atomic.session());
+        if(previous)return res.json({...previous,inventory:serializeInventory(await getGamePlayerByAddress(address))});
+      }
       const listing = await Listing.findById(id).exec();
       if (!listing) return res.status(404).json({ error: 'listing_not_found', message: 'Esa publicación ya no está disponible' });
       if (listing.owner === address) {
         return res.status(400).json({ error: 'cannot_buy_own_listing', message: 'No puedes comprar tu propia publicación' });
       }
 
+      if(ctx.assetTransfer && !await ctx.assetTransfer.ready(listing,atomic.session()))return res.status(409).json({error:'market_escrow_pending',message:'El depósito del vendedor aún no está confirmado en el contrato.'});
       let qty = req.body && req.body.qty ? Math.floor(Number(req.body.qty)) : listing.qty;
       if (!Number.isSafeInteger(qty) || qty < 1 || qty > listing.qty) {
         return res.status(400).json({ error: 'invalid_qty' });
@@ -843,6 +869,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
       if (sellerPaid.matchedCount !== 1) throw new Error('market_seller_stats_missing');
       await ingresarAlTesoro(listing.currency, fee, listing.ownerName, listing.itemId, qty);
 
+      const receiptId=ctx.assetTransfer ? await ctx.assetTransfer.claim({listing,wallet:address,qty,op:'deliver',ref:buyRef},atomic.session()) : null;
       // 5) Entregar el ítem al comprador
       await applyInsertPlan(address, listing.itemId, plan);
 
@@ -855,6 +882,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
             playerName: buyerGP.playerName,
             address,
             type: 'buy',
+            listingId: String(listing._id),
             itemId: listing.itemId,
             name: meta.name,
             category: meta.category,
@@ -872,6 +900,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
             playerName: listing.ownerName,
             address: listing.owner,
             type: 'sell',
+            listingId: String(listing._id),
             itemId: listing.itemId,
             name: meta.name,
             category: meta.category,
@@ -896,6 +925,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
       return res.json({
         success: true,
         paid: totalPrice,
+        receiptId,
         fee,
         currency: listing.currency,
         oro: freshStats.oro,
@@ -903,6 +933,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         inventory: serializeInventory(freshGP)
       });
     } catch (err) {
+      if(err.status===409 && err.code)return res.status(409).json({error:err.code});
       console.error('❌ POST /api/marketplace/buy/:id:', err);
       return res.status(500).json({ error: 'internal_server_error' });
     }
@@ -1121,6 +1152,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
 
       const listing = await Listing.findById(listingId).exec();
       if (!listing) return res.status(404).json({ error: 'listing_not_found' });
+      if(ctx.assetTransfer && !await ctx.assetTransfer.ready(listing,atomic.session()))return res.status(409).json({error:'market_escrow_pending'});
       if (listing.owner === address) {
         return res.status(400).json({ error: 'cannot_offer_own_listing' });
       }
@@ -1245,6 +1277,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         return res.commitStatus(409).json({ error: 'listing_gone', message: 'Esa publicación ya no existe. Se devolvió el dinero al comprador.' });
       }
 
+      if(ctx.assetTransfer && !await ctx.assetTransfer.ready(listing,atomic.session()))return res.status(409).json({error:'market_escrow_pending'});
       const meta = catalogMeta(offer.itemId);
       const buyerGP = await GamePlayer.findOne({ address: offer.buyer }).lean();
       if (!buyerGP) return res.status(404).json({ error: 'buyer_not_found' });
@@ -1286,6 +1319,7 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
       if (sellerPaid.matchedCount !== 1) throw new Error('market_seller_stats_missing');
       await ingresarAlTesoro(offer.currency, fee, offer.sellerName, offer.itemId, offer.qty);
 
+      const receiptId=ctx.assetTransfer ? await ctx.assetTransfer.claim({listing,wallet:offer.buyer,qty:offer.qty,op:'deliver',ref:'offer_'+String(offer._id)},atomic.session()) : null;
       await applyInsertPlan(offer.buyer, offer.itemId, plan);
 
       offer.status = 'accepted';
@@ -1299,14 +1333,14 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
         await MarketHistory.insertMany([
           {
             playerName: offer.buyerName, address: offer.buyer, type: 'buy',
-            itemId: offer.itemId, name: meta.name, category: meta.category,
+            listingId: String(listing._id), itemId: offer.itemId, name: meta.name, category: meta.category,
             qty: offer.qty, pricePerUnit: offer.pricePerUnit, total: offer.total,
             fee: 0, sellerReceives: null, currency: offer.currency,
             counterparty: offer.seller, counterpartyName: offer.sellerName, createdAt: new Date()
           },
           {
             playerName: offer.sellerName, address: offer.seller, type: 'sell',
-            itemId: offer.itemId, name: meta.name, category: meta.category,
+            listingId: String(listing._id), itemId: offer.itemId, name: meta.name, category: meta.category,
             qty: offer.qty, pricePerUnit: offer.pricePerUnit, total: offer.total,
             fee, sellerReceives, currency: offer.currency,
             counterparty: offer.buyer, counterpartyName: offer.buyerName, createdAt: new Date()
@@ -1316,10 +1350,11 @@ module.exports = function registerMarketplaceRoutes(rawApp, ctx) {
 
       const stats = await PlayerStats.findOne({ address: offer.seller }).lean();
       return res.json({
-        success: true, received: sellerReceives, fee,
+        success: true, received: sellerReceives, fee, receiptId,
         oro: stats ? stats.oro : null, plata: stats ? stats.plata : null
       });
     } catch (err) {
+      if(err.status===409 && err.code)return res.status(409).json({error:err.code});
       console.error('❌ POST /api/marketplace/offer/accept:', err);
       return res.status(500).json({ error: 'internal_server_error' });
     }

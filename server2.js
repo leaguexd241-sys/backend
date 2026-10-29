@@ -2775,6 +2775,7 @@ const relayedTransactionSchema = new mongoose.Schema({
   // Resultados y errores
   result: { type: Object },
   error: { type: String },
+  errorFingerprint: { type: String, index: true },
   revertReason: { type: String },
   logs: { type: Array, default: [] },
   
@@ -2804,6 +2805,20 @@ relayedTransactionSchema.index({
   createdAt: -1 
 });
 
+relayedTransactionSchema.pre('save', function (next) {
+  if (this.isModified('error')) this.errorFingerprint = reporterFingerprint(this.error);
+  next();
+});
+relayedTransactionSchema.pre(['updateOne', 'findOneAndUpdate'], function (next) {
+  const update = this.getUpdate();
+  if (update && !Array.isArray(update)) {
+    const fields = update.$set || update;
+    if (Object.prototype.hasOwnProperty.call(fields, 'error')) {
+      fields.errorFingerprint = reporterFingerprint(fields.error);
+    }
+  }
+  next();
+});
 const RelayedTransaction = mongoose.model('RelayedTransaction', relayedTransactionSchema);
 
 // --- NUEVO ESQUEMA: Contract Whitelist ---
@@ -7788,6 +7803,7 @@ io.on("connection", (socket) => {
     // reconexión el socket es otro y no pertenece a ninguna sala del adaptador
     // aunque `rooms` diga que sí.
     socket.join(room);
+    livePresenceJoin(socket);
 
     // Antes de mandar la foto de la sala, fuera los que ya no tienen socket:
     // si no, el que acaba de entrar se encuentra con dobles de los que se
@@ -10099,21 +10115,8 @@ app.post('/api/tree/lock',
       }
       const { treeKey, treeType } = req.body;
 
-      // Obtener el porcentaje actual de deforestación para este tipo
-      const deforest = await Deforestation.findOne({ treeType });
-      const percent = deforest ? deforest.percent : 0;
-
-      const config = TREE_TYPE_CONFIG[treeType];
-      if (!config) {
-        return res.status(400).json({ error: 'Tipo de árbol no válido' });
-      }
-
-      // Deforestación al 100 % ya NO bloquea el árbol para siempre: solo lo
-      // penaliza con el respawn máximo. Un bloqueo permanente dejaba el mapa
-      // muerto y era lo que el jugador veía como "siglos de respawn".
-      let respawnSeconds = config.baseRespawn + (percent * config.respawnMultiplier);
-      if (percent >= 100) respawnSeconds = RESPAWN_MAX_SECONDS;
-      respawnSeconds = Math.min(RESPAWN_MAX_SECONDS, Math.max(5, respawnSeconds));
+      const tableState = await resourceRespawn(treeType);
+      const respawnSeconds = tableState.respawnSeconds;
       const lockedUntil = new Date(Date.now() + respawnSeconds * 1000);
 
       await TreeLock.findOneAndUpdate(
@@ -10145,11 +10148,8 @@ app.get('/api/tree/deforestation/:treeType',
   async (req, res) => {
     try {
       const { treeType } = req.params;
-      const deforest = await Deforestation.findOne({ treeType });
-      res.json({ 
-        treeType, 
-        percent: deforest?.percent || 0 
-      });
+      const table = await resourceRespawn(treeType);
+      res.json({ treeType, percent: table.occupancy, table });
     } catch (error) {
       console.error('Error obteniendo deforestación:', error);
       res.status(500).json({ error: 'Internal server error' });
@@ -10238,15 +10238,8 @@ app.post(
         return res.status(400).json({ error: 'Tipo de mineral no válido' });
       }
  
-      // Obtener porcentaje de agotamiento actual
-      const depletion = await MineDepletion.findOne({ mineralType });
-      const percent   = depletion ? depletion.percent : 0;
- 
-      // Igual que con los árboles: el agotamiento al 100 % penaliza con el
-      // respawn máximo, nunca con un bloqueo permanente.
-      let respawnSeconds = config.baseRespawn + (percent * config.respawnMultiplier);
-      if (percent >= 100) respawnSeconds = RESPAWN_MAX_SECONDS;
-      respawnSeconds = Math.min(RESPAWN_MAX_SECONDS, Math.max(5, respawnSeconds));
+      const tableState = await resourceRespawn(mineralType);
+      const respawnSeconds = tableState.respawnSeconds;
       const lockedUntil = new Date(Date.now() + respawnSeconds * 1000);
 
       await MineLock.findOneAndUpdate(
@@ -10331,11 +10324,8 @@ app.get(
         return res.status(400).json({ error: 'Tipo de mineral no válido' });
       }
  
-      const depletion = await MineDepletion.findOne({ mineralType });
-      return res.json({
-        mineralType,
-        percent: depletion?.percent || 0
-      });
+      const table = await resourceRespawn(mineralType);
+      return res.json({ mineralType, percent: table.occupancy, table });
     } catch (error) {
       console.error('Error obteniendo agotamiento de mina:', error);
       res.status(500).json({ error: 'Internal server error' });
@@ -10384,9 +10374,10 @@ app.get(
 // (`GATHER_ENFORCE=true`) SOLO tras cablear el cliente para que llame a
 // /api/gather/claim en vez de acuñar, y probarlo en staging.
 // =============================================================================
-const GATHER_ENFORCE = String(process.env.GATHER_ENFORCE || '').toLowerCase() === 'true';
+const GATHER_ENFORCE = true; // All deployed gathering clients use the authoritative endpoint.
 
 // nodeKey (sprite) → tipo de nodo, y tipo de nodo → item que suelta.
+const RESOURCE_WORLD_NODES = new Set(["carbon_pngx1", "carbon_pngx2", "sprite_arbolx1", "sprite_arbolx10", "sprite_arbolx11", "sprite_arbolx12", "sprite_arbolx13", "sprite_arbolx14", "sprite_arbolx15", "sprite_arbolx16", "sprite_arbolx17", "sprite_arbolx18", "sprite_arbolx2", "sprite_arbolx3", "sprite_arbolx4", "sprite_arbolx5", "sprite_arbolx6", "sprite_arbolx7", "sprite_arbolx8", "sprite_arbolx9", "sprite_arbustos_1", "sprite_arbustos_10", "sprite_arbustos_11", "sprite_arbustos_12", "sprite_arbustos_13", "sprite_arbustos_14", "sprite_arbustos_15", "sprite_arbustos_16", "sprite_arbustos_17", "sprite_arbustos_18", "sprite_arbustos_19", "sprite_arbustos_2", "sprite_arbustos_20", "sprite_arbustos_21", "sprite_arbustos_22", "sprite_arbustos_23", "sprite_arbustos_24", "sprite_arbustos_25", "sprite_arbustos_26", "sprite_arbustos_27", "sprite_arbustos_28", "sprite_arbustos_3", "sprite_arbustos_4", "sprite_arbustos_5", "sprite_arbustos_6", "sprite_arbustos_7", "sprite_arbustos_8", "sprite_arbustos_9", "sprite_minar_cobre1", "sprite_minar_cobre2", "sprite_minar_cobre3", "sprite_minar_cobre4", "sprite_minar_hierro1", "sprite_minar_hierro2", "sprite_minar_hierro3", "sprite_minar_piedra1", "sprite_minar_piedra2", "sprite_minar_piedra3", "sprite_minar_piedra4", "sprite_minar_piedra5", "sprite_pinos1", "sprite_pinos10", "sprite_pinos11", "sprite_pinos12", "sprite_pinos13", "sprite_pinos14", "sprite_pinos15", "sprite_pinos16", "sprite_pinos17", "sprite_pinos18", "sprite_pinos19", "sprite_pinos2", "sprite_pinos20", "sprite_pinos21", "sprite_pinos22", "sprite_pinos23", "sprite_pinos24", "sprite_pinos25", "sprite_pinos26", "sprite_pinos27", "sprite_pinos28", "sprite_pinos29", "sprite_pinos3", "sprite_pinos30", "sprite_pinos31", "sprite_pinos32", "sprite_pinos33", "sprite_pinos34", "sprite_pinos35", "sprite_pinos36", "sprite_pinos37", "sprite_pinos38", "sprite_pinos39", "sprite_pinos4", "sprite_pinos40", "sprite_pinos41", "sprite_pinos42", "sprite_pinos43", "sprite_pinos44", "sprite_pinos45", "sprite_pinos5", "sprite_pinos6", "sprite_pinos7", "sprite_pinos8", "sprite_pinos9"]);
 function gatherNodeTypeFromKey(key) {
   const k = String(key || '');
   if (k.startsWith('sprite_pinos'))    return { kind: 'tree', type: 'pinos' };
@@ -10416,7 +10407,7 @@ const GATHER_REWARD_TIPO = {
   carbon: 'carbon'
 };
 // Conjunto de tipos que SOLO el servidor puede acuñar (recolección).
-const GATHER_TIPOS = new Set(Object.values(GATHER_REWARD_TIPO));
+const GATHER_TIPOS = new Set([...Object.values(GATHER_REWARD_TIPO), 'mineral_carbon']);
 
 // El servidor decide la recompensa (misma idea que el cliente, pero autoritativa):
 // herramienta baja (madera) → menos probabilidad; alta → +cantidad. Puede dar 0.
@@ -10496,12 +10487,12 @@ async function mintGatherReward(address, tipo, quantity) {
   try {
     if (target) {
       const tx = await c.increaseInvoiceQuantity(target.id, quantity, { gasPrice, nonce });
-      await tx.wait();
+      await tx.wait(1, 120000);
       return { id: target.id, manualId: target.manualId, cantidad: target.cantidad + quantity };
     } else {
       const manualId = ('g' + tipo.replace(/[^a-z0-9]/gi, '').slice(0, 10) + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)).slice(0, 60);
       const tx = await c.createInvoice(address, tipo, quantity, manualId, { gasPrice, nonce });
-      const receipt = await tx.wait();
+      const receipt = await tx.wait(1, 120000);
       let newId = null;
       try {
         for (const log of receipt.logs) {
@@ -10519,79 +10510,119 @@ async function mintGatherReward(address, tipo, quantity) {
   }
 }
 
-// Cooldown en memoria por jugador (evita spam del endpoint). El tope económico
-// REAL es el bloqueo por respawn del nodo.
-const _gatherLastByPlayer = new Map();
-
-// POST /api/gather/claim — el cliente lo llama al COMPLETAR una tala/mina.
-// Valida el nodo, lo bloquea (respawn), decide y acuña la recompensa.
-app.post('/api/gather/claim',
-  apiLimiter,
-  authMiddleware,
-  csrfProtection,
-  body('nodeKey').isString().notEmpty(),
-  body('toolId').optional().isString(),
+// RESOURCE_GATHER_START
+// Each known world node is acquired with one Mongo compare-and-set. A duplicate
+// upsert is a competing claim, never permission to award the same node twice.
+async function claimResourceNode(node, nodeKey, lockedUntil) {
+  const Model = node.kind === 'tree' ? TreeLock : MineLock;
+  const key = node.kind === 'tree' ? 'treeKey' : 'mineKey';
+  const type = node.kind === 'tree' ? 'treeType' : 'mineralType';
+  try {
+    return await Model.findOneAndUpdate({ [key]: nodeKey, $or: [{ lockedUntil: { $lte: new Date() } }, { lockedUntil: null }] },
+      { $set: { [type]: node.type, lockedUntil } }, { new: true, upsert: true }).lean();
+  } catch (e) { if (e.code === 11000) return null; throw e; }
+}
+async function gatherToolAllowed(address, node, toolId) {
+  const match = /^(hacha|pico)_de_(madera|piedra|cobre|hierro)$/.exec(String(toolId));
+  if (!match || match[1] !== (node.kind === 'tree' ? 'hacha' : 'pico')) return false;
+  const tipo = itemTipoOnChain(toolId);
+  if (!tipo) return false;
+  const contract = new ethers.Contract(CONTRACTS.ITEMS_CONTRACT.address, CONTRACTS.ITEMS_CONTRACT.abi, obtenerProveedorLecturaAdmin());
+  const invoices = await contract.getUserInventorySnapshot(address);
+  return invoices.some(inv => inv.active && String(inv.owner).toLowerCase() === address && String(inv.tipo) === tipo && BigInt(inv.cantidad) > 0n);
+}
+// Existing probabilities and mixed mine outputs are preserved from GameScene.
+const RESOURCE_NODE_REWARDS = Object.freeze({
+  pinos: [{ id: 'madera_pinos', chance: 100 }], arbustos: [{ id: 'madera_con_hojas', chance: 100 }], arbolx: [{ id: 'madera_seca', chance: 100 }],
+  piedra: [{ id: 'mineral_piedra', chance: 100 }],
+  cobre: [{ id: 'mineral_piedra', chance: 40 }, { id: 'mineral_piedra_cobre', chance: 60 }],
+  hierro: [{ id: 'mineral_piedra', chance: 60 }, { id: 'mineral_piedra_hierro', chance: 40 }],
+  carbon: [{ id: 'carbon', chance: 100 }, { id: 'mineral_carbon', chance: 100 }]
+});
+function resourceRollRewards(node, toolId, tables, random = Math.random) {
+  const bonus = toolId.endsWith('_madera') ? 0.6 : toolId.endsWith('_piedra') ? 1.1 : toolId.endsWith('_cobre') ? 1.25 : 1.5;
+  const candidates = RESOURCE_NODE_REWARDS[node.type].filter(r => tables.some(t => t.tipo === itemTipoOnChain(r.id) && !t.exhausted));
+  let selected = candidates.filter(r => Math.floor(random() * 100) + 1 <= Math.min(100, r.chance * bonus));
+  if (!selected.length && bonus >= 1 && candidates.length) selected = [candidates[0]];
+  return selected.map(r => {
+    const tipo = itemTipoOnChain(r.id), table = tables.find(t => t.tipo === tipo);
+    return { tipo, itemId: r.id, quantity: Math.min(rollGatherAmount(toolId),
+      Number(BigInt(table.remaining) < 3n ? BigInt(table.remaining) : 3n), Number(BigInt(table.perInvoiceLimit) < 3n ? BigInt(table.perInvoiceLimit) : 3n)) };
+  });
+}
+const _resourceGatherInFlight = new Set();
+const gatherReceiptSchema = new mongoose.Schema({
+  _id: String, wallet: String, nodeKey: String, result: mongoose.Schema.Types.Mixed,
+  status: { type: String, default: 'pending' }, createdAt: { type: Date, default: Date.now }
+}, { collection: 'resource_gather_receipts', versionKey: false });
+gatherReceiptSchema.index({ createdAt: 1 }, { expireAfterSeconds: 7 * 86400 });
+const GatherReceipt = mongoose.models.GatherReceipt || mongoose.model('GatherReceipt', gatherReceiptSchema);
+async function resourcePersistInventory(address) {
+  const auth = await PlayerAuth.findOne({ address }).lean();
+  if (!auth?.playerName) throw new Error('user_not_found');
+  const invoices = (await facturasLibresDeCadena(address)).filter(f => f.owner === address);
+  for (let n = 0; n < 4; n++) {
+    const gp = await GamePlayer.findOne({ playerName: auth.playerName, address }).lean();
+    if (!gp) throw new Error('user_not_found');
+    const slots = reconciliarSlotsDeCadena(gp, invoices);
+    const stamp = new Date(Math.max(Date.now(), new Date(gp.marketWriteAt || 0).getTime() + 1));
+    const saved = await GamePlayer.updateOne({ playerName: auth.playerName, address,
+      inventory: gp.inventory ?? null, chest: gp.chest ?? null, marketWriteAt: gp.marketWriteAt || null },
+      { $set: { inventory: slots.inventory, chest: slots.chest, marketWriteAt: stamp } });
+    if (saved.matchedCount === 1) return stamp.toISOString();
+  }
+  throw new Error('inventory_changed_retry');
+}
+app.post('/api/gather/claim', apiLimiter, authMiddleware, csrfProtection,
+  body('nodeKey').isString().isLength({ min: 1, max: 100 }), body('toolId').isString().isLength({ min: 1, max: 50 }),
+  body('ref').isString().matches(/^[A-Za-z0-9_-]{8,64}$/),
   async (req, res) => {
     try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
-      const address = req.user.address.toLowerCase();
-      const { nodeKey, toolId } = req.body;
+      if (!validationResult(req).isEmpty()) return res.status(400).json({ error: 'invalid_gather_request' });
+      const address = String(req.user.address).toLowerCase(), { nodeKey, toolId, ref } = req.body;
       if (await esFantasma({ address })) return responderFantasma(res);
-
       const node = gatherNodeTypeFromKey(nodeKey);
-      if (!node) return res.status(400).json({ error: 'invalid_node' });
-
-      // Cooldown por jugador (200ms) — anti-spam.
-      const now = Date.now();
-      const last = _gatherLastByPlayer.get(address) || 0;
-      if (now - last < 200) return res.status(429).json({ error: 'too_fast' });
-      _gatherLastByPlayer.set(address, now);
-
-      // El nodo no debe estar ya bloqueado (en respawn).
-      // 60 s, igual que TREE_TYPE_CONFIG / MINERAL_TYPE_CONFIG.
-      const respawnSec = 60;
-      if (node.kind === 'tree') {
-        const lock = await TreeLock.findOne({ treeKey: nodeKey });
-        if (lock && lock.lockedUntil && lock.lockedUntil > new Date()) {
-          return res.status(409).json({ error: 'node_locked', lockedUntil: lock.lockedUntil });
+      if (!node || !RESOURCE_WORLD_NODES.has(nodeKey)) return res.status(400).json({ error: 'invalid_node' });
+      if (_resourceGatherInFlight.has(address) || _resourceGatherInFlight.size >= 64) return res.status(429).json({ error: 'gather_busy' });
+      _resourceGatherInFlight.add(address);
+      try { return await enColaDelJugador('inventory:' + address, async () => {
+        const receiptKey = address + ':' + ref;
+        const previous = await GatherReceipt.findById(receiptKey).lean();
+        if (previous) {
+          if (previous.nodeKey !== nodeKey) return res.status(409).json({ error: 'gather_ref_conflict' });
+          return res.status(previous.result ? previous.result.revision ? 202 : 200 : 202).json(previous.result || {
+            ok: false, revision: true, error: 'gather_confirmation_pending', message: 'This gathering request is awaiting reconciliation; it will not be minted twice.' });
         }
-      } else {
-        const lock = await MineLock.findOne({ mineKey: nodeKey });
-        if (lock && lock.lockedUntil && lock.lockedUntil > new Date()) {
-          return res.status(409).json({ error: 'node_locked', lockedUntil: lock.lockedUntil });
+        const table = await resourceRespawn(node.type);
+        if (table.exhausted) return res.status(409).json({ error: 'resource_capacity_exhausted', message: 'This resource has reached its global table limit. Capacity returns when resources are consumed.', table });
+        if (!await gatherToolAllowed(address, node, toolId)) return res.status(403).json({ error: 'gather_tool_required', message: 'You need to own the required tool.' });
+        const lockedUntil = new Date(Date.now() + table.respawnSeconds * 1000);
+        const acquired = await claimResourceNode(node, nodeKey, lockedUntil);
+        if (!acquired) return res.status(409).json({ error: 'node_locked', message: 'Another player has already gathered this node.' });
+        await GatherReceipt.create({ _id: receiptKey, wallet: address, nodeKey, createdAt: new Date() });
+        try { io.emit(node.kind === 'tree' ? 'treeLocked' : 'mineLocked', { [node.kind === 'tree' ? 'treeKey' : 'mineKey']: nodeKey,
+          [node.kind === 'tree' ? 'treeType' : 'mineralType']: node.type, lockedUntil }); } catch (_) {}
+        const rewards = resourceRollRewards(node, toolId, table.tables), confirmed = [];
+        let revision = false;
+        for (const reward of rewards) {
+          let minted;
+          try { minted = await mintGatherReward(address, reward.tipo, reward.quantity); } catch (_) {}
+          if (!minted || !minted.id) { revision = true; break; }
+          confirmed.push({ ...reward, invoiceId: minted.id, manualId: minted.manualId, newTotal: minted.cantidad });
         }
-      }
-
-      // Bloquear el nodo (respawn) — tope económico.
-      const lockedUntil = new Date(now + respawnSec * 1000);
-      if (node.kind === 'tree') {
-        await TreeLock.findOneAndUpdate({ treeKey: nodeKey }, { treeKey: nodeKey, treeType: node.type, lockedUntil }, { upsert: true });
-      } else {
-        await MineLock.findOneAndUpdate({ mineKey: nodeKey }, { mineKey: nodeKey, mineralType: node.type, lockedUntil }, { upsert: true });
-      }
-
-      // Decidir y acuñar la recompensa (server-authoritative).
-      const reward = decideGatherReward(node.type, toolId);
-      let minted = null;
-      if (reward.tipo && reward.quantity > 0) {
-        minted = await mintGatherReward(address, reward.tipo, reward.quantity);
-      }
-
-      return res.json({
-        ok: true,
-        locked: true,
-        lockedUntil,
-        reward: minted ? { tipo: reward.tipo, quantity: reward.quantity, invoiceId: minted.id, manualId: minted.manualId, newTotal: minted.cantidad } : null
-      });
+        let inventoryLoadedAt = null;
+        if (confirmed.length) { try { inventoryLoadedAt = await resourcePersistInventory(address); } catch (_) { revision = true; } }
+        const result = { ok: true, locked: true, lockedUntil, table, rewards: confirmed, inventoryLoadedAt,
+          revision, message: revision ? 'Some deliveries need inventory reconciliation. Only confirmed items are shown.' : undefined };
+        await GatherReceipt.updateOne({ _id: receiptKey }, { $set: { result, status: revision ? 'review' : 'confirmed' } });
+        return res.status(revision ? 202 : 200).json(result);
+      }); } finally { _resourceGatherInFlight.delete(address); }
     } catch (e) {
-      console.error('❌ Error en /api/gather/claim:', e);
-      return res.status(500).json({ error: 'internal_server_error' });
+      console.warn('gather:', e.code || e.message);
+      return res.status(503).json({ error: e.code || 'resource_read_unavailable', message: 'Resources cannot be verified right now. No delivery was reported as confirmed.' });
     }
-  }
-);
-
+  });
+// RESOURCE_GATHER_END
 
 
 // =============================================================================
@@ -15590,38 +15621,9 @@ const TABLAS_SOLO_ACUNA_SERVIDOR = new Set(['pes1', 'pes2', 'pes3', 'pes4', 'pes
   'pes9', 'pes10', 'pes11', 'pes12', 'pes13', 'pes14']);
 
 // =============================================================================
-// CUPO DE LAS TABLAS DE ÍTEM EN EL CONTRATO
-// -----------------------------------------------------------------------------
-// BUG QUE ESTO ARREGLA — "al minar carbón fallan las transacciones":
-//
-// En el ItemContract cada `tipo` (carbon, mineral_hierro, "madera pinos"…) es
-// una TABLA con dos topes: `limit` (cuántas unidades pueden existir en total en
-// todo el juego) y `perInvoiceLimit` (cuántas caben en una sola factura). Si la
-// tabla no está dada de alta o se quedó sin cupo, `createInvoice` trunca la
-// cantidad y `increaseInvoiceQuantity` revierte con ExceedsTipoLimit.
-//
-// Para las barras del jugador (vida, agua, comida, oro, plata, exp) esto ya se
-// vigilaba con ensureStatTipo() — de hecho fue justo el fallo que dejaba a la
-// gente con "agua 12 %". Para los ÍTEMS no lo vigilaba NADIE. Los tipos que se
-// dieron de alta a mano al desplegar funcionan; los que se quedaron fuera (o los
-// que agoten su cupo con el tiempo) fallan siempre, y desde el juego se ve como
-// "Could not confirm the on-chain transaction" cada vez que se pica ese
-// mineral. El carbón es el caso que se nota porque solo sale de dos rocas.
-//
-// Aquí se hace lo mismo que con las barras: antes de firmar una acuñación, se
-// mira la tabla y, si hace falta, el relayer (que es admin del contrato) la
-// prepara con setLimit. Es idempotente y se cachea, así que en marcha normal no
-// añade ni una lectura.
-//
-// SEGURIDAD: solo se preparan tipos de la LISTA BLANCA (los valores de
-// ITEM_TIPO_MAP, que son los ítems reales del juego). Un cliente manipulado que
-// pida acuñar un tipo inventado no consigue que se le dé de alta: la
-// transacción sigue su curso y revierte como antes.
+// ITEM TABLE CAPACITY: owner-configured limits are checked before minting.
+// Missing or full tables reject issuance; gameplay never increases their caps.
 // =============================================================================
-const ITEM_TIPO_CACHE_TTL_MS = 5 * 60 * 1000;
-const ITEM_TIPO_HEADROOM     = 1_000_000;  // unidades libres que se quieren tener
-const ITEM_TIPO_RAISE_FACTOR = 10;         // al ampliar se deja headroom × esto
-const _itemTipoCache = new Map();          // tipo → { at: ms, ok: bool }
 let _tiposItemPermitidos = null;
 
 function tiposDeItemPermitidos() {
@@ -15641,81 +15643,21 @@ function stackMaximoDelTipo(tipo) {
 
 /**
  * Se asegura de que la tabla `tipo` exista y tenga cupo para acuñar `cantidad`.
- * No lanza nunca: si algo falla, se registra y la transacción sigue su camino
- * (fallará como fallaba antes, pero no por culpa de esta comprobación).
+ * Rechaza capacidad insuficiente o lecturas fallidas. No amplía ningún límite.
  */
 async function ensureItemTipoOnChain(contract, tipo, cantidad) {
-  if (!relayerWallet || !tipo) return;
-  // Las tablas que crea el administrador a mano (parcelas, nivel, nombre,
-  // cons_parcelas) no se tocan: su perInvoiceLimit es una decisión de diseño
-  // (20 parcelas por casilla), no un cupo que haya que ensanchar.
-  if (TABLAS_MANUALES.has(tipo)) return;
-  if (!tiposDeItemPermitidos().has(tipo)) return;      // lista blanca
-  if (typeof contract.getTipoStats !== 'function') return;
-
-  const cache = _itemTipoCache.get(tipo);
-  if (cache && cache.ok && (Date.now() - cache.at) < ITEM_TIPO_CACHE_TTL_MS) return;
-
-  const perInvoiceObjetivo = Math.max(stackMaximoDelTipo(tipo), 50);
-  const necesitaAhora      = Math.max(Number(cantidad) || 0, 1);
-
-  let info;
-  try {
-    const ts = await contract.getTipoStats(tipo);
-    info = {
-      totalQuantity:   Number(ts.totalQuantity   ?? ts[0] ?? 0),
-      limit:           Number(ts.limit           ?? ts[1] ?? 0),
-      perInvoiceLimit: Number(ts.perInvoiceLimit ?? ts[2] ?? 0),
-      exists:          Boolean(ts.exists !== undefined ? ts.exists : ts[5])
-    };
-  } catch (e) {
-    console.warn(`⚠️  ensureItemTipoOnChain[${tipo}]: getTipoStats falló:`, e.message);
-    return;
-  }
-
-  const libre            = info.limit > info.totalQuantity ? info.limit - info.totalQuantity : 0;
-  const faltaPerInvoice  = info.perInvoiceLimit < perInvoiceObjetivo;
-  const faltaCupoGlobal  = libre < Math.max(necesitaAhora, ITEM_TIPO_HEADROOM / 100);
-
-  if (info.exists && !faltaPerInvoice && !faltaCupoGlobal) {
-    _itemTipoCache.set(tipo, { at: Date.now(), ok: true });
-    return;
-  }
-
-  if (typeof contract.setLimit !== 'function') {
-    console.warn(`⚠️  Tabla [${tipo}] corta y el ABI no expone setLimit — no se puede ampliar`);
-    return;
-  }
-
-  const nuevoPerInvoice = Math.max(perInvoiceObjetivo, info.perInvoiceLimit);
-  const nuevoLimit      = Math.max(
-    info.limit,
-    info.totalQuantity + ITEM_TIPO_HEADROOM * ITEM_TIPO_RAISE_FACTOR,
-    nuevoPerInvoice
-  );
-
-  try {
-    const nonce = await relayerNonceManager.getNextNonce();
-    console.log(
-      `🧾 setLimit[${tipo}]: limit ${info.limit}→${nuevoLimit}, ` +
-      `perInvoice ${info.perInvoiceLimit}→${nuevoPerInvoice}` +
-      (info.exists ? '' : ' (tabla NUEVA — nunca se había dado de alta)')
-    );
-    const tx = await contract.setLimit(tipo, nuevoLimit, nuevoPerInvoice, {
-      gasPrice: gatherGasPrice(), nonce
-    });
-    await tx.wait();
-    console.log(`✅ Tabla de ítem [${tipo}] lista: limit=${nuevoLimit} perInvoice=${nuevoPerInvoice}`);
-    _itemTipoCache.set(tipo, { at: Date.now(), ok: true });
-  } catch (e) {
-    // Lo más probable: el relayer no es admin del contrato. Se avisa claro,
-    // porque es una intervención manual (setLimit desde el owner).
-    console.error(
-      `❌ setLimit[${tipo}] falló (¿el relayer es admin del ItemContract?):`, e.message
-    );
-    try { await relayerNonceManager.resetNonce(); } catch (_) {}
-    _itemTipoCache.set(tipo, { at: Date.now(), ok: false });
-  }
+  // Limits configured by the owner are immutable during gameplay, including
+  // per-invoice limits. The contract remains the final atomic supply guard.
+  if (!tipo || TABLAS_MANUALES.has(tipo) || !tiposDeItemPermitidos().has(tipo)) return;
+  const stats = await contract.getTipoStats(tipo);
+  const exists = Boolean(stats.exists ?? stats[5]);
+  const quantity = BigInt(stats.totalQuantity ?? stats[0]);
+  const limit = BigInt(stats.limit ?? stats[1]);
+  const perInvoice = BigInt(stats.perInvoiceLimit ?? stats[2]);
+  const requested = BigInt(cantidad);
+  if (!exists || limit <= 0n || perInvoice <= 0n) throw Object.assign(new Error('resource_not_configured'), { code: 'resource_not_configured' });
+  if (requested < 0n || quantity + requested > limit) throw Object.assign(new Error('resource_capacity_exhausted'), { code: 'resource_capacity_exhausted' });
+  if (requested > perInvoice) throw Object.assign(new Error('resource_invoice_limit'), { code: 'resource_invoice_limit' });
 }
 
 /**
@@ -18076,12 +18018,13 @@ app.get('/api/admin/overview', adminAuth, apiLimiter, async (req, res) => {
       GamePlayer.countDocuments({ createdAt: { $gte: hace24h } }),
       GamePlayer.countDocuments({ createdAt: { $gte: hace7d } }),
       PlayerPlaytime.countDocuments({ ultimaVez: { $gte: hace24h } }),
-      ConnectedUser.countDocuments({}),
+      Promise.resolve(_liveGameAccounts.size),
       PlayerPlaytime.aggregate([{ $group: { _id: null, total: { $sum: '$segundos' } } }])
     ]);
     const totalSeg = (agg && agg[0] && agg[0].total) || 0;
     return res.json({
       totalCuentas, nuevas24h, nuevas7d, activos24h, conectados,
+      presencia: { scope: 'instance', source: 'authenticated_game_sockets', observedAt: new Date().toISOString() },
       tiempoTotalSegundos: totalSeg,
       tiempoTotal: formatearDuracion(totalSeg),
       adminAddress: req.admin.address || null
@@ -18115,6 +18058,7 @@ console.log('✅ Admin players routes: /api/admin/players, /api/admin/overview, 
 // ── GET /api/admin/client-errors ───────────────────────────────────────────
 app.get('/api/admin/client-errors', adminAuth, apiLimiter, async (req, res) => {
   try {
+    if (req.query.grouped === '1') return await reporterGrouped(req, res, 'client');
     const limite  = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100));
     const salto   = Math.max(0, parseInt(req.query.skip, 10) || 0);
     const busca   = String(req.query.q || '').trim().slice(0, 120);
@@ -18182,6 +18126,7 @@ app.delete('/api/admin/client-errors', adminAuth, strictLimiter, async (req, res
       return res.status(400).json({ ok: false, error: 'confirmation_required' });
     }
     const r = await ErrorReport.deleteMany({});
+    await ErrorReportActor.deleteMany({});
     console.warn(`🗑️  ${req.admin.address} vació la bandeja de errores (${r.deletedCount} fichas)`);
     res.json({ ok: true, borrados: r.deletedCount || 0 });
   } catch (e) {
@@ -18200,6 +18145,7 @@ app.delete('/api/admin/client-errors', adminAuth, strictLimiter, async (req, res
 // a un problema de infraestructura y que sí hay que mirar.
 app.get('/api/admin/relay-failures', adminAuth, apiLimiter, async (req, res) => {
   try {
+    if (req.query.grouped === '1') return await reporterGrouped(req, res, 'relay');
     const limite = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100));
     const salto  = Math.max(0, parseInt(req.query.skip, 10) || 0);
 
@@ -18229,6 +18175,544 @@ app.get('/api/admin/relay-failures', adminAuth, apiLimiter, async (req, res) => 
 });
 
 console.log('✅ Reporter routes: /api/admin/client-errors, /api/admin/relay-failures');
+
+// RESOURCE_MARKET_START — existing items move; normal P2P never mints or burns.
+const marketAssetEscrowSchema = new mongoose.Schema({
+  _id: String, owner: String, itemId: String, qty: Number, sourceInvoiceId: Number, sourceManualId: String,
+  status: { type: String, default: 'awaiting_escrow' }, escrowInvoiceId: Number, escrowManualId: String,
+  leaseToken: String, leaseUntil: Date, createdAt: { type: Date, default: Date.now }
+}, { collection: 'market_asset_escrows', versionKey: false });
+const MarketAssetEscrow = mongoose.models.MarketAssetEscrow || mongoose.model('MarketAssetEscrow', marketAssetEscrowSchema);
+const marketAssetClaimSchema = new mongoose.Schema({
+  _id: String, listingId: { type: String, index: true }, wallet: { type: String, index: true }, itemId: String,
+  qty: Number, op: String, sourceInvoiceId: Number, sourceManualId: String, destinationManualId: String,
+  status: { type: String, default: 'pending', index: true }, txHash: String, nonce: Number,
+  rawTx: { type: String, select: false },
+  invoiceId: Number, manualId: String, error: String, createdAt: { type: Date, default: Date.now }, updatedAt: Date
+}, { collection: 'market_asset_claims', versionKey: false });
+marketAssetClaimSchema.index({ wallet: 1, status: 1, createdAt: -1 });
+const MarketAssetClaim = mongoose.models.MarketAssetClaim || mongoose.model('MarketAssetClaim', marketAssetClaimSchema);
+const MARKET_TRANSFER_ABI = [
+  'function getInvoice(uint256) view returns(tuple(uint256 id,string manualId,address owner,string tipo,uint256 cantidad,bool active,uint256 createdAt))',
+  'function getInvoiceByManualId(string) view returns(tuple(uint256 id,string manualId,address owner,string tipo,uint256 cantidad,bool active,uint256 createdAt))',
+  'function transferInvoice(address,address,uint256,uint256,string) returns(uint256)',
+  'event InvoiceTransferred(uint256 indexed originalId,uint256 newId,address indexed from,address indexed to,uint256 amount)'
+];
+function marketTransferKey(op, listingId, wallet, ref) { return 'mt_' + crypto.createHash('sha256').update([op,listingId,wallet,ref].join(':')).digest('hex'); }
+function marketTransferError(code) { return Object.assign(new Error(code), { code, status: 409 }); }
+function marketRequireSession(session) { if (!session) throw new Error('market_asset_session_required'); }
+const resourceMarketAdapter = {
+  async prepareListing({ listing, owner, itemId, qty, slot }, session) {
+    marketRequireSession(session); if (!itemTipoOnChain(itemId)) return;
+    if (!slot || !Number.isSafeInteger(Number(slot.IDX)) || Number(slot.IDX) < 1 || !slot.Manualid) throw marketTransferError('canonical_invoice_required');
+    await MarketAssetEscrow.create([{ _id: String(listing._id), owner, itemId, qty,
+      sourceInvoiceId: Number(slot.IDX), sourceManualId: String(slot.Manualid), status: 'awaiting_escrow' }], { session });
+  },
+  async ready(listing, session) {
+    marketRequireSession(session); if (!itemTipoOnChain(listing.itemId)) return true;
+    const escrow = await MarketAssetEscrow.findById(String(listing._id)).session(session).lean();
+    return !!(escrow && escrow.status === 'held' && escrow.itemId === listing.itemId && escrow.owner === listing.owner);
+  },
+  async claim({ listing, wallet, qty, op, ref }, session) {
+    marketRequireSession(session); if (!itemTipoOnChain(listing.itemId)) return null;
+    const escrow = await MarketAssetEscrow.findById(String(listing._id)).session(session).lean();
+    if (!escrow) throw marketTransferError('legacy_listing_requires_review');
+    if (op === 'refund' && escrow.status === 'awaiting_escrow') {
+      const updated=await MarketAssetEscrow.updateOne({ _id: escrow._id, status: 'awaiting_escrow' }, { $set: { status:'cancelled' } }, { session });
+      if(updated.matchedCount!==1)throw marketTransferError('market_escrow_changed');
+      return null;
+    }
+    if (escrow.status !== 'held') throw marketTransferError('market_escrow_pending');
+    const id = marketTransferKey(op, String(listing._id), wallet, ref);
+    await MarketAssetClaim.create([{ _id:id, listingId:String(listing._id), wallet, itemId:listing.itemId, qty, op,
+      sourceInvoiceId:escrow.escrowInvoiceId, sourceManualId:escrow.escrowManualId,
+      destinationManualId:'mt:' + id.slice(3,43), createdAt:new Date() }], { session });
+    return id;
+  },
+  async replay({ listingId, wallet, ref, op }, session) {
+    marketRequireSession(session);
+    const id = marketTransferKey(op, String(listingId), wallet, ref);
+    const claim = await MarketAssetClaim.findById(id).session(session).lean();
+    if (!claim) return null;
+    const gp = await GamePlayer.findOne({ address:wallet }).session(session).lean();
+    const stats = gp && await PlayerStats.findOne({ playerName:gp.playerName }).session(session).lean();
+    return { success:true, alreadyProcessed:true, receiptId:id, oro:stats?.oro, plata:stats?.plata,
+      inventory:gp ? [...(gp.inventory || []).map(s=>({...s, source:'inventory'})),...(gp.chest || []).map(s=>({...s,source:'chest'}))] : [] };
+  },
+  async describe(listings) {
+    const docs = await MarketAssetEscrow.find({ _id: { $in:listings.map(l=>String(l.id)) } }).select('_id status').lean();
+    const byId = new Map(docs.map(d=>[d._id,d.status]));
+    return listings.map(l=>({ ...l, chainReady: !itemTipoOnChain(l.itemId) || byId.get(String(l.id)) === 'held',
+      chainStatus:byId.get(String(l.id)) || 'legacy_review' }));
+  }
+};
+async function executeMarketAssetClaim(id) {
+  let claim = await MarketAssetClaim.findById(id).select('+rawTx').lean();
+  if (!claim) throw marketTransferError('market_receipt_not_found');
+  if (claim.status === 'confirmed' || claim.status === 'failed') return claim;
+  if (!relayerWallet) throw marketTransferError('relayer_unavailable');
+  const token = crypto.randomUUID(), now = new Date();
+  const escrow = await MarketAssetEscrow.findOneAndUpdate({ _id:claim.listingId,
+    $or:[{leaseUntil:{$lte:now}},{leaseUntil:null}] }, { $set:{leaseToken:token,leaseUntil:new Date(Date.now()+180000)} }, {new:true}).lean();
+  if (!escrow) return claim;
+  try {
+    claim = await MarketAssetClaim.findById(id).select('+rawTx').lean();
+    if (claim.status === 'confirmed') return claim;
+    const c = new ethers.Contract(CONTRACTS.ITEMS_CONTRACT.address, MARKET_TRANSFER_ABI, relayerWallet);
+    const from = claim.op === 'escrow' ? escrow.owner : relayerWallet.address.toLowerCase();
+    const to = claim.op === 'escrow' ? relayerWallet.address.toLowerCase() : claim.wallet;
+    let receipt = null, destination = null;
+    if (claim.txHash) {
+      receipt = await relayerWallet.provider.getTransactionReceipt(claim.txHash);
+      if (!receipt && claim.rawTx) {
+        const signed=ethers.Transaction.from(claim.rawTx);
+        const expected=c.interface.encodeFunctionData('transferInvoice',[from,to,claim.sourceInvoiceId,claim.qty,claim.destinationManualId]);
+        if(signed.hash!==claim.txHash || signed.from.toLowerCase()!==relayerWallet.address.toLowerCase() ||
+            signed.to.toLowerCase()!==String(CONTRACTS.ITEMS_CONTRACT.address).toLowerCase() || signed.data!==expected || signed.value!==0n)throw marketTransferError('market_signed_intent_mismatch');
+        try{await relayerWallet.provider.broadcastTransaction(claim.rawTx);}catch(_){}
+        receipt=await relayerWallet.provider.waitForTransaction(claim.txHash,1,120000);
+      }
+      if (!receipt) return claim;
+      if (Number(receipt.status) !== 1) {
+        await MarketAssetClaim.updateOne({_id:id},{$set:{status:'failed',error:'confirmed_chain_revert',updatedAt:new Date()}});
+        return { ...claim,status:'failed',error:'confirmed_chain_revert' };
+      }
+    } else if (claim.status === 'processing' || claim.status === 'review') {
+      // No tx hash after a process/network interruption: do not guess that it
+      // failed. A human can reconcile the ledger and contract events.
+      return claim;
+    } else {
+      if (claim.op !== 'escrow' && escrow.status !== 'held') throw marketTransferError('market_escrow_pending');
+      if (claim.op === 'escrow' && escrow.status !== 'awaiting_escrow' && escrow.status !== 'processing') throw marketTransferError('market_escrow_changed');
+      const inv = await c.getInvoice(claim.sourceInvoiceId);
+      if (!inv.active || String(inv.owner).toLowerCase() !== from || String(inv.tipo) !== itemTipoOnChain(claim.itemId) ||
+          String(inv.manualId) !== claim.sourceManualId || BigInt(inv.cantidad) < BigInt(claim.qty)) throw marketTransferError('market_source_invoice_changed');
+      const unsigned=await c.transferInvoice.populateTransaction(from,to,claim.sourceInvoiceId,claim.qty,claim.destinationManualId);
+      unsigned.gasPrice=gatherGasPrice();
+      unsigned.gasLimit=(await relayerWallet.provider.estimateGas({...unsigned,from:relayerWallet.address}))*120n/100n;
+      unsigned.chainId=(await relayerWallet.provider.getNetwork()).chainId;
+      await ecoTransaccion(async session=>{
+        const updated=await MarketAssetClaim.updateOne({_id:id,status:'pending'},{$set:{status:'processing',updatedAt:new Date()}},{session});
+        if(updated.matchedCount!==1)throw marketTransferError('market_claim_changed');
+        if(claim.op==='escrow'){
+          const locked=await MarketAssetEscrow.updateOne({_id:escrow._id,leaseToken:token,status:'awaiting_escrow'},{$set:{status:'processing'}},{session});
+          if(locked.matchedCount!==1)throw marketTransferError('market_escrow_changed');
+        }
+      });
+      const nonce = await relayerNonceManager.getNextNonce();
+      const rawTx=await relayerWallet.signTransaction({...unsigned,nonce});
+      const txHash=ethers.keccak256(rawTx);
+      await MarketAssetClaim.updateOne({_id:id},{$set:{nonce,txHash,rawTx,updatedAt:new Date()}});
+      const tx = await relayerWallet.provider.broadcastTransaction(rawTx);
+      receipt = await tx.wait(1,120000);
+    }
+    for (const log of receipt.logs || []) {
+      if (String(log.address).toLowerCase() !== String(CONTRACTS.ITEMS_CONTRACT.address).toLowerCase()) continue;
+      try {
+        const parsed=c.interface.parseLog(log);
+        if (parsed?.name==='InvoiceTransferred' && Number(parsed.args.originalId)===claim.sourceInvoiceId &&
+            String(parsed.args.to).toLowerCase()===to && BigInt(parsed.args.amount)===BigInt(claim.qty)) destination=Number(parsed.args.newId);
+      } catch (_) {}
+    }
+    if (!Number.isSafeInteger(destination) || destination<1) throw marketTransferError('market_transfer_receipt_needs_review');
+    // Persist the escrow receipt before exposing the listing to buyers.
+    if (claim.op==='escrow') await MarketAssetEscrow.updateOne({_id:escrow._id,leaseToken:token},{$set:{status:'held',escrowInvoiceId:destination,escrowManualId:claim.destinationManualId}});
+    await MarketAssetClaim.updateOne({_id:id},{$set:{status:'confirmed',invoiceId:destination,manualId:claim.destinationManualId,
+      txHash:receipt.hash || receipt.transactionHash || claim.txHash,updatedAt:new Date(),error:''}});
+    try { await enColaDelJugador('inventory:'+claim.wallet,()=>resourcePersistInventory(claim.wallet)); } catch (_) {}
+    return await MarketAssetClaim.findById(id).lean();
+  } catch (e) {
+    await MarketAssetClaim.updateOne({_id:id,status:{$ne:'confirmed'}},{$set:{status:'review',error:String(e.code || e.message).slice(0,250),updatedAt:new Date()}}).catch(()=>{});
+    return await MarketAssetClaim.findById(id).lean();
+  } finally {
+    await MarketAssetEscrow.updateOne({_id:escrow._id,leaseToken:token},{$set:{leaseUntil:new Date(0)},$unset:{leaseToken:1}}).catch(()=>{});
+  }
+}
+app.post('/api/marketplace/onchain/settle', strictLimiter, authMiddleware, csrfProtection, async (req,res)=>{
+  try {
+    const wallet=String(req.user.address || '').toLowerCase(), {op,listingId,receiptId}=req.body || {};
+    if (!['escrow','deliver','refund'].includes(op) || typeof listingId!=='string' || !mongoose.Types.ObjectId.isValid(listingId)) return res.status(400).json({error:'invalid_settlement'});
+    let id=receiptId;
+    if (op==='escrow') {
+      const deposit=await MarketAssetEscrow.findById(listingId).lean();
+      if (!deposit) return res.status(409).json({error:'legacy_listing_requires_review'});
+      if (deposit.owner!==wallet) return res.status(403).json({error:'not_listing_owner'});
+      id=marketTransferKey('escrow',listingId,wallet,'deposit');
+      if (!await MarketAssetClaim.exists({_id:id})) {
+        if (deposit.status!=='awaiting_escrow') return res.status(409).json({error:'market_escrow_changed'});
+        try { await MarketAssetClaim.create({_id:id,listingId,wallet,itemId:deposit.itemId,qty:deposit.qty,op:'escrow',
+          sourceInvoiceId:deposit.sourceInvoiceId,sourceManualId:deposit.sourceManualId,destinationManualId:'me:'+listingId,createdAt:new Date()}); }
+        catch(e){if(e.code!==11000)throw e;}
+      }
+    }
+    if (typeof id!=='string' || !/^mt_[a-f0-9]{64}$/.test(id)) return res.status(409).json({error:'market_receipt_required'});
+    const claim=await MarketAssetClaim.findById(id).lean();
+    if (!claim || claim.wallet!==wallet || claim.op!==op || claim.listingId!==listingId) return res.status(403).json({error:'not_settlement_owner'});
+    const done=await executeMarketAssetClaim(id);
+    res.set('Cache-Control','no-store');
+    return res.status(done.status==='confirmed'?200:202).json({ok:done.status==='confirmed',onchain:true,receiptId:id,status:done.status,
+      txHash:done.txHash || null,invoiceId:done.invoiceId,manualId:done.manualId,error:done.status==='confirmed'?undefined:'market_transfer_pending'});
+  } catch(e){return res.status(503).json({error:e.code || 'market_transfer_unavailable'});}
+});
+app.get('/api/marketplace/onchain/pending',apiLimiter,authMiddleware,async(req,res)=>{
+  try {
+    const wallet=String(req.user.address || '').toLowerCase();
+    const rows=await MarketAssetClaim.find({wallet,status:{$ne:'confirmed'}}).select('_id listingId itemId qty op status txHash error createdAt').sort({createdAt:1}).limit(30).lean();
+    res.set('Cache-Control','no-store');return res.json({ok:true,rows:rows.map(r=>({...r,receiptId:r._id}))});
+  }catch(_){return res.status(503).json({error:'market_pending_unavailable'});}
+});
+app.get('/api/marketplace/onchain/:listingId',apiLimiter,authMiddleware,async(req,res)=>{
+  try {
+    const deposit=await MarketAssetEscrow.findById(String(req.params.listingId)).lean();
+    if(!deposit)return res.status(409).json({error:'legacy_listing_requires_review'});
+    return res.json({ok:true,protocol:'transfer',status:deposit.status,itemId:deposit.itemId,qty:deposit.qty});
+  }catch(_){return res.status(503).json({error:'market_transfer_unavailable'});}
+});
+app.get('/api/admin/recursos/entregas',adminAuth,apiLimiter,async(req,res)=>{
+  try {
+    const after=String(req.query.after || ''),filter={status:{$ne:'confirmed'}};
+    if(after && !/^mt_[a-f0-9]{64}$/.test(after))return res.status(400).json({error:'invalid_cursor'});
+    if(after)filter._id={$gt:after};
+    const rows=await MarketAssetClaim.find(filter).select('_id listingId wallet itemId qty op status txHash error createdAt').sort({_id:1}).limit(51).maxTimeMS(5000).lean();
+    const hasMore=rows.length>50;if(hasMore)rows.pop();
+    // Historic burn/remint records have no provable native escrow. Show a sample,
+    // never manufacture a transfer entitlement from the old request payload.
+    const legacy=await Listing.aggregate([{$set:{listingKey:{$toString:'$_id'}}},{$lookup:{from:MarketAssetEscrow.collection.name,localField:'listingKey',foreignField:'_id',as:'escrow'}},
+      {$match:{'escrow.0':{$exists:false}}},{$sort:{_id:1}},{$limit:20},{$project:{_id:1,owner:1,itemId:1,qty:1}}]).option({maxTimeMS:5000});
+    res.set('Cache-Control','no-store');return res.json({ok:true,rows,hasMore,next:hasMore?rows.at(-1)._id:null,legacy});
+  }catch(_){return res.status(503).json({error:'market_review_unavailable'});}
+});
+app.post('/api/admin/recursos/entregas/revisar',adminAuth,strictLimiter,csrfProtection,async(req,res)=>{
+  try {
+    const id=String(req.body.receiptId || '');if(!/^mt_[a-f0-9]{64}$/.test(id))return res.status(400).json({error:'invalid_receipt'});
+    const claim=await MarketAssetClaim.findById(id).lean();
+    if(!claim)return res.status(404).json({error:'receipt_not_found'});
+    if(!['pending','confirmed'].includes(claim.status) && !claim.txHash)return res.status(409).json({error:'manual_review_required',message:'No hay un hash verificable. No se repite la transferencia ni se devuelve dinero sin revisar la cadena.'});
+    const result=await executeMarketAssetClaim(id);
+    res.set('Cache-Control','no-store');return res.json({ok:true,status:result.status,txHash:result.txHash || null});
+  }catch(_){return res.status(503).json({error:'market_review_unavailable'});}
+});
+let _marketTransferSweepBusy=false;
+async function resourceMarketSweep(){
+  if(_marketTransferSweepBusy || !relayerWallet || mongoose.connection.readyState!==1)return;
+  _marketTransferSweepBusy=true;
+  try{
+    const rows=await MarketAssetClaim.find({$or:[{status:'pending'},{status:{$in:['processing','review']},txHash:{$type:'string',$ne:''}}]}).sort({createdAt:1}).limit(10).select('_id').lean();
+    for(const row of rows)await executeMarketAssetClaim(row._id);
+  }catch(e){console.warn('market transfer sweep:',e.code || e.message);}
+  finally{_marketTransferSweepBusy=false;}
+}
+setTimeout(()=>resourceMarketSweep(),40000).unref?.();
+setInterval(()=>resourceMarketSweep(),60000).unref?.();
+// RESOURCE_MARKET_END
+
+
+// RESOURCE_ECONOMY_START — controlled by the deployed table caps; never raises them.
+function createResourceEconomy({ readStats, readPolicy, now = Date.now, ttl = 15000, concurrency = 3, knownTypes }) {
+  const defaults = Object.freeze({ enabled: true, startPercent: 50, baseRespawn: 60, maxRespawn: 1800, priceMax: 2.5 });
+  const allowed = new Set(knownTypes), cache = new Map();
+  let active = 0, queue = [], policy = null, policyAt = 0, policyWork = null;
+  function validate(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('invalid_resource_policy');
+    const out = { ...defaults, ...input };
+    for (const k of Object.keys(input)) if (!Object.prototype.hasOwnProperty.call(defaults, k)) throw new Error('unknown_resource_policy_field');
+    if (typeof out.enabled !== 'boolean') throw new Error('invalid_resource_policy');
+    for (const [key, min, max] of [['startPercent', 0, 95], ['baseRespawn', 10, 3600], ['maxRespawn', 10, 86400], ['priceMax', 1, 5]]) {
+      if (typeof out[key] !== 'number' || !Number.isFinite(out[key]) || out[key] < min || out[key] > max) throw new Error('invalid_resource_policy');
+    }
+    if (!Number.isInteger(out.baseRespawn) || !Number.isInteger(out.maxRespawn) || out.maxRespawn < out.baseRespawn) throw new Error('invalid_resource_policy');
+    return out;
+  }
+  function evaluate(raw, settings = defaults) {
+    const cfg = validate(settings);
+    const quantity = BigInt(raw.totalQuantity ?? raw[0]), limit = BigInt(raw.limit ?? raw[1]);
+    const perInvoice = BigInt(raw.perInvoiceLimit ?? raw[2]), burned = BigInt(raw.totalBurned ?? raw[4] ?? 0);
+    const invoices = BigInt(raw.invoiceCount ?? raw[3] ?? 0), exists = Boolean(raw.exists ?? raw[5]);
+    if ([quantity, limit, perInvoice, burned, invoices].some(n => n < 0n)) throw new Error('invalid_table_stats');
+    const configured = exists && limit > 0n && perInvoice > 0n;
+    const remaining = limit > quantity ? limit - quantity : 0n;
+    const occupancy = configured ? Number((quantity * 10000n) / limit) / 100 : null;
+    const pressure = configured && cfg.enabled ? Math.min(1, Math.max(0, (occupancy - cfg.startPercent) / (100 - cfg.startPercent))) : 0;
+    const curve = pressure * pressure * (3 - 2 * pressure);
+    return { configured, exists, totalQuantity: quantity.toString(), limit: limit.toString(), perInvoiceLimit: perInvoice.toString(),
+      totalBurned: burned.toString(), invoiceCount: invoices.toString(), remaining: remaining.toString(), occupancy,
+      exhausted: configured && remaining === 0n, respawnSeconds: Math.round(cfg.baseRespawn + (cfg.maxRespawn - cfg.baseRespawn) * curve),
+      priceFactor: Math.round((1 + (cfg.priceMax - 1) * curve) * 10000) / 10000 };
+  }
+  async function config() {
+    if (policy && now() - policyAt < 10000) return policy;
+    if (!policyWork) policyWork = Promise.resolve().then(readPolicy).then(doc => {
+      policy = { version: doc?.version || 0, settings: validate(doc?.settings || {}) }; policyAt = now(); return policy;
+    }).finally(() => { policyWork = null; });
+    return policyWork;
+  }
+  async function limited(work) {
+    if (active >= concurrency) {
+      if (queue.length >= allowed.size) throw new Error('resource_read_queue_full');
+      await new Promise(resolve => queue.push(resolve));
+    } else active++;
+    try { return await work(); } finally { const next = queue.shift(); if (next) next(); else active--; }
+  }
+  async function state(tipo, force = false) {
+    if (!allowed.has(tipo)) throw new Error('unknown_resource_table');
+    let entry = cache.get(tipo);
+    if (!entry) { entry = {}; cache.set(tipo, entry); }
+    if (!force && entry.value && now() - entry.at < ttl) return entry.value;
+    if (entry.work) return entry.work;
+    if (entry.retryAt > now()) throw new Error('resource_rpc_unavailable');
+    entry.work = limited(async () => {
+      try {
+        const [stats, cfg] = await Promise.all([readStats(tipo), config()]);
+        entry.value = { tipo, ...evaluate(stats, cfg.settings), observedAt: new Date(now()).toISOString(), policyVersion: cfg.version };
+        entry.at = now(); entry.retryAt = 0; return entry.value;
+      } catch (e) { entry.retryAt = now() + 5000; throw e; }
+    }).finally(() => { entry.work = null; });
+    return entry.work;
+  }
+  function invalidate(tipo) { if (tipo) cache.delete(tipo); else { cache.clear(); policy = null; } }
+  return { defaults, validate, evaluate, config, state, invalidate, metrics: () => ({ entries: cache.size, active, queued: queue.length }) };
+}
+
+const resourcePolicySchema = new mongoose.Schema({
+  _id: { type: String }, version: { type: Number, default: 0 }, settings: { type: mongoose.Schema.Types.Mixed, default: {} },
+  updatedBy: String, updatedAt: Date
+}, { versionKey: false, collection: 'resource_economy_policy' });
+const ResourcePolicy = mongoose.models.ResourcePolicy || mongoose.model('ResourcePolicy', resourcePolicySchema);
+const RESOURCE_STATS_ABI = ['function getTipoStats(string) view returns(uint256 totalQuantity,uint256 limit,uint256 perInvoiceLimit,uint256 invoiceCount,uint256 totalBurned,bool exists)',
+  'function migrationSealed() view returns(bool)', 'function setLimit(string,uint256,uint256)'];
+const RESOURCE_ITEM_IDS = Object.freeze({ 'madera pinos': 'madera_pinos', 'madera seca': 'madera_seca', 'madera con hojas': 'madera_con_hojas',
+  mineral_piedra: 'mineral_piedra', mineral_piedra_cobre: 'mineral_piedra_cobre', mineral_piedra_hierro: 'mineral_piedra_hierro', carbon: 'carbon', mineral_carbon: 'mineral_carbon' });
+const resourceEconomy = createResourceEconomy({
+  knownTypes: Object.keys(RESOURCE_ITEM_IDS),
+  readPolicy: () => ResourcePolicy.findById('policy').lean(),
+  readStats: tipo => new ethers.Contract(CONTRACTS.ITEMS_CONTRACT.address, RESOURCE_STATS_ABI, obtenerProveedorLecturaAdmin()).getTipoStats(tipo)
+});
+async function resourceState(tipo) { return resourceEconomy.state(tipo); }
+async function resourcePurchaseBatch(itemId, quantity) {
+  const tipo=itemTipoOnChain(itemId);
+  if(!Object.prototype.hasOwnProperty.call(RESOURCE_ITEM_IDS,tipo))return null;
+  const table=await resourceState(tipo);
+  if(!table.configured)throw ecoError('resource_not_configured',409);
+  if(BigInt(table.remaining)<BigInt(quantity))throw ecoError('resource_capacity_exhausted',409);
+  return Number(BigInt(table.perInvoiceLimit)<BigInt(quantity)?BigInt(table.perInvoiceLimit):BigInt(quantity));
+}
+let _resourceMigration = { at: 0, sealed: null }, _resourceMigrationWork = null;
+async function resourceMigrationStatus() {
+  if (Date.now() - _resourceMigration.at < 60000) return _resourceMigration.sealed;
+  if (!_resourceMigrationWork) _resourceMigrationWork = (async()=>{
+    let sealed = null;
+    try { sealed = await new ethers.Contract(CONTRACTS.ITEMS_CONTRACT.address, RESOURCE_STATS_ABI, obtenerProveedorLecturaAdmin()).migrationSealed(); } catch (_) {}
+    _resourceMigration = {at:Date.now(),sealed}; return sealed;
+  })().finally(()=>{_resourceMigrationWork=null;});
+  return _resourceMigrationWork;
+}
+async function resourceRespawn(nodeType) {
+  const tipos = RESOURCE_NODE_REWARDS[nodeType].map(r => itemTipoOnChain(r.id));
+  const tables = await Promise.all(tipos.map(resourceState));
+  if (tables.some(s => !s.configured)) throw Object.assign(new Error('Resource table has not been configured by the administrator.'), { code: 'resource_not_configured' });
+  const main = tables.find(t => t.tipo === GATHER_REWARD_TIPO[nodeType]) || tables[0];
+  return { ...main, tables, exhausted: tables.every(t => t.exhausted), respawnSeconds: Math.max(...tables.map(t => t.respawnSeconds)) };
+}
+async function resourceSnapshot() {
+  const cfg = await resourceEconomy.config();
+  const rows = await Promise.all(Object.keys(RESOURCE_ITEM_IDS).map(async tipo => {
+    try { return { ...await resourceState(tipo), itemId: RESOURCE_ITEM_IDS[tipo], available: true }; }
+    catch (_) { return { tipo, itemId: RESOURCE_ITEM_IDS[tipo], available: false, error: 'resource_read_unavailable' }; }
+  }));
+  return { ok: true, migrationSealed: await resourceMigrationStatus(), contract:CONTRACTS.ITEMS_CONTRACT.address, chainId:Number(CHAIN_ID), settings: cfg.settings, version: cfg.version, rows, observedAt: new Date().toISOString(), cacheSeconds: 15,
+    gatherAuthoritative: GATHER_ENFORCE, capsAutomaticallyRaised: false };
+}
+app.get('/api/economia/recursos', apiLimiter, async (req, res) => {
+  try { res.set('Cache-Control', 'no-store'); return res.json(await resourceSnapshot()); }
+  catch (_) { return res.status(503).json({ error: 'resource_read_unavailable' }); }
+});
+app.get('/api/admin/recursos', adminAuth, apiLimiter, async (req, res) => {
+  try { res.set('Cache-Control', 'no-store'); return res.json({ ...await resourceSnapshot(), diagnostics: resourceEconomy.metrics() }); }
+  catch (_) { return res.status(503).json({ error: 'resource_read_unavailable' }); }
+});
+app.post('/api/admin/recursos/simular', adminAuth, apiLimiter, csrfProtection, async (req, res) => {
+  try {
+    const settings = resourceEconomy.validate(req.body.settings), current = await resourceSnapshot();
+    const rows = current.rows.map(row => row.available ? { ...row, ...resourceEconomy.evaluate(row, settings) } : row);
+    const curve = Array.from({ length: 101 }, (_, occupancy) => ({ occupancy, ...resourceEconomy.evaluate({ totalQuantity: occupancy,
+      limit: 100, perInvoiceLimit: 10, invoiceCount: 0, totalBurned: 0, exists: true }, settings) }));
+    res.set('Cache-Control', 'no-store'); return res.json({ ok: true, simulation: true, rows, curve, settings });
+  } catch (e) { return res.status(/invalid_resource_policy|unknown_resource_policy_field/.test(e.message) ? 400 : 503).json({ error: e.message === 'unknown_resource_policy_field' ? e.message : 'resource_preview_unavailable' }); }
+});
+app.post('/api/admin/recursos/config', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  try {
+    const settings = resourceEconomy.validate(req.body.settings);
+    const version = req.body.version;
+    if (!Number.isSafeInteger(version) || version < 0) return res.status(400).json({ error: 'invalid_version' });
+    let doc;
+    try {
+      doc = await ResourcePolicy.findOneAndUpdate({ _id: 'policy', version }, {
+        $set: { settings, updatedBy: req.admin.address, updatedAt: new Date() }, $inc: { version: 1 }
+      }, { new: true, upsert: version === 0, runValidators: true }).lean();
+    } catch (e) { if (e.code !== 11000) throw e; }
+    if (!doc) return res.status(409).json({ error: 'resource_config_conflict', message: 'Another administrator changed this policy. Refresh before saving.' });
+    resourceEconomy.invalidate();
+    let pricesRecalculated = true;
+    try { await eco2RecalcularPrecios('recursos'); } catch (_) { pricesRecalculated = false; }
+    res.set('Cache-Control', 'no-store'); return res.json({ ok: true, version: doc.version, settings, pricesRecalculated });
+  } catch (e) {
+    if (/invalid_resource_policy|unknown_resource_policy_field/.test(e.message)) return res.status(400).json({ error: e.message });
+    return res.status(503).json({ error: 'resource_config_unavailable' });
+  }
+});
+const resourceLimitAuditSchema=new mongoose.Schema({_id:String,admin:String,tipo:String,limit:String,perInvoiceLimit:String,observedAt:Date},{collection:'resource_limit_audit',versionKey:false});
+const ResourceLimitAudit=mongoose.models.ResourceLimitAudit || mongoose.model('ResourceLimitAudit',resourceLimitAuditSchema);
+app.post('/api/admin/recursos/limites/confirmar',adminAuth,strictLimiter,csrfProtection,async(req,res)=>{
+  try{
+    const hash=String(req.body.txHash || '');if(!/^0x[a-f0-9]{64}$/i.test(hash))return res.status(400).json({error:'invalid_transaction_hash'});
+    const provider=obtenerProveedorLecturaAdmin(),[receipt,tx]=await Promise.all([provider.getTransactionReceipt(hash),provider.getTransaction(hash)]);
+    if(!receipt || Number(receipt.status)!==1 || !tx)return res.status(409).json({error:'limit_transaction_not_confirmed'});
+    if(String(tx.to).toLowerCase()!==String(CONTRACTS.ITEMS_CONTRACT.address).toLowerCase() || String(tx.from).toLowerCase()!==String(req.admin.address).toLowerCase())return res.status(403).json({error:'limit_transaction_owner_mismatch'});
+    const parsed=new ethers.Interface(RESOURCE_STATS_ABI).parseTransaction({data:tx.data,value:tx.value});
+    if(parsed?.name!=='setLimit' || !Object.prototype.hasOwnProperty.call(RESOURCE_ITEM_IDS,String(parsed.args[0])))return res.status(400).json({error:'not_a_resource_limit_transaction'});
+    const tipo=String(parsed.args[0]);
+    await ResourceLimitAudit.updateOne({_id:hash},{$setOnInsert:{admin:req.admin.address,tipo,limit:String(parsed.args[1]),perInvoiceLimit:String(parsed.args[2]),observedAt:new Date()}},{upsert:true});
+    resourceEconomy.invalidate();let pricesRecalculated=true;
+    try{await eco2RecalcularPrecios('recursos',null,true);}catch(_){pricesRecalculated=false;}
+    res.set('Cache-Control','no-store');return res.json({ok:true,txHash:hash,tipo,pricesRecalculated});
+  }catch(_){return res.status(503).json({error:'limit_confirmation_unavailable',message:'Comprueba el hash antes de volver a enviar una transacción.'});}
+});
+// RESOURCE_ECONOMY_END
+
+// CONTROL_SECURITY_START — no secrets or vault material are selected here.
+const _liveGameAccounts = new Map();
+function livePresenceJoin(socket) {
+  const wallet = String(socket.authenticatedAddress || '').toLowerCase();
+  if (!socket.authenticatedPlayer || !/^0x[a-f0-9]{40}$/.test(wallet)) return;
+  if (socket._presenceWallet === wallet) return;
+  if (socket._presenceWallet) livePresenceLeave(socket);
+  let item = _liveGameAccounts.get(wallet);
+  if (!item) { item = { playerName: socket.authenticatedPlayer, sockets: new Set() }; _liveGameAccounts.set(wallet, item); }
+  item.sockets.add(socket.id); socket._presenceWallet = wallet;
+  if (!socket._presenceBound) { socket._presenceBound = true; socket.once('disconnect', () => livePresenceLeave(socket)); }
+}
+function livePresenceLeave(socket) {
+  const wallet = socket._presenceWallet, item = _liveGameAccounts.get(wallet);
+  if (item) { item.sockets.delete(socket.id); if (!item.sockets.size) _liveGameAccounts.delete(wallet); }
+  socket._presenceWallet = null;
+}
+app.get('/api/admin/presencia', adminAuth, apiLimiter, (req, res) => {
+  res.set('Cache-Control', 'no-store'); return res.json({ ok: true, conectados: _liveGameAccounts.size,
+    presencia: { scope: 'instance', source: 'authenticated_game_sockets', observedAt: new Date().toISOString() } });
+});
+function reporterFingerprint(...parts) {
+  const normalize = value => String(value || '').trim().slice(0, 8000)
+    .replace(/0x[a-fA-F0-9]{40,}/g, '<address-or-hash>')
+    .replace(/([?&](?:address|token|ticket|v|t|nonce)=)[^&\s]*/gi, '$1<value>')
+    .replace(/\b(?:requestId|transactionId|nonce)\s*[:=]\s*[\w-]+/gi, '<request>');
+  return 'group_' + crypto.createHash('sha256').update(parts.map(normalize).join('|')).digest('hex');
+}
+const errorActorSchema = new mongoose.Schema({
+  errorId: { type: String, required: true }, wallet: { type: String, required: true }, playerName: String,
+  count: { type: Number, default: 0 }, lastSeen: Date
+}, { collection: 'error_report_actors', versionKey: false });
+errorActorSchema.index({ errorId: 1, wallet: 1 }, { unique: true });
+errorActorSchema.index({ lastSeen: 1 }, { expireAfterSeconds: 90 * 86400 });
+const ErrorReportActor = mongoose.models.ErrorReportActor || mongoose.model('ErrorReportActor', errorActorSchema);
+const reporterInboxSchema = new mongoose.Schema({ _id: String, clearedAt: Date, clearedBy: String }, { collection: 'reporter_inbox_state', versionKey: false });
+const ReporterInbox = mongoose.models.ReporterInbox || mongoose.model('ReporterInbox', reporterInboxSchema);
+async function reporterUpsert(key, update, options) {
+  try { return await ErrorReport.findOneAndUpdate(key, update, options); }
+  catch (e) { if (e.code !== 11000) throw e; return ErrorReport.findOneAndUpdate(key, update, { ...options, upsert: false }); }
+}
+
+app.get('/api/admin/cuentas', adminAuth, apiLimiter, async (req, res) => {
+  try {
+    res.set('Cache-Control', 'no-store'); res.set('Pragma', 'no-cache');
+    const q = String(req.query.q || '').trim().slice(0, 100), after = String(req.query.after || '');
+    if (after && !mongoose.Types.ObjectId.isValid(after)) return res.status(400).json({ error: 'invalid_cursor' });
+    const filter = {}, limit = 50;
+    if (after) filter._id = { $gt: new mongoose.Types.ObjectId(after) };
+    if (q) {
+      const prefix = new RegExp('^' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [{ address: prefix }, { playerName: prefix }, { Username: prefix }];
+    }
+    const docs = await GamePlayer.find(filter).select('playerName Username address email correo createdAt nivel tutorial mundo isGhost')
+      .sort({ _id: 1 }).limit(limit + 1).maxTimeMS(5000).lean();
+    const more = docs.length > limit; if (more) docs.pop();
+    const wallets = docs.map(d => d.address).filter(Boolean), names = docs.map(d => d.playerName);
+    const [identities, activity] = await Promise.all([
+      mongoose.connection.collection('social_wallets').find({ address: { $in: wallets } },
+        { projection: { _id: 0, address: 1, provider: 1, email: 1, emailVerified: 1, identityVerifiedAt: 1, lastUnlockAt: 1 } }).limit(150).toArray(),
+      UserActivity.find({ playerName: { $in: names } }).select('playerName lastLogin loginCount registeredAt ultimaPartida discord').lean()
+    ]);
+    const byWallet = new Map(identities.map(x => [x.address, x])), byName = new Map(activity.map(x => [x.playerName, x]));
+    return res.json({ ok: true, hasMore: more, next: more ? String(docs.at(-1)._id) : null, observedAt: new Date().toISOString(), presenceScope: 'instance',
+      rows: docs.map(d => {
+        const identity = byWallet.get(d.address), a = byName.get(d.playerName) || {};
+        return { id: String(d._id), wallet: d.address || null, playerName: d.playerName, username: d.Username,
+          email: identity?.email || d.email || d.correo || null, emailVerified: identity?.emailVerified === true,
+          emailSource: identity?.email ? identity.provider : d.email || d.correo ? 'legacy_profile' : null,
+          loginProvider: identity?.provider || 'wallet_signature', identityVerifiedAt: identity?.identityVerifiedAt || null,
+          createdAt: d.createdAt, lastLogin: a.lastLogin || null, loginCount: a.loginCount || 0,
+          lastGameplay: a.ultimaPartida || null, online: _liveGameAccounts.has(d.address), level: d.nivel,
+          world: d.mundo, tutorial: d.tutorial, isGhost: !!d.isGhost, discord: a.discord || null };
+      }) });
+  } catch (e) { console.warn('admin accounts:', e.code || e.message); return res.status(503).json({ error: 'account_directory_unavailable' }); }
+});
+
+async function reporterGrouped(req, res, kind) {
+  const relay = kind === 'relay', Model = relay ? RelayedTransaction : ErrorReport;
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 30)), skip = Math.min(10000, Math.max(0, parseInt(req.query.skip, 10) || 0));
+  const inbox = relay ? await ReporterInbox.findById('relay').lean() : null;
+  const filter = relay ? { status: 'failed', $and: [
+    { $or: [{ revertReason: { $in: [null, ''] } }, { revertReason: { $exists: false } }] },
+    { $or: [{ error: { $exists: false } }, { error: { $not: /execution reverted|call_exception|revert/i } }] }
+  ] } : {};
+  if (inbox?.clearedAt) filter.updatedAt = { $gt: inbox.clearedAt };
+  const q = String(req.query.q || '').trim().slice(0, 120);
+  if (q) {
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    filter.$or = (relay ? ['error', 'playerName', 'playerAddress', 'functionName'] : ['message', 'scene', 'file', 'playerName']).map(k => ({ [k]: re }));
+    if (!relay && /^0x[a-f0-9]{40}$/i.test(q)) {
+      const ids = await ErrorReportActor.find({wallet:q.toLowerCase()}).select('errorId').limit(1000).maxTimeMS(5000).lean();
+      filter.$or.push({errorId:{$in:ids.map(x=>x.errorId)}});
+    }
+  }
+  if (!relay && req.query.type) filter.type = String(req.query.type).slice(0, 40);
+  const key = relay ? { fingerprint: { $ifNull: ['$errorFingerprint', '$error'] }, contract: '$contractName', fn: '$functionName' }
+    : { type: '$type', message: '$message', file: '$file', line: '$line', scene: '$scene' };
+  const report = await Model.aggregate([{ $match: filter }, { $group: { _id: key, count: { $sum: relay ? 1 : { $ifNull: ['$count', 1] } },
+    lastSeen: { $max: relay ? '$updatedAt' : '$lastSeen' }, sample: { $first: relay ? {
+      _id: '$_id', playerName: '$playerName', playerAddress: '$playerAddress', contractName: '$contractName', functionName: '$functionName',
+      error: '$error', errorFingerprint: '$errorFingerprint', txHash: '$txHash', retryCount: '$retryCount', createdAt: '$createdAt'
+    } : { _id: '$_id', errorId: '$errorId', type: '$type', message: '$message', scene: '$scene', file: '$file', line: '$line', stack: '$stack', playerName: '$playerName' } } } },
+    { $sort: { count: -1, lastSeen: -1, '_id': 1 } }, { $facet: { tipos: [{ $group: { _id: '$_id.type' } }, { $sort: { _id: 1 } }, { $limit: 100 }], totals: [{ $group: { _id: null, groups: { $sum: 1 }, occurrences: { $sum: '$count' } } }],
+      rows: [{ $skip: skip }, { $limit: limit }] } }]).allowDiskUse(true).option({ maxTimeMS: 10000 });
+  const groups = report[0]?.rows || [];
+  // Query only the current page. $facet limits returned actors without building
+  // unbounded wallet arrays; the grouping itself can spill to disk.
+  const items = [];
+  for (const g of groups) {
+    if (req.aborted || res.destroyed) return;
+    const match = relay ? { ...filter, contractName: g.sample.contractName, functionName: g.sample.functionName,
+      ...(g.sample.errorFingerprint ? { errorFingerprint: g.sample.errorFingerprint } : { error: g.sample.error || '' }) } : { errorId: g.sample.errorId };
+    const actorModel = relay ? RelayedTransaction : ErrorReportActor;
+    const actors = await actorModel.aggregate([{ $match: match }, { $group: { _id: relay ? '$playerAddress' : '$wallet',
+      playerName: { $first: '$playerName' }, count: { $sum: relay ? 1 : '$count' } } }, { $sort: { count: -1, _id: 1 } },
+      { $facet: { rows: [{ $limit: 20 }], total: [{ $count: 'n' }] } }]).allowDiskUse(true).option({ maxTimeMS: 5000 });
+    items.push({ ...g.sample, count: g.count, lastSeen: g.lastSeen, actors: (actors[0]?.rows || []).map(a => ({ wallet: a._id, playerName: a.playerName, count: a.count, verified: true })),
+      actorCount: actors[0]?.total?.[0]?.n || 0, historicalActor: !relay && !(actors[0]?.rows || []).length ? g.sample.playerName : null });
+  }
+  res.set('Cache-Control', 'no-store'); return res.json({ ok: true, grouped: true, items, total: report[0]?.totals?.[0]?.groups || 0,
+    tipos: (report[0]?.tipos || []).map(t=>t._id).filter(Boolean), ocurrencias: report[0]?.totals?.[0]?.occurrences || 0, clearedAt: inbox?.clearedAt || null });
+}
+app.post('/api/admin/relay-failures/clear', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  if (req.body.confirm !== 'CLEAR') return res.status(400).json({ error: 'confirmation_required' });
+  try {
+    const clearedAt = new Date();
+    await ReporterInbox.findOneAndUpdate({ _id: 'relay' }, { $set: { clearedAt, clearedBy: req.admin.address } }, { upsert: true });
+    res.set('Cache-Control', 'no-store'); return res.json({ ok: true, clearedAt, auditPreserved: true });
+  } catch (_) { return res.status(503).json({ error: 'reporter_clear_unavailable' }); }
+});
+// CONTROL_SECURITY_END
+
+
 
 // =============================================================================
 // PREFERENCIAS DE GRÁFICOS DEL JUGADOR                           (2026-08-11)
@@ -19948,7 +20432,13 @@ app.post('/api/report-error', apiLimiter, async (req, res) => {
     try {
         const { errors, password } = req.body;
         
-        if (password !== ERROR_PASSWORD) {
+        let reporterActor = null;
+        try {
+          const token = req.cookies && req.cookies.session;
+          const claims = token && jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+          if (claims && claims.type === 'access') reporterActor = await GamePlayer.findOne({ address: String(claims.address).toLowerCase() }).select('playerName address').lean();
+        } catch (_) {}
+        if (!reporterActor && (!ERROR_PASSWORD || password !== ERROR_PASSWORD)) {
             safeLog('Contraseña incorrecta recibida');
             return res.status(401).json({ 
                 success: false, 
@@ -19996,7 +20486,7 @@ app.post('/api/report-error', apiLimiter, async (req, res) => {
                 // que se vio. Así la bandeja muestra CADA error UNA sola vez,
                 // con cuántas veces ha ocurrido — que es la información que
                 // de verdad sirve para priorizar.
-                const res$ = await ErrorReport.findOneAndUpdate(
+                const res$ = await reporterUpsert(
                     { errorId: errorId },
                     {
                         $inc: { count: 1 },
@@ -20008,7 +20498,7 @@ app.post('/api/report-error', apiLimiter, async (req, res) => {
                             scene:      error.scene    || 'unknown',
                             url:        error.url      || 'unknown',
                             userAgent:  error.userAgent|| 'unknown',
-                            playerName: error.playerName || 'unknown'
+                            playerName: reporterActor ? reporterActor.playerName : String(error.playerName || 'unknown').slice(0, 100)
                         },
                         $setOnInsert: {
                             errorId: errorId,
@@ -20028,6 +20518,12 @@ app.post('/api/report-error', apiLimiter, async (req, res) => {
                 // `new: false` devuelve el documento ANTERIOR: si es null, esta
                 // es la primera vez que se ve este error.
                 if (!res$) guardadosNuevos++;
+                if (reporterActor) {
+                  const actorKey = { errorId, wallet: reporterActor.address };
+                  const actorUpdate = { $inc: { count: 1 }, $set: { playerName: reporterActor.playerName, lastSeen: new Date() } };
+                  try { await ErrorReportActor.updateOne(actorKey, actorUpdate, { upsert: true }); }
+                  catch (e) { if (e.code !== 11000) throw e; await ErrorReportActor.updateOne(actorKey, actorUpdate); }
+                }
                 procesados++;
                 
             } catch (dbError) {
@@ -20054,31 +20550,8 @@ app.post('/api/report-error', apiLimiter, async (req, res) => {
 });
 
 function generateErrorId(error) {
-    try {
-        const contenido = [
-            error.type || 'unknown',
-            error.message || 'no-message',
-            error.scene || 'no-scene',
-            error.url || 'no-url',
-            error.file || 'no-file',
-            error.line || 'no-line'
-        ].join('|');
-        
-        let hash = 0;
-        for (let i = 0; i < contenido.length; i++) {
-            const char = contenido.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
-            hash = hash & 0xFFFFFFFF;
-        }
-        
-        const timestamp = Date.now().toString(36);
-        const random = Math.random().toString(36).substring(2, 9);
-        
-        return `err_${Math.abs(hash).toString(16).substring(0, 8)}_${timestamp}_${random}`;
-        
-    } catch (e) {
-        return `err_fallback_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-    }
+  const file = String(error.file || '').split('?')[0];
+  return reporterFingerprint(error.type || 'unknown', String(error.message || 'Sin mensaje').slice(0, 800), error.scene || 'unknown', file, error.line || 'unknown');
 }
 
 // Socket status
@@ -22813,6 +23286,7 @@ require('./marketplace-routes')(app, {
   // (2026-10-27) La auditoría: los fallos del mercado al centro de control, y el
   // nivel de cada objeto (no se compra por debajo, como al recoger del suelo).
   auditarMercado: gfAuditarMercado,
+  assetTransfer: resourceMarketAdapter,
   nivelObjeto: gfNivelDeObjeto,
   nivelJugador: gfNivelDeJugador,
   alertar: (tipo, gp, datos) => gfAlertar(tipo, 'aviso', gp, datos, tipo + ':' + (gp && gp.playerName) + ':' + (datos && datos.itemId))
@@ -23230,6 +23704,8 @@ let _eco2Recalculando = null;
 async function eco2RecalcularPrecios(motivo, soloItem, sinHistoria) {
   const cfg = await eco2Config();
   const indice = eco2IndiceSync();
+  const resources = await resourceSnapshot();
+  const resourceFactors = new Map(resources.rows.filter(r => r.available && r.configured).map(r => [r.itemId, r.priceFactor]));
   const ovs = await PrecioBase.find({}).lean();
   const ov = new Map(ovs.map((o) => [o._id, o]));
   const anterior = eco2PreciosActuales();
@@ -23240,7 +23716,7 @@ async function eco2RecalcularPrecios(motivo, soloItem, sinHistoria) {
   const ancla = new Map(anclas.map(x => [x._id, x]));
   const items = Object.assign({}, anterior.items);
   let demanda = null;
-  if (!soloItem) { try { demanda = await eco2DemandaTienda(); } catch (e) { demanda = new Map(); } }
+  if (!soloItem && motivo !== 'recursos') { try { demanda = await eco2DemandaTienda(); } catch (e) { demanda = new Map(); } }
   for (const id of (soloItem ? [soloItem] : eco2Catalogo())) {
     const base = eco2BaseDe(id, ov.get(id));
     let dem = 1;
@@ -23250,7 +23726,8 @@ async function eco2RecalcularPrecios(motivo, soloItem, sinHistoria) {
       const previa = anterior.items[id] && anterior.items[id].demanda;
       if (demanda && previa > 0 && anterior.dia) dem = Math.max(previa * (1 - cfg.pasoMax), Math.min(previa * (1 + cfg.pasoMax), dem));
     }
-    const p = eco2PrecioDinamico(base, cfg.indiceActivo ? indice : 1, dem);
+    const resourceFactor = resourceFactors.get(id) || anterior.items[id]?.recurso || 1;
+    const p = eco2PrecioDinamico(base, (cfg.indiceActivo ? indice : 1) * resourceFactor, dem);
     const ayer = ancla.get(id);
     if (!soloItem && base.sigueIndice !== false && ayer && ayer.moneda === base.moneda) {
       for (const k of ['compra', 'venta']) if (ayer[k] > 0 && p[k] > 0) {
@@ -23260,10 +23737,10 @@ async function eco2RecalcularPrecios(motivo, soloItem, sinHistoria) {
     }
     items[id] = { compra: p.compra, venta: p.venta, moneda: base.moneda, tienda: base.tienda, sigueIndice: base.sigueIndice !== false,
                   demanda: Math.round(dem * 10000) / 10000, base: { compra: base.compra, venta: base.venta, moneda: base.moneda },
-                  cambiado: !!base.cambiado };
+                  cambiado: !!base.cambiado, recurso: resourceFactor };
   }
   const version = Date.now();
-  _eco2Precios = { version, dia: soloItem ? (anterior.dia || _diaUTC()) : _diaUTC(), indice, items,
+  _eco2Precios = { version, resourceCheckedAt: Date.now(), dia: soloItem ? (anterior.dia || _diaUTC()) : _diaUTC(), indice, items,
                    previas: [{ version: anterior.version, hasta: version, items: anterior.items }].concat(anterior.previas || []).slice(0, 4) };
   const hoy = _diaUTC();
   let escribir = sinHistoria ? [] : soloItem ? [soloItem] : eco2Catalogo();
@@ -23280,9 +23757,9 @@ async function eco2TrasFoto(doc, indiceNuevo) {
   if (!doc) return;
   if (Number(doc.indice) > 0) _eco2Indice = { valor: Number(doc.indice), dia: doc._id };
   const p = eco2PreciosActuales();
-  if (indiceNuevo || p.dia !== doc._id) {
+  if (indiceNuevo || p.dia !== doc._id || Date.now() - (p.resourceCheckedAt || 0) >= 60000) {
     if (_eco2Recalculando) return _eco2Recalculando;
-    _eco2Recalculando = eco2RecalcularPrecios('diario').finally(() => { _eco2Recalculando = null; });
+    _eco2Recalculando = eco2RecalcularPrecios(indiceNuevo || p.dia !== doc._id ? 'diario' : 'recursos', null, !(indiceNuevo || p.dia !== doc._id)).finally(() => { _eco2Recalculando = null; });
     await _eco2Recalculando;
   }
 }
@@ -23863,6 +24340,7 @@ app.post('/api/economia/tienda', strictLimiter, authMiddleware, csrfProtection, 
         return res.status(previous.estado === 'completado' ? 200 : 202).json({ ok: previous.estado === 'completado', revision: previous.estado !== 'completado',
           confirmadas: previous.confirmadas || 0, stats: st && buildStatsResponse(st), ref: id });
       }
+      const resourceBatch = op === 'compra' ? await resourcePurchaseBatch(b.itemId,q) : null;
       await ecoTransaccion(async session => {
         const st = await PlayerStats.findOne({ playerName: gp.playerName }).session(session).lean();
         if (!st) throw ecoError('sin_stats', 409);
@@ -23897,7 +24375,7 @@ app.post('/api/economia/tienda', strictLimiter, authMiddleware, csrfProtection, 
         else {
           const stack = Math.max(1, Number(ITEM_MAX_STACK[b.itemId]) || 1);
           while (confirmed < q) {
-            const batch = Math.min(stack, q - confirmed);
+            const batch = Math.min(stack, resourceBatch || stack, q - confirmed);
             const minted = await mintGatherReward(gp.address, tipo, batch);
             if (!minted || !minted.id) break;
             confirmed += batch;
@@ -23942,7 +24420,7 @@ async function ecoTransaccion(fn) {
     await session.withTransaction(async () => { result = await fn(session); },
       { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
     return result;
-  } finally { await session.endSession(); }
+  } finally { try { await session.endSession(); } catch (e) { console.warn("economia session cleanup:", e.code || e.message); } }
 }
 let _eco2Migracion = null;
 function eco2MigrarReserva() {
@@ -24073,27 +24551,8 @@ console.log('✅ Economía (2.ª parte): /api/tiempo, /api/economia/{precios,pre
 
 
 // =============================================================================
-// LIQUIDACIÓN ON-CHAIN DEL MERCADO P2P  (2026-08-03)
-// -----------------------------------------------------------------------------
-// PROBLEMA: en market.html se publicaba, se compraba y se cancelaba, pero todo
-// se quedaba en el backend — los ítems nunca se movían de verdad en la
-// blockchain, así que el mercado no manipulaba los NFT/facturas del contrato.
-//
-// SOLUCIÓN: tres operaciones que el mercado llama justo después de que su
-// operación en base de datos sale bien:
-//
-//   escrow  → al PUBLICAR: quema en cadena las unidades del vendedor
-//             (decreaseInvoiceQuantity / deleteInvoice). El ítem sale de su
-//             cartera y queda "en depósito" del mercado.
-//   deliver → al COMPRAR: acuña esas unidades al comprador (createInvoice o
-//             increaseInvoiceQuantity).
-//   refund  → al CANCELAR: devuelve al vendedor lo que quedaba en depósito.
-//
-// CONSERVACIÓN: por cada publicación se lleva un libro (MarketSettlement) y
-// NUNCA se puede entregar/devolver más de lo que se quemó al publicar. Es
-// decir, el mercado no puede crear ítems de la nada aunque el cliente mienta.
-// Además cada operación es idempotente por (listingId, op, dirección, nonce).
-// =============================================================================
+// Historic P2P burn/remint ledger retained for audit and reconciliation.
+// New listings use native transfer custody in RESOURCE_MARKET above.
 
 const marketSettlementSchema = new mongoose.Schema({
   listingId: { type: String, required: true, index: true },
@@ -25791,123 +26250,7 @@ app.post('/api/admin/players/:playerName/cadena', adminAuth, strictLimiter, asyn
   }
 });
 
-// POST /api/marketplace/onchain/settle
-// body: { op: 'escrow'|'deliver'|'refund', listingId, itemId, qty }
-app.post('/api/marketplace/onchain/settle',
-  strictLimiter,
-  authMiddleware,
-  csrfProtection,
-  [
-    body('op').isIn(['escrow', 'deliver', 'refund']),
-    body('listingId').isString().notEmpty(),
-    body('itemId').isString().notEmpty(),
-    body('qty').isInt({ min: 1, max: 10000 })
-  ],
-  (req, res, next) => (req.body && req.body.op === 'escrow' ? gfExigeNombre(req, res, () => gfExigeVip(req, res, next)) : next()),
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
-      const address = String(req.user.address || '').toLowerCase();
-      const { op, listingId, itemId } = req.body;
-      const qty = parseInt(req.body.qty, 10);
-
-      const tipo = marketOnchainTipo(itemId);
-      if (!tipo) {
-        // Ítem sin representación on-chain: la operación de base de datos ya
-        // está hecha y aquí no hay nada que mover.
-        return res.json({ ok: true, onchain: false, reason: 'item_not_onchain' });
-      }
-      if (!relayerWallet) {
-        return res.status(503).json({ error: 'relayer_unavailable' });
-      }
-
-      // ── Idempotencia ────────────────────────────────────────────────────
-      const idem = `${op}:${listingId}:${address}:${itemId}:${qty}`;
-      const yaHecho = await MarketSettlement.findOne({ idem }).lean();
-      if (yaHecho) {
-        return res.json({ ok: true, onchain: true, alreadySettled: true, txHash: yaHecho.txHash || '' });
-      }
-
-      // ── Libro de la publicación ─────────────────────────────────────────
-      const movimientos = await MarketSettlement.find({ listingId }).lean();
-      const suma = (o) => movimientos.filter(m => m.op === o).reduce((n, m) => n + m.qty, 0);
-      const depositado = suma('escrow');
-      const entregado  = suma('deliver') + suma('refund');
-      const disponible = depositado - entregado;
-
-      if (op === 'escrow') {
-        // Solo el dueño de una publicación viva puede depositar, y solo por lo
-        // que esa publicación declara.
-        let listing = null;
-        try { listing = await Listing.findById(listingId).lean(); } catch (_) {}
-        if (!listing) return res.status(404).json({ error: 'listing_not_found' });
-        if (String(listing.owner).toLowerCase() !== address) {
-          return res.status(403).json({ error: 'not_listing_owner' });
-        }
-        if (String(listing.itemId) !== String(itemId)) {
-          return res.status(400).json({ error: 'item_mismatch' });
-        }
-        if (depositado + qty > Number(listing.qty)) {
-          return res.status(400).json({ error: 'escrow_exceeds_listing' });
-        }
-
-        const quemadas = await burnItemOnChain(address, tipo, qty);
-        if (quemadas <= 0) {
-          return res.status(409).json({ error: 'onchain_burn_failed' });
-        }
-        await MarketSettlement.create({ listingId, op, address, itemId, qty: quemadas, idem });
-        return res.json({ ok: true, onchain: true, burned: quemadas });
-      }
-
-      // deliver / refund solo pueden repartir lo que ya se depositó.
-      if (disponible <= 0) return res.status(409).json({ error: 'nothing_in_escrow' });
-      if (qty > disponible) return res.status(400).json({ error: 'exceeds_escrow', available: disponible });
-
-      if (op === 'refund') {
-        // Devolver solo al vendedor original (quien depositó).
-        const deposito = movimientos.find(m => m.op === 'escrow');
-        if (!deposito || deposito.address !== address) {
-          return res.status(403).json({ error: 'not_escrow_owner' });
-        }
-      }
-
-      const minted = await mintGatherReward(address, tipo, qty);
-      if (!minted) return res.status(409).json({ error: 'onchain_mint_failed' });
-
-      await MarketSettlement.create({ listingId, op, address, itemId, qty, idem });
-      return res.json({
-        ok: true, onchain: true,
-        invoiceId: minted.id, manualId: minted.manualId, newTotal: minted.cantidad
-      });
-    } catch (e) {
-      console.error('POST /api/marketplace/onchain/settle:', e);
-      return res.status(500).json({ error: 'internal_error' });
-    }
-  }
-);
-
-// Estado on-chain de una publicación (lo consulta market.html para saber si
-// una liquidación quedó pendiente y reintentarla).
-app.get('/api/marketplace/onchain/:listingId', apiLimiter, authMiddleware, async (req, res) => {
-  try {
-    const movimientos = await MarketSettlement.find({ listingId: req.params.listingId }).lean();
-    const suma = (o) => movimientos.filter(m => m.op === o).reduce((n, m) => n + m.qty, 0);
-    return res.json({
-      ok: true,
-      escrowed: suma('escrow'),
-      delivered: suma('deliver'),
-      refunded: suma('refund'),
-      available: suma('escrow') - suma('deliver') - suma('refund')
-    });
-  } catch (e) {
-    console.error('GET /api/marketplace/onchain/:listingId:', e);
-    return res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-console.log('✅ Liquidación on-chain del mercado: /api/marketplace/onchain/settle');
+// P2P custody and settlement routes are registered in RESOURCE_MARKET.
 
 // manualId de LA factura de un stat. Usa la dirección COMPLETA: con los 8
 // primeros caracteres que se usaban antes, dos jugadores cuyas direcciones
