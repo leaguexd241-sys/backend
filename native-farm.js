@@ -140,7 +140,7 @@ module.exports=function createNativeFarm(d){
  async function mature(row){
   const dead=Math.random()*100>row.successChance,fields={isCompleted:true,isDead:dead,growthStage:dead?5:4,currentGrowthTime:row.growthDuration,expiresAt:dead?null:d.expiry()};
   const changed=await Crop.updateOne({_id:row._id,nativeLocked:{$ne:true},isCompleted:false},{$set:fields});
-  if(changed.modifiedCount===1){const {expiresAt,...publicFields}=fields;d.notify(row.userId,'cropGrowthUpdate',{userId:row.userId,plotId:row.plotId,...publicFields,isHalfway:true,timeRemaining:0,cropConfig:catalog.crops[row.cropType]});}
+  if(changed.modifiedCount===1){const {expiresAt,...publicFields}=fields;d.notify(row.userId,'cropGrowth',{userId:row.userId,plotId:row.plotId,...publicFields,isHalfway:true,timeRemaining:0,cropConfig:catalog.crops[row.cropType]});}
  }
  async function refresh(gp,plots){
   const rows=await Crop.find({...cropQuery(gp,plots),nativeFarm:true,nativeLocked:{$ne:true},isWatered:true,isCompleted:false,isDead:false,nativeReadyAt:{$lte:new Date()}}).limit(50).lean();
