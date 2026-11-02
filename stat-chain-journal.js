@@ -9,6 +9,16 @@ module.exports=function createStatChainJournal(d){
   lease:String,leaseUntil:Date,updatedAt:Date},{collection:'authoritative_stat_intents',versionKey:false});
  const Intent=mongoose.models.AuthoritativeStatIntent || mongoose.model('AuthoritativeStatIntent',schema),running=new Set();
  const fail=code=>Object.assign(Error(code),{code});
+ // True only with proof these bytes can never execute: refused as too high (the node
+ // does not keep them and this row holds the only copy), or their nonce was spent by
+ // another transaction. Only then may the delta be recomputed and signed again.
+ const deadSignature=async(e,provider,hash)=>{
+  const text=String(e?.shortMessage||'')+' '+String(e?.message||'');
+  if(/nonce too high/i.test(text))return true;
+  if(e?.code!=='NONCE_EXPIRED' && !/nonce too low|nonce has already been used/i.test(text))return false;
+  await new Promise(resolve=>{const timer=setTimeout(resolve,d.deadSignatureWaitMs ?? 5000);timer.unref?.();});
+  return !(await bounded(()=>provider.getTransactionReceipt(hash)));
+ };
  async function bounded(fn,ms=15000){let timer;try{return await Promise.race([Promise.resolve().then(fn),new Promise((_,reject)=>{timer=setTimeout(()=>reject(fail('stat_rpc_pending')),ms);timer.unref?.();})]);}finally{clearTimeout(timer);}}
  async function apply(contract,stat,invoiceId,target,gasPrice){
   if(!Number.isSafeInteger(invoiceId)||invoiceId<1||!Number.isSafeInteger(target)||target<1)throw fail('stat_invalid_target');
@@ -41,7 +51,10 @@ module.exports=function createStatChainJournal(d){
    if(ethers.keccak256(row.raw)!==row.hash || signed.from?.toLowerCase()!==String(wallet.address).toLowerCase() || signed.to?.toLowerCase()!==to || String(signed.chainId)!==chainId || signed.data!==expected || signed.value!==0n)throw fail('stat_signed_intent_mismatch');
    let receipt=await bounded(()=>provider.getTransactionReceipt(row.hash));
    if(!receipt){
-    try{await bounded(()=>provider.broadcastTransaction(row.raw));}catch(e){if(!/already known|nonce too low/i.test(String(e.message)))throw e;}
+    try{await bounded(()=>provider.broadcastTransaction(row.raw));}catch(e){
+     if(await deadSignature(e,provider,row.hash)){await patch({status:'idle',raw:null,hash:null,tx:null,ticket:null});return {ok:false,chainQty:null,pending:true,error:'stat_signature_replaced'};}
+     if(!/already known|nonce too low/i.test(String(e.message)))throw e;
+    }
     receipt=await provider.waitForTransaction(row.hash,1,90000);if(!receipt)throw fail('stat_confirmation_pending');
    }
    if(Number(receipt.status)!==1){await patch({status:'reverted'});return {ok:false,chainQty:await quantity(),error:'stat_transaction_reverted'};}

@@ -13,6 +13,16 @@ module.exports=function createCraftingAuthority(d){
  const Job=mongoose.models.AuthoritativeCraft || mongoose.model('AuthoritativeCraft',schema);
  const outputTypes=new Set(recipes.map(r=>d.itemType(r.itemId)));
  const running=new Set();
+ // True only with proof these bytes can never execute: refused as too high (the node
+ // does not keep them and the step holds the only copy), or their nonce was spent by
+ // another transaction. Only then may a step be signed again.
+ const deadSignature=async(e,provider,hash)=>{
+  const text=String(e?.shortMessage||'')+' '+String(e?.message||'');
+  if(/nonce too high/i.test(text))return true;
+  if(e?.code!=='NONCE_EXPIRED' && !/nonce too low|nonce has already been used/i.test(text))return false;
+  await new Promise(resolve=>{const timer=setTimeout(resolve,d.deadSignatureWaitMs ?? 5000);timer.unref?.();});
+  return !(await provider.getTransactionReceipt(hash));
+ };
  function materials(recipe,quantity,option){
   const need=new Map();const add=x=>{
    const amount=x.quantity*(x.absolute?1:quantity);if(!Number.isSafeInteger(amount)||amount<1)throw fail('craft_invalid_material_quantity');
@@ -94,17 +104,22 @@ module.exports=function createCraftingAuthority(d){
   else {method='createInvoice';args=[job.wallet,step.tipo,step.amount,step.manualId];}
   const patch=async fields=>{const result=await Job.updateOne({_id:job._id,leaseToken:lease},{$set:Object.fromEntries(Object.entries(fields).map(([k,v])=>['privateSteps.'+index+'.'+k,v]))});if(result.matchedCount!==1)throw fail('craft_lease_changed');Object.assign(step,fields);};
   let receipt;
+  const signAgain=()=>patch({status:'planned',nonce:null,rawTx:null,txHash:null,nonceTicket:null,signatures:(step.signatures||0)+1});
+  for(let attempt=0;attempt<4 && !receipt;attempt++){
   if(step.txHash){
    receipt=await provider.getTransactionReceipt(step.txHash);
    if(!receipt){
     if(!step.rawTx)throw fail('craft_signed_intent_missing');
     const signed=ethers.Transaction.from(step.rawTx),expected=c.interface.encodeFunctionData(method,args);
     if(ethers.keccak256(step.rawTx)!==step.txHash || signed.from?.toLowerCase()!==relayer || signed.to?.toLowerCase()!==String(await c.getAddress()).toLowerCase() || signed.data!==expected || signed.value!==0n)throw fail('craft_signed_intent_mismatch');
-    try{await provider.broadcastTransaction(step.rawTx);}catch(e){if(!/already known|nonce too low/i.test(String(e.message)))throw e;}
+    try{await provider.broadcastTransaction(step.rawTx);}catch(e){
+     if(await deadSignature(e,provider,step.txHash)){await signAgain();continue;}
+     if(!/already known|nonce too low/i.test(String(e.message)))throw e;
+    }
     receipt=await provider.waitForTransaction(step.txHash,1,120000);if(!receipt)throw fail('craft_confirmation_pending');
    }
   }else{
-   const ticket='craft:'+job._id+':'+index;
+   const ticket='craft:'+job._id+':'+index+(step.signatures?':s'+step.signatures:'');
    if(step.status!=='planned' && !(step.status==='signing' && step.nonceTicket===ticket))throw fail('craft_unsigned_step_requires_review');
    if(method!=='createInvoice'){
     const source=await c.getInvoice(args[method==='transferInvoice'?2:0]);
@@ -114,7 +129,13 @@ module.exports=function createCraftingAuthority(d){
    }
    const tx=await c[method].populateTransaction(...args);tx.gasPrice=await d.gasPrice();tx.gasLimit=(await provider.estimateGas({...tx,from:relayer}))*120n/100n;tx.chainId=(await provider.getNetwork()).chainId;
    await patch({status:'signing',nonceTicket:ticket});const nonce=await d.nonce(ticket);const rawTx=await d.wallet().signTransaction({...tx,nonce}),txHash=ethers.keccak256(rawTx);
-   await patch({status:'signed',nonce,rawTx,txHash});const sent=await provider.broadcastTransaction(rawTx);receipt=await sent.wait(1,120000);
+   await patch({status:'signed',nonce,rawTx,txHash});let sent;
+   try{sent=await provider.broadcastTransaction(rawTx);}catch(e){
+    if(!await deadSignature(e,provider,txHash))throw e;
+    await signAgain();await new Promise(resolve=>{const timer=setTimeout(resolve,500*(attempt+1));timer.unref?.();});continue;
+   }
+   receipt=await sent.wait(1,120000);
+  }
   }
   if(!receipt)throw fail('craft_confirmation_pending');
   if(Number(receipt.status)!==1){await patch({status:'failed'});throw fail('craft_transaction_reverted');}

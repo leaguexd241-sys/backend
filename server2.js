@@ -1871,11 +1871,56 @@ Object.values(CONTRACTS).forEach(contract => {
 });
 
 // --- Sistema de Nonce del Relayer (Thread-safe) ---
+/* UN NONCE PERDIDO NO PUEDE PARAR EL RELAYER (2026-11-02). "No puedo comprar ni
+   vender: Your operation is recorded for chain review." El contador persistente
+   solo subía: si una reserva no llegaba a la cadena (un error del RPC al difundir,
+   por ejemplo), todas las siguientes quedaban con un nonce por delante; LitVM las
+   rechaza con "nonce too high" sin guardarlas y cada intento gastaba otro número,
+   así que el contador se alejaba cada vez más y NADA del relayer volvía a minarse.
+   Pasó el 2026-10-30 a las 07:03:04 UTC, nonce 14615: tres días sin una sola
+   transacción, y reiniciar no lo curaba porque el contador vive en Mongo.
+
+   Reutilizar un nonce no puede ejecutar nada dos veces: la cadena solo admite
+   UNA transacción por nonce. Por eso, cuando el contador va por delante y la
+   cadena no lo sigue, vuelve a donde está la cadena. Se considera atascado si el
+   nodo ya ha rechazado un nonce alto, si nadie reserva desde hace 30 s, o si en
+   30 s la cadena no se ha movido; 30 s cubren de sobra lo que tarda una reserva
+   en llegar al nodo (si aun así chocan dos, una recibe "nonce too low" y se firma
+   de nuevo). Mientras la cadena avance, nada de esto se activa. */
 class RelayerNonceManager {
   constructor() {
     this.currentNonce = null; this.lock = false; this.pending = 0;
     this._tail = Promise.resolve();
     if (relayerWallet) this.init();
+  }
+  /** Se entera de los nonces que el nodo rechaza por altos: cualquier firma del relayer pasa por aquí. */
+  vigilar(proveedor) {
+    if (!proveedor || typeof proveedor.broadcastTransaction !== 'function' || proveedor.__nonceVigilado) return;
+    const difundir = proveedor.broadcastTransaction.bind(proveedor);
+    proveedor.broadcastTransaction = async (firmada) => {
+      try { return await difundir(firmada); }
+      catch (e) {
+        if (/nonce too high/i.test(String(e && e.message))) this._notarNonceAlto(firmada);
+        throw e;
+      }
+    };
+    proveedor.__nonceVigilado = true;
+  }
+  /* Una firma vieja, de antes de volver atrás, no prueba nada: solo cuenta un nonce
+     que este contador pudo haber repartido hace poco. */
+  _notarNonceAlto(firmada) {
+    let nonce = null;
+    try { nonce = ethers.Transaction.from(firmada).nonce; } catch (_) {}
+    if (this._ultimoNonce == null || nonce == null || nonce <= this._ultimoNonce) this._rechazoAlto = true;
+  }
+  _contadorAtascado(remote, estado, ahora) {
+    const next = Number(estado && estado.next);
+    if (remote !== this._remotoVisto) { this._remotoVisto = remote; this._adelantadoDesde = null; this._rechazoAlto = false; }
+    if (!Number.isSafeInteger(next) || next <= remote) { this._adelantadoDesde = null; this._rechazoAlto = false; return false; }
+    if (!this._adelantadoDesde) this._adelantadoDesde = ahora;
+    const CADUCA = 30000;
+    return ahora - new Date(estado.updatedAt || 0).getTime() >= CADUCA || ahora - this._adelantadoDesde >= CADUCA ||
+      (this._rechazoAlto === true && ahora - (this._ultimoRebobinado || 0) >= 2000);
   }
   _serialize(work) {
     if (this.pending >= 512) return Promise.reject(Object.assign(new Error('Relayer nonce queue is full'), {code:'RELAY_QUEUE_CAPACITY'}));
@@ -1903,18 +1948,36 @@ class RelayerNonceManager {
         if(request.length>240)throw new Error('nonce_ticket_too_long');
         const requestId=key+':'+crypto.createHash('sha256').update(request).digest('hex');
         const counters=mongoose.connection.collection('relayer_nonce_counters'),requests=mongoose.connection.collection('relayer_nonce_reservations');
-        const session=await mongoose.connection.startSession();let allocated;
+        const session=await mongoose.connection.startSession();let allocated,rebobinado=null;
         try{await session.withTransaction(async()=>{
-          const previous=await requests.findOne({_id:requestId},{session});
-          if(previous){allocated=previous.nonce;return;}
-          const floor=Math.max(this.currentNonce??0,remote);
-          const result=await counters.findOneAndUpdate({_id:key},[{$set:{next:{$add:[{$max:[{$ifNull:['$next',floor]},floor]},1]},updatedAt:new Date()}}],{upsert:true,returnDocument:'after',session});
+          allocated=undefined;rebobinado=null;
+          const previous=await requests.findOne({_id:requestId},{session}),ahora=Date.now();
+          // A ticket keeps its nonce, unless the chain never reached it long after the reservation.
+          const perdida=previous&&Number(previous.nonce)>remote&&ahora-new Date(previous.createdAt||0).getTime()>=30000;
+          if(previous&&!perdida){allocated=previous.nonce;return;}
+          const estado=await counters.findOne({_id:key},{session});
+          const atascado=this._contadorAtascado(remote,estado,ahora);
+          const floor=atascado?remote:Math.max(this.currentNonce??0,remote);
+          const cambios={next:{$add:[atascado?remote:{$max:[{$ifNull:['$next',floor]},floor]},1]},updatedAt:new Date()};
+          if(atascado){
+            rebobinado={desde:estado.next,a:remote};
+            cambios.rebobinado={$literal:{desde:estado.next,a:remote,en:new Date(ahora)}};
+            cambios.primerRebobinado={$ifNull:['$primerRebobinado',{$literal:{a:remote,en:new Date(ahora)}}]};
+          }
+          const result=await counters.findOneAndUpdate({_id:key},[{$set:cambios}],{upsert:true,returnDocument:'after',session});
           const row=result?.value || result;
           if(!Number.isSafeInteger(row?.next)||row.next<1)throw new Error('invalid_persisted_nonce');
           allocated=row.next-1;
-          await requests.insertOne({_id:requestId,counter:key,source:ticket?request:null,nonce:allocated,createdAt:new Date()},{session});
+          if(previous)await requests.updateOne({_id:requestId},{$set:{nonce:allocated,createdAt:new Date(),nonceAnterior:previous.nonce}},{session});
+          else await requests.insertOne({_id:requestId,counter:key,source:ticket?request:null,nonce:allocated,createdAt:new Date()},{session});
         },{readConcern:{level:'snapshot'},writeConcern:{w:'majority'}});}finally{await session.endSession();}
         if(!Number.isSafeInteger(allocated)||allocated<0)throw new Error('invalid_nonce_reservation');
+        this._ultimoNonce=allocated;
+        if(rebobinado){
+          this.currentNonce=allocated+1;this._ultimoRebobinado=this._adelantadoDesde=Date.now();this._rechazoAlto=false;
+          console.warn(`🔢 [relayer] el contador iba en ${rebobinado.desde} y la cadena en ${rebobinado.a}: vuelve a la cadena (reservas que nunca entraron)`);
+          return allocated;
+        }
         this.currentNonce=Math.max(this.currentNonce??0,allocated+1);return allocated;
       }
       // Pure isolated fixtures have no mongoose binding; production requires it.
@@ -1934,6 +1997,61 @@ class RelayerNonceManager {
 }
 
 const relayerNonceManager = new RelayerNonceManager();
+relayerNonceManager.vigilar(provider);
+
+/* QUÉ SIGNIFICA QUE UN ENVÍO FALLE (2026-11-02). ethers esconde el texto del nodo:
+   para "nonce too high" da shortMessage "could not coalesce error" y el motivo solo
+   está en message. */
+function relayerTextoDeError(e) {
+  return [e && e.shortMessage, e && e.message, e && e.error && e.error.message, e && e.info && e.info.error && e.info.error.message]
+    .filter(Boolean).join(' | ');
+}
+/** El nodo rechazó esos bytes por su nonce: otro nonce sí puede entrar. */
+function relayerRechazoDeNonce(e) {
+  return ['NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(e && e.code) ||
+    /nonce too (high|low)|nonce has already been used|replacement (transaction underpriced|fee too low)/i.test(relayerTextoDeError(e));
+}
+/** Se sabe que esa transacción NO tendrá efecto. Un error de red no lo prueba: pudo llegar. */
+function relayerRechazoSeguro(e) {
+  if (!e) return false;
+  if (e.receipt && Number(e.receipt.status) === 0) return true;    // minada y revertida
+  return relayerRechazoDeNonce(e) || e.code === 'INSUFFICIENT_FUNDS' ||
+    /insufficient funds|intrinsic gas|max fee per gas less than block base fee|bandwidth limit|rate limit|too many requests/i.test(relayerTextoDeError(e));
+}
+/* Reserva un nonce y envía; si el NODO rechaza esos bytes, repite. Nunca repite un
+   error ambiguo: ejecutaría dos veces. Un nonce alto se reintenta una vez tal cual,
+   porque su antecesor puede venir de camino; si sigue alto se pide otro, y es ese
+   pedido el que hace volver al contador. envio.sinEfecto (opcional) dice si lo último
+   que se intentó quedó sin efecto seguro. */
+async function relayerEnviarConNonce(ticket, enviar, envio) {
+  let nonce = null, reservas = 0, reenviado = false;
+  for (let intento = 0; ; intento++) {
+    if (nonce === null) {
+      nonce = await relayerNonceManager.getNextNonce(ticket ? (reservas ? ticket + ':r' + reservas : ticket) : undefined);
+      reservas++; reenviado = false;
+    }
+    if (envio) envio.sinEfecto = false;
+    try { return await enviar(nonce); }
+    catch (e) {
+      if (!relayerRechazoSeguro(e)) throw e;
+      if (envio) envio.sinEfecto = true;
+      if (intento >= 6 || (e.receipt && Number(e.receipt.status) === 0)) throw e;
+      if (/nonce too high/i.test(relayerTextoDeError(e)) && !reenviado) reenviado = true; else nonce = null;
+      await new Promise(r => setTimeout(r, 300 * (intento + 1)));
+    }
+  }
+}
+/* ¿Esta firma ya no puede minarse nunca? "nonce too high" = el nodo no la guardó, y
+   su única copia es la que tiene quien pregunta. "nonce too low" = ese nonce lo gastó
+   alguien: si tras esperar a que los nodos del RPC se pongan al día no hay recibo de
+   ESTE hash, lo gastó otra. Solo con esta prueba se puede volver a firmar. */
+async function relayerFirmaMuerta(e, hash) {
+  const texto = relayerTextoDeError(e);
+  if (/nonce too high/i.test(texto)) return true;
+  if (!(e && e.code === 'NONCE_EXPIRED') && !/nonce too low|nonce has already been used/i.test(texto)) return false;
+  await new Promise(r => setTimeout(r, 5000));
+  return !(await provider.getTransactionReceipt(hash));
+}
 
 // Un fallo HTTP después de enviar NO prueba que el nodo rechazó la transacción.
 // Se persiste su hash antes del envío y se reintentan exactamente los mismos
@@ -1965,8 +2083,10 @@ async function broadcastRelayTransaction(tx, relayTx, intentos = 5) {
          que el nonce lo gastó OTRA transacción: no hay duda, se avisa para
          firmar de nuevo con otro nonce. Tras un intento ambiguo (pudo llegar)
          sigue valiendo lo de abajo. */
+      // "nonce too high" (2026-11-02): rechazada y no guardada; solo se ve en message, shortMessage no lo trae.
       const nonceOcupado = ['NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(error?.code) ||
-        /nonce too low|nonce has already been used|replacement transaction underpriced/.test(mensaje);
+        /nonce too low|nonce has already been used|replacement transaction underpriced/.test(mensaje) ||
+        /nonce too high/i.test(String(error?.message || ''));
       if (nonceOcupado && !ambiguoPrevio) {
         relayTx.txHash = undefined;
         relayTx.broadcastedAt = undefined;
@@ -4434,7 +4554,11 @@ class RelayManager {
                 if(tx.rawTransaction){
                   const signed=ethers.Transaction.from(tx.rawTransaction);
                   if(ethers.keccak256(tx.rawTransaction)!==tx.txHash || signed.from?.toLowerCase()!==String(relayerWallet.address).toLowerCase() || signed.to?.toLowerCase()!==String(tx.contractAddress).toLowerCase() || signed.nonce!==tx.nonce || signed.chainId!==BigInt(CHAIN_ID))throw new Error('stored_relay_intent_mismatch');
-                  try{await provider.broadcastTransaction(tx.rawTransaction);}catch(e){if(!/already known|nonce too low/i.test(String(e.shortMessage||e.message)))throw e;}
+                  try{await provider.broadcastTransaction(tx.rawTransaction);}catch(e){
+                    // Rejected and not kept by the node: leave it for the client to resend, not for a later restart to mine it late.
+                    if(/nonce too high/i.test(String(e.message))){tx.status='failed';tx.error='relay_dropped: nonce '+tx.nonce+' refused as too high; it never entered the chain';await tx.save();continue;}
+                    if(!/already known|nonce too low/i.test(String(e.shortMessage||e.message)))throw e;
+                  }
                 }
                 // Una ausencia de receipt no autoriza repetir la operación con
                 // otro nonce: la original aún puede minarse. Se consulta su hash.
@@ -10256,8 +10380,9 @@ function gatherGasPrice() {
 
 // Acuña `quantity` de `tipo` para `address`: si el jugador ya tiene una factura
 // activa de ese tipo con cupo, la aumenta; si no, crea una nueva. Devuelve
-// { id, manualId, cantidad } o null.
-async function mintGatherReward(address, tipo, quantity) {
+// { id, manualId, cantidad } o null. `envio` (opcional): ver relayerEnviarConNonce.
+async function mintGatherReward(address, tipo, quantity, envio) {
+  if (envio) envio.sinEfecto = true;
   if (!relayerWallet || quantity <= 0) return null;
   const c = new ethers.Contract(CONTRACTS.ITEMS_CONTRACT.address, CONTRACTS.ITEMS_CONTRACT.abi, relayerWallet);
   const gasPrice = gatherGasPrice();
@@ -10293,15 +10418,15 @@ async function mintGatherReward(address, tipo, quantity) {
   try {
     if (target) {
       const gasLimit=(await c.increaseInvoiceQuantity.estimateGas(target.id,quantity,{gasPrice}))*120n/100n;
-      const nonce=await relayerNonceManager.getNextNonce('gather-increase:'+target.id+':'+crypto.randomUUID());
-      const tx = await c.increaseInvoiceQuantity(target.id, quantity, { gasPrice, gasLimit, nonce });
+      const tx = await relayerEnviarConNonce('gather-increase:'+target.id+':'+crypto.randomUUID(), nonce => c.increaseInvoiceQuantity(target.id, quantity, { gasPrice, gasLimit, nonce }), envio);
+      if (envio) envio.hash = tx.hash;
       await tx.wait(1, 120000);
       return { id: target.id, manualId: target.manualId, cantidad: target.cantidad + quantity };
     } else {
       const manualId=('g'+tipo.replace(/[^a-z0-9]/gi,'').slice(0,10)+crypto.randomBytes(12).toString('hex')).slice(0,60);
       const gasLimit=(await c.createInvoice.estimateGas(address,tipo,quantity,manualId,{gasPrice}))*120n/100n;
-      const nonce=await relayerNonceManager.getNextNonce('gather-create:'+manualId);
-      const tx = await c.createInvoice(address, tipo, quantity, manualId, { gasPrice, gasLimit, nonce });
+      const tx = await relayerEnviarConNonce('gather-create:'+manualId, nonce => c.createInvoice(address, tipo, quantity, manualId, { gasPrice, gasLimit, nonce }), envio);
+      if (envio) envio.hash = tx.hash;
       const receipt = await tx.wait(1, 120000);
       let newId = null;
       try {
@@ -10315,6 +10440,7 @@ async function mintGatherReward(address, tipo, quantity) {
   } catch (e) {
     // Ante nonce desincronizado, resetear (mismo criterio que el relay).
     console.error('❌ gather mint error:', e.message);
+    if (envio && relayerRechazoSeguro(e)) envio.sinEfecto = true;
     try { await relayerNonceManager.resetNonce(); } catch (_) {}
     return null;
   }
@@ -17959,7 +18085,7 @@ const MarketAssetEscrow = mongoose.models.MarketAssetEscrow || mongoose.model('M
 const marketAssetClaimSchema = new mongoose.Schema({
   _id: String, listingId: { type: String, index: true }, wallet: { type: String, index: true }, itemId: String,
   qty: Number, op: String, sourceInvoiceId: Number, sourceManualId: String, destinationManualId: String,
-  status: { type: String, default: 'pending', index: true }, txHash: String, nonce: Number,
+  status: { type: String, default: 'pending', index: true }, txHash: String, nonce: Number, firmas: Number,
   rawTx: { type: String, select: false },
   invoiceId: Number, manualId: String, error: String, createdAt: { type: Date, default: Date.now }, updatedAt: Date
 }, { collection: 'market_asset_claims', versionKey: false });
@@ -18042,7 +18168,14 @@ async function executeMarketAssetClaim(id) {
         const expected=c.interface.encodeFunctionData('transferInvoice',[from,to,claim.sourceInvoiceId,claim.qty,claim.destinationManualId]);
         if(signed.hash!==claim.txHash || signed.from.toLowerCase()!==relayerWallet.address.toLowerCase() ||
             signed.to.toLowerCase()!==String(CONTRACTS.ITEMS_CONTRACT.address).toLowerCase() || signed.data!==expected || signed.value!==0n)throw marketTransferError('market_signed_intent_mismatch');
-        try{await relayerWallet.provider.broadcastTransaction(claim.rawTx);}catch(_){}
+        let muerta=false;
+        try{await relayerWallet.provider.broadcastTransaction(claim.rawTx);}catch(e){muerta=await relayerFirmaMuerta(e,claim.txHash);}
+        if(muerta){
+          // (2026-11-02) These bytes can never be mined: sign again with a new ticket on the next sweep.
+          if(claim.op==='escrow')await MarketAssetEscrow.updateOne({_id:escrow._id,leaseToken:token,status:'processing'},{$set:{status:'awaiting_escrow'}});
+          await MarketAssetClaim.updateOne({_id:id,status:{$ne:'confirmed'}},{$set:{status:'pending',error:'',firmas:(claim.firmas||0)+1,updatedAt:new Date()},$unset:{nonce:1,txHash:1,rawTx:1}});
+          return await MarketAssetClaim.findById(id).lean();
+        }
         receipt=await relayerWallet.provider.waitForTransaction(claim.txHash,1,120000);
       }
       if (!receipt) return claim;
@@ -18072,7 +18205,7 @@ async function executeMarketAssetClaim(id) {
           if(locked.matchedCount!==1)throw marketTransferError('market_escrow_changed');
         }
       });
-      const nonce = await relayerNonceManager.getNextNonce('market-claim:'+id);
+      const nonce = await relayerNonceManager.getNextNonce('market-claim:'+id+(claim.firmas?':f'+claim.firmas:''));
       const rawTx=await relayerWallet.signTransaction({...unsigned,nonce});
       const txHash=ethers.keccak256(rawTx);
       await MarketAssetClaim.updateOne({_id:id},{$set:{nonce,txHash,rawTx,updatedAt:new Date()}});
@@ -24044,26 +24177,41 @@ app.post('/api/economia/tienda', strictLimiter, authMiddleware, csrfProtection, 
           bronce: reserve, precioBronce: price, estado: 'cobrado' }], { session });
       });
       // The durable row now prevents replay even if the process crashes during the chain operation.
-      let confirmed = 0;
+      let confirmed = 0, cerrando = false;
+      const envio = {};
       try {
         const tipo = itemTipoOnChain(b.itemId);
-        if (!tipo) throw new Error('tipo_no_configurado');
-        if (op === 'venta') confirmed = await burnItemOnChain(gp.address, tipo, q);
+        if (!tipo) { envio.sinEfecto = true; throw new Error('tipo_no_configurado'); }
+        if (op === 'venta') confirmed = await burnItemOnChain(gp.address, tipo, q, envio);
         else {
           const stack = Math.max(1, Number(ITEM_MAX_STACK[b.itemId]) || 1);
           while (confirmed < q) {
             const batch = Math.min(stack, resourceBatch || stack, q - confirmed);
-            const minted = await mintGatherReward(gp.address, tipo, batch);
+            const minted = await mintGatherReward(gp.address, tipo, batch, envio);
             if (!minted || !minted.id) break;
             confirmed += batch;
             await ServicioCobro.updateOne({ _id: id }, { $set: { confirmadas: confirmed } });
           }
         }
         if (confirmed !== q) throw new Error('confirmacion_incompleta');
+        cerrando = true;
         const result = await ecoTiendaResolver(id, confirmed);
         return res.json(result);
       } catch (e) {
-        await ServicioCobro.updateOne({ _id: id }, { $set: { estado: 'revision', confirmadas: confirmed, revisionMotivo: String(e.message || '').slice(0, 200) } });
+        /* (2026-11-02) Lo que el nodo rechazó no necesita que nadie lo revise: no hay
+           nada vivo en la cadena. Se cobra lo confirmado y el resto vuelve ya. La
+           revisión queda para lo único dudoso: una transacción que pudo entrar. */
+        if (envio.sinEfecto && !cerrando) {
+          try {
+            const result = await ecoTiendaResolver(id, confirmed);
+            if (confirmed > 0) return res.json(result);
+            const conocido = ['resource_capacity_exhausted', 'resource_not_configured', 'resource_invoice_limit'].includes(e.code);
+            return res.status(409).json({ ok: false, error: conocido ? e.code : 'cadena_ocupada', confirmadas: 0, stats: result.stats,
+              message: 'The chain did not accept this trade. Nothing was charged and no item changed. Please try again.' });
+          } catch (e2) { console.warn('economia: no se pudo saldar sin efecto:', e2.code || e2.message); }
+        }
+        await ServicioCobro.updateOne({ _id: id }, { $set: { estado: 'revision', confirmadas: confirmed,
+          revisionMotivo: (String(e.message || '') + (envio.hash ? ' · tx ' + envio.hash : '')).slice(0, 200) } });
         return res.status(202).json({ ok: false, revision: true, ref: id,
           message: 'The operation is recorded for chain review. Do not repeat it with a new reference.' });
       }
@@ -24081,6 +24229,59 @@ app.post('/api/admin/economia/tienda/revisar', adminAuth, strictLimiter, async (
     res.json(result);
   } catch (e) { ecoResponderError(res, e); }
 });
+
+/* LO QUE SE QUEDÓ "EN REVISIÓN" DURANTE EL ATASCO (2026-11-02). Desde el 2026-10-30
+   07:03:04 UTC hasta que el contador volvió a la cadena, el relayer no minó NADA: su
+   nonce siguió en 14615. Por eso ninguna compra o venta de esas fechas llegó a
+   ejecutarse, y el dinero retenido de esas filas se puede devolver sin mirar una a una.
+
+   La prueba es la propia cadena y se comprueba antes de tocar nada: la cartera tiene
+   que ser esa y su nonce seguir en 14615 (o constar que el contador volvió a atrás
+   estando en 14615). Si no, no se toca nada y queda el panel. `hasta` se guarda una vez.
+   Una fila 'cobrado' pudo estar en marcha al arrancar: de esas, solo las de 5 min antes. */
+const TIENDA_ATASCO_RELAYER = Object.freeze({ id: 'tienda-atasco-20261030', relayer: '0x1dda2cdc8e35908d27ce7f1622d30839d15510ae',
+  nonce: 14615, desde: new Date('2026-10-30T07:03:04Z') });
+async function tiendaSaldarAtasco() {
+  if (!relayerWallet || mongoose.connection.readyState !== 1) return false;
+  const A = TIENDA_ATASCO_RELAYER, direccion = String(relayerWallet.address).toLowerCase();
+  const marcas = mongoose.connection.collection('relayer_nonce_counters');
+  let marca = await marcas.findOne({ _id: A.id });
+  if (!marca) {
+    let hasta = null;
+    if (direccion === A.relayer) {
+      const contador = await marcas.findOne({ _id: String(CHAIN_ID) + ':' + direccion });
+      const primero = contador && contador.primerRebobinado, antes = new Date();
+      if (primero && primero.a === A.nonce) hasta = new Date(primero.en);
+      else if (await provider.getTransactionCount(relayerWallet.address, 'latest') === A.nonce) hasta = antes;
+    }
+    await marcas.updateOne({ _id: A.id }, { $setOnInsert: { hasta, en: new Date(), hecho: !hasta } }, { upsert: true });
+    marca = await marcas.findOne({ _id: A.id });
+  }
+  if (marca.hecho || !marca.hasta) return true;
+  const hasta = new Date(marca.hasta);
+  const filas = await ServicioCobro.find({ tipo: { $in: ['tienda_compra', 'tienda_venta'] }, confirmadas: { $in: [0, null] }, $or: [
+    { estado: 'revision', t: { $gt: A.desde, $lt: hasta } },
+    { estado: 'cobrado', t: { $gt: A.desde, $lt: new Date(hasta.getTime() - 5 * 60000) } }
+  ] }).sort({ t: 1 }).limit(200).lean();
+  let saldadas = 0;
+  for (const f of filas) {
+    try {
+      await ecoTiendaResolver(f._id, 0);
+      await ServicioCobro.updateOne({ _id: f._id }, { $set: { revisionMotivo: 'Relayer stall 2026-10-30: nothing reached the chain; settled at 0 units' } });
+      saldadas++;
+    } catch (e) { console.warn('tienda: atasco:', f._id, e.code || e.message); }
+  }
+  if (saldadas) console.log(`🏪 Tienda: ${saldadas} operaciones del atasco del relayer devueltas a sus dueños`);
+  if (!filas.length) await marcas.updateOne({ _id: A.id }, { $set: { hecho: true, terminado: new Date() } });
+  return !filas.length;
+}
+let _tiendaAtascoTimer = null;
+const _tiendaAtascoTurno = () => tiendaSaldarAtasco()
+  .then((listo) => { if (listo && _tiendaAtascoTimer) { clearInterval(_tiendaAtascoTimer); _tiendaAtascoTimer = null; } })
+  .catch((e) => console.warn('tienda: atasco:', e.code || e.message));
+setTimeout(_tiendaAtascoTurno, 30000).unref();
+_tiendaAtascoTimer = setInterval(_tiendaAtascoTurno, 5 * 60000);
+_tiendaAtascoTimer.unref();
 
 
 // ECONOMY SAFETY POLICY v3. Deterministic decisions, bounded jobs, two active treasuries.
@@ -24260,8 +24461,9 @@ function marketOnchainTipo(itemId) {
 }
 
 // Quema `quantity` unidades de `tipo` repartidas entre las facturas activas de
-// la dirección. Devuelve cuántas se quemaron realmente.
-async function burnItemOnChain(address, tipo, quantity) {
+// la dirección. Devuelve cuántas se quemaron realmente. `envio` (opcional): ver relayerEnviarConNonce.
+async function burnItemOnChain(address, tipo, quantity, envio) {
+  if (envio) envio.sinEfecto = true;
   if (!relayerWallet || quantity <= 0) return 0;
   const c = new ethers.Contract(CONTRACTS.ITEMS_CONTRACT.address, CONTRACTS.ITEMS_CONTRACT.abi, relayerWallet);
   const gasPrice = gatherGasPrice();
@@ -24294,15 +24496,18 @@ async function burnItemOnChain(address, tipo, quantity) {
     try {
       const estimate=aQuitar>=f.cantidad?await c.deleteInvoice.estimateGas(f.id,{gasPrice}):await c.decreaseInvoiceQuantity.estimateGas(f.id,aQuitar,{gasPrice});
       const gasLimit=BigInt(estimate)*120n/100n;
-      const nonce = await relayerNonceManager.getNextNonce();
-      const tx = (aQuitar >= f.cantidad)
-        ? await c.deleteInvoice(f.id, { gasPrice, gasLimit, nonce })
-        : await c.decreaseInvoiceQuantity(f.id, aQuitar, { gasPrice, gasLimit, nonce });
-      await tx.wait();
+      const tx = await relayerEnviarConNonce(null, nonce => (aQuitar >= f.cantidad)
+        ? c.deleteInvoice(f.id, { gasPrice, gasLimit, nonce })
+        : c.decreaseInvoiceQuantity(f.id, aQuitar, { gasPrice, gasLimit, nonce }), envio);
+      if (envio) envio.hash = tx.hash;
+      // Con tope: sin él, una transacción perdida dejaba la cola del jugador esperando para siempre.
+      await tx.wait(1, 120000);
       restante -= aQuitar;
       quemadas += aQuitar;
+      if (envio) envio.sinEfecto = true;     // esta factura ya está contada; de la siguiente aún no ha salido nada
     } catch (e) {
       console.error(`❌ market burn (factura ${f.id}):`, e.message);
+      if (envio && relayerRechazoSeguro(e)) envio.sinEfecto = true;
       try { await relayerNonceManager.resetNonce(); } catch (_) {}
       break;
     }
