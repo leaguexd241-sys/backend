@@ -10,7 +10,12 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { ethers } = require('ethers');
 const crypto = require('crypto');
-const GF_CROP_CATALOG=require('./gf-crop-catalog');
+// (2026-11-02) Panes, tortas, armas, cañas, peces, construcciones y monturas: gf-items-v2.js se funde con el de plantas.
+let GF_ITEMS_V2;
+try{GF_ITEMS_V2=require('./gf-items-v2');}
+catch(e){console.error('❌ Falta gf-items-v2.js junto a server2.js: sin él no hay panes, tortas, armas nuevas ni monturas. Súbelo.',e.message);
+ GF_ITEMS_V2={fusionar:c=>c,pesca:{},canasSuerte:{},pvpDano:{},pvpAlcance:{},obras:{},monturas:{}};}
+const GF_CROP_CATALOG=GF_ITEMS_V2.fusionar(require('./gf-crop-catalog'));
 const { v4: uuidv4 } = require('uuid');
 const { body, param, validationResult } = require('express-validator');
 const useragent = require('express-useragent');
@@ -1691,6 +1696,35 @@ console.warn  = (...a) => { const m = a.map(String).join(' '); if (_isRpcNoise(m
 // ─────────────────────────────────────────────────────────────────────────────
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
+
+/* EL CUPO DEL RPC (2026-11-02). "Cuando hago muchas compras seguidas, a veces sale el error."
+   Una compra lee la cadena varias veces antes de cobrar (tabla, cupo, inventario) y el RPC de
+   LitVM contesta "Bandwidth limit exceeded" (-31002) a la IP del servidor cuando se le pide mucho
+   de golpe. Esa respuesta llega como error de JSON-RPC, no como HTTP 429, así que el reintento de
+   ethers no la ve y subía hasta la ruta como un 503 sin explicación. Es un rechazo sin efecto: se
+   repite aquí, con espera creciente, antes de que nadie se entere. Reenviar una transacción ya
+   firmada es seguro por el mismo motivo: son los mismos bytes y un nonce solo se mina una vez. */
+const RPC_ES_CUPO = (m) => /bandwidth limit|rate limit|too many requests|request limit|capacity exceeded|exceeded the limit/i.test(String(m || ''));
+const RPC_ESPERAS_MS = Object.freeze([250, 600, 1200, 2500, 4000]);
+{
+  const enviarOriginal = provider._send.bind(provider);
+  provider._send = async function (payload) {
+    for (let intento = 0; ; intento++) {
+      try {
+        const respuestas = await enviarOriginal(payload);
+        const cortado = Array.isArray(respuestas) && respuestas.some((r) => r && r.error && (Number(r.error.code) === -31002 || RPC_ES_CUPO(r.error.message)));
+        if (!cortado || intento >= RPC_ESPERAS_MS.length) return respuestas;
+      } catch (e) {
+        // Un fallo de transporte es dudoso para un envío: solo se repiten las lecturas.
+        const lista = Array.isArray(payload) ? payload : [payload];
+        const soloLectura = lista.every((p) => p && p.method !== 'eth_sendRawTransaction');
+        const pasajero = e && (['SERVER_ERROR', 'TIMEOUT', 'NETWORK_ERROR'].includes(e.code) || RPC_ES_CUPO(e.message));
+        if (!soloLectura || !pasajero || intento >= RPC_ESPERAS_MS.length) throw e;
+      }
+      await new Promise((r) => setTimeout(r, RPC_ESPERAS_MS[intento]));
+    }
+  };
+}
 
 // Historical analytics reads use their own bounded HTTP transport. The existing
 // game provider retains its signing/broadcast behavior. Chain validation is done
@@ -7707,6 +7741,7 @@ io.on("connection", (socket) => {
       // entra vea a los demas ya con su color, sin esperar a que se muevan.
       nameColor: socket._nameColor || null,
       petNameColor: socket._petNameColor || null,
+      montura: socket._montura || null,
       lastUpdate: Date.now(),
       /* MODO REPOSO (2026-10-05): cuándo se movió por última vez. Re-entrar
          en la MISMA sala tras una reconexión no es moverse: se hereda. */
@@ -7994,7 +8029,7 @@ io.on("connection", (socket) => {
 
       const encontrado = mensajeDeLaSala(socket, data && data.mid);
       const msg = encontrado.msg;
-      if (!msg) return;
+      if (!msg) { socket.emit('chatReactFallo', { mid: data && data.mid }); return; }
 
       const quien  = socket.authenticatedPlayer || socket.id;
       const nombre = escapeHtml(socket.playerData.username || '---');
@@ -8021,6 +8056,44 @@ io.on("connection", (socket) => {
     } catch (e) {
       console.error('chatReact error:', e);
     }
+  });
+
+  /* (2026-11-02) LA RÁFAGA DE VIENTO (tecla X, gf-poderes.js). Se reparte a la sala con la posición
+     que conoce el servidor, no con la que diga el cliente; cada navegador se empuja a sí mismo (la
+     posición del jugador la lleva su cliente en todo el juego). No hace daño. Una cada 5 s. */
+  /* (2026-11-02) MONTAR. Lo que lleva cada uno se apunta en la sala para que quien llegue lo vea; y se
+     mira en la cadena que la tenga. Es solo el dibujo: la velocidad la lleva su cliente, como la posición. */
+  socket.on('montura:cambio', async (data) => {
+    try {
+      const id = String((data && data.id) || '');
+      if (id && !(typeof GF_ITEMS_V2 !== 'undefined' && Object.prototype.hasOwnProperty.call(GF_ITEMS_V2.monturas, id))) return;
+      const ahora = Date.now();
+      if (ahora - (socket._ultimaMontura || 0) < 800) return;
+      socket._ultimaMontura = ahora;
+      if (id && socket.authenticatedAddress) {
+        const mias = await facturasLibresDeCadena(String(socket.authenticatedAddress).toLowerCase());
+        if (!mias.some(f => f.tipo === id && f.cantidad > 0)) return;
+      }
+      socket._montura = id || null;
+      const room = socket.playerData && socket.playerData.room;
+      if (!room || !rooms[room] || !rooms[room][socket.id]) return;
+      rooms[room][socket.id].montura = id || null;
+      socket.to(room).emit('montura:estado', { id: socket.id, montura: id || null });
+    } catch (e) { /* si la cadena no contesta, se queda como estaba */ }
+  });
+
+  socket.on('poder:viento', (data) => {
+    try {
+      const room = socket.playerData && socket.playerData.room;
+      const yo = room && rooms[room] && rooms[room][socket.id];
+      if (!yo) return;
+      const ahora = Date.now();
+      if (ahora - (socket._ultimoViento || 0) < 5000) return;
+      socket._ultimoViento = ahora;
+      const ang = Number(data && data.ang);
+      if (!Number.isFinite(ang) || Math.abs(ang) > 7) return;
+      socket.to(room).emit('poder:viento', { id: socket.id, x: Number(yo.x) || 0, y: Number(yo.y) || 0, ang });
+    } catch (_) { /* un paquete raro no corta nada */ }
   });
 
   /* EL CHAT GENERAL NO SE EDITA.
@@ -8399,6 +8472,25 @@ const loginLimiter = createCustomRateLimiter(15 * 60 * 1000, NODE_ENV === 'devel
 const apiLimiter = createCustomRateLimiter(60 * 1000, NODE_ENV === 'development' ? 500 : 200, 'too_many_requests', true);
 const strictLimiter = createCustomRateLimiter(15 * 60 * 1000, NODE_ENV === 'development' ? 500 : 200, 'Demasiadas peticiones. Por favor espera.', true);
 const relayLimiter = createCustomRateLimiter(60 * 1000, NODE_ENV === 'development' ? 50 : 20, 'too_many_relay_requests', true);
+/* (2026-11-02) Tienda, granja y crafteo compartían con TODO lo demás los 200 cada 15 minutos por IP
+   de strictLimiter (unas 13 al minuto, sumando también a los que comparten red): quien sembraba y
+   compraba seguido se quedaba sin cupo y veía un error genérico. Las acciones de juego llevan su
+   propio límite, por CUENTA, y dicen cuánto hay que esperar. La cookie se resume con un hash. */
+const gameplayLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: NODE_ENV === 'development' ? 2000 : 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: false,
+  keyGenerator: (req) => {
+    const s = req.cookies && req.cookies.session;
+    return s ? 'c:' + crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 32) : 'ip:' + (req.clientIp || req.ip);
+  },
+  handler: (req, res) => {
+    res.status(429).json({ error: 'too_many_requests', reintentar: true,
+      message: 'Too many actions in a row. Wait a few seconds and try again. Nothing was charged.' });
+  }
+});
 const publicTutorialLimiter = createCustomRateLimiter(60 * 1000, 60, 'too_many_public_requests');
 
 const transactionLimiter = rateLimit({
@@ -12722,21 +12814,35 @@ const PESCA_ESPECIES = [               // [itemId, probabilidad acumulada, exp]
   // lucioperca, fáciles; el lucio y el salmón real, duros; el pez arcoíris,
   // casi una leyenda; y el pez globo, VENENOSO. Las probabilidades de los de
   // antes se reparten para hacerles sitio (la suma sigue siendo 1).
-  ['pes1', 0.20, 15],                  // trucha marrón      fácil
-  ['pes4', 0.33, 12],                  // perca de río       muy fácil
-  ['pes5', 0.44, 18],                  // brema              fácil
-  ['pes11', 0.54, 20],                 // trucha de hielo    fácil
-  ['pes2', 0.64, 25],                  // carpa común        media
-  ['pes10', 0.72, 28],                 // lucioperca         media
-  ['pes7', 0.78, 35],                  // anguila venenosa   media  · veneno
-  ['pes9', 0.84, 40],                  // lucio plateado     difícil
-  ['pes13', 0.89, 45],                 // salmón real        difícil
-  ['pes3', 0.93, 60],                  // trucha dorada      difícil
-  ['pes8', 0.96, 70],                  // pez león venenoso  difícil · veneno
-  ['pes14', 0.98, 75],                 // pez globo          difícil · veneno
-  ['pes6', 0.995, 80],                 // esturión           muy difícil
-  ['pes12', 1.00, 90]                  // pez arcoíris       muy difícil, rarísimo
+  ['pes1', 0.1421, 15],                 // trucha marrón      fácil
+  ['pes4', 0.2345, 12],                 // perca de río       muy fácil
+  ['pes5', 0.3127, 18],                 // brema              fácil
+  ['pes11', 0.3838, 20],                // trucha de hielo    fácil
+  ['pes2', 0.4549, 25],                 // carpa común        media
+  ['pes15', 0.5259, 14],                // Polar Cod          muy fácil
+  ['pes10', 0.5828, 28],                // lucioperca         media
+  ['pes17', 0.6326, 20],                // Sea Bass           fácil
+  ['pes7', 0.6752, 35],                 // anguila venenosa   media  · veneno
+  ['pes9', 0.7178, 40],                 // lucio plateado     difícil
+  ['pes16', 0.7605, 22],                // Gilthead Bream     media
+  ['pes13', 0.7960, 45],                // salmón real        difícil
+  ['pes18', 0.8316, 24],                // Red Mullet         media
+  ['pes3', 0.8600, 60],                 // trucha dorada      difícil
+  ['pes22', 0.8884, 30],                // Discus Fish        media
+  ['pes8', 0.9097, 70],                 // pez león venenoso  difícil · veneno
+  ['pes20', 0.9311, 34],                // Red Piranha        difícil
+  ['pes19', 0.9488, 40],                // Barracuda          difícil
+  ['pes14', 0.9630, 75],                // pez globo          difícil · veneno
+  ['pes21', 0.9773, 50],                // Bluefin Tuna       difícil
+  ['pes6', 0.9879, 80],                 // esturión           muy difícil
+  ['pes23', 0.9936, 80],                // Blue Marlin        muy difícil
+  ['pes12', 0.9972, 90],                // pez arcoíris       muy difícil, rarísimo
+  ['pes24', 1.0000, 110]                // Swordfish          muy difícil, rarísimo
 ];
+/* (2026-11-02) Las cañas buenas. `suerte` acerca la tirada al final de la lista, donde están los raros
+   (r' = r^(1/(1+suerte))) y acorta la espera. La caña de siempre (tabla `caña_pescar`) no da suerte. */
+const PESCA_SUERTE_CANA = typeof GF_ITEMS_V2 === 'undefined' ? {} : GF_ITEMS_V2.canasSuerte;
+function pescaTirada(suerte) { return Math.pow(Math.random(), 1 / (1 + (Number(suerte) || 0))); }
 const PESCA_ESCAPA = 0.12;             // a veces se suelta igual (solo sin lucha)
 /* Cómo pelea cada pez. `tam`: el alto de su cuadro (fracción de la pista);
    `vel`: pistas por segundo a las que puede ir; `nervio`: cuántas veces por
@@ -12764,7 +12870,8 @@ const PESCA_DIFICULTAD = {
   pes11: { tam: 0.38, vel: 0.40, nervio: 0.90, mengua: 0.06, rafaga: 0.06 },
   pes12: { tam: 0.27, vel: 0.64, nervio: 1.45, mengua: 0.24, rafaga: 0.22 },
   pes13: { tam: 0.30, vel: 0.58, nervio: 1.10, mengua: 0.18, rafaga: 0.20 },
-  pes14: { tam: 0.29, vel: 0.50, nervio: 1.60, mengua: 0.18, rafaga: 0.16 }
+  pes14: { tam: 0.29, vel: 0.50, nervio: 1.60, mengua: 0.18, rafaga: 0.16 },
+  ...(typeof GF_ITEMS_V2 === 'undefined' ? {} : Object.fromEntries(Object.entries(GF_ITEMS_V2.pesca).map(([id, p]) => [id, p.dificultad])))
 };
 
 /* LOS VENENOSOS (2026-10-10). "Quiero venenosos que quiten un porcentaje de
@@ -12935,9 +13042,13 @@ app.post('/api/pesca/lanzar', apiLimiter, authMiddleware, csrfProtection, gfExig
     }
     // La caña, en la cadena: la del inventario local no basta.
     const address = String(gp.address || '').toLowerCase();
-    let tieneCana = false;
+    let tieneCana = false, suerteCana = 0;
     try {
-      tieneCana = (await facturasLibresDeCadena(address)).some(f => f.tipo === 'caña_pescar' && f.cantidad > 0);
+      for (const f of await facturasLibresDeCadena(address)) {
+        if (!(f.cantidad > 0)) continue;
+        if (f.tipo === 'caña_pescar') tieneCana = true;
+        else if (Object.prototype.hasOwnProperty.call(PESCA_SUERTE_CANA, f.tipo)) { tieneCana = true; suerteCana = Math.max(suerteCana, PESCA_SUERTE_CANA[f.tipo]); }
+      }
     } catch (e) {
       return res.status(503).json({ error: 'cadena', message: 'The chain is not answering. Try again.' });
     }
@@ -12945,8 +13056,8 @@ app.post('/api/pesca/lanzar', apiLimiter, authMiddleware, csrfProtection, gfExig
 
     _pescaUltimo.set(gp.playerName, ahora);
     const sesion = crypto.randomBytes(8).toString('hex');
-    const espera = PESCA_PICA_MIN + Math.random() * (PESCA_PICA_MAX - PESCA_PICA_MIN);
-    _pescaSesiones.set(gp.playerName, { id: sesion, t0: ahora, picaEn: ahora + espera });
+    const espera = PESCA_PICA_MIN + Math.random() * (PESCA_PICA_MAX - PESCA_PICA_MIN) * (1 - suerteCana);
+    _pescaSesiones.set(gp.playerName, { id: sesion, t0: ahora, picaEn: ahora + espera, suerte: suerteCana });
     return res.json({ ok: true, sesion, picaEnMs: Math.round(espera), ventanaMs: PESCA_VENTANA_MS });
   } catch (e) {
     console.error('POST /api/pesca/lanzar:', e);
@@ -12966,7 +13077,7 @@ app.post('/api/pesca/enganchar', apiLimiter, authMiddleware, csrfProtection, asy
     if (ahora - s.t0 > PESCA_SESION_MS) { _pescaSesiones.delete(gp.playerName); return res.json({ ok: false, motivo: 'tarde' }); }
     if (ahora < s.picaEn - 150) { _pescaSesiones.delete(gp.playerName); return res.json({ ok: false, motivo: 'pronto' }); }
     if (ahora > s.picaEn + PESCA_VENTANA_MS + PESCA_MARGEN_MS) { _pescaSesiones.delete(gp.playerName); return res.json({ ok: false, motivo: 'tarde' }); }
-    const r = Math.random();
+    const r = pescaTirada(s.suerte);
     const [itemId, , exp] = PESCA_ESPECIES.find(e => r <= e[1]) || PESCA_ESPECIES[0];
     s.especie = itemId; s.exp = exp; s.enganchadoEn = ahora;
     return res.json({ ok: true, especie: itemId, dificultad: PESCA_DIFICULTAD[itemId], maxMs: PESCA_LUCHA_MAX_MS });
@@ -13000,7 +13111,7 @@ app.post('/api/pesca/recoger', apiLimiter, authMiddleware, csrfProtection, gfExi
       if (ahora < s.picaEn - 150) return res.json({ ok: false, motivo: 'pronto' });
       if (ahora > s.picaEn + PESCA_VENTANA_MS + PESCA_MARGEN_MS) return res.json({ ok: false, motivo: 'tarde' });
       if (Math.random() < PESCA_ESCAPA) return res.json({ ok: false, motivo: 'escapo' });
-      const r = Math.random();
+      const r = pescaTirada(s.suerte);
       [itemId, , exp] = PESCA_ESPECIES.find(e => r <= e[1]) || PESCA_ESPECIES[0];
     }
     const tipo = ITEM_TIPO_MAP[itemId];
@@ -13383,12 +13494,12 @@ const PVP_ZONAS = {
 };
 function esSalaSalvaje(sala) { return SALAS_SALVAJES.has(salaBase(sala)); }
 // Vida que quita cada espada a otro jugador (la vida va de 0 a 100).
-const PVP_DANO = { espada_madera: 4, espada_cobre: 6, espada_hierro: 9, arco: 5, baston_mago: 6 };
+const PVP_DANO = { espada_madera: 4, espada_cobre: 6, espada_hierro: 9, arco: 5, baston_mago: 6, ...(typeof GF_ITEMS_V2 === 'undefined' ? {} : GF_ITEMS_V2.pvpDano) };
 // (2026-10-21) El arco y el bastón dan de lejos: su alcance propio (generoso,
 // como el de la espada: las dos posiciones llegan con el retraso de la red).
 // (2026-10-21) El cliente llega a 300 x 1,35 (combate) x 1,3 (poder B) + 30 px:
 // se deja ese margen más el retraso de las posiciones de la sala.
-const PVP_ALCANCE_ARMA = { arco: 600, baston_mago: 520 };
+const PVP_ALCANCE_ARMA = { arco: 600, baston_mago: 520, ...(typeof GF_ITEMS_V2 === 'undefined' ? {} : GF_ITEMS_V2.pvpAlcance) };
 // Generoso: las dos posiciones llegan con el retraso de la red.
 const PVP_ALCANCE = 150;
 const PVP_ENFRIA_MS = 300;
@@ -15786,6 +15897,13 @@ function agregarASlots(inventory, itemId, cantidad, { invoiceId = null, manualId
   return { metidas: cantidad - restante, inventory: limpia };
 }
 
+/* (2026-11-02) La entrega quema y paga en la cadena y tarda: cerrar el panel y reabrirlo permitía
+   mandarla dos veces y las dos pasaban el "¿ya estaba entregada?". Se hace cola con el resto de lo
+   que toca el inventario de ese jugador, hasta que la respuesta sale. */
+function gfEnColaHastaResponder(req, res, next) {
+  const clave = 'inventory:' + String((req.user && req.user.address) || '').toLowerCase();
+  enColaDelJugador(clave, () => new Promise((fin) => { res.once('finish', fin); res.once('close', fin); next(); })).catch(next);
+}
 app.post('/api/missions/daily/complete',
   apiLimiter,
   authMiddleware,
@@ -15793,6 +15911,7 @@ app.post('/api/missions/daily/complete',
   gfExigeNombre,
   body('npcId').isString().notEmpty(),
   body('missionId').isString().notEmpty(),
+  gfEnColaHastaResponder,
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -16492,7 +16611,7 @@ async function gfTieneVipPorDireccion(address) {
 /** Middleware: sin VIP, 403 vip_required (después de authMiddleware). */
 function gfExigeVip(req, res, next) {
   gfTieneVipPorDireccion(req.user && req.user.address)
-    .then((ok) => (ok ? next() : res.status(403).json({ error: 'vip_required', message: 'You need VIP to do this. Talk to Rosalind the Weaver in Farmer Joe\'s house.' })))
+    .then((ok) => (ok ? next() : res.status(403).json({ error: 'vip_required', message: 'You need VIP to do this. Talk to Rosalind the VIP Merchant in Farmer Joe\'s house.' })))
     .catch(() => res.status(403).json({ error: 'vip_required' }));
 }
 /** Cobra `cantidad` de una moneda (atómico) y lo deja pendiente para la cadena. */
@@ -16513,6 +16632,28 @@ async function gfDevolverStat(playerName, stat, cantidad) {
   }
   return doc;
 }
+/* PAGAR UN VIAJE CON LO QUE HAYA (2026-11-02). "Solo cobra bronce; si no tuviera bronce no aplica
+   la conversión con plata u oro." El precio sigue en bronce, pero si no llega se cambia lo justo de
+   plata y luego de oro (1 plata = 1000 bronce, 1 oro = 1000 plata) y la vuelta queda en bronce: el
+   mismo plan que la tienda (eco2PlanPago). Comprobación y escritura van juntas: si el saldo cambió
+   entre medias, se vuelve a mirar. */
+function gfValorEnBronce(st) {
+  return Math.floor(Number(st && st.oro) || 0) * 1000000 + Math.floor(Number(st && st.plata) || 0) * 1000 + Math.floor(Number(st && st.bronce) || 0);
+}
+async function gfCobrarConCambio(playerName, cuanto) {
+  for (let i = 0; i < 4; i++) {
+    const st = await PlayerStats.findOne({ playerName }).select('oro plata bronce').lean();
+    const plan = st && eco2PlanPago(cuanto, st);
+    if (!plan) return null;
+    const doc = await PlayerStats.findOneAndUpdate(
+      { _id: st._id, oro: st.oro, plata: st.plata, bronce: st.bronce },
+      { $set: { ...plan, chainPendingSince: new Date() }, $addToSet: { chainPending: { $each: ['oro', 'plata', 'bronce'] } } },
+      { new: true });
+    if (doc) return doc;
+  }
+  return null;
+}
+
 /** El precio en bronce de viajar hasta otro jugador (botón de amigos). */
 const GF_VIAJE_OTRO_MAPA = 3000;
 function gfPrecioViaje(socket, salaDestino, pDestino) {
@@ -16671,9 +16812,9 @@ app.get('/api/viaje/mapa', apiLimiter, authMiddleware, async (req, res) => {
   try {
     const gp = await jugadorDeLaSesion(req);
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
-    const st = await PlayerStats.findOne({ playerName: gp.playerName }).select('bronce').lean();
+    const st = await PlayerStats.findOne({ playerName: gp.playerName }).select('oro plata bronce').lean();
     return res.json({ ok: true, version: GF_MAPA_MUNDO.version, ...await gfMapaEstado(gp),
-                      bronce: Math.floor(Number(st && st.bronce) || 0), precio: GF_MAPA_PRECIO });
+                      bronce: Math.floor(Number(st && st.bronce) || 0), valorBronce: gfValorEnBronce(st), precio: GF_MAPA_PRECIO });
   } catch (e) {
     console.error('GET /api/viaje/mapa:', e);
     return res.status(500).json({ error: 'internal_server_error' });
@@ -16698,10 +16839,10 @@ app.post('/api/viaje/mapa', apiLimiter, authMiddleware, csrfProtection, async (r
       // moviste lejos), se vuelve a preguntar.
       const visto = Number(req.body && req.body.precio);
       if (Number.isFinite(visto) && e.precio > visto) return res.status(409).json({ error: 'precio_cambio', precio: e.precio });
-      const doc = await gfCobrarStat(gp.playerName, 'bronce', e.precio);
+      const doc = await gfCobrarConCambio(gp.playerName, e.precio);
       if (!doc) {
-        const st = await PlayerStats.findOne({ playerName: gp.playerName }).select('bronce').lean();
-        return res.status(400).json({ error: 'insufficient_funds', need: e.precio, have: Math.floor(Number(st && st.bronce) || 0) });
+        const st = await PlayerStats.findOne({ playerName: gp.playerName }).select('oro plata bronce').lean();
+        return res.status(400).json({ error: 'insufficient_funds', need: e.precio, have: gfValorEnBronce(st) });
       }
       const billete = crypto.randomBytes(8).toString('hex');
       _gfMapaBilletes.set(billete, { playerName: gp.playerName, precio: e.precio, hasta: Date.now() + 2 * 60 * 1000 });
@@ -24120,7 +24261,7 @@ async function ecoTiendaResolver(id, confirmed) {
     return { ok: true, confirmadas: confirmed, bronce: credit, fee, stats: buildStatsResponse(stats) };
   });
 }
-app.post('/api/economia/tienda', strictLimiter, authMiddleware, csrfProtection, async (req, res) => {
+app.post('/api/economia/tienda', gameplayLimiter, authMiddleware, csrfProtection, async (req, res) => {
   try {
     const gp = await jugadorDeLaSesion(req), b = req.body || {};
     if (!gp) return res.status(403).json({ error: 'no_autorizado' });
@@ -24288,8 +24429,10 @@ _tiendaAtascoTimer.unref();
 function ecoError(code, status = 503) { return Object.assign(new Error(code), { code, status }); }
 function ecoResponderError(res, e) {
   console.warn('economia:', e.code || e.message);
+  // Sin `status` es un fallo pasajero (la cadena o Mongo no contestaron) antes de cobrar nada.
   return res.status(e.status || 503).json({ error: e.status ? e.code : 'economia_no_disponible', bronce: e.bronce,
-    message: ({precios_actualizados:'The price changed. Review the updated price and try again.',tienda_sin_liquidez:'The shop needs reserve funds before it can buy items. Nothing was consumed.',
+    reintentar: !e.status || e.code === 'saldo_ocupado',
+    message: !e.status ? 'The server is busy right now. Nothing was charged. Please try again.' : ({precios_actualizados:'The price changed. Review the updated price and try again.',tienda_sin_liquidez:'The shop needs reserve funds before it can buy items. Nothing was consumed.',
       saldo_insuficiente:'You do not have enough coins, including the shop fee.',nivel_bajo:'Your character has not reached the required level.',tope_diario_tienda:'You have reached the daily purchase limit for this item.',
       objeto_no_disponible:'This item is not available for this trade.',resource_capacity_exhausted:'This resource table is full. Nothing was charged. Try again when capacity is available.',
       crop_table_unavailable:'This crop table could not be prepared. Nothing was charged. Please try again later.',referencia_no_reutilizable:'This reference belongs to a different trade. Check your pending operations.',
@@ -25246,7 +25389,9 @@ const TIPOS_DE_CONSTRUCCION = {
      de `espantapajaros` al ponerlo y se acuña al recogerlo con la pala. No
      caduca: guarda las parcelas de la isla que tenga a su alrededor (ver
      ESPANTAPAJAROS_GUARDA_CASILLAS y /api/crops/crow). */
-  espantapajaros: { ancho: 2, alto: 2, itemId: 'espantapajaros', tablaItem: 'espantapajaros', tablaConstruccion: null }
+  espantapajaros: { ancho: 2, alto: 2, itemId: 'espantapajaros', tablaItem: 'espantapajaros', tablaConstruccion: null },
+  // (2026-11-02) Las 20 de gf-items-v2.js: como el bote y los cofres, solo en Mongo y con su objeto quemado al ponerlas.
+  ...(typeof GF_ITEMS_V2 === 'undefined' ? {} : GF_ITEMS_V2.obras)
 };
 
 /* Cuántas casillas (32 px) guarda un espantapájaros de la isla, del centro de
@@ -32535,12 +32680,13 @@ io.on('connection', (socket) => {
          jugador acepta, se vuelve a pedir con { pagar: true, precio }. */
       const precio = gfPrecioViaje(socket, sala, p);
       resp.precio = precio;
-      const stYo = await PlayerStats.findOne({ playerName: yo }).select('bronce').lean();
-      const saldo = Math.floor(Number(stYo && stYo.bronce) || 0);
+      const stYo = await PlayerStats.findOne({ playerName: yo }).select('oro plata bronce').lean();
+      // `saldo` es lo que vale TODO lo que lleva, en bronce: se paga con cambio (gfCobrarConCambio).
+      const saldo = gfValorEnBronce(stYo), bronceSuelto = Math.floor(Number(stYo && stYo.bronce) || 0);
       if (!(data && data.pagar) || Math.floor(Number(data.precio) || 0) < precio) {
-        return socket.emit('friends:ir', { ...resp, ok: false, motivo: 'precio', saldo });
+        return socket.emit('friends:ir', { ...resp, ok: false, motivo: 'precio', saldo, bronce: bronceSuelto });
       }
-      const pagado = await gfCobrarStat(yo, 'bronce', precio);
+      const pagado = await gfCobrarConCambio(yo, precio);
       if (!pagado) return socket.emit('friends:ir', { ...resp, ok: false, motivo: 'sin_bronce', saldo });
       resp.pagado = precio;
       resp.stats = buildStatsResponse(pagado);
@@ -33988,8 +34134,8 @@ const authoritativeFarm=require('./native-farm')({
   notify:(wallet,event,data)=>io.to('wallet:'+String(wallet).toLowerCase()).emit(event,data)
 });
 const authoritativeCrafts = require('./crafting-authority')({
-  mongoose, ethers, crypto, recipes: require('./craft-recipes.json'), consumables:[...require('./consumables.json'),...GF_CROP_CATALOG.consumables], app, authMiddleware,
-  adminAuth, csrfProtection, strictLimiter, apiLimiter,
+  mongoose, ethers, crypto, recipes:[...require('./craft-recipes.json'),...(GF_CROP_CATALOG.recipes||[])], consumables:[...require('./consumables.json'),...GF_CROP_CATALOG.consumables], app, authMiddleware,
+  adminAuth, csrfProtection, strictLimiter: gameplayLimiter, apiLimiter,
   services:[...authoritativeFarm.recipes,...Object.entries(VIP_PLANES).flatMap(([plan,r])=>VIP_MONEDAS.map(stat=>({
     id:'vip_'+plan+'_'+stat,kind:'vip',plan,level:0,allowGhost:true,resources:[],itemId:'vip',outputType:'vip',
     quantity:r.dias,outputMax:r.dias,singleInvoice:true,maxQuantity:1,
@@ -34022,7 +34168,7 @@ const authoritativeCrafts = require('./crafting-authority')({
       facturaId:f.privateSteps.find(s=>s.kind==='mint')?.invoiceId,transactionHash:f.privateSteps.find(s=>s.kind==='mint')?.txHash,
       planes:VIP_PLANES,ahora:Date.now()};
   },
-  itemType:itemTipoOnChain,maxStack:id=>Math.max(1,Number(ITEM_MAX_STACK[id]) || 1),
+  itemType:itemTipoOnChain,maxStack:id=>Math.max(1,Number(ITEM_MAX_STACK[id]) || 1),ensureTable:tipo=>crearTablaSiFalta(tipo),
   items:contratoItemsServidor,wallet:()=>relayerWallet,nonce:key=>relayerNonceManager.getNextNonce(key),gasPrice:gatherGasPrice,
   freeInvoices:facturasLibresDeCadena,player:jugadorDeLaSesion,ghost:esFantasma,level:gfNivelDeJugador,
   transaction:ecoTransaccion,queue:enColaDelJugador,loadEconomy:eco2Config,price:eco2PrecioServicio,planPayment:eco2PlanPago,
@@ -34030,7 +34176,7 @@ const authoritativeCrafts = require('./crafting-authority')({
   persistInventory:resourcePersistInventory,statsResponse:buildStatsResponse,
   award:awardVerifiedProgress,
   gain:async(playerName,stat,amount,session)=>{
-    if(!['agua','comida'].includes(stat)||!Number.isSafeInteger(amount)||amount<1)throw new Error('invalid_consumption');
+    if(!['agua','comida','vida'].includes(stat)||!Number.isSafeInteger(amount)||amount<1)throw new Error('invalid_consumption');
     const result=await PlayerStats.updateOne({playerName},[{$set:{[stat]:{$min:[100,{$add:[{$ifNull:['$'+stat,0]},amount]}]},chainPendingSince:new Date(),chainPending:{$setUnion:[{$ifNull:['$chainPending',[]]},[stat]]}}}],{session});
     if(result.matchedCount!==1)throw new Error('consumption_player_missing');
   }
@@ -34039,7 +34185,52 @@ const authoritativeCrafts = require('./crafting-authority')({
 for(const recipe of require('./craft-recipes.json')) TABLAS_SOLO_ACUNA_SERVIDOR.add(itemTipoOnChain(recipe.itemId));
 setInterval(()=>authoritativeCrafts.sweep().catch(e=>console.warn('craft sweep:',e.code || e.message)),60000).unref();
 
-app.post('/api/farm/execute',strictLimiter,authMiddleware,csrfProtection,async(req,res)=>{
+/* (2026-11-02) ORDEÑAR LA VACA. "Con el pote de agarrar agua se pueda tener posibilidades de ordeñar la
+   vaca del GameScene, y al beber esa leche me suba un poquito de vida." La suerte, la espera y el tope
+   del día las pone el servidor. El cubo vacío se quema y se acuña el de leche con el crafteo autoritativo
+   (receta interna `ordenar_vaca`, sin comisión): si la vaca no se deja, el cubo sigue siendo tuyo. */
+const GF_ORDENAR_PROB = 0.6, GF_ORDENAR_ESPERA_MS = 90000, GF_ORDENAR_FALLO_MS = 15000, GF_ORDENAR_AL_DIA = 30;
+const _gfOrdenarEspera = new Map();
+app.post('/api/granja/ordenar', gameplayLimiter, authMiddleware, csrfProtection, gfExigeNombre, async (req, res) => {
+  try {
+    const gp = await jugadorDeLaSesion(req);
+    if (!gp) return res.status(403).json({ error: 'not_authorized' });
+    const ref = String((req.body && req.body.ref) || '');
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(ref)) return res.status(400).json({ error: 'invalid_request' });
+    const wallet = String(gp.address || '').toLowerCase();
+    const idJob = 'craft_' + crypto.createHash('sha256').update(wallet + ':' + ref).digest('hex');
+    // Si ya salió bien y solo se repite la petición, no se vuelve a tirar el dado.
+    let ponerEspera = false;
+    if (!await authoritativeCrafts.Job.exists({ _id: idJob })) {
+      if (await esFantasma({ playerName: gp.playerName })) return responderFantasma(res);
+      const vista = pescaPosicionVista(gp.playerName);
+      if (!vista || vista.sala !== 'game') return res.status(409).json({ error: 'lejos_de_la_vaca', message: 'The cow is in the village.' });
+      const ahora = Date.now(), libre = _gfOrdenarEspera.get(gp.playerName) || 0;
+      if (ahora < libre) return res.status(429).json({ error: 'vaca_descansa', esperaMs: libre - ahora, message: 'The cow needs a rest. Try again in a moment.' });
+      const hechas = await authoritativeCrafts.Job.countDocuments({ wallet, recipe: 'ordenar_vaca', createdAt: { $gte: new Date(_diaUTC() + 'T00:00:00Z') } });
+      if (hechas >= GF_ORDENAR_AL_DIA) return res.status(409).json({ error: 'vaca_seca', message: 'The cow gave you all her milk today. Come back tomorrow.' });
+      if (Math.random() >= GF_ORDENAR_PROB) {
+        _gfOrdenarEspera.set(gp.playerName, ahora + GF_ORDENAR_FALLO_MS);
+        return res.json({ ok: true, leche: false, esperaMs: GF_ORDENAR_FALLO_MS });
+      }
+      ponerEspera = true;
+    }
+    const preparado = await enColaDelJugador('inventory:' + wallet, () => authoritativeCrafts.create(gp, { recipeId: 'ordenar_vaca', quantity: 1, ref }, { internal: true }));
+    if (ponerEspera) _gfOrdenarEspera.set(gp.playerName, Date.now() + GF_ORDENAR_ESPERA_MS);
+    const hecho = preparado.status === 'completed' ? preparado : await authoritativeCrafts.execute(preparado._id);
+    res.set('Cache-Control', 'no-store');
+    return res.status(hecho.status === 'completed' ? 200 : 202).json({ ...await authoritativeCrafts.describe(hecho), leche: true, esperaMs: GF_ORDENAR_ESPERA_MS });
+  } catch (e) {
+    const code = e.code || 'craft_unavailable';
+    const message = code === 'craft_materials_missing' ? 'You need an Empty Bucket to milk the cow.'
+      : code === 'craft_level_required' ? 'You need a higher level to milk the cow.'
+      : code === 'craft_previous_pending' ? 'Another item operation is still finishing. Try again in a moment.'
+      : 'The cow could not be milked right now. Your bucket is safe.';
+    return res.status(e.status || 503).json({ error: code, message, reintentar: code === 'craft_previous_pending' });
+  }
+});
+
+app.post('/api/farm/execute',gameplayLimiter,authMiddleware,csrfProtection,async(req,res)=>{
  try{
   const gp=await jugadorDeLaSesion(req);if(!gp)return res.status(403).json({error:'not_authorized'});
   const body=req.body || {},action=String(body.action || '');let recipeId,quantity;
@@ -34063,7 +34254,15 @@ app.post('/api/farm/execute',strictLimiter,authMiddleware,csrfProtection,async(r
   }else return res.status(400).json({error:'invalid_farm_action'});
   const prepared=await enColaDelJugador('inventory:'+String(gp.address).toLowerCase(),()=>authoritativeCrafts.create(gp,{recipeId,quantity,plotIds:plots,ref:body.ref}));
   const done=prepared.status==='completed'?prepared:await authoritativeCrafts.execute(prepared._id);res.set('Cache-Control','no-store');return res.status(done.status==='completed'?200:202).json(await authoritativeCrafts.describe(done));
- }catch(e){return res.status(e.status||503).json({error:e.code || 'farm_unavailable',message:'The farm operation could not be confirmed. Check pending operations before retrying.'});}
+ }catch(e){
+   /* (2026-11-02) "No me deja regar, sembrar ni cosechar." Cualquier fallo salía con la misma
+      frase y sin rastro en el registro. Lo que no lleva `status` es pasajero (la cadena o Mongo no
+      contestaron) y ocurre antes de reservar nada: el cliente lo repite solo. */
+   console.warn('farm/execute:',req.body&&req.body.action,e.code || '',String(e.message||'').slice(0,160));
+   const pasajero=!e.status;
+   return res.status(e.status||503).json({error:pasajero?'farm_unavailable':e.code,reintentar:pasajero||e.code==='craft_previous_pending',
+     message:pasajero?'The farm is busy right now. Nothing was spent. Please try again.':'This farm action could not be done right now. Nothing was spent.'});
+ }
 });
 setInterval(()=>authoritativeFarm.sweep().catch(e=>console.warn('native farm sweep:',e.code || e.message)),15000).unref();
 require('./crop-admin')({app,catalog:GF_CROP_CATALOG,adminAuth,apiLimiter,strictLimiter,csrfProtection,

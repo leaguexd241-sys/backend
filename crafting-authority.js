@@ -54,21 +54,31 @@ module.exports=function createCraftingAuthority(d){
   }
   const resultQuantity=recipe.quantity*quantity;
   if(!resultQuantity){if(steps.length>192)throw fail('craft_batch_too_large',400);return {steps,resultQuantity:0,option};}
-  const tipo=recipe.outputType || d.itemType(recipe.itemId),stats=await c.getTipoStats(tipo);
+  const tipo=recipe.outputType || d.itemType(recipe.itemId);
+  if(d.ensureTable)await d.ensureTable(tipo);
+  const stats=await c.getTipoStats(tipo);
   if(!stats.exists || BigInt(stats.limit)-BigInt(stats.totalQuantity)<BigInt(resultQuantity) || BigInt(stats.perInvoiceLimit)<1n)throw fail('craft_result_capacity_unavailable');
   if(recipe.singleInvoice && BigInt(stats.perInvoiceLimit)<BigInt(resultQuantity))throw fail('craft_result_capacity_unavailable');
   const max=Math.min(recipe.outputMax || d.maxStack(recipe.itemId),Number(BigInt(stats.perInvoiceLimit)<BigInt(resultQuantity)?BigInt(stats.perInvoiceLimit):BigInt(resultQuantity)));
   if(!Number.isSafeInteger(max) || max<1)throw fail('craft_invalid_result_stack');
   for(let n=0;n<resultQuantity;n+=max)steps.push({kind:'mint',itemId:recipe.itemId,tipo,amount:Math.min(max,resultQuantity-n),manualId:recipe.singleInvoice?metadata.manualId:'cf:'+key.slice(0,32)+':'+steps.length,status:'planned'});
+  // Lo que la receta devuelve además (el cubo vacío de la leche).
+  for(const extra of recipe.returns || []){
+   const total=extra.quantity*quantity,pila=Math.max(1,d.maxStack(extra.itemId));
+   if(d.ensureTable)await d.ensureTable(d.itemType(extra.itemId));
+   for(let n=0;n<total;n+=pila)steps.push({kind:'mint',itemId:extra.itemId,tipo:d.itemType(extra.itemId),amount:Math.min(pila,total-n),manualId:'cf:'+key.slice(0,32)+':'+steps.length,status:'planned'});
+  }
   if(steps.length>192)throw fail('craft_batch_too_large',400);
   return {steps,resultQuantity,option};
  }
- async function create(gp,body){
+ async function create(gp,body,opciones){
   // The single-pending-operation constraint must exist before the first debit,
   // including immediately after deployment or on a second backend instance.
   await Job.init();
   const wallet=String(gp.address).toLowerCase(),r=recipeMap.get(body.recipeId),q=Number(body.quantity),option=body.option==null?null:Number(body.option),ref=String(body.ref||'');
   if(!r || !Number.isSafeInteger(q)||q<1||q>(r.maxQuantity || 99)||!/^[A-Za-z0-9_-]{8,64}$/.test(ref))throw fail('craft_invalid_request',400);
+  // Una receta interna solo se pide desde su ruta (ordeñar: la suerte y la espera están allí).
+  if(r.internal && !opciones?.internal)throw fail('craft_invalid_request',400);
   const key=crypto.createHash('sha256').update(wallet+':'+ref).digest('hex'),id='craft_'+key,fingerprint=JSON.stringify([r.id,q,option,...(r.farm?[d.serviceFingerprint(r,body)]:[])]);
   let previous=await Job.findById(id).lean();if(previous){if(previous.fingerprint!==fingerprint)throw fail('craft_reference_conflict');return previous;}
   if(!r.allowGhost && await d.ghost(gp))throw fail('fantasma',403);
@@ -150,7 +160,21 @@ module.exports=function createCraftingAuthority(d){
   if(!proved || step.kind!=='burn' && (!Number.isSafeInteger(invoiceId)||invoiceId<1))throw fail('craft_receipt_requires_review');
   await patch({status:'confirmed',invoiceId});return step;
  }
+ /* (2026-11-02) Un trabajo sin tocar cuyo material ya no está (se vendió o se gastó mientras
+    esperaba turno) quedaba "en revisión" para siempre, y como solo cabe uno activo por cartera
+    dejaba al jugador sin poder sembrar, regar ni craftear hasta que un admin lo mirase. Si no llegó
+    a firmarse nada no hay nada que revisar: se cancela y se devuelve lo reservado. */
  async function execute(id){
+  const job=await executeStep(id);
+  if(job?.status==='review' && /craft_source_changed|craft_materials_missing/.test(String(job.error||''))){
+   try{
+    const full=await Job.findById(id).select('+privateSteps').lean();
+    if(full?.active && full.privateSteps.every(step=>step.status==='planned'&&!step.txHash&&!step.rawTx)){await cancelUntouched(id);return Job.findById(id).lean();}
+   }catch(_){}
+  }
+  return job;
+ }
+ async function executeStep(id){
   if(running.size>=16 || running.has(id))return Job.findById(id).lean();running.add(id);
   const token=crypto.randomUUID();let job;
   try{
