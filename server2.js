@@ -1,5 +1,247 @@
 // server.js - VERSIÓN COMPLETA CORREGIDA CON SOPORTE PARA KEYSTORE CIFRADO
 require('dotenv').config();
+/* ═══════════════════════════════════════════════════════════════════════════
+   LA RED DE LA CADENA                                               (2026-11-10)
+   ───────────────────────────────────────────────────────────────────────────
+   "Actualiza el RPC y toda la información de la blockchain porque fue cambiado,
+   y quiero que en control-center exista el método para cambiar el RPC u otros
+   datos del juego, y para migrar de testnet a mainnet."
+
+   El RPC de Caldera (liteforge.rpc.caldera.xyz) ya contesta 404: LitVM pasó a
+   Zeeve. La red ya no va escrita a mano por el código; se decide así, de menos
+   a más peso:
+
+     1. GF_RED_POR_DEFECTO (aquí abajo): LitVM LiteForge en Zeeve;
+     2. las variables de entorno de siempre (RPC_URL, ITEM_CONTRACT_ADDRESS,
+        SIMPLE_MESSAGE_LOGGER_ADDRESS) y las nuevas (CHAIN_ID, NETWORK_NAME,
+        EXPLORER_URL, RPC_RESPALDO, RPC_PUBLICO, GF_RED_ENTORNO,
+        GF_MONEDA_SIMBOLO / _NOMBRE / _DECIMALES);
+     3. lo que el administrador guarda en el centro de control (Mongo,
+        colección `gf_config_red`, documento 'activa').
+
+   GF_RED_FIJA=1 en el entorno hace que mande solo el entorno: la salida de
+   emergencia si alguien guardara una red mala.
+
+   Lo guardado se lee ANTES de que nada use la red, con un proceso hijo que
+   pregunta a Mongo (como mucho 12 s): la cadena y los contratos se fijan al
+   arrancar, porque media aplicación los copia al cargar (esquemas, contadores
+   de nonce, la auditoría). Los RPC, el explorador, el nombre y la moneda sí se
+   cambian en caliente (GF_RED, más abajo).
+
+   Un RPC de entorno que apunte a Caldera se ignora con un aviso: si no, el
+   servidor seguiría hablando con una dirección muerta aunque se suba este
+   archivo.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const GF_RED_POR_DEFECTO = Object.freeze({
+  nombre: 'LitVM LiteForge',
+  entorno: 'testnet',
+  chainId: 4441,
+  rpcServidor: Object.freeze(['https://rpc.testnet.liteforge.zeeve.net/']),
+  rpcPublico: Object.freeze(['https://rpc.testnet.liteforge.zeeve.net/']),
+  explorerUrl: 'https://explorer.testnet.liteforge.zeeve.net',
+  moneda: Object.freeze({ simbolo: 'zkLTC', nombre: 'zkLTC', decimales: 18 }),
+  contratoItems: '0x686E17D89Bf97247fadC04C3A3f0dfD02F914115',
+  contratoMensajes: '0x786E17D89Bf97247fadC04C3A3f0dfD02F914115'
+});
+const GF_RED_RETIRADAS = /(^|\.)liteforge\.(rpc|explorer)\.caldera\.xyz$/i;
+
+/** Una URL de RPC o de explorador aceptable: https (http solo a la propia máquina fuera de producción), sin usuario. */
+function gfRedUrl(u) {
+  let x;
+  try { x = new URL(String(u == null ? '' : u).trim()); } catch (_) { return null; }
+  if (x.username || x.password) return null;
+  const local = /^(localhost|127\.\d+\.\d+\.\d+|\[::1\])$/i.test(x.hostname);
+  if (x.protocol === 'http:') { if (!local || process.env.NODE_ENV === 'production') return null; }
+  else if (x.protocol !== 'https:') return null;
+  x.hash = '';
+  const s = x.toString();
+  return s.length <= 300 ? s : null;
+}
+
+/**
+ * Valida y completa una red. Lo que falta sale de `base`. Devuelve { cfg, errores }:
+ * con errores, `cfg` no se usa.
+ */
+function gfRedNormalizar(entrada, base) {
+  const e = entrada && typeof entrada === 'object' ? entrada : {};
+  const b = base || GF_RED_POR_DEFECTO;
+  const errores = [];
+  const texto = (v, max, def) => {
+    const t = String(v == null ? '' : v).replace(/[\u0000-\u001f\u007f<>"`]/g, '').trim().slice(0, max);
+    return t || def;
+  };
+  const vacio = (v) => v == null || v === '';
+  const urls = (v, def, campo) => {
+    const crudo = Array.isArray(v) ? v : (typeof v === 'string' ? v.split(/[\s,]+/) : null);
+    if (!crudo) return def.slice();
+    const out = [];
+    for (const u of crudo) {
+      if (!String(u == null ? '' : u).trim()) continue;
+      const ok = gfRedUrl(u);
+      if (!ok) { errores.push(campo + ': ' + String(u).slice(0, 80)); continue; }
+      if (!out.includes(ok)) out.push(ok);
+    }
+    return out.slice(0, 6);
+  };
+  const m = e.moneda && typeof e.moneda === 'object' ? e.moneda : {};
+  const cfg = {
+    nombre: texto(e.nombre, 60, b.nombre),
+    entorno: ['testnet', 'mainnet', 'devnet'].includes(e.entorno) ? e.entorno : b.entorno,
+    chainId: vacio(e.chainId) ? b.chainId : Number(e.chainId),
+    rpcServidor: urls(e.rpcServidor, b.rpcServidor, 'rpcServidor'),
+    rpcPublico: urls(e.rpcPublico, b.rpcPublico, 'rpcPublico'),
+    explorerUrl: vacio(e.explorerUrl) ? b.explorerUrl : (gfRedUrl(e.explorerUrl) || ''),
+    moneda: {
+      simbolo: texto(m.simbolo, 12, b.moneda.simbolo),
+      nombre: texto(m.nombre, 40, b.moneda.nombre),
+      decimales: vacio(m.decimales) ? b.moneda.decimales : Number(m.decimales)
+    },
+    contratoItems: vacio(e.contratoItems) ? b.contratoItems : String(e.contratoItems).trim(),
+    contratoMensajes: vacio(e.contratoMensajes) ? b.contratoMensajes : String(e.contratoMensajes).trim()
+  };
+  cfg.explorerUrl = String(cfg.explorerUrl || '').replace(/\/+$/, '');
+  if (!Number.isSafeInteger(cfg.chainId) || cfg.chainId < 1 || cfg.chainId > 4294967295) errores.push('chainId');
+  if (!cfg.rpcServidor.length) errores.push('rpcServidor');
+  if (!cfg.rpcPublico.length) errores.push('rpcPublico');
+  if (!cfg.explorerUrl) errores.push('explorerUrl');
+  if (!/^[A-Za-z0-9.$_-]{1,12}$/.test(cfg.moneda.simbolo)) errores.push('moneda.simbolo');
+  if (!Number.isSafeInteger(cfg.moneda.decimales) || cfg.moneda.decimales < 0 || cfg.moneda.decimales > 36) errores.push('moneda.decimales');
+  for (const k of ['contratoItems', 'contratoMensajes']) if (!/^0x[0-9a-fA-F]{40}$/.test(cfg[k])) errores.push(k);
+  return { cfg, errores };
+}
+
+/** Lee la red guardada en Mongo SIN esperar a nada más: un proceso hijo que pregunta y contesta en JSON. */
+function gfRedLeerGuardadaAlArrancar() {
+  const uri = process.env.MONGO_URL || process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/grassland';
+  const codigo = [
+    "const { MongoClient } = require('mongoose').mongo;",
+    "const c = new MongoClient(process.env.GF_RED_MONGO, { serverSelectionTimeoutMS: 7000, connectTimeoutMS: 7000 });",
+    "c.connect().then(() => c.db().collection('gf_config_red').findOne({ _id: 'activa' }, { projection: { cfg: 1, revision: 1, actualizadoEn: 1 } }))",
+    "  .then((d) => { process.stdout.write(JSON.stringify(d || null)); return c.close(); })",
+    "  .catch((e) => { process.stderr.write(String((e && e.message) || e).slice(0, 300)); process.exitCode = 2; return c.close().catch(() => {}); });"
+  ].join('\n');
+  try {
+    const salida = require('child_process').execFileSync(process.execPath, ['-e', codigo], {
+      cwd: __dirname, env: { ...process.env, GF_RED_MONGO: uri }, timeout: 12000,
+      maxBuffer: 512 * 1024, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, encoding: 'utf8'
+    });
+    const doc = JSON.parse(salida || 'null');
+    return { doc: doc && typeof doc === 'object' ? doc : null, error: null };
+  } catch (e) {
+    const detalle = String((e && e.stderr) || (e && e.message) || e).replace(/\s+/g, ' ').slice(0, 200);
+    return { doc: null, error: detalle || 'sin respuesta' };
+  }
+}
+
+const GF_RED_ARRANQUE = (function gfRedArranque() {
+  const env = process.env, fuentes = {};
+  let cfg = gfRedNormalizar({}, GF_RED_POR_DEFECTO).cfg;
+  Object.keys(cfg).forEach((k) => { fuentes[k] = 'defecto'; });
+  const retirada = (u) => { try { return GF_RED_RETIRADAS.test(new URL(u).hostname); } catch (_) { return false; } };
+  const lista = (v) => String(v || '').split(/[\s,]+/).filter(Boolean);
+  const desdeEnv = {};
+  if (env.RPC_URL && retirada(env.RPC_URL)) {
+    console.warn('⚠️  [red] RPC_URL apunta a ' + env.RPC_URL + ', que ya no funciona (LitVM pasó a Zeeve): se ignora. Cámbialo o bórralo en las variables del servidor.');
+  } else if (env.RPC_URL) desdeEnv.rpcServidor = [env.RPC_URL].concat(lista(env.RPC_RESPALDO));
+  if (!desdeEnv.rpcServidor && env.RPC_RESPALDO) desdeEnv.rpcServidor = cfg.rpcServidor.concat(lista(env.RPC_RESPALDO));
+  if (env.RPC_PUBLICO) desdeEnv.rpcPublico = lista(env.RPC_PUBLICO);
+  if (env.CHAIN_ID) desdeEnv.chainId = Number(env.CHAIN_ID);
+  if (env.NETWORK_NAME) desdeEnv.nombre = env.NETWORK_NAME;
+  if (env.GF_RED_ENTORNO) desdeEnv.entorno = env.GF_RED_ENTORNO;
+  if (env.EXPLORER_URL && !retirada(env.EXPLORER_URL)) desdeEnv.explorerUrl = env.EXPLORER_URL;
+  if (env.ITEM_CONTRACT_ADDRESS) desdeEnv.contratoItems = env.ITEM_CONTRACT_ADDRESS;
+  if (env.SIMPLE_MESSAGE_LOGGER_ADDRESS) desdeEnv.contratoMensajes = env.SIMPLE_MESSAGE_LOGGER_ADDRESS;
+  if (env.GF_MONEDA_SIMBOLO) desdeEnv.moneda = { simbolo: env.GF_MONEDA_SIMBOLO, nombre: env.GF_MONEDA_NOMBRE || env.GF_MONEDA_SIMBOLO, decimales: env.GF_MONEDA_DECIMALES };
+  // Campo a campo: uno que no valga no tira los demás.
+  for (const k of Object.keys(desdeEnv)) {
+    const r = gfRedNormalizar({ [k]: desdeEnv[k] }, cfg);
+    if (r.errores.length) { console.warn('⚠️  [red] ' + k + ' del entorno no vale (' + r.errores.join(', ') + '): se ignora.'); continue; }
+    cfg = r.cfg; fuentes[k] = 'entorno';
+  }
+  let guardada = null, errorLectura = null;
+  if (env.GF_RED_FIJA === '1') errorLectura = 'GF_RED_FIJA=1';
+  else {
+    const r = gfRedLeerGuardadaAlArrancar();
+    errorLectura = r.error;
+    if (r.doc && r.doc.cfg) {
+      const n = gfRedNormalizar(r.doc.cfg, cfg);
+      if (n.errores.length) console.warn('⚠️  [red] la red guardada en el centro de control no vale (' + n.errores.join(', ') + '): se usa la del entorno.');
+      else {
+        for (const k of Object.keys(n.cfg)) if (JSON.stringify(n.cfg[k]) !== JSON.stringify(cfg[k])) fuentes[k] = 'panel';
+        cfg = n.cfg;
+        guardada = { revision: Number(r.doc.revision) || 0, en: r.doc.actualizadoEn || null };
+      }
+    }
+  }
+  if (errorLectura && errorLectura !== 'GF_RED_FIJA=1') console.warn('⚠️  [red] no se pudo leer la red guardada al arrancar (' + errorLectura + '): se usa la del entorno y se vuelve a mirar al conectar con Mongo.');
+  const host = (u) => { try { return new URL(u).host; } catch (_) { return '?'; } };
+  console.log('🔗 Red: ' + cfg.nombre + ' (' + cfg.entorno + ', cadena ' + cfg.chainId + ') · RPC ' + cfg.rpcServidor.map(host).join(' → ') +
+    ' · explorador ' + host(cfg.explorerUrl) + (guardada ? ' · revisión ' + guardada.revision + ' del centro de control' : ''));
+  return Object.freeze({ cfg: Object.freeze(cfg), fuentes: Object.freeze(fuentes), guardada, errorLectura });
+})();
+
+/* LA RED EN MARCHA. Se cambia sin reiniciar: los RPC del servidor (con paso al siguiente si
+   uno falla), los RPC públicos que se dan a las carteras de los jugadores, el explorador, el
+   nombre y la moneda. La cadena y los contratos son los del arranque hasta el próximo. */
+const GF_RED = {
+  cfg: JSON.parse(JSON.stringify(GF_RED_ARRANQUE.cfg)),
+  revision: GF_RED_ARRANQUE.guardada ? GF_RED_ARRANQUE.guardada.revision : 0,
+  revisionLeida: GF_RED_ARRANQUE.guardada ? GF_RED_ARRANQUE.guardada.revision : 0,
+  indice: 0, cambioEn: 0, ultimoFallo: null, pendienteReinicio: null,
+  rpcActual() {
+    const l = this.cfg.rpcServidor;
+    // En un RPC de respaldo, cada 5 minutos se vuelve a probar el principal.
+    if (this.indice && Date.now() - this.cambioEn > 5 * 60000) { this.indice = 0; this.cambioEn = Date.now(); }
+    return l[this.indice % l.length] || l[0];
+  },
+  fallo(url, motivo) {
+    const l = this.cfg.rpcServidor;
+    this.ultimoFallo = { url, motivo: String(motivo || '').slice(0, 160), en: new Date().toISOString() };
+    if (l.length < 2 || url !== l[this.indice % l.length]) return;
+    this.indice = (this.indice + 1) % l.length;
+    this.cambioEn = Date.now();
+    console.warn('🔀 [red] el RPC ' + gfRedHost(url) + ' falla (' + this.ultimoFallo.motivo + '): se pasa a ' + gfRedHost(l[this.indice]));
+  }
+};
+function gfRedHost(u) { try { return new URL(u).host; } catch (_) { return '?'; } }
+
+/** Que un JsonRpcProvider de ethers hable siempre con la URL que diga `urlDe()` (cambiar el RPC sin reiniciar). */
+function gfRedEnganchar(prov, urlDe) {
+  if (!prov || typeof prov._getConnection !== 'function' || prov.__gfRed) return prov;
+  const original = prov._getConnection.bind(prov);
+  prov._getConnection = function () {
+    const r = original();
+    const u = urlDe();
+    if (u && r && r.url !== u) { try { r.url = u; } catch (_) {} }
+    return r;
+  };
+  prov.__gfRed = true;
+  return prov;
+}
+
+/** La red con la que corre el servidor ahora (lo caliente + la cadena y los contratos del arranque). */
+function gfRedEnMarcha() {
+  return { ...JSON.parse(JSON.stringify(GF_RED.cfg)), chainId: CHAIN_ID,
+    contratoItems: CONTRACTS.ITEMS_CONTRACT.address, contratoMensajes: CONTRACTS.SIMPLE_MESSAGE_LOGGER.address };
+}
+/** ¿Cambia la cadena o algún contrato? Eso solo puede entrar al reiniciar. */
+function gfRedEsMigracion(cfg) {
+  return Number(cfg.chainId) !== Number(CHAIN_ID) ||
+    String(cfg.contratoItems).toLowerCase() !== String(CONTRACTS.ITEMS_CONTRACT.address).toLowerCase() ||
+    String(cfg.contratoMensajes).toLowerCase() !== String(CONTRACTS.SIMPLE_MESSAGE_LOGGER.address).toLowerCase();
+}
+/** Pone en marcha una red de la MISMA cadena y contratos (RPC, explorador, nombre, moneda). */
+function gfRedAplicarEnCaliente(cfg, revision) {
+  GF_RED.cfg = { ...GF_RED.cfg, nombre: cfg.nombre, entorno: cfg.entorno, rpcServidor: cfg.rpcServidor.slice(),
+    rpcPublico: cfg.rpcPublico.slice(), explorerUrl: cfg.explorerUrl, moneda: { ...cfg.moneda } };
+  GF_RED.indice = 0; GF_RED.cambioEn = Date.now(); GF_RED.pendienteReinicio = null;
+  if (revision != null) { GF_RED.revision = revision; GF_RED.revisionLeida = revision; }
+  RPC_URL = GF_RED.cfg.rpcServidor[0];
+  EXPLORER_URL = GF_RED.cfg.explorerUrl;
+  NETWORK_NAME = GF_RED.cfg.nombre;
+  // El lector del panel de administración se rehace con el RPC nuevo la próxima vez que se use.
+  if (adminReadProvider && !process.env.ADMIN_RPC_URL) { try { adminReadProvider.destroy(); } catch (_) {} adminReadProvider = null; }
+}
 const express = require('express');
 const mongoose = require('mongoose');
 const cookieParser = require('cookie-parser');
@@ -1615,10 +1857,12 @@ if (NODE_ENV !== 'production' && (process.env.RAILWAY_ENVIRONMENT || process.env
 }
 
 // --- Configuración de Blockchain y Relay ---
-const RPC_URL = process.env.RPC_URL || "https://liteforge.rpc.caldera.xyz/http";
-const CHAIN_ID = 4441;
-const NETWORK_NAME = "LitVM Testnet";
-const EXPLORER_URL = "https://liteforge.explorer.caldera.xyz";
+// (2026-11-10) Salen de GF_RED_ARRANQUE (arriba del todo): el centro de control, el entorno o
+// lo de por defecto. RPC_URL, el explorador y el nombre se cambian en caliente; la cadena, no.
+let RPC_URL = GF_RED_ARRANQUE.cfg.rpcServidor[0];
+const CHAIN_ID = GF_RED_ARRANQUE.cfg.chainId;
+let NETWORK_NAME = GF_RED_ARRANQUE.cfg.nombre;
+let EXPLORER_URL = GF_RED_ARRANQUE.cfg.explorerUrl;
 
 // SISTEMA SEGURO DE GESTIÓN DE CLAVES PRIVADAS
 const KEY_MANAGEMENT_TYPE = process.env.KEY_MANAGEMENT_TYPE || 'ENV_VARS';
@@ -1696,6 +1940,31 @@ console.warn  = (...a) => { const m = a.map(String).join(' '); if (_isRpcNoise(m
 // ─────────────────────────────────────────────────────────────────────────────
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
+// (2026-11-10) Habla siempre con el RPC que toque (el principal o, si falla, el de respaldo).
+gfRedEnganchar(provider, () => GF_RED.rpcActual());
+
+/* Lo guardado en el centro de control también se mira al conectar con Mongo (por si no se
+   pudo leer al arrancar) y cada 2 minutos (por si otra instancia lo cambió). */
+async function gfRedReleer(motivo) {
+  if (impactReadProvider && !process.env.LITVM_AUDIT_RPC_URL) gfRedEnganchar(impactReadProvider, () => GF_RED.cfg.rpcServidor[0]);
+  if (process.env.GF_RED_FIJA === '1' || mongoose.connection.readyState !== 1) return;
+  const doc = await mongoose.connection.collection('gf_config_red').findOne({ _id: 'activa' }, { projection: { cfg: 1, revision: 1 } });
+  if (!doc || !doc.cfg) return;
+  const rev = Number(doc.revision) || 0;
+  if (rev === GF_RED.revisionLeida) return;
+  GF_RED.revisionLeida = rev;
+  const n = gfRedNormalizar(doc.cfg, gfRedEnMarcha());
+  if (n.errores.length) { console.warn('⚠️  [red] la revisión ' + rev + ' guardada no vale (' + n.errores.join(', ') + '): no se aplica.'); return; }
+  if (gfRedEsMigracion(n.cfg)) {
+    GF_RED.pendienteReinicio = { chainId: n.cfg.chainId, contratoItems: n.cfg.contratoItems, contratoMensajes: n.cfg.contratoMensajes, revision: rev };
+    console.warn('⚠️  [red] la revisión ' + rev + ' cambia la cadena o los contratos: entra al reiniciar el servidor.');
+    return;
+  }
+  gfRedAplicarEnCaliente(n.cfg, rev);
+  console.log('🔗 [red] revisión ' + rev + ' aplicada (' + motivo + '): RPC ' + n.cfg.rpcServidor.map(gfRedHost).join(' → '));
+}
+mongoose.connection.on('open', () => { gfRedReleer('conectar').catch((e) => console.warn('⚠️  [red] releer:', e && e.message)); });
+setInterval(() => { gfRedReleer('periódico').catch(() => {}); }, 120000).unref();
 
 /* EL CUPO DEL RPC (2026-11-02). "Cuando hago muchas compras seguidas, a veces sale el error."
    Una compra lee la cadena varias veces antes de cobrar (tabla, cupo, inventario) y el RPC de
@@ -1710,15 +1979,19 @@ const RPC_ESPERAS_MS = Object.freeze([250, 600, 1200, 2500, 4000]);
   const enviarOriginal = provider._send.bind(provider);
   provider._send = async function (payload) {
     for (let intento = 0; ; intento++) {
+      // (2026-11-10) Con qué RPC se habla: si falla, se pasa al siguiente de la lista (GF_RED).
+      const usada = GF_RED.rpcActual();
       try {
         const respuestas = await enviarOriginal(payload);
         const cortado = Array.isArray(respuestas) && respuestas.some((r) => r && r.error && (Number(r.error.code) === -31002 || RPC_ES_CUPO(r.error.message)));
+        if (cortado) GF_RED.fallo(usada, 'cupo');
         if (!cortado || intento >= RPC_ESPERAS_MS.length) return respuestas;
       } catch (e) {
         // Un fallo de transporte es dudoso para un envío: solo se repiten las lecturas.
         const lista = Array.isArray(payload) ? payload : [payload];
         const soloLectura = lista.every((p) => p && p.method !== 'eth_sendRawTransaction');
         const pasajero = e && (['SERVER_ERROR', 'TIMEOUT', 'NETWORK_ERROR'].includes(e.code) || RPC_ES_CUPO(e.message));
+        if (pasajero) GF_RED.fallo(usada, (e && (e.shortMessage || e.code)) || 'transporte');
         if (!soloLectura || !pasajero || intento >= RPC_ESPERAS_MS.length) throw e;
       }
       await new Promise((r) => setTimeout(r, RPC_ESPERAS_MS[intento]));
@@ -1876,13 +2149,13 @@ function loadContractABI(contractName) {
 // --- CONFIGURACIÓN DE MÚLTIPLES CONTRATOS CON ABIs EXTERNOS ---
 const CONTRACTS = {
   SIMPLE_MESSAGE_LOGGER: {
-    address: process.env.SIMPLE_MESSAGE_LOGGER_ADDRESS || '0x786E17D89Bf97247fadC04C3A3f0dfD02F914115',
+    address: GF_RED_ARRANQUE.cfg.contratoMensajes,     // (2026-11-10) entorno o centro de control
     name: 'SecureMessageLogger',
     description: 'Contrato seguro para registrar mensajes en la blockchain',
     abi: loadContractABI('SecureMessageLogger')
   },
   ITEMS_CONTRACT: {
-    address: process.env.ITEM_CONTRACT_ADDRESS || '0x686E17D89Bf97247fadC04C3A3f0dfD02F914115',
+    address: GF_RED_ARRANQUE.cfg.contratoItems,        // (2026-11-10) entorno o centro de control
     name: 'ItemContract',
     description: 'Contrato para manejar items del juego',
     abi: loadContractABI('ItemContract')
@@ -4358,7 +4631,8 @@ SecurityController.PUERTAS_ABIERTAS = new Set([
   '/api/auth/me',
   '/api/auth/logout',
   '/api/auth/refresh',
-  '/api/wallet/config'
+  '/api/wallet/config',
+  '/api/red'
 ]);
 
 const securityController = new SecurityController();
@@ -6635,6 +6909,30 @@ let players = {};
 const chatHistory = new Map();          // sala -> array de mensajes
 const MAX_HISTORY = 50;
 
+/* RESPONDER A UN MENSAJE (2026-11-10). La cita que acompaña a una respuesta la arma el
+   SERVIDOR con el mensaje original, nunca con lo que mande el cliente: si no, cualquiera
+   podría "citar" a otro jugador diciendo lo que no dijo. El texto guardado ya está
+   escapado (escapeHtml), así que al recortarlo no se puede dejar una entidad partida
+   ("&am"): se quita el resto colgante. */
+function gfRecortarCita(escapado, max) {
+  const pts = [...String(escapado == null ? '' : escapado)];
+  if (pts.length <= max) return pts.join('');
+  return pts.slice(0, max).join('').replace(/&[#A-Za-z0-9]{0,7}$/, '') + '…';
+}
+/* LO QUE SALE A LA SALA DE UNA REACCIÓN ES EL NOMBRE VISIBLE, NO LA CUENTA. Cada reacción
+   guarda `k` (la cuenta, para saber de quién es al quitarla) y `n` (el nombre). Se
+   repartía el objeto entero: la cuenta de todo el que reaccionaba le llegaba a los 50 del
+   canal. `k` se queda en el servidor. */
+function gfReaccionesPublicas(lista) {
+  return (Array.isArray(lista) ? lista : []).map(r => ({
+    emoji: r.emoji,
+    quienes: (Array.isArray(r.quienes) ? r.quienes : []).map(q => ({ n: q && q.n }))
+  }));
+}
+function gfMensajePublico(m) {
+  return m ? { ...m, reacciones: gfReaccionesPublicas(m.reacciones) } : m;
+}
+
 /** El anillo de mensajes de una sala, creándolo si hace falta. */
 function historialDe(room) {
   let h = chatHistory.get(room);
@@ -7961,9 +8259,22 @@ io.on("connection", (socket) => {
          numero 3 de uno es el 4 de otro. */
       const mid = 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
+      /* ¿Contesta a un mensaje concreto? Tiene que ser uno de ESTA sala y seguir en el
+         anillo de 50; si ya no está, el mensaje sale igual, sin cita. */
+      let re = null;
+      const reMid = typeof payload.replyTo === 'string' ? payload.replyTo.slice(0, 48) : '';
+      if (reMid) {
+        const original = historialDe(room).find(m => m && m.mid === reMid);
+        if (original) {
+          re = { mid: original.mid, playerName: original.playerName,
+                 nameColor: original.nameColor || null, text: gfRecortarCita(original.text, 120) };
+        }
+      }
+
       const message = {
         id: socket.id,
         mid,
+        re,
         playerName,
         // El color que el jugador eligio para su nombre. Sale del servidor y no
         // del mensaje: si viniera en el cuerpo, cualquiera podria pintarse el
@@ -8052,7 +8363,7 @@ io.on("connection", (socket) => {
         grupo.quienes.push({ k: quien, n: nombre });
       }
 
-      io.to(encontrado.room).emit('chatReaction', { mid: msg.mid, reacciones: msg.reacciones });
+      io.to(encontrado.room).emit('chatReaction', { mid: msg.mid, reacciones: gfReaccionesPublicas(msg.reacciones) });
     } catch (e) {
       console.error('chatReact error:', e);
     }
@@ -8144,7 +8455,7 @@ io.on("connection", (socket) => {
          en vez de mandarle una lista vacía sin explicación. */
       const room = socket.playerData && socket.playerData.room;
       if (!room) { socket.emit('rejoinRequired', { motivo: 'sin_sala' }); return; }
-      socket.emit('chatHistory', historialDe(room).slice(-MAX_HISTORY));
+      socket.emit('chatHistory', historialDe(room).slice(-MAX_HISTORY).map(gfMensajePublico));
     } catch (e) {
       console.error('Error enviando chatHistory:', e);
     }
@@ -11389,6 +11700,205 @@ const adminAuth = async (req, res, next) => {
     return res.status(403).json({ error: 'Token de administrador inválido' });
   }
 };
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LA RED: LO QUE VE CUALQUIERA Y LO QUE CAMBIA EL ADMINISTRADOR    (2026-11-10)
+   ───────────────────────────────────────────────────────────────────────────
+   GET  /api/red               pública: lo que necesitan las carteras y las páginas
+                               (cadena, RPC públicos, explorador, moneda, contratos).
+   GET  /api/admin/red         la red en marcha, lo guardado, de dónde sale cada
+                               valor, el historial y si hay algo esperando al reinicio.
+   POST /api/admin/red/probar  prueba una red sin guardarla: cada RPC (cadena, bloque,
+                               latencia), el código de los contratos, el saldo del
+                               relayer en esa cadena y el explorador.
+   POST /api/admin/red         la guarda. Misma cadena y contratos: se aplica YA. Otra
+                               cadena u otros contratos (migrar a mainnet): hace falta
+                               escribir MIGRAR y entra al reiniciar el servidor.
+   Nada se guarda sin pasar la prueba: un RPC que no conteste o que sea de otra cadena
+   dejaría el juego sin cadena. Las pruebas solo llaman a direcciones públicas (https y
+   nada de la red interna) y solo las puede pedir un administrador.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function gfRedPublica() {
+  const c = GF_RED.cfg;
+  return { ok: true, revision: GF_RED.revision, nombre: c.nombre, entorno: c.entorno,
+    chainId: CHAIN_ID, chainIdHex: '0x' + Number(CHAIN_ID).toString(16),
+    rpcUrls: c.rpcPublico.slice(), explorerUrl: c.explorerUrl,
+    moneda: { simbolo: c.moneda.simbolo, nombre: c.moneda.nombre, decimales: c.moneda.decimales },
+    contratos: { items: CONTRACTS.ITEMS_CONTRACT.address, mensajes: CONTRACTS.SIMPLE_MESSAGE_LOGGER.address } };
+}
+app.get('/api/red', apiLimiter, (req, res) => {
+  res.set('Cache-Control', 'public, max-age=60');
+  return res.json(gfRedPublica());
+});
+
+function gfRedHostPrivado(host) {
+  const h = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h || h === 'localhost' || /\.(localhost|local|internal|lan|home)$/.test(h)) return true;
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(h);
+  if (m) {
+    const a = Number(m[1]), b = Number(m[2]);
+    return a === 10 || a === 127 || a === 0 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  }
+  return h.includes(':') && (h === '::1' || h === '::' || /^f[cd]/.test(h) || /^fe[89ab]/.test(h) || h.startsWith('::ffff:'));
+}
+function gfRedUrlProbable(u) {
+  try { const x = new URL(u); return NODE_ENV !== 'production' || !gfRedHostPrivado(x.hostname); } catch (_) { return false; }
+}
+function gfRedPeticion(url, cuerpo) {
+  const r = new ethers.FetchRequest(url);
+  r.timeout = 8000;
+  r.setThrottleParams({ maxAttempts: 1 });
+  r.retryFunc = async () => false;
+  if (cuerpo) { r.body = JSON.stringify(cuerpo); r.setHeader('content-type', 'application/json'); }
+  return r;
+}
+async function gfRedRpc(url, metodo, params) {
+  const t0 = Date.now();
+  let resp;
+  try { resp = await gfRedPeticion(url, { jsonrpc: '2.0', id: 1, method: metodo, params: params || [] }).send(); }
+  catch (e) { throw Object.assign(new Error(String((e && (e.shortMessage || e.message)) || e).slice(0, 140)), { ms: Date.now() - t0 }); }
+  const ms = Date.now() - t0;
+  if (resp.statusCode < 200 || resp.statusCode >= 300) throw Object.assign(new Error('HTTP ' + resp.statusCode), { ms });
+  let j = null;
+  try { j = resp.bodyJson; } catch (_) {}
+  if (!j || typeof j !== 'object') throw Object.assign(new Error('the answer is not JSON-RPC'), { ms });
+  if (j.error) throw Object.assign(new Error(String(j.error.message || 'RPC error').slice(0, 140)), { ms });
+  return { valor: j.result, ms };
+}
+async function gfRedWeb(url) {
+  const t0 = Date.now();
+  try {
+    const resp = await gfRedPeticion(url).send();
+    return { ok: resp.statusCode >= 200 && resp.statusCode < 400, estado: resp.statusCode, ms: Date.now() - t0 };
+  } catch (e) { return { ok: false, error: String((e && (e.shortMessage || e.message)) || e).slice(0, 140), ms: Date.now() - t0 }; }
+}
+async function gfRedProbar(cfg) {
+  const lista = cfg.rpcServidor.map((u) => ({ url: u, servidor: true, publico: cfg.rpcPublico.includes(u) }))
+    .concat(cfg.rpcPublico.filter((u) => !cfg.rpcServidor.includes(u)).map((u) => ({ url: u, servidor: false, publico: true })));
+  const rpcs = await Promise.all(lista.map(async (r) => {
+    const fila = { ...r, ok: false };
+    if (!gfRedUrlProbable(r.url)) { fila.error = 'private or local address'; return fila; }
+    try {
+      const [cid, bloque] = await Promise.all([gfRedRpc(r.url, 'eth_chainId'), gfRedRpc(r.url, 'eth_blockNumber')]);
+      fila.chainId = Number(cid.valor); fila.bloque = Number(bloque.valor); fila.ms = Math.max(cid.ms, bloque.ms);
+      fila.ok = fila.chainId === cfg.chainId;
+      if (!fila.ok) fila.error = 'chain ' + fila.chainId + ', expected ' + cfg.chainId;
+    } catch (e) { fila.error = e.message; fila.ms = e.ms || null; }
+    return fila;
+  }));
+  const buena = rpcs.find((f) => f.ok && f.servidor);
+  const contratos = {};
+  for (const [clave, dir] of [['items', cfg.contratoItems], ['mensajes', cfg.contratoMensajes]]) {
+    if (!buena) { contratos[clave] = { ok: false, error: 'no server RPC answers' }; continue; }
+    try {
+      const c = await gfRedRpc(buena.url, 'eth_getCode', [dir, 'latest']);
+      const bytes = Math.max(0, Math.floor((String(c.valor || '0x').length - 2) / 2));
+      contratos[clave] = { ok: bytes > 0, bytes };
+      if (!bytes) contratos[clave].error = 'no contract at this address on this chain';
+    } catch (e) { contratos[clave] = { ok: false, error: e.message }; }
+  }
+  let relayer = null;
+  if (buena && relayerWallet) {
+    relayer = { address: relayerWallet.address };
+    try {
+      const [s, n] = await Promise.all([gfRedRpc(buena.url, 'eth_getBalance', [relayerWallet.address, 'latest']),
+        gfRedRpc(buena.url, 'eth_getTransactionCount', [relayerWallet.address, 'latest'])]);
+      const saldo = BigInt(s.valor || '0x0');
+      relayer.saldo = ethers.formatUnits(saldo, cfg.moneda.decimales);
+      relayer.nonce = Number(n.valor);
+      relayer.sinFondos = saldo === 0n;
+    } catch (e) { relayer.error = e.message; }
+  }
+  const explorador = gfRedUrlProbable(cfg.explorerUrl) ? await gfRedWeb(cfg.explorerUrl) : { ok: false, error: 'private or local address' };
+  const avisos = [];
+  if (!contratos.mensajes.ok) avisos.push('The message logger contract does not answer on this chain.');
+  if (!explorador.ok) avisos.push('The explorer did not answer: links to transactions may not open.');
+  if (relayer && relayer.sinFondos) avisos.push('The relayer wallet has no funds on this chain: it cannot pay gas.');
+  const ok = rpcs.filter((f) => f.servidor).every((f) => f.ok) && rpcs.filter((f) => f.publico).every((f) => f.ok) && contratos.items.ok;
+  return { ok, rpcs, contratos, relayer, explorador, avisos, en: new Date().toISOString() };
+}
+function gfRedValidarParaGuardar(entrada) {
+  const { cfg, errores } = gfRedNormalizar(entrada, gfRedEnMarcha());
+  for (const u of [...cfg.rpcServidor, ...cfg.rpcPublico, cfg.explorerUrl]) if (u && !gfRedUrlProbable(u)) errores.push('private or local address: ' + u);
+  return { cfg, errores };
+}
+async function gfRedEstadoAdmin() {
+  let doc = null;
+  if (mongoose.connection.readyState === 1) {
+    doc = await mongoose.connection.collection('gf_config_red').findOne({ _id: 'activa' });
+  }
+  return {
+    ok: true,
+    enMarcha: { ...gfRedEnMarcha(), revision: GF_RED.revision, rpcActivo: GF_RED.rpcActual(), ultimoFallo: GF_RED.ultimoFallo },
+    fuentes: GF_RED_ARRANQUE.fuentes,
+    fija: process.env.GF_RED_FIJA === '1',
+    lecturaAlArrancar: GF_RED_ARRANQUE.errorLectura || 'ok',
+    pendienteReinicio: GF_RED.pendienteReinicio,
+    guardada: doc ? { cfg: doc.cfg, revision: Number(doc.revision) || 0, actualizadoPor: doc.actualizadoPor || null,
+      actualizadoEn: doc.actualizadoEn || null, migra: !!doc.pendienteReinicio } : null,
+    historial: doc && Array.isArray(doc.historial) ? doc.historial.slice(-20).reverse() : [],
+    relayer: relayerWallet ? relayerWallet.address : null,
+    porDefecto: GF_RED_POR_DEFECTO
+  };
+}
+app.get('/api/admin/red', adminAuth, apiLimiter, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try { return res.json(await gfRedEstadoAdmin()); }
+  catch (e) { return res.status(503).json({ error: 'estado_no_disponible', message: e.message }); }
+});
+app.post('/api/admin/red/probar', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const { cfg, errores } = gfRedValidarParaGuardar(req.body && req.body.cfg);
+    if (errores.length) return res.status(400).json({ error: 'datos_invalidos', errores, message: 'Check: ' + errores.join(', ') });
+    return res.json({ ok: true, cfg, migra: gfRedEsMigracion(cfg), prueba: await gfRedProbar(cfg) });
+  } catch (e) { return res.status(503).json({ error: 'prueba_fallida', message: e.message }); }
+});
+app.post('/api/admin/red', adminAuth, strictLimiter, csrfProtection, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'sin_base_de_datos' });
+    const b = req.body || {};
+    const { cfg, errores } = gfRedValidarParaGuardar(b.cfg);
+    if (errores.length) return res.status(400).json({ error: 'datos_invalidos', errores, message: 'Check: ' + errores.join(', ') });
+    const migra = gfRedEsMigracion(cfg);
+    if (migra && b.confirmar !== 'MIGRAR') {
+      return res.status(409).json({ error: 'confirmacion_requerida',
+        message: 'Changing the chain or the contracts needs the word MIGRAR and a server restart.' });
+    }
+    const prueba = await gfRedProbar(cfg);
+    if (!prueba.ok) return res.status(409).json({ error: 'red_no_responde', prueba, message: 'The network did not pass the test: nothing was saved.' });
+    const coleccion = mongoose.connection.collection('gf_config_red');
+    const actual = await coleccion.findOne({ _id: 'activa' }, { projection: { revision: 1 } });
+    const revActual = actual ? Number(actual.revision) || 0 : 0;
+    if (b.revisionBase != null && Number(b.revisionBase) !== revActual) {
+      return res.status(409).json({ error: 'cambiada_por_otro', revision: revActual,
+        message: 'Someone saved another network meanwhile. Reload and check before saving.' });
+    }
+    const revision = revActual + 1;
+    const quien = String((req.admin && (req.admin.address || req.admin.role)) || 'admin').slice(0, 64);
+    const en = new Date();
+    const r = await coleccion.updateOne(actual ? { _id: 'activa', revision: revActual } : { _id: 'activa' }, {
+      $set: { cfg, revision, actualizadoPor: quien, actualizadoEn: en, pendienteReinicio: migra },
+      $push: { historial: { $each: [{ revision, cfg, por: quien, en, migra }], $slice: -20 } }
+    }, { upsert: !actual });
+    if (actual && !r.matchedCount) return res.status(409).json({ error: 'cambiada_por_otro', message: 'Someone saved another network meanwhile. Reload and check before saving.' });
+    GF_RED.revisionLeida = revision;
+    if (migra) {
+      GF_RED.pendienteReinicio = { chainId: cfg.chainId, contratoItems: cfg.contratoItems, contratoMensajes: cfg.contratoMensajes, revision };
+      console.warn('⚠️  [red] ' + quien + ' guardó la revisión ' + revision + ' con OTRA cadena o contratos: entra al reiniciar el servidor.');
+    } else {
+      gfRedAplicarEnCaliente(cfg, revision);
+      console.log('🔗 [red] ' + quien + ' aplicó la revisión ' + revision + ': RPC ' + cfg.rpcServidor.map(gfRedHost).join(' → ') + ' · explorador ' + gfRedHost(cfg.explorerUrl));
+    }
+    return res.json({ ok: true, revision, aplicado: migra ? 'al_reiniciar' : 'ahora', prueba, estado: await gfRedEstadoAdmin() });
+  } catch (e) {
+    if (e && e.code === 11000) return res.status(409).json({ error: 'cambiada_por_otro' });
+    console.warn('⚠️  POST /api/admin/red:', e && e.message);
+    return res.status(503).json({ error: 'no_se_pudo_guardar', message: e && e.message });
+  }
+});
 
 // --- RUTAS DE ADMIN PARA GESTIÓN DE CONTRATOS ---
 const contractAdminAuth = async (req, res, next) => {
@@ -23593,6 +24103,25 @@ function eco2PrecioTienda(itemId) {
   if (!p) return TIENDA_PRECIOS[itemId];
   return [p.compra, p.venta, ECO2_LETRA_DE[p.moneda] || 'p'];
 }
+/* (2026-11-10) "A VECES COMPRO RÁPIDO Y FALLAN LAS COMPRAS DE LA TIENDA."
+   Los precios se recalculan cada minuto (con lo que queda de cada recurso en las tablas
+   globales, que justo baja al comprar). Las compras del jugador van en cola, una detrás de
+   otra, y cada una lleva el precio que VIO al pulsar: si entre medias se recalculaba, la
+   siguiente llegaba con el precio de antes y se rechazaba con "el precio cambió". Se acepta
+   el precio que el jugador vio si fue el de la tienda en los últimos minutos (las versiones
+   anteriores se guardan en `previas`, hasta 4). */
+function eco2PrecioBronceReciente(op, itemId, precioBronce, ventanaMs) {
+  if (!(Number.isSafeInteger(precioBronce) && precioBronce > 0)) return false;
+  const ahora = Date.now();
+  for (const prev of (_eco2Precios.previas || [])) {
+    if (!prev || !prev.items || ahora - (prev.hasta || 0) > ventanaMs) continue;
+    const p = prev.items[itemId];
+    if (!p) continue;
+    const unidad = Number(op === 'compra' ? p.compra : p.venta) || 0;
+    if (unidad > 0 && unidad * (TESORO_BRONCE_POR[p.moneda] || 0) === precioBronce) return true;
+  }
+  return false;
+}
 /** ¿Ese precio por unidad fue el de la tienda en los últimos 30 minutos? (cambió con la compra en marcha) */
 function eco2PrecioAnteriorValido(op, itemId, precioUnidad, moneda) {
   const ahora = Date.now();
@@ -24276,8 +24805,12 @@ app.post('/api/economia/tienda', gameplayLimiter, authMiddleware, csrfProtection
     const level = await gfNivelDeJugador(gp);
     if (level < gfNivelDeObjeto(b.itemId)) throw ecoError('nivel_bajo', 403);
     const native = ECO2_MONEDA_DE[p[2]], unit = p[op === 'compra' ? 0 : 1];
-    const price = unit * TESORO_BRONCE_POR[native];
-    if (Number(b.precioBronce) !== price) throw ecoError('precios_actualizados', 409);
+    let price = unit * TESORO_BRONCE_POR[native];
+    // El precio que vio el jugador vale si fue el de la tienda hace menos de 5 minutos (ver eco2PrecioBronceReciente).
+    if (Number(b.precioBronce) !== price) {
+      if (!eco2PrecioBronceReciente(op, b.itemId, Number(b.precioBronce), 5 * 60 * 1000)) throw ecoError('precios_actualizados', 409);
+      price = Number(b.precioBronce);
+    }
     const gross = price * q, fee = gross > 0 ? Math.max(1, Math.round(gross * TESORO_COMISION_BPS / 10000)) : 0;
     const reserve = op === 'compra' ? gross + fee : gross - fee + tesoroParteCircular(fee);
     if (!Number.isSafeInteger(reserve) || reserve < 1) throw ecoError('precio_invalido', 409);
@@ -32194,6 +32727,19 @@ const mensajePrivadoSchema = new mongoose.Schema({
   /* Editado una sola vez, y marcado. Ver el manejador `friends:dm:edit`. */
   editado:  { type: Boolean, default: false },
 
+  /* (2026-11-10) A QUÉ MENSAJE CONTESTA, si contesta a uno: su id y una copia corta de lo
+     que decía y de quién era EN ESE MOMENTO. Se copia (como `deNombre`) porque el original
+     puede editarse, vaciarse o caducar, y la respuesta tiene que seguir leyéndose. */
+  re: {
+    type: new mongoose.Schema({
+      id:       { type: String, default: '' },
+      de:       { type: String, default: '' },
+      deNombre: { type: String, default: '---' },
+      texto:    { type: String, default: '' }
+    }, { _id: false, versionKey: false }),
+    default: null
+  },
+
   /* Reacciones al privado: [{emoji, quienes:[playerName]}]. Aquí SÍ se guardan
      —al revés que en el chat general, que vive en un anillo de 50 en memoria—
      porque un privado se conserva y su reacción tiene que seguir ahí mañana. */
@@ -32957,18 +33503,33 @@ io.on('connection', (socket) => {
       const texto = escapeHtml(recortado);
       if (!texto) return;
 
+      /* ¿Contesta a un mensaje concreto? Tiene que ser de ESTA conversación (entre los dos)
+         y que quien contesta no lo haya vaciado de su lado. La cita la copia el servidor. */
+      let cita = null;
+      const reId = String((data && data.re) || '');
+      if (/^[0-9a-fA-F]{24}$/.test(reId)) {
+        const original = await MensajePrivado.findOne({
+          _id: reId, ocultoPara: { $ne: yo },
+          $or: [{ de: yo, para: otro }, { de: otro, para: yo }]
+        }).select('de deNombre texto').lean();
+        if (original) {
+          cita = { id: String(original._id), de: original.de,
+                   deNombre: original.deNombre || '---', texto: gfRecortarCita(original.texto, 120) };
+        }
+      }
+
       const fichas = await fichasDe([yo]);
       const doc = await MensajePrivado.create({
         de: yo, para: otro,
         deNombre: (fichas.get(yo) || {}).username || yo,
-        texto, ts: new Date(), leido: false
+        texto, ts: new Date(), leido: false, re: cita
       });
 
       const paquete = {
         id: String(doc._id), de: yo, para: otro,
         deNombre: doc.deNombre, texto: doc.texto,
         ts: doc.ts.toISOString(), leido: false,
-        editado: false, reacciones: []
+        editado: false, reacciones: [], re: cita
       };
 
       // A él (todas sus pestañas) y a mí (para que el mensaje salga también en
@@ -33297,6 +33858,7 @@ io.on('connection', (socket) => {
           id: String(m._id), de: m.de, para: m.para, deNombre: m.deNombre,
           texto: m.texto, ts: new Date(m.ts).toISOString(), leido: !!m.leido,
           editado: !!m.editado,
+          re: m.re && m.re.id ? { id: String(m.re.id), de: m.re.de, deNombre: m.re.deNombre, texto: m.re.texto } : null,
           reacciones: (m.reacciones || []).map(r => ({ emoji: r.emoji, quienes: (r.quienes || []).slice() }))
         }))
       });
