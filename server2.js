@@ -14807,11 +14807,15 @@ const boteSchema = new mongoose.Schema({
   playerName: { type: String, required: true, unique: true },     // uno por jugador
   deNombre:   { type: String, default: '' },
   x:          { type: Number, required: true },
-  y:          { type: Number, required: true }
+  y:          { type: Number, required: true },
+  // (2026-11-12) "Los botes que pongan en el agua deben autodestruirse si llevan 30 minutos
+  // sin usar": la última vez que se usó (al ponerlo, al subir y al bajar; remando no cuenta).
+  usadoEn:    { type: Date, default: Date.now, index: true }
 }, { timestamps: true, versionKey: false });
 const Bote = mongoose.model('Bote', boteSchema);
 const _boteABordo = new Map();     // id del bote -> socket.id de quien rema
 const _botePos = new Map();        // id del bote -> { x, y } mientras se rema
+const BOTE_SIN_USO_MS = 30 * 60 * 1000;   // (2026-11-12) tanto tiempo sin nadie a bordo y se hunde
 
 /** ¿Es agua (de la que se pesca) ese punto de esa zona? */
 function gfEsAgua(zona, x, y) {
@@ -14822,10 +14826,51 @@ function gfEsAgua(zona, x, y) {
 }
 function _botePublico(b) {
   const id = String(b._id);
+  const usado = b.usadoEn ? new Date(b.usadoEn).getTime() : NaN;
   return { id, zona: b.zona, x: Math.round(b.x), y: Math.round(b.y), dueno: b.playerName,
-           deNombre: String(b.deNombre || '').slice(0, 40), aBordo: _boteABordo.get(id) || null };
+           deNombre: String(b.deNombre || '').slice(0, 40), aBordo: _boteABordo.get(id) || null,
+           hundeEn: Number.isFinite(usado) ? usado + BOTE_SIN_USO_MS : null };
 }
 function _idBoteValido(id) { return typeof id === 'string' && /^[a-f0-9]{24}$/.test(id); }
+
+/* (2026-11-12) EL BOTE QUE NADIE USA SE HUNDE. Cada minuto, los que llevan BOTE_SIN_USO_MS sin
+   nadie a bordo se borran. Ya se quemó al ponerlo (decreaseInvoiceQuantity), así que no vuelve
+   a la bolsa: para guardarlo está la pala. Se avisa a la zona con el `bote:quitado` de siempre
+   (motivo 'sin_uso') y al dueño, esté donde esté, con `bote:hundido`. Con alguien remando no
+   cuenta: se le renueva la hora. Un barrido a la vez y como mucho 200 por vuelta. */
+let _botesBarriendo = false;
+async function gfBotesHundirSinUso() {
+  if (_botesBarriendo || mongoose.connection.readyState !== 1) return;
+  _botesBarriendo = true;
+  try {
+    const limite = new Date(Date.now() - BOTE_SIN_USO_MS);
+    const viejos = await Bote.find({ usadoEn: { $lt: limite } }).select('_id').limit(200).lean();
+    for (const v of viejos) {
+      const id = String(v._id);
+      const quien = _boteABordo.get(id);
+      if (quien && io.sockets.sockets.get(quien)) {
+        await Bote.updateOne({ _id: v._id }, { $set: { usadoEn: new Date() } }).catch(() => {});
+        continue;
+      }
+      // Con la misma condición: si alguien se subió o se bajó entretanto, ya no se hunde.
+      const quitado = await Bote.findOneAndDelete({ _id: v._id, usadoEn: { $lt: limite } }).lean().catch(() => null);
+      if (!quitado) continue;
+      _boteABordo.delete(id); _botePos.delete(id);
+      const minutos = Math.round(BOTE_SIN_USO_MS / 60000);
+      _avisarZona(quitado.zona, 'bote:quitado', { id, por: '', motivo: 'sin_uso', x: Math.round(quitado.x), y: Math.round(quitado.y) });
+      for (const s of socketsDeJugador(quitado.playerName)) {
+        try { s.emit('bote:hundido', { id, zona: quitado.zona, minutos }); } catch (_) {}
+      }
+      console.log(`⛵ El bote de ${quitado.playerName} se hundió: ${minutos} min sin uso (${quitado.zona})`);
+    }
+  } catch (e) { console.warn('⚠️  bote: barrido de los que nadie usa:', e.message); }
+  finally { _botesBarriendo = false; }
+}
+setInterval(gfBotesHundirSinUso, 60 * 1000).unref();
+// Los de antes no tenían hora de uso: sus 30 minutos cuentan desde que arranca este servidor.
+mongoose.connection.once('open', () => {
+  Bote.updateMany({ usadoEn: { $exists: false } }, { $set: { usadoEn: new Date() } }).catch(() => {});
+});
 
 app.get('/api/botes', apiLimiter, authMiddleware, async (req, res) => {
   try {
@@ -14970,7 +15015,9 @@ io.on('connection', (socket) => {
       const doc = await Bote.findById(id);
       if (!doc) { _botePos.delete(id); return; }
       const p = (Number.isFinite(x) && Number.isFinite(y) && gfEsAgua(doc.zona, x, y)) ? { x, y } : (_botePos.get(id) || null);
-      if (p) { doc.x = Math.round(p.x); doc.y = Math.round(p.y); await doc.save(); }
+      if (p) { doc.x = Math.round(p.x); doc.y = Math.round(p.y); }
+      doc.usadoEn = new Date();        // (2026-11-12) los 30 minutos sin uso cuentan desde que se baja
+      await doc.save();
       _botePos.delete(id);
       _avisarZona(doc.zona, 'bote:estado', _botePublico(doc));
     } catch (e) { console.warn('⚠️  bote: bajar:', e.message); }
@@ -14994,6 +15041,8 @@ io.on('connection', (socket) => {
       if (socket._boteId && socket._boteId !== id) await bajarse();
       _boteABordo.set(id, socket.id);
       socket._boteId = id;
+      doc.usadoEn = new Date();
+      Bote.updateOne({ _id: doc._id }, { $set: { usadoEn: doc.usadoEn } }).catch(() => {});
       _avisarZona(doc.zona, 'bote:estado', _botePublico(doc));
     } catch (e) { console.warn('⚠️  bote: subir:', e.message); }
   });
